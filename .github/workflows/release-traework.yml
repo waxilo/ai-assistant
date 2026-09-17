@@ -46,7 +46,8 @@ jobs:
 
       - name: 添加 macOS 双架构 target
         if: matrix.target != ''
-        run: rustup target add ${{ matrix.target }}
+        shell: bash
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -54,11 +55,13 @@ jobs:
 
       - name: 安装前端依赖
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: npm ci
 
       - name: 确定版本号（tag 优先，否则读配置）
         id: version
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: |
           REF="$GITHUB_REF_NAME"
           if [[ "$REF" == traework-v* ]]; then
@@ -69,6 +72,7 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: 检查签名私钥
+        shell: bash
         run: |
           if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
             echo "::error::缺少 TAURI_SIGNING_PRIVATE_KEY secret。"
@@ -79,6 +83,7 @@ jobs:
 
       - name: Tauri build（带更新产物）
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -117,6 +122,7 @@ jobs:
 
       - name: 确定版本号
         id: version
+        shell: bash
         run: |
           REF="$GITHUB_REF_NAME"
           if [[ "$REF" == traework-v* ]]; then
@@ -127,6 +133,7 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: 合并各平台 latest.json
+        shell: bash
         run: |
           mkdir -p dist
           i=0
@@ -138,10 +145,12 @@ jobs:
           node ../scripts/merge-latest.mjs /tmp/latest-*.json
 
       - name: 收集安装包
+        shell: bash
         run: |
           find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.app.tar.gz' -o -name '*.dmg' -o -name '*.sig' \) -exec cp {} dist/ \;
 
       - name: 发布 Release（固定 tag，两个应用各自独立，版本号随意演进）
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         working-directory: dist
