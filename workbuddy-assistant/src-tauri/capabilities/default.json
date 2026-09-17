@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "默认权限：核心能力 + 更新器 + 进程控制（用于更新后重启）+ 文件对话框（账号导入导出）",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "updater:default",
+    "process:default",
+    "dialog:default"
+  ]
+}

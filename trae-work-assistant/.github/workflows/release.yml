@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# gh CLI / tauri-action 要用 GITHUB_TOKEN 创建 Release / 上传产物，默认 token 是只读的
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS runner 当前为 Apple Silicon；如需 Intel/通用包，见 README“跨平台说明”
+          - platform: macos-latest
+            args: ""
+            artifact: bundles-macos
+          - platform: windows-latest
+            args: ""
+            artifact: bundles-windows
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS universal targets (可选)
+        if: matrix.platform == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        continue-on-error: true
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      # 只构建 + 本地签名，不创建/上传 Release。发布统一交给 normalize-assets 用 gh CLI 完成，
+      # 彻底绕开 tauri-action 在 Node 下发布步骤的兼容问题（create-a-release 偶发 403 / Node 24 静默崩溃）。
+      - name: Build & sign (tauri-action, no publish)
+        uses: tauri-apps/tauri-action@v0
+        # 2025-09 起 runner 默认强制 Node 24，而 tauri-action@v0 是 Node 20 动作；
+        # 该变量允许它回退到原生 Node 20 运行时，避免构建包装层在 Node 24 下出问题。
+        env:
+          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: ${{ matrix.args }}
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          # tauri 把所有安装包与 .sig 签名放在 bundle 目录
+          path: src-tauri/target/release/bundle/
+          if-no-files-found: error
+
+  # 产物命名统一：Tauri 默认产物名只有架构（aarch64/x64），两平台混在一个 Release 里不好分辨。
+  # 这里在架构前插入 macos_ / windows_ 平台标识，并全量重建 latest.json（签名只覆盖文件内容，
+  # 改名不影响校验），最后创建 Release 并转正——应用内「检查更新」走 releases/latest/download/latest.json，
+  # draft 状态下取不到。
+  normalize-assets:
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Flatten, rename & publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets && cd assets
+
+          python3 - <<'PY'
+          import json, os, shutil
+          from datetime import datetime, timezone
+
+          tag, repo = os.environ["TAG"], os.environ["REPO"]
+
+          # 只收集真实安装包（白名单扩展名），绝不把 .app 内部的二进制 / Info.plist /
+          # icon.icns、dmg 资源 bundle_dmg.sh 等垃圾搬进 Release。
+          WHITELIST = (".dmg", ".msi", ".app.tar.gz", ".sig")
+          def is_installer(name):
+              if name.endswith(WHITELIST):
+                  return True
+              if name.endswith("-setup.exe"):   # NSIS 安装包
+                  return True
+              return False
+
+          collected = []
+          for root, _, fs in os.walk("."):
+              if root == ".":
+                  continue
+              for name in fs:
+                  if name == "latest.json":
+                      continue
+                  if is_installer(name):
+                      collected.append(os.path.join(root, name))
+          collected.sort()
+
+          def target_name(f):
+              base = os.path.basename(f)
+              if "_aarch64" in base:        # macOS Apple Silicon
+                  return base.replace("_aarch64", "_macos_aarch64")
+              if "_x86_64" in base:         # macOS Intel
+                  return base.replace("_x86_64", "_macos_x86_64")
+              if "_x64" in base:            # Windows x64
+                  return base.replace("_x64", "_windows_x64")
+              return base
+
+          mapping = {}
+          for f in collected:
+              new = target_name(f)
+              dest = new
+              if os.path.exists(dest):      # 冲突保护，避免静默丢文件
+                  i = 1
+                  stem, ext = os.path.splitext(new)
+                  while os.path.exists(dest):
+                      dest = f"{stem}_{i}{ext}"
+                      i += 1
+              shutil.move(f, dest)
+              mapping[os.path.basename(f)] = dest
+          print("moved:", json.dumps(mapping, indent=2))
+
+          for root, dirs, _ in os.walk(".", topdown=False):
+              for d in dirs:
+                  try:
+                      os.rmdir(os.path.join(root, d))
+                  except OSError:
+                      pass
+
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+          files = set(os.listdir("."))
+          platforms = {}
+
+          def add(key, artifact):
+              sig = artifact + ".sig"
+              if artifact in files and sig in files:
+                  platforms[key] = {
+                      "signature": open(sig).read().strip(),
+                      "url": f"{base}/{artifact}",
+                  }
+
+          for f in sorted(files):
+              if f.endswith(".app.tar.gz"):
+                  # macos-latest runner 为 Apple Silicon；文件名无架构后缀时默认 aarch64
+                  arch = "x86_64" if "_x86_64" in f else "aarch64"
+                  add(f"darwin-{arch}", f)
+          msi = next((f for f in sorted(files) if f.endswith(".msi")), None)
+          nsis = next((f for f in sorted(files) if f.endswith("-setup.exe")), None)
+          if msi:
+              add("windows-x86_64", msi)
+              add("windows-x86_64-msi", msi)
+          if nsis:
+              add("windows-x86_64-nsis", nsis)
+
+          if not platforms:
+              raise SystemExit("没有任何可用的更新产物，拒绝发布")
+
+          manifest = {
+              "version": tag.lstrip("v"),
+              "notes": "自动构建的桌面安装包（Windows / macOS）。",
+              "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          json.dump(manifest, open("latest.json", "w"), ensure_ascii=False, indent=2)
+          print("platforms:", list(platforms.keys()))
+
+          # 记录最终要上传的产物（改名后的安装包 + .sig + latest.json），供下方 gh 显式上传，
+          # 避免用 ./* 通配到 bundle/ 残留目录（如 dmg/、TraeWorkAssistant.app/）导致上传失败。
+          with open("publish_list.txt", "w") as pl:
+              for dest in mapping.values():
+                  pl.write(dest + "\n")
+              pl.write("latest.json\n")
+          print("publish_list:", sorted(mapping.values()) + ["latest.json"])
+          PY
+
+          # 先创建空的 draft Release（不挂任何产物，避免 ./* 把 bundle 残留目录当文件上传）
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --draft \
+            --title "TraeWork 助手 $TAG" \
+            --notes "自动构建的桌面安装包（Windows / macOS）。"
+
+          # 仅上传 publish_list.txt 中列出的真实产物（安装包 + .sig + latest.json）
+          mapfile -t ASSETS < publish_list.txt
+          gh release upload "$TAG" \
+            --repo "$REPO" \
+            --clobber \
+            "${ASSETS[@]}"
+
+          # draft 状态下应用内「检查更新」取不到，这里转正并设为 latest
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest

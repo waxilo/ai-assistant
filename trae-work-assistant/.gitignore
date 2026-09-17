@@ -1,0 +1,56 @@
+# --- Rust / Tauri build artifacts ---
+/src-tauri/target
+**/*.rs.bk
+/src-tauri/gen/schemas
+
+# --- Node / frontend ---
+node_modules
+dist
+dist-ssr
+*.local
+
+# --- Logs ---
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- OS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Editor ---
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Tauri updater signing key (NEVER commit) ---
+src-tauri/tauri.key
+src-tauri/tauri.key.pub
+
+# --- Local WorkBuddy memory (project-local, not for repo) ---
+.workbuddy/
+
+# --- 逆向/取证资料，永不入库（仓库是 PUBLIC）---
+# docs/ 含免证书接管方案的逆向细节（闸门地址、补丁指纹、TCC 规避）；
+# scripts/ 是额度与代理探针。两者只在本机存在，靠 .gitignore 兜住 ——
+# 光靠「记得别用 git add -A」是会失手的（2026-09-16 补）。
+docs/
+scripts/

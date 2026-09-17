@@ -1,0 +1,208 @@
+/**
+ * 基础层：重置、页面底色、排版、焦点、动效关键帧、入场节奏。
+ *
+ * 底色是**纯白**（`--bg`），不带任何环境光渐变 —— 见下方 body 处的说明。
+ * 动效词汇表集中在这里：所有关键帧只定义一次，页面与组件只引用动画名。
+ * 旧版把 7 个 @keyframes 分散在 App.css 各处（navDotPulse / pageIn / fadeIn /
+ * modalIn / indet …），命名各不相同、时长也各写一遍，是无意义的分叉。
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  color: var(--text);
+  font-size: var(--fs-cell);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* 纯白底（2026-09-16 用户要求「背景色改为白色」）。
+     这里**刻意不放任何环境光 / 渐变**：白底上的彩色渐变渲染出来就是用户看到的那片浅绿，
+     属于把品牌色铺满背景 —— 品牌色只该出现在强调件上。
+     毛玻璃仍然保留（见 `.sidebar` / `.pagebar` 的 backdrop-filter）：它真正起作用的地方是
+     内容滚动时从页头底下穿过，而不是靠背景色"透"出来。 */
+  background-color: var(--bg);
+  background-image: none;
+  /* 应用外壳是固定高度的两栏结构，滚动只发生在内容区 */
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--primary-soft-2);
+  color: var(--primary-d);
+}
+
+/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示。
+   注意这里**不设 border-radius** —— 它是全局选择器，设了就会在聚焦瞬间
+   把卡片（12px）/ 弹窗（16px）的圆角改掉，属于「看起来只是加了个描边」的隐性破相。 */
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* 滚动条：与整体圆角/低对比语言一致。
+   （旧版是「全站隐藏滚动条」，代价是长表格没有位置参照；这里改成细滚动条。） */
+.content::-webkit-scrollbar,
+.modal::-webkit-scrollbar,
+.feed::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.content::-webkit-scrollbar-thumb,
+.modal::-webkit-scrollbar-thumb,
+.feed::-webkit-scrollbar-thumb {
+  background: rgba(107, 116, 136, 0.28);
+  border: 3px solid transparent;
+  border-radius: var(--radius-pill);
+  background-clip: content-box;
+}
+.content::-webkit-scrollbar-thumb:hover,
+.modal::-webkit-scrollbar-thumb:hover,
+.feed::-webkit-scrollbar-thumb:hover {
+  background: rgba(107, 116, 136, 0.45);
+  background-clip: content-box;
+}
+.content::-webkit-scrollbar-track,
+.modal::-webkit-scrollbar-track,
+.feed::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── 关键帧：全应用共用的动效词汇表 ─────────────────────────── */
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px var(--primary-ring);
+  }
+  50% {
+    /* 尾帧必须**完全透明**，用 transparent 而不是某个色的 0 透明度版本 ——
+       否则一旦品牌色换了，这里就成了一个忘记跟上的硬编码色值 */
+    box-shadow: 0 0 0 5px transparent;
+  }
+}
+@keyframes nav-dot-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.35);
+    opacity: 0.55;
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+@keyframes upd-slide {
+  0% {
+    margin-left: -40%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+/* 页面入场：轻微上浮 */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 遮罩淡入 */
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+/* 弹窗落定：略带回弹，比线性缩放更有「落下来」的物理感 */
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 内容块出现（列表项、提示块） */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 页面入场节奏：面板页的直接子块依次浮现。
+   刻意用 animation-delay 而不是把 JS 写进每个组件 —— 页面自己不用知道这事。
+   ⚠️ 只对块级容器生效，且页面根必须是 .panel-page（见 ui.css）。 */
+.panel-page > * {
+  animation: rise var(--dur-3) var(--ease-out) both;
+}
+.panel-page > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.panel-page > *:nth-child(2) {
+  animation-delay: 40ms;
+}
+.panel-page > *:nth-child(3) {
+  animation-delay: 80ms;
+}
+.panel-page > *:nth-child(4) {
+  animation-delay: 120ms;
+}
+.panel-page > *:nth-child(5) {
+  animation-delay: 160ms;
+}
+.panel-page > *:nth-child(n + 6) {
+  animation-delay: 200ms;
+}
+
+/**
+ * 无障碍：尊重系统的「减少动态效果」。
+ * 用一条近乎全局的规则把动画与过渡压到 0.01ms —— 比逐个去禁用可靠得多，
+ * 新增动画也不会漏掉。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

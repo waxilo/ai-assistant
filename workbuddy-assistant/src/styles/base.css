@@ -1,0 +1,193 @@
+/**
+ * 基础层：重置、环境背景、排版、焦点、动效关键帧。
+ *
+ * 毛玻璃的前置条件是「背后有东西」——所以这里把纯色底换成了柔和的环境光
+ * （三团低透明度径向渐变 + 一层竖向提亮）。没有这层，backdrop-filter 只是
+ * 半透明，看不出玻璃感。
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  color: var(--text);
+  font-size: var(--fs-cell);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* 环境光：位置刻意避开内容中心，避免读写区被染色影响对比度 */
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(920px 620px at 8% -12%, rgba(59, 108, 255, 0.16), transparent 62%),
+    radial-gradient(760px 520px at 96% 2%, rgba(122, 92, 255, 0.11), transparent 64%),
+    radial-gradient(700px 500px at 74% 108%, rgba(46, 163, 107, 0.1), transparent 62%),
+    linear-gradient(180deg, #f8fafd 0%, #eef2f9 100%);
+  background-repeat: no-repeat;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--primary-soft-2);
+  color: var(--primary-d);
+}
+
+/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示。
+   注意这里**不设 border-radius** —— 它是全局选择器，设了就会在聚焦瞬间
+   把卡片（12px）/ 弹窗（16px）的圆角改掉，属于"看起来只是加了个描边"的隐性破相。 */
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/**
+ * 滚动条：**全应用不显示**，但滚动能力完整保留（滚轮 / 触控板 / 键盘 / 触屏照常）。
+ *
+ * 为什么是全局而不是逐个容器：Windows 上原生滚动条按 DPI 吃掉 12–17px 宽度，
+ * 这恰好是页头那排按钮需要的余量 —— 它一出现，标题就被挤到要换行；同时面板都是
+ * 圆角玻璃，一条浅灰轨道会把圆角切出一道直边，是「看着不像一家」里最廉价也最
+ * 顽固的一条。此前 `.content` / `.modal-body` / `.pick-list` / `.evt-list` 各写了
+ * 一遍，四种形态互不相同，所以统一收到这里。
+ *
+ * 两条属性各写一遍是必要的：`scrollbar-width` 给 Firefox 与新版 Chromium，
+ * `::-webkit-scrollbar` 给老内核。**这里是全应用唯一允许出现滚动条规则的地方。**
+ *
+ * 代价与对策：看不到滚动条就看不出「这里还能滚」，所以任何横向可滚区域都不允许
+ * 在窄窗口下真的溢出 —— `.table-wrap` 的次要列会在窄窗收起，见 responsive.css。
+ */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* ── 关键帧：全应用共用的动效词汇表 ─────────────────────────── */
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px var(--primary-ring);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(59, 108, 255, 0);
+  }
+}
+@keyframes nav-dot-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.35);
+    opacity: 0.55;
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+/* 页面入场：轻微上浮。四页共用，靠 nth-child 做 40ms 递进 */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 遮罩淡入 */
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+/* 弹窗落定：略带回弹，比线性缩放更有「落下来」的物理感 */
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 内容块出现（列表项、提示块） */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 页面入场节奏：面板页的直接子块依次浮现。
+   刻意用 animation-delay 而不是把 JS 写进每个组件 —— 页面自己不用知道这事。 */
+.panel-page > * {
+  animation: rise var(--dur-3) var(--ease-out) both;
+}
+.panel-page > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.panel-page > *:nth-child(2) {
+  animation-delay: 40ms;
+}
+.panel-page > *:nth-child(3) {
+  animation-delay: 80ms;
+}
+.panel-page > *:nth-child(4) {
+  animation-delay: 120ms;
+}
+.panel-page > *:nth-child(5) {
+  animation-delay: 160ms;
+}
+.panel-page > *:nth-child(n + 6) {
+  animation-delay: 200ms;
+}
+
+/**
+ * 无障碍：尊重系统的「减少动态效果」。
+ * 用一条近乎全局的规则把动画与过渡压到 0.01ms —— 比逐个去禁用可靠得多，
+ * 新增动画也不会漏掉。历史版本全站 7 处动画，一处降级都没有。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

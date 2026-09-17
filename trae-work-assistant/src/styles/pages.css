@@ -1,0 +1,722 @@
+/**
+ * 页面层：只在「某页独有」时才写在这里，且必须复用通用层的语言。
+ *
+ * 旧版 App.css 里的魔法色值（#f6d3d1 / #fef3f2 / #b42318 / #94a3b8 / #f59e0b /
+ * #8b5cf6 / #d97706 / #eef1f5 …）在这里全部收敛到 tokens.css 的语义令牌 ——
+ * 这是「同一个语义在四个页面各写一遍」这类漂移不再复发的关键。
+ */
+
+/* ── 账号与签到页 ─────────────────────────────────────────── */
+.ac-title-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.ac-token {
+  font-family: var(--font-mono);
+  font-size: var(--fs-cap);
+  color: var(--muted);
+}
+.ac-credits {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: var(--tnum);
+}
+.ac-cell-actions {
+  white-space: nowrap;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+/* ── 签到日志页 ───────────────────────────────────────────── */
+/* 筛选工具条：由 .card 承载，与下方表格同一种卡片语言 */
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  flex-wrap: wrap;
+}
+.logs-toolbar .filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-body);
+  color: var(--muted);
+  margin: 0;
+}
+.logs-toolbar .filter input {
+  min-width: 220px;
+  margin: 0;
+}
+.log-cell-time {
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: var(--tnum);
+  font-size: var(--fs-sm);
+}
+.log-cell-msg {
+  color: var(--text-2);
+  word-break: break-word;
+  min-width: 180px;
+}
+.logs-scroll {
+  max-height: min(62vh, 620px);
+  overflow: auto;
+}
+
+/* ── 智能接管页 ───────────────────────────────────────────── */
+/* 控制区做成「设置行」结构：左右各一行、标签靠左、控件靠右，行间一条细线。
+   除此以外不放任何文字 —— 状态由开关颜色表达，异常/提示由下面的接管动态流承担。 */
+.card.hero {
+  padding: 2px 20px;
+}
+.card.hero.live {
+  border-color: var(--ok-line);
+  box-shadow: var(--shadow-sm), var(--hl), 0 8px 26px var(--primary-glow);
+}
+.hero-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 62px;
+}
+.hero-row + .hero-row {
+  border-top: 1px solid var(--border);
+}
+.hero-row h2 {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 650;
+}
+.field-label {
+  font-size: var(--fs-cell);
+  color: var(--text-2);
+  flex: 0 0 auto;
+}
+
+/* 端口：等宽数字、右对齐，像「一个值」而不是一个输入框；数字输入的原生箭头去掉 */
+input.port-input {
+  width: 96px;
+  margin: 0;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: var(--tnum);
+  letter-spacing: 0.5px;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+input.port-input::-webkit-outer-spin-button,
+input.port-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input.port-input:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  border-color: var(--border);
+}
+
+/* 次级动作：不常按、又不该跟主开关抢注意力 */
+.link-btn {
+  flex: none;
+  padding: 5px 11px;
+  border-radius: 7px;
+  border: 1px solid currentColor;
+  background: transparent;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-1) var(--ease-out),
+    opacity var(--dur-1) var(--ease-out);
+}
+.link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.hero-row .link-btn {
+  color: var(--text-2);
+  border-color: var(--border);
+}
+.hero-row .link-btn:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+/* 卡片右上角的图标按钮：与内容抢注意力不划算，悬停/聚焦才出现 */
+.card-head .icon-btn {
+  opacity: 0;
+  visibility: hidden;
+}
+.card:hover .icon-btn,
+.card-head .icon-btn:focus-visible {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* ── 接管动态：一条时间轴（左侧竖线 + 彩色圆点） ───────────── */
+.feed {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  max-height: 52vh;
+  overflow: auto;
+}
+.feed-item {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 8px 9px 24px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+}
+.feed-item:hover {
+  background: var(--panel-2);
+}
+/* 竖线只连到首尾两个点，不悬在列表外面 */
+.feed-item::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-strong);
+}
+.feed-item:first-child::before {
+  top: 21px;
+}
+.feed-item:last-child::before {
+  bottom: auto;
+  height: 21px;
+}
+.feed-item:only-child::before {
+  display: none;
+}
+.feed-dot {
+  position: absolute;
+  left: 0;
+  top: 16px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 3px var(--card-glass);
+}
+.feed-time {
+  flex: 0 0 auto;
+  width: 62px;
+  color: var(--muted-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: var(--tnum);
+}
+.feed-label {
+  flex: 0 0 auto;
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.feed-count {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-3);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 700;
+}
+.feed-detail {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.feed-empty {
+  padding: 30px 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+/* 事件配色：圆点定性质（一眼扫出哪些是异常），标签用同色底，正文保持中性以免整屏发花 */
+.k-on .feed-dot {
+  background: var(--ok);
+}
+.k-on .feed-label {
+  background: var(--ok-soft-2);
+  color: var(--ok-d);
+}
+.k-off .feed-dot {
+  background: var(--muted-2);
+}
+/* 「开始使用账号」= 一次**正常**的路由，所以用与「成功」同族的绿；
+   含义靠标签文字区分，不再为它单独引入一支蓝（2026-09-16 用户要求全站绿白、去掉蓝色）。
+   全站色相收敛为：品牌绿 / 中性灰 / 琥珀（限流·上游拒绝）/ 红（异常）。 */
+.k-route .feed-dot {
+  background: var(--ok);
+}
+.k-route .feed-label {
+  background: var(--ok-soft-2);
+  color: var(--ok-d);
+}
+.k-failover .feed-dot {
+  background: var(--warn);
+}
+.k-failover .feed-label {
+  background: var(--warn-soft-2);
+  color: var(--warn-d);
+}
+.k-restart .feed-dot {
+  background: var(--warn-d);
+}
+.k-restart .feed-label {
+  background: var(--warn-soft-2);
+  color: var(--warn-d);
+}
+.k-warn .feed-dot {
+  background: var(--warn);
+}
+.k-warn .feed-label {
+  background: var(--warn-soft-2);
+  color: var(--warn-d);
+}
+/* 「上游拒绝」与「代理异常」的差别是**性质**：一个是上游说了什么，一个是接管自己坏了。
+   两者都用红会让「扣费明明成功了，日志却一片红」（2026-09-15 用户实测困惑点）。 */
+.k-err .feed-dot {
+  background: var(--err);
+}
+.k-err .feed-label {
+  background: var(--err-soft-2);
+  color: var(--err);
+}
+
+/* ── 多选胶囊（接管应用 / 参与扣费） ───────────────────────── */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+  max-width: 74%;
+  justify-content: flex-end;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px dashed var(--border-strong);
+  font-size: var(--fs-cap);
+  font-family: inherit;
+  font-variant-numeric: var(--tnum);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out);
+}
+.chip:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text-2);
+}
+.chip.on {
+  background: var(--primary-soft);
+  color: var(--primary-d);
+  border: 1px solid transparent;
+  font-weight: 600;
+}
+.chip:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.chip .tick {
+  font-size: 10.5px;
+}
+/* 「接管应用」：本机只发现一个应用时那枚 chip 是只读的 —— 它仍是**已选**状态，
+   所以不能被 .chip:disabled 的 55% 透明压暗（那看起来像没勾上）。 */
+.chip.static,
+.chip.static:hover:not(:disabled) {
+  cursor: default;
+}
+.chip.static.on,
+.chip.static.on:hover:not(:disabled) {
+  opacity: 1;
+}
+/* chip 尾部的健康灯（只在接管开着时渲染）：绿 = 已改道且补丁在位，橙 = 这个应用有事 */
+.app-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted-2);
+}
+.app-dot.ok {
+  background: var(--ok);
+}
+.app-dot.warn {
+  background: var(--warn);
+}
+
+/* ── 设置页：左右两栏卡片布局 ─────────────────────────────── */
+/* 设置卡：组合 .card 取得统一外观，这里只描述「左栏卡片头 + 右栏设置组」的横向排布。
+   注意 .card 必须由 JSX 显式组合（className="set-card card"），这里不自带边框底色。 */
+.set-card {
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+}
+.set-card-head {
+  flex: 0 0 200px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 16px 18px 18px;
+  border-right: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.set-card-icon {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  color: var(--primary);
+  margin-top: 1px;
+  box-shadow: var(--hl);
+}
+.set-card-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+.set-card-sub {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  margin-top: 4px;
+  line-height: 1.5;
+}
+.set-group {
+  flex: 1;
+  padding: 6px 18px;
+  min-width: 0;
+}
+.set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 0;
+}
+/* 仅相邻同级行之间显示分隔线（嵌套行 / 展开区内部行不显示） */
+.set-group > .set-row ~ .set-row:not(.sub):not(.in-expand) {
+  border-top: 1px solid var(--border);
+}
+/* 从属于上一项开关的嵌套行：浅色背景块 */
+.set-row.sub {
+  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+  padding: 13px 14px;
+  margin: 0 -4px;
+}
+.set-row-main {
+  min-width: 0;
+}
+.set-row-title {
+  font-size: var(--fs-md);
+  font-weight: 500;
+  color: var(--text);
+}
+.set-row-desc {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  margin-top: 4px;
+  line-height: 1.55;
+  max-width: 480px;
+}
+.set-row-ctrl {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.set-row-ctrl input[type="time"],
+.set-row-ctrl input[type="number"] {
+  min-width: 108px;
+  margin: 0;
+}
+/* 设置行右侧的文本输入：只给一个够用的固定宽度，不占满整行
+   （`.panel-page input` 会把宽度交给容器，而这里的容器是一条靠右的行） */
+.set-row-ctrl .set-input {
+  width: 280px;
+  margin: 0;
+}
+.set-row-ctrl .switch {
+  margin: 0;
+}
+.set-suffix {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+}
+.set-foot {
+  margin: 0 0 14px;
+  padding: 0 18px;
+}
+/* 只读的设置值：长得像控件但不可交互（比禁用态更明确 —— 不是「暂时不能用」，
+   而是「这个值本来就不开放修改」） */
+.set-readonly {
+  display: inline-flex;
+  align-items: center;
+  height: var(--pill-h);
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: var(--fs-cap);
+  font-variant-numeric: var(--tnum);
+  cursor: default;
+  user-select: none;
+}
+/* 设置页底部自动保存状态：无按钮，纯提示 */
+.set-autosave {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 18px;
+  font-size: var(--fs-body);
+  color: var(--ok-d);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--glass);
+  backdrop-filter: blur(var(--blur-sm));
+  -webkit-backdrop-filter: blur(var(--blur-sm));
+  box-shadow: var(--shadow-sm);
+  animation: fade-in var(--dur-2) var(--ease-out) both;
+}
+.set-autosave .muted {
+  color: var(--muted);
+}
+.set-autosave svg {
+  flex: 0 0 auto;
+}
+
+/* ── 积分简报页 ─────────────────────────────────────────────
+   三层结构：日条目（卡）→ 时条目（展开后的行）→ 逐账号扣费（行点开的弹窗）。
+   消耗用暖色、新增用成功色 —— 与签到日志页「本次积分 = 绿色」的既有语言一致。 */
+.bp-consumed {
+  color: var(--warn);
+}
+.bp-gained {
+  color: var(--ok);
+}
+.brief-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* 一条日条目 = 一张卡：整行可点，展开后接当天的时条目列表 */
+.brief {
+  overflow: hidden;
+}
+.brief-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  width: 100%;
+  padding: 13px 18px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out);
+}
+.brief-head:hover {
+  background: var(--row-hover);
+}
+.brief-date {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  font-variant-numeric: var(--tnum);
+  white-space: nowrap;
+}
+.brief-window {
+  font-size: var(--fs-xs);
+  color: var(--muted-2);
+  font-variant-numeric: var(--tnum);
+  white-space: nowrap;
+}
+.brief-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.brief-metric .bm-label {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+}
+.brief-metric .bm-num {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  font-variant-numeric: var(--tnum);
+}
+/* 展开指示：用 border 画一个 chevron，不必为一个箭头再引一个图标 */
+.brief-caret {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid var(--muted-2);
+  border-bottom: 2px solid var(--muted-2);
+  transform: rotate(-45deg);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+.brief-caret.open {
+  transform: rotate(45deg);
+}
+
+/* ── 时条目行 ───────────────────────────────────────────── */
+/* 展开出来的列表：与上面那行之间留一条分隔线，不然会贴在按钮上 */
+.brief-hours {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+}
+/* 一行时条目 = 一颗整行可点的按钮（点开才是逐账号扣费） */
+.bh-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 18px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font-variant-numeric: var(--tnum);
+  transition: background var(--dur-1) var(--ease-out);
+}
+.bh-row + .bh-row {
+  border-top: 1px solid var(--hairline);
+}
+.bh-row:hover {
+  background: var(--panel-3);
+}
+/* 整行就是按钮（曾经右边还挂一个「明细」小字，已去掉：一行里出现第二个可点区域，
+   反而让人以为只有那里能点）。鼠标点开明细弹窗、关闭后焦点会回到这一行上，
+   全局 `:focus-visible` 的主色描边就会把它框成一个蓝框，看着像选中态 ——
+   所以这一行的焦点提示改成与 hover 同底的极淡高亮：键盘照样看得见，
+   鼠标路径不会再留下一个框。 */
+.bh-row:focus {
+  outline: none;
+}
+.bh-row:focus-visible {
+  outline: none;
+  background: var(--panel-3);
+}
+.bh-hour {
+  flex: 0 0 auto;
+  width: 46px;
+  color: var(--text-2);
+}
+/* 迷你条：两根细横条按**当天**峰值归一 —— 只看形状（哪个小时最贵），
+   精确读数在右边那一列数字里。0 值不画：给一个最小宽度会让人误以为有数据。 */
+.bh-track {
+  flex: 1 1 auto;
+  min-width: 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.bh-fill {
+  display: block;
+  height: 4px;
+  border-radius: var(--radius-pill);
+}
+.bh-fill.consumed {
+  background: var(--warn);
+}
+.bh-fill.gained {
+  background: var(--ok);
+}
+.bh-num {
+  flex: 0 0 auto;
+  min-width: 62px;
+  font-weight: 600;
+  text-align: right;
+}
+.bh-accts {
+  flex: 0 0 auto;
+  min-width: 62px;
+  font-size: var(--fs-xs);
+  color: var(--muted-2);
+}
+.brief-hint {
+  margin: 0;
+  padding: 9px 18px 10px;
+  border-top: 1px solid var(--hairline);
+  font-size: var(--fs-micro);
+  line-height: 1.6;
+  color: var(--muted-2);
+}
+
+/* 简报页的开关：`.logs-toolbar` 是 flex，控件间距交给它的 gap，
+   这里只负责「开关 + 状态文字」自己内部对齐（文字跟着开关走，别被 flex 拉开）。 */
+.bp-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  cursor: pointer;
+}
+.bp-toggle-text {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* 工具栏里的「当前剩余」：读的是与账号页**同一份** `credit_snapshot`，
+   给数字一点权重，好让「两页是一个数」这件事一眼能对上。 */
+.bp-now {
+  color: var(--text);
+  font-weight: 650;
+  font-variant-numeric: var(--tnum);
+  white-space: nowrap;
+}
+
+/* ── 窄窗口适配 ───────────────────────────────────────────── */
+/* 设置卡左右分栏在窄窗口下改为上下堆叠，否则右栏被挤到无法阅读 */
+@media (max-width: 860px) {
+  .set-card {
+    flex-direction: column;
+  }
+  .set-card-head {
+    flex: 0 0 auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .set-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

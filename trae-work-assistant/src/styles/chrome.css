@@ -1,0 +1,364 @@
+/**
+ * 外壳层：应用骨架（侧栏 / 页头 / 内容区）、导航、按钮、Toast。
+ *
+ * 关键结构（相对旧版的变化）：页头从「页面内部的一行 h2」提升为**悬浮在内容之上的
+ * 玻璃层**，承载「这一页是什么 + 这一页现在什么状态 + 这一页能做什么」。内容区
+ * 绝对定位并向上溢出到页头之下，滚动时内容从毛玻璃页头底下穿过 —— 侧栏与页头的
+ * backdrop-filter 才有实际被模糊的对象。
+ */
+
+.app {
+  display: flex;
+  height: 100%;
+}
+
+/* ── 侧边导航栏：半透明玻璃 + 细描边 ───────────────────────── */
+.sidebar {
+  flex: 0 0 216px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px 14px;
+  z-index: 10;
+  background: var(--glass);
+  backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  border-right: 1px solid var(--hairline);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 2px 6px;
+  min-width: 0;
+}
+.logo {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, var(--primary-lite), var(--primary-d));
+  color: #fff;
+  box-shadow: 0 2px 8px var(--primary-ring), var(--hl);
+}
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+.brand-name {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.brand-ver {
+  font-size: var(--fs-micro);
+  color: var(--muted-2);
+  letter-spacing: 0.2px;
+  font-variant-numeric: var(--tnum);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+/* 导航项：选中态用一条会「长出来」的强调条（scaleY 过渡），
+   比静态的 inset box-shadow 更有反馈感。 */
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: var(--fs-cell);
+  font-family: inherit;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  position: relative;
+  transition: background var(--dur-2) var(--ease-out),
+    color var(--dur-2) var(--ease-out);
+}
+.nav-item::before {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 50%;
+  width: 3px;
+  height: 20px;
+  border-radius: 0 3px 3px 0;
+  background: var(--primary);
+  transform: translateY(-50%) scaleY(0);
+  opacity: 0;
+  transition: transform var(--dur-2) var(--ease-spring),
+    opacity var(--dur-2) var(--ease-out);
+}
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.66);
+  color: var(--text);
+}
+.nav-item.active {
+  background: var(--primary-soft);
+  color: var(--primary-d);
+  font-weight: 600;
+}
+.nav-item.active::before {
+  transform: translateY(-50%) scaleY(1);
+  opacity: 1;
+}
+.nav-icon {
+  width: 18px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.nav-dot {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.nav-dot.err {
+  background: var(--err);
+  animation: nav-dot-pulse 1.8s ease-in-out infinite;
+}
+
+/* ── 右侧主区：页头悬浮于内容之上 ───────────────────────────── */
+.main {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}
+.pagebar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  z-index: 5;
+  height: var(--pagebar-h);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 var(--page-pad);
+  background: var(--glass);
+  backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  border-bottom: 1px solid var(--hairline);
+}
+.pagebar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pagebar-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  color: var(--primary-d);
+}
+.pagebar h2 {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+/* 状态胶囊：高度由 --pill-h 统一定义，与接管页的胶囊**结构上**同高，
+   而不是靠两条 padding 公式碰巧算成一样（那样一改就分叉） */
+.status-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--pill-h);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 0 11px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.status-pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.status-pill.warn .dot {
+  background: var(--warn);
+}
+.status-pill.err .dot {
+  background: var(--err);
+}
+.action-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.spacer {
+  flex: 1;
+}
+.count {
+  font-size: var(--fs-body);
+  color: var(--muted);
+  font-variant-numeric: var(--tnum);
+}
+
+/* ── 按钮 ─────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-body);
+  font-weight: 500;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out),
+    transform var(--dur-1) var(--ease-out);
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--panel-2);
+}
+/* 按下时轻微下沉：给点击一个物理反馈，成本极低 */
+.btn:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn.primary {
+  background: linear-gradient(180deg, var(--primary-lite), var(--primary));
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 1px 2px var(--primary-ring), var(--hl);
+}
+.btn.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--primary), var(--primary-d));
+  border-color: var(--primary-d);
+  box-shadow: 0 3px 10px var(--primary-ring);
+}
+.btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.btn.ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+  border-color: transparent;
+}
+.btn.danger {
+  color: var(--err);
+  border-color: var(--border);
+}
+.btn.danger:hover:not(:disabled) {
+  background: var(--err-soft);
+  border-color: var(--err-line);
+}
+/* 小号按钮：只有这一个类名（不再有第二个等价的 .btn-sm） */
+.btn.small {
+  padding: 7px 12px;
+  font-size: var(--fs-sm);
+}
+.btn.block {
+  width: 100%;
+}
+/* 图标按钮（日志 / 删除等轻量操作，高度 32px） */
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out);
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+.icon-btn.icon-danger:hover:not(:disabled) {
+  background: var(--err-soft);
+  color: var(--err);
+  border-color: var(--err-line);
+}
+.spin {
+  animation: spin 0.7s linear infinite;
+}
+
+/* ── 内容区：绝对定位向上溢出到页头之下 ─────────────────────── */
+.content {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: calc(var(--pagebar-h) + 20px) var(--page-pad) 28px;
+}
+
+/* ── Toast：顶部居中的一条胶囊，按 kind 染色 ───────────────── */
+.toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(560px, 88vw);
+  padding: 10px 16px;
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-body);
+  font-weight: 500;
+  color: #fff;
+  z-index: 90;
+  box-shadow: var(--shadow-lg);
+  animation: toast-in var(--dur-3) var(--ease-spring);
+}
+.toast-ok {
+  background: var(--ok);
+}
+.toast-err {
+  background: var(--err);
+}
+.toast-info {
+  /* 中性提示用**中性深灰**，不用彩色：
+     品牌绿会把「至少保留一个应用」读成「成功了」，而另加一支蓝色会被一眼看出来
+     （2026-09-16 用户两次否掉蓝色通知条）。 */
+  background: var(--neutral-solid);
+}

@@ -1,0 +1,53 @@
+[package]
+name = "traework-assistant"
+version = "0.1.11"
+description = "TraeWork 多账号签到 + 池化接管的本地助手"
+authors = ["waxilo"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "traework_assistant_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+regex = "1"
+thiserror = "1"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+rand = "0.8"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+cipher = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+tauri-plugin-single-instance = "2.4.4"
+# 本地 HTTPS 端点所需的证书与 TLS 栈（接管端点必须是 https://，见 src/tls.rs 顶部说明）
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+# 反代作为 WebSocket **客户端**去连官方 ws 上游时需要一套根证书。
+# 走公开根（webpki-roots）而不是系统信任库：目标主机是公网域名，与用户钥匙串无关，
+# 少一层「依赖用户环境」的变数。
+webpki-roots = "1"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
