@@ -25,7 +25,8 @@ traework-assistant 与 workbuddy-assistant 由 CI 构建 **macOS（universal 双
 
 1. 改版本号：`src-tauri/tauri.conf.json` 与 `package.json` 里的 `version`
 2. 打 tag 推送：`traework-v0.1.12` 或 `workbuddy-v0.1.29`（版本以 tag 为准）
-3. CI 构建两个平台 → 合并 `latest.json` → delete+recreate 各自的固定 tag Release
+3. CI 构建两个平台 → 由 `scripts/build-latest.mjs` 用 `.sig` 生成 `latest.json`
+   （v2 的 `tauri build` 不产 manifest）→ delete+recreate 各自的固定 tag Release
 
 也可在 Actions 页面手动 `workflow_dispatch`（用配置里的版本号）。
 

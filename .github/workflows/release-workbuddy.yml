@@ -132,22 +132,15 @@ jobs:
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: 合并各平台 latest.json
-        shell: bash
-        run: |
-          mkdir -p dist
-          i=0
-          for f in $(find artifacts -name latest.json); do
-            cp "$f" "/tmp/latest-$i.json"
-            i=$((i + 1))
-          done
-          cd dist
-          node ../scripts/merge-latest.mjs /tmp/latest-*.json
-
       - name: 收集安装包
         shell: bash
         run: |
+          mkdir -p dist
           find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.app.tar.gz' -o -name '*.dmg' -o -name '*.sig' \) -exec cp {} dist/ \;
+
+      - name: 生成 latest.json（v2 CLI 只产 .sig，manifest 需自行拼装）
+        shell: bash
+        run: node scripts/build-latest.mjs "${{ steps.version.outputs.version }}" workbuddy-latest dist "${{ env.RELEASE_REPO }}"
 
       - name: 发布 Release（固定 tag，两个应用各自独立，版本号随意演进）
         shell: bash
