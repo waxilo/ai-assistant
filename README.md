@@ -6,7 +6,7 @@ AI 桌面助手相关项目集合（迁移自 TraeWorkAssistant 与 workbuddy-as
 
 | 目录 | 说明 |
 | ---- | ---- |
-| [trae-work-assistant](./trae-work-assistant) | Trae Work Assistant（原 TraeWorkAssistant） |
+| [traework-assistant](./traework-assistant) | Trae Work Assistant（原 TraeWorkAssistant） |
 | [workbuddy-assistant](./workbuddy-assistant) | WorkBuddy Assistant |
 
 两个子项目均基于 Tauri + React + Rust。
