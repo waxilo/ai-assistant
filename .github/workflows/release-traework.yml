@@ -103,7 +103,7 @@ jobs:
             ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/latest.json
 
   release:
-    name: 发布到 ${{ env.RELEASE_REPO }}
+    name: 发布到 waxilo/ai-assistant
     needs: build
     runs-on: ubuntu-latest
     permissions:
