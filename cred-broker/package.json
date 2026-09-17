@@ -1,0 +1,16 @@
+{
+  "name": "cred-broker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "账号凭证池：存一整池凭证 + 发一把续签闸，保证同一时刻只有一台机器在续签（续签仍在客户端本机执行）",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/cred.test.js",
+    "logs": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

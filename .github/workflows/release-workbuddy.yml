@@ -1,0 +1,154 @@
+# 构建 WorkBuddyAssistant（macOS universal + Windows NSIS）并发布到 ai-assistant 仓库的
+# GitHub Release，使应用内更新（@tauri-apps/plugin-updater）可用。
+#
+# 触发方式：
+#   1. 打 tag `workbuddy-v<版本>` 并推送（版本号以 tag 为准，覆盖 tauri.conf.json）
+#   2. 手动 workflow_dispatch（用 tauri.conf.json 里的版本号）
+#
+# 需要的仓库 Secrets：
+#   TAURI_SIGNING_PRIVATE_KEY            —— updater 签名私钥（`npm run tauri signer generate` 生成）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   —— 私钥密码，无密码可不配
+name: Release WorkBuddyAssistant
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["workbuddy-v*"]
+
+env:
+  APP_DIR: workbuddy-assistant
+  RELEASE_REPO: waxilo/ai-assistant
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: universal-apple-darwin
+            bundles: app
+          - platform: windows-latest
+            target: ""
+            bundles: nsis
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 添加 macOS 双架构 target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.APP_DIR }}/src-tauri
+
+      - name: 安装前端依赖
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: 确定版本号（tag 优先，否则读配置）
+        id: version
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          REF="$GITHUB_REF_NAME"
+          if [[ "$REF" == workbuddy-v* ]]; then
+            V="${REF#workbuddy-v}"
+          else
+            V=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 检查签名私钥
+        run: |
+          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+            echo "::error::缺少 TAURI_SIGNING_PRIVATE_KEY secret。"
+            echo "请先在本地跑 `npx tauri signer generate` 拿到私钥，"
+            echo "并把私钥（及密码）配到本仓库 Actions secrets。"
+            exit 1
+          fi
+
+      - name: Tauri build（带更新产物）
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          ARGS="--config {\"version\":\"${{ steps.version.outputs.version }}\"} --bundles ${{ matrix.bundles }}"
+          if [ -n "${{ matrix.target }}" ]; then
+            ARGS="$ARGS --target ${{ matrix.target }}"
+          fi
+          npx tauri build $ARGS
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.exe
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.msi
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.app.tar.gz
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.dmg
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.sig
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/latest.json
+
+  release:
+    name: 发布到 ${{ env.RELEASE_REPO }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 确定版本号
+        id: version
+        run: |
+          REF="$GITHUB_REF_NAME"
+          if [[ "$REF" == workbuddy-v* ]]; then
+            V="${REF#workbuddy-v}"
+          else
+            V=$(node -p "require('./${{ env.APP_DIR }}/src-tauri/tauri.conf.json').version")
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 合并各平台 latest.json
+        run: |
+          mkdir -p dist
+          i=0
+          for f in $(find artifacts -name latest.json); do
+            cp "$f" "/tmp/latest-$i.json"
+            i=$((i + 1))
+          done
+          cd dist
+          node ../scripts/merge-latest.mjs /tmp/latest-*.json
+
+      - name: 收集安装包
+        run: |
+          find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.app.tar.gz' -o -name '*.dmg' -o -name '*.sig' \) -exec cp {} dist/ \;
+
+      - name: 发布 Release（固定 tag，两个应用各自独立，版本号随意演进）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          TAG="workbuddy-latest"
+          gh release delete "$TAG" --repo "${{ env.RELEASE_REPO }}" --yes || true
+          gh release create "$TAG" * \
+            --repo "${{ env.RELEASE_REPO }}" \
+            --title "WorkBuddyAssistant（自动构建）" \
+            --notes "版本 ${{ steps.version.outputs.version }}：macOS universal + Windows NSIS"

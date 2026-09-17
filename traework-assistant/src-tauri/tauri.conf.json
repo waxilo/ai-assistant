@@ -40,7 +40,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/waxilo/TraeWorkAssistant/releases/latest/download/latest.json"
+        "https://github.com/waxilo/ai-assistant/releases/download/traework-latest/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMwQzM5RUZEMDc1NTBBQzkKUldUSkNsVUgvWjdEd0ppL0dZTyt1UC9FZ0JoMTFsaDFOcnczZkxwcDZzNXd3NXlML292SGdJeVMK",
       "windows": {
