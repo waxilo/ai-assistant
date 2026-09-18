@@ -107,7 +107,7 @@ npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不�
 > macOS 首次构建若提示「无法验证开发者」，在「系统设置 → 隐私与安全性」中点「仍要打开」。
 >
 > `tauri build` 结尾若报 **`A public key has been found, but no private key`**：因为
-> `tauri.conf.json` 里已配置 `updater.pubkey`（占位符也算「已配置」）且 `createUpdaterArtifacts=true`，
+> `tauri.conf.json` 里已内嵌真实 `updater.pubkey` 且 `createUpdaterArtifacts=true`，
 > 但没有设置签名私钥。**这不影响 `.app` / `.dmg` 产出**，只是 updater 产物无法签名；
 > 按下面「开启 GitHub 自动更新」配好密钥后即消失。
 >
@@ -117,42 +117,64 @@ npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不�
 
 ---
 
-## 开启 GitHub 自动更新（重要）
+## 应用内自动更新
 
-`tauri.conf.json` 里的更新配置当前是**占位符**，需要替换为你自己的仓库与签名密钥后，自动更新才会真正生效。
+更新链路**已配好并跑通**，日常发版只需打 tag（见下）。本节记录它怎么接的 ——
+换仓库或换签名密钥时才需要动。
 
-### 1. 生成更新签名密钥对
+当前配置（`src-tauri/tauri.conf.json`）：
 
-```bash
-npx tauri signer generate -w ~/.tauri/qoder-assistant.key
-```
+| 项 | 值 |
+|---|---|
+| `plugins.updater.endpoints` | `https://github.com/waxilo/ai-assistant/releases/download/qoder-latest/latest.json` |
+| `plugins.updater.pubkey` | 已内嵌真实公钥（与 traework / workbuddy 共用同一把 updater 签名密钥） |
+| 发布通道 | 固定 tag `qoder-latest`，与 traework / workbuddy 各自独立 |
+| 触发工作流 | 仓库根 `.github/workflows/release-qoder.yml` |
 
-命令会输出**公钥（pubkey）**，并生成私钥文件。私钥请妥善保管，**不要提交进仓库**。
+> **版本号各自演进、互不参照。** 三款助手共用一套代码但发布通道独立，版本号也各走各的线：
+> QoderAssistant 从 **`0.1.0`** 起算自己的版本线，**不跟随** WorkBuddyAssistant 的数字。
+> 新增应用或从别的应用 fork 时，**不要**沿用对方的版本序列。
 
-### 2. 替换配置里的占位符
+> ⚠️ 历史备注：本应用曾以 `0.1.36` 首次发布（那是照搬 WorkBuddy 当时 `0.1.35` 的结果，
+> 并非自己的版本历史），现重新起算为 `0.1.0`。已安装的 `0.1.36` 比它高，**不会**通过
+> 「检查更新」降级，需要手动装一次新包；之后再发版就都在自己的 `0.1.x` 线上正常更新了。
 
-- 把 `src-tauri/tauri.conf.json` 中 `plugins.updater.endpoints` 的 `OWNER/REPO`
-  改成你的 GitHub 仓库，例如 `https://github.com/waxilo/qoder-assistant/releases/latest/download/latest.json`。
-- 把 `plugins.updater.pubkey` 的 `REPLACE_WITH_YOUR_TAURI_UPDATER_PUBLIC_KEY`
-  替换为第 1 步输出的公钥。
+### 发版流程
 
-### 3. 在仓库配置 CI Secret
+1. **改版本号**，以下三处必须一致（应用内「关于」显示的是 `Cargo.toml` 的 `CARGO_PKG_VERSION`）：
 
-在本仓库 **Settings → Secrets and variables → Actions** 增加：
+   | 文件 | 字段 |
+   |---|---|
+   | `src-tauri/tauri.conf.json` | `version` |
+   | `src-tauri/Cargo.toml` | `[package] version` |
+   | `package.json` | `version` |
 
-- `TAURI_SIGNING_PRIVATE_KEY`：第 1 步生成的私钥文件内容（纯文本）。
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（可选）：若生成密钥时设置了密码。
+   改完跑一次 `npm install --package-lock-only` 同步 `package-lock.json`；
+   `src-tauri/Cargo.lock` 里本应用那一条由 `cargo` 自动跟进。
 
-### 4. 打 tag 触发发布
+2. **打 tag 推送**（版本号以 tag 为准，会覆盖 `tauri.conf.json`）：
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+   ```bash
+   git tag qoder-v0.1.1
+   git push origin qoder-v0.1.1
+   ```
 
-GitHub Actions 会在 macOS / Windows 两个 runner 上分别构建、用私钥签名更新产物，
-并发布一个 Draft Release（`latest.json` + 各平台安装包 + `.sig`）。
-在 GitHub 页面把 Draft 改为正式发布后，旧版本客户端即可通过「检查更新」拉取新版本。
+3. CI 在 macOS / Windows 两个 runner 上构建、用私钥签名更新产物，按
+   `QoderAssistant-macos-<版本>` / `QoderAssistant_windows_<版本>` 重命名，
+   再 delete+recreate 固定 tag `qoder-latest` 的 Release
+   （`latest.json` + 各平台安装包 + `.sig`）。`latest.json` 由根目录
+   `scripts/build-latest.mjs` 用各 `.sig` 拼装（Tauri v2 的 CLI 不再自动产出 manifest）。
+
+也可在 Actions 页面手动 `workflow_dispatch`（此时用 `tauri.conf.json` 里的版本号）。
+
+### 需要配置的 Secrets
+
+仓库 **Settings → Secrets and variables → Actions**：
+
+| Secret | 用途 |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | updater 签名私钥（`npx tauri signer generate` 生成，公钥已内嵌在 `tauri.conf.json`） |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 私钥密码，无密码可不配 |
 
 > 注意：更新只在**已签名的 Release** 之间生效。本地 `npm run tauri build` 未设置
 > `TAURI_SIGNING_PRIVATE_KEY` 时不会生成 `.sig`，此类构建包无法用于自动更新。
