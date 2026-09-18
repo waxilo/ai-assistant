@@ -1,10 +1,16 @@
 import { memo, useState } from "react";
 import type { Settings } from "../types";
-import { checkAndInstall, mb, percentOf, type UpdateProgress } from "../updater";
+import {
+  checkAndInstall,
+  downloadProgress,
+  formatBytes,
+  type UpdateProgress,
+} from "../updater";
 import type { Toast } from "../common";
 import Switch from "../components/Switch";
 import { Row } from "../components/SettingsControls";
-import { IconCalendar, IconInfo, IconRefresh } from "../components/Icons";
+import { FONT_OPTIONS, getFontKey, setFontKey } from "../font";
+import { IconCalendar, IconInfo, IconRefresh, IconType } from "../components/Icons";
 
 /**
  * 「设置」页：定时签到与失败通知。
@@ -27,11 +33,24 @@ interface Props {
   update: (patch: Partial<Settings>) => void;
   version: string;
   onToast: (t: Toast) => void;
+  /** 后台轮询查到的版本号（就是点亮侧边栏红点的那条），这里用于打开页面就有提示 */
+  updateVersion: string | null;
+  /** 把手动检查的结果回传外层：null = 已是最新，据此清掉后台留下的过期提醒 */
+  onUpdateResult: (version: string | null) => void;
 }
 
-function SettingsPage({ settings, update, version, onToast }: Props) {
+function SettingsPage({
+  settings,
+  update,
+  version,
+  onToast,
+  updateVersion,
+  onUpdateResult,
+}: Props) {
   const [progress, setProgress] = useState<UpdateProgress | null>(null);
   const [busy, setBusy] = useState(false);
+  // 界面字体：纯前端偏好，即时生效并持久化（见 src/font.ts），不经过后端 settings
+  const [fontKey, setFontKeyState] = useState(() => getFontKey());
 
   const onUpdate = async () => {
     if (busy) return;
@@ -41,18 +60,54 @@ function SettingsPage({ settings, update, version, onToast }: Props) {
       setProgress(p);
       if (p.status === "error") onToast({ kind: "err", text: p.message });
       if (p.status === "no-update") onToast({ kind: "info", text: p.message });
+      // 手动检查的结论要回传外层，否则侧边栏那颗红点会一直按后台那份过期结果亮着：
+      // 查到新版本 → 点亮（用户已经在看，直接算已读）；确认已是最新 → 清掉。
+      if (p.status === "available") onUpdateResult(p.version ?? null);
+      else if (p.status === "no-update") onUpdateResult(null);
     });
     setBusy(false);
   };
 
-  /** 下载百分比；总量未知（服务端没给 Content-Length）时为 null → 走不确定态动画 */
-  const pct = percentOf(progress);
-  const downloading =
-    progress?.status === "downloading" || progress?.status === "installing";
+  /** 下载进度：percent 为 null = 总量未知 / 不在下载阶段（两者都不画条） */
+  const dl = downloadProgress(progress);
   const checkinOn = !!settings?.checkin_enabled;
 
   return (
     <>
+      <section className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconType size={19} />
+          </span>
+          <div>
+            <div className="set-card-title">界面外观</div>
+            <div className="set-card-sub">界面使用的字体，改动即时生效</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title="界面字体"
+            desc="选择常用字体之一；此项为本机偏好，重新安装应用不受影响。"
+            ctrl={
+              <select
+                value={fontKey}
+                onChange={(e) => {
+                  const k = e.target.value;
+                  setFontKeyState(k);
+                  setFontKey(k); // 即时生效并落盘 localStorage
+                }}
+              >
+                {FONT_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            }
+          />
+        </div>
+      </section>
+
       <section className="set-card card">
         <div className="set-card-head">
           <span className="set-card-icon">
@@ -123,12 +178,20 @@ function SettingsPage({ settings, update, version, onToast }: Props) {
           />
           <Row
             title="检查更新"
-            desc="若提示「已经是最新版本」，说明当前已是最新。"
+            desc={
+              updateVersion
+                ? `后台已发现新版本 v${updateVersion}，点右侧按钮立即更新。`
+                : "应用会自动检查更新，发现新版本会在侧边栏「设置」上点亮一颗小红点。"
+            }
             ctrl={
               <>
-                <button className="btn small" disabled={busy} onClick={() => void onUpdate()}>
+                <button
+                  className={`btn small${updateVersion ? " primary" : ""}`}
+                  disabled={busy}
+                  onClick={() => void onUpdate()}
+                >
                   <IconRefresh size={14} className={busy ? "spin" : undefined} />
-                  {busy ? "处理中…" : "检查更新"}
+                  {busy ? "处理中…" : updateVersion ? "立即更新" : "检查更新"}
                 </button>
               </>
             }
@@ -143,19 +206,20 @@ function SettingsPage({ settings, update, version, onToast }: Props) {
                 >
                   {progress.message}
                 </div>
-                {/* 下载/安装进度条：总量已知给百分比，未知则走不确定态动画 */}
-                {downloading && (
+                {/* 只有拿得到百分比才画条：总量未知时进度条没有可信的长度，
+                    与其摆一条不确定态动画，不如干脆不画（下面照实报字节数）。
+                    下载完成/安装阶段 dl.percent 为 100，条走到头、等应用重启才像一条完整的进度。 */}
+                {dl && (
                   <div className="upd-row">
-                    <div className="upd-progress-wrap">
-                      <div
-                        className={`upd-progress-bar${pct === null ? " indet" : ""}`}
-                        style={pct === null ? undefined : { width: `${pct}%` }}
-                      />
-                    </div>
+                    {dl.percent !== null && (
+                      <div className="upd-progress-wrap">
+                        <div className="upd-progress-bar" style={{ width: `${dl.percent}%` }} />
+                      </div>
+                    )}
                     <div className="upd-progress-text">
-                      {pct === null
-                        ? `已下载 ${mb(progress.downloaded ?? 0)} MB`
-                        : `${pct}% · ${mb(progress.downloaded ?? 0)} / ${mb(progress.total ?? 0)} MB`}
+                      {dl.percent === null
+                        ? `已下载 ${formatBytes(dl.downloaded)}`
+                        : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
                     </div>
                   </div>
                 )}

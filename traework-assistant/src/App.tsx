@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -37,6 +37,7 @@ import BriefingPage from "./pages/BriefingPage";
 import LogsPage from "./pages/LogsPage";
 import SettingsPage from "./pages/SettingsPage";
 import AddAccountModal from "./pages/AddAccountModal";
+import { nextUpdateNotice, probeUpdate, type UpdateNotice } from "./updater";
 
 /**
  * 应用外壳：左侧导航 + 悬浮玻璃页头 + 内容区。
@@ -91,10 +92,17 @@ const PAGE_ICON: Record<Page, (p: { size?: number }) => ReactNode> = {
   settings: IconGear,
 };
 
+// 后台轮询新版本：启动延迟 + 间隔。只为点亮侧栏那颗小红点，不求实时，间隔放宽到 6 小时。
+// 首次延迟 8s，让首屏先渲染完再悄悄去问 GitHub。
+const UPDATE_FIRST_DELAY_MS = 8_000;
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 export default function App() {
   const [page, setPage] = useState<Page>("accounts");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [version, setVersion] = useState("");
+  /** 后台轮询发现的新版本（驱动侧边栏「设置」上的小红点） */
+  const [updateNotice, setUpdateNotice] = useState<UpdateNotice>(null);
   const [toast, setToast] = useState<Toast>(null);
   const [confirmReq, setConfirmReq] = useState<ConfirmReq | null>(null);
   const [adding, setAdding] = useState(false);
@@ -182,6 +190,46 @@ export default function App() {
       void un.then((f) => f());
     };
   }, [refreshStatus]);
+
+  // 后台轮询要判断「用户此刻在不在设置页」，但不能把 page 写进依赖（会让定时器反复重建）
+  const pageRef = useRef(page);
+  useEffect(() => {
+    pageRef.current = page;
+  }, [page]);
+
+  // 后台定时检查新版本，只为点亮侧边栏那颗小红点。
+  // 窗口被隐藏时 webview 仍在跑（点红按钮只是 hide、不销毁窗口），所以常驻期间定时器一直有效。
+  useEffect(() => {
+    let alive = true;
+    const run = async () => {
+      try {
+        const v = await probeUpdate();
+        if (!alive) return;
+        setUpdateNotice((prev) =>
+          nextUpdateNotice(prev, v, pageRef.current === "settings")
+        );
+      } catch (e) {
+        // 轮询失败一律静默：网络抖动、代理不通都是常态，不该弹提示打扰用户。
+        // 想看明确报错就到设置页手动点「检查更新」。
+        console.warn("后台检查更新失败：", e);
+      }
+    };
+    const first = window.setTimeout(run, UPDATE_FIRST_DELAY_MS);
+    const timer = window.setInterval(run, UPDATE_INTERVAL_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  /** 小红点：后台查到了新版本，且用户还没看过 */
+  const showUpdateDot = updateNotice !== null && !updateNotice.seen;
+
+  /** 用户进设置页就算看过这条提醒（设置页里仍写明有新版本，信息不丢） */
+  const markUpdateSeen = useCallback(() => {
+    setUpdateNotice((n) => (n && !n.seen ? { ...n, seen: true } : n));
+  }, []);
 
   /** 设置改动：乐观写内存 + 落盘，失败弹 toast（设置页不弹成功提示，避免每次改动都刷屏） */
   const update = useCallback(
@@ -455,7 +503,11 @@ export default function App() {
             <button
               key={key}
               className={"nav-item" + (page === key ? " active" : "")}
-              onClick={() => setPage(key)}
+              onClick={() => {
+                setPage(key);
+                // 进设置页 = 看到了更新提醒，熄灭小红点
+                if (key === "settings") markUpdateSeen();
+              }}
               title={label}
             >
               <span className="nav-icon">
@@ -464,6 +516,12 @@ export default function App() {
               {label}
               {key === "takeover" && settings?.takeover_enabled && (
                 <span className="nav-dot" title="接管生效中" />
+              )}
+              {key === "settings" && showUpdateDot && (
+                <span
+                  className="nav-dot err"
+                  title={`有新版本 v${updateNotice?.version} 可更新`}
+                />
               )}
             </button>
           ))}
@@ -528,6 +586,10 @@ export default function App() {
                 update={update}
                 version={version}
                 onToast={showToast}
+                updateVersion={updateNotice?.version ?? null}
+                onUpdateResult={(v) =>
+                  setUpdateNotice(v ? { version: v, seen: true } : null)
+                }
               />
             )}
           </div>
