@@ -80,6 +80,15 @@ export const IconDownload = (p: IconProps) => (
   </Svg>
 );
 
+/** 文字/字体：界面外观 */
+export const IconType = (p: IconProps) => (
+  <Svg {...p}>
+    <polyline points="4 7 4 4 20 4 20 7" />
+    <line x1="9" y1="20" x2="15" y2="20" />
+    <line x1="12" y1="4" x2="12" y2="20" />
+  </Svg>
+);
+
 /** 上传：把本机账号整体放到云端那一池上 */
 export const IconUpload = (p: IconProps) => (
   <Svg {...p}>

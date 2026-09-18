@@ -3,6 +3,7 @@ import type { Settings } from "../types";
 import { setAutostart, getAutostart, testNotify } from "../api";
 import { checkAndInstall, downloadProgress, type UpdateProgress } from "../updater";
 import { formatBytes, type ConfirmReq, type Toast } from "../common";
+import { FONT_OPTIONS, getFontKey, setFontKey } from "../font";
 import {
   IconCalendar,
   IconShield,
@@ -11,6 +12,7 @@ import {
   IconAlertTriangle,
   IconInfo,
   IconDownload,
+  IconType,
 } from "../components/Icons";
 import { Row, Toggle } from "../components/SettingsControls";
 import { NetfixCard } from "../components/NetfixCard";
@@ -49,6 +51,8 @@ export function SettingsPage({
   onUpdateResult: (version: string | null) => void;
 }) {
   const [auto, setAuto] = useState(settings.auto_checkin_on_start);
+  // 界面字体：纯前端偏好，即时生效并持久化（见 src/font.ts），不经过后端 settings
+  const [fontKey, setFontKeyState] = useState(() => getFontKey());
   const [schedOn, setSchedOn] = useState(settings.schedule_enabled);
   const [schedTime, setSchedTime] = useState(settings.schedule_time);
   // 定时签到的随机时间窗（分钟）：0 = 关闭随机，精确到设定时刻
@@ -176,6 +180,41 @@ export function SettingsPage({
           定时签到、多账号风控、通知、应用更新与网络急救。智能接管相关配置请在「智能接管」页调整。
         </span>
       </p>
+
+      {/* 界面外观 */}
+      <div className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconType size={20} />
+          </span>
+          <div>
+            <div className="set-card-title">界面外观</div>
+            <div className="set-card-sub">界面使用的字体，改动即时生效</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title="界面字体"
+            desc="选择常用字体之一；此项为本机偏好，重新安装应用不受影响。"
+            ctrl={
+              <select
+                value={fontKey}
+                onChange={(e) => {
+                  const k = e.target.value;
+                  setFontKeyState(k);
+                  setFontKey(k); // 即时生效并落盘 localStorage
+                }}
+              >
+                {FONT_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            }
+          />
+        </div>
+      </div>
 
       {/* 签到自动化 */}
       <div className="set-card card">
