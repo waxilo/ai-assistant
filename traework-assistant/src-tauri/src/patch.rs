@@ -150,7 +150,10 @@ pub fn status(target: &AppTarget) -> PatchStatus {
 
     let patched = marker && after == GATE_WANT;
     let recognized = (before == GATE_WANT && id_before) || (after == GATE_WANT && id_after);
-    let writable = crate::endpoint::is_writable_file(&path);
+    // 可写性只读记忆，**绝不在这里真写**（见 `crate::probe` 顶部）。补丁是「同目录写
+    // 临时文件再 rename」，所以判据是 `out/` 这个目录。这里曾直接真写探针，结果界面
+    // 每轮询一次状态，就往别人的应用包里写一次 —— 也就是每轮询一次要一次系统权限。
+    let writable = path.parent().map(crate::probe::lookup).unwrap_or(false);
     let app = &target.id;
 
     let message = if patched && recognized {
@@ -424,7 +427,13 @@ pub fn apply(dir: &Path, target: &AppTarget) -> Result<PatchStatus, String> {
     if !st.recognized {
         return Err(st.message);
     }
-    if !st.writable {
+    // 走到这里就是**马上要真写**了，所以正当探测一次（并记账）：`status` 只读记忆，
+    // 界面得靠这里记下的结论才知道这个应用的 `out/` 究竟写不写得进去。
+    let writable = path
+        .parent()
+        .map(crate::probe::probe_and_remember)
+        .unwrap_or(false);
+    if !writable {
         return Err(format!(
             "「{}」的 out/main.js 写不进去——{}",
             target.id,

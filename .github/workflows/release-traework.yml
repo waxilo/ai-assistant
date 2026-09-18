@@ -8,6 +8,12 @@
 # 需要的仓库 Secrets：
 #   TAURI_SIGNING_PRIVATE_KEY            —— updater 签名私钥（`npm run tauri signer generate` 生成）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   —— 私钥密码，无密码可不配
+#   MACOS_CERT_P12                       —— macOS 代码签名证书（base64 的 p12，内含叶证书+私钥+自签 CA）
+#   MACOS_CERT_PASSWORD                  —— 该 p12 的密码
+#
+# ⚠️ macOS 证书是**必需项**，不是可选优化：`tauri.conf.json` 里写死了
+#    `bundle.macOS.signingIdentity`，缺证书时 `tauri build` 会直接失败。
+#    为什么必须有固定身份，见下方「导入 macOS 签名证书」步骤的注释。
 name: Release TraeWorkAssistant
 
 on:
@@ -80,6 +86,50 @@ jobs:
             echo "并把私钥（及密码）配到本仓库 Actions secrets。"
             exit 1
           fi
+
+      # ⚠️ 签名身份**必须**有：未签名（或 ad-hoc 签名）的包，macOS 会把「App 管理」的授权
+      # 记在易变的 cdhash 上 —— 每次重新构建 / 自动更新后授权即失效，用户又要重新授权一遍。
+      # 这里导入自签代码签名证书（自签 CA + 叶证书）；身份名由 tauri.conf.json 的
+      # `bundle.macOS.signingIdentity` 指定，两处必须一致，否则构建直接失败。
+      - name: 导入 macOS 签名证书
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          CERT_P12_B64: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CERT_P12_B64:-}" ]; then
+            echo "::error::缺少 secret MACOS_CERT_P12 —— 未签名的构建会让 macOS「App 管理」授权在每次更新后失效，拒绝继续。"
+            echo "生成方式见本机 traework-assistant/docs/macOS代码签名.md（docs/ 按约定未入库）。"
+            exit 1
+          fi
+
+          P12="$RUNNER_TEMP/twa.p12"
+          CA="$RUNNER_TEMP/twa-ca.crt"
+          KEYCHAIN="$RUNNER_TEMP/twa-signing.keychain-db"
+
+          echo "$CERT_P12_B64" | openssl base64 -d -A > "$P12"
+
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN"
+
+          # 构建用的 codesign 要在这个钥匙串里找到身份（保留原有的搜索条目）
+          EXISTING=$(security list-keychains -d user | tr -d ' "' | tr '\n' ' ')
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+
+          # 自签 CA 必须被信任，否则 codesign 看不到任何可用身份
+          security find-certificate -c "TraeWorkAssistant Local CA" -p "$KEYCHAIN" > "$CA"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$CA"
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          rm -f "$P12"
 
       - name: Tauri build（带更新产物）
         working-directory: ${{ env.APP_DIR }}

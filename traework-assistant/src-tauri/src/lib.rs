@@ -15,6 +15,7 @@ mod notify;
 mod oauth;
 mod patch;
 mod portcheck;
+mod probe;
 mod proc;
 mod profile;
 mod proxy;

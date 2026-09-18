@@ -641,24 +641,11 @@ fn backup_once(app: &Path, path: &Path) {
     }
 }
 
-/// 真写一次探针，判断安装目录**实际可写**。
+/// 目录「能不能写」的判定整体搬到 [`crate::probe`] 了。
 ///
-/// 只查权限位是不够的：macOS 的「App 管理」TCC 会对写别的 app 包返回 `EPERM`，
-/// 只读卷（DMG / 只读镜像）同理——都必须靠真写才能发现。
-fn writable_probe(app: &Path) -> bool {
-    let probe = app.join(".twa_write_probe");
-    let ok = std::fs::write(&probe, b"1").is_ok();
-    let _ = std::fs::remove_file(&probe);
-    ok
-}
-
-/// 某个文件**所在目录**是否实际可写。
-///
-/// 给 [`crate::patch`] 用：补丁是「同目录写临时文件再 rename」，所以判据是目录而不是文件本身。
-/// 同样必须真写一次 —— macOS「App 管理」TCC 只有落到写操作上才会回 `EPERM`。
-pub fn is_writable_file(path: &Path) -> bool {
-    path.parent().map(writable_probe).unwrap_or(false)
-}
+/// 那边把一条界线划清楚：**查询只读记忆，真写只发生在即将写入之前**。这条线是这里
+/// 踩出来的 —— 探针本身就是在写别人的应用包，挂在 `status()` 上会让界面每一次轮询
+/// 都变成一次系统权限请求，用户看到的就是「每次启动都要重新授权」。
 
 /// 从可执行文件路径里找出它所属的 `.app` 包（开发模式没有，返回 `None`）。
 ///
@@ -779,14 +766,18 @@ pub struct EndpointStatus {
     pub message: String,
 }
 
-/// 读取某个目标的当前状态（只读，不修改任何文件）。
+/// 读取某个目标的当前状态。
+///
+/// **名副其实的只读**：可写性走 [`crate::probe::lookup`]（只读记忆，不碰盘）。
+/// 这里曾经直接真写探针 —— 一个自称「只读，不修改任何文件」的函数，每轮询一次就
+/// 往别人的应用包里写一次，于是界面开着就等于持续向系统索要「App 管理」权限。
 pub fn status(target: &AppTarget, dir: &Path, endpoint_base: &str) -> EndpointStatus {
     let app = target.app_dir.clone();
     let (up_http, up_ws) = upstreams_of(target);
     let doc = read_product(&target.product_path()).ok();
     let installed = doc.as_ref().map(|d| doc_points_at(d, endpoint_base)).unwrap_or(false);
     let ours = doc.as_ref().map(doc_is_ours).unwrap_or(false);
-    let writable = writable_probe(&app);
+    let writable = crate::probe::lookup(&app);
     let message = if !target.product_path().exists() {
         format!("在「{}」里没找到 product.json，本机不支持对它做端点改写。", target.id)
     } else if !writable {
@@ -922,7 +913,9 @@ pub fn install(
 
     // ② 先探针再动手：只读卷 / macOS「App 管理」TCC 会让写入直接 EPERM，
     //    与其写到一半失败，不如带着可操作的提示提前返回。
-    if !writable_probe(&app) {
+    //    这里是**即将真写之前**，所以可以正当地写一次探针，并把结论记账 ——
+    //    查询路径（`status`）此后就能从记忆里读到它，不必再自己动手写。
+    if !crate::probe::probe_and_remember(&app) {
         return Err(format!(
             "「{}」的安装目录不可写，无法改写端点配置。{}",
             target.id,
@@ -1157,18 +1150,8 @@ mod tests {
     /// 反面样本：纯 HTTP 端点 —— 2026-09-14「开启接管后 Trae 打不开」的事故现场。
     const LOCAL_PLAIN: &str = "http://127.0.0.1:8788";
 
-    #[test]
-    fn writable_probe_reflects_reality() {
-        let dir = std::env::temp_dir().join(format!("twa-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(writable_probe(&dir), "临时目录应当可写");
-        // 探针必须自清理，别在人家安装目录里留垃圾
-        assert!(!dir.join(".twa_write_probe").exists(), "探针文件应当被删掉");
-
-        let missing = dir.join("no-such-dir");
-        assert!(!writable_probe(&missing), "不存在的目录不可写");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // 探针「真写 + 自清理」的覆盖已经搬到 `crate::probe` 的测试里 —— 那里才是它现在的家。
+    // 这里不再需要：`status` 已经不该碰盘了，值得测的是「它没碰」，而那条在 probe 侧。
 
     /// 「该授权给谁」完全取决于本进程的形态，所以先单测这个判据本身。
     #[test]
