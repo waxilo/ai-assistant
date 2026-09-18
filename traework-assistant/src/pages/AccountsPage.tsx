@@ -8,7 +8,6 @@ import {
   daysUntil,
   formatCredits,
   maskToken,
-  mmdd,
   stamp,
 } from "../common";
 import {
@@ -385,7 +384,7 @@ function AccountsPage({
                       {/* 到期时间就是「智能接管先扣谁」的第一排序键，所以直接显示、不埋进 title */}
                       {!cr.unlimited && cr.expiry ? (
                         <span className={`sub${credCls}`} title="智能接管优先使用到期最早的积分">
-                          {days !== null && days < 0 ? "已过期" : `${mmdd(cr.expiry)} 到期`}
+                          {days !== null && days < 0 ? "已过期" : `还有 ${days} 天后过期`}
                         </span>
                       ) : null}
                     </td>

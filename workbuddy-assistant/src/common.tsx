@@ -255,3 +255,16 @@ export function expiryInfo(
   const text = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   return { text, expired };
 }
+
+/// 积分过期倒计时：毫秒时间戳 → 「还有 N 天后过期」，看起来更直观。
+/// 已过期的返回「已过期」并标 expired。null/非法返回「—」。
+export function expiryCountdown(
+  ms?: number | null
+): { text: string; expired: boolean } {
+  if (ms == null) return { text: "—", expired: false };
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return { text: "—", expired: false };
+  const days = Math.ceil((ms - Date.now()) / 86_400_000);
+  if (days <= 0) return { text: "已过期", expired: true };
+  return { text: `还有 ${days} 天后过期`, expired: false };
+}

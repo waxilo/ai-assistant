@@ -8,6 +8,7 @@ import {
   formatCredits,
   signState,
   expiryInfo,
+  expiryCountdown,
   type SignState,
 } from "../common";
 import { creditsOf, expiryOf, totalCredits, useCredits } from "../credits";
@@ -132,8 +133,8 @@ export function AccountsPage({
           <thead>
             <tr>
               <th>账号</th>
-              <th>剩余积分</th>
-              <th>积分到期</th>
+              <th className="num">剩余积分</th>
+              <th className="num">积分过期</th>
               {/* 次要列：窄窗口下收起（见 responsive.css）。
                   滚动条已全局隐藏，横向溢出就是静默截断，所以窄窗必须真的不溢出；
                   Token 过期在签到日志 / 弹窗里都有，是这一行里最该让位的一列。 */}
@@ -148,7 +149,7 @@ export function AccountsPage({
               const st = signState(a, busy);
               const bal = creditsOf(book, a.id);
               const low = bal != null && bal < 100;
-              const e = expiryInfo(expiryOf(book, a.id));
+              const e = expiryCountdown(expiryOf(book, a.id));
               const tok = expiryInfo(a.expires_at);
               return (
                 <tr key={a.id}>
@@ -164,7 +165,7 @@ export function AccountsPage({
                       <span className="muted">—</span>
                     )}
                   </td>
-                  <td className="ac-cell-expiry">
+                  <td className="ac-cell-expiry num">
                     {e.text === "—" ? (
                       <span className="muted">—</span>
                     ) : (
