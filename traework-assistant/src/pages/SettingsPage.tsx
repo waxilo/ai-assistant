@@ -1,12 +1,6 @@
 import { memo, useState } from "react";
 import type { Settings } from "../types";
-import {
-  checkAndInstall,
-  downloadProgress,
-  formatBytes,
-  type UpdateProgress,
-} from "../updater";
-import type { Toast } from "../common";
+import { downloadProgress, formatBytes, type UpdateProgress } from "../updater";
 import Switch from "../components/Switch";
 import { Row } from "../components/SettingsControls";
 import { FONT_OPTIONS, getFontKey, setFontKey } from "../font";
@@ -32,44 +26,31 @@ interface Props {
   settings: Settings | null;
   update: (patch: Partial<Settings>) => void;
   version: string;
-  onToast: (t: Toast) => void;
+  /** 全局更新状态（App 持有，下载是整机动作，切页进度不丢） */
+  updateStatus: UpdateProgress | null;
+  updateBusy: boolean;
+  /** 触发检查并安装（实现与状态都在 App 层） */
+  onRunUpdate: () => void;
   /** 后台轮询查到的版本号（就是点亮侧边栏红点的那条），这里用于打开页面就有提示 */
   updateVersion: string | null;
-  /** 把手动检查的结果回传外层：null = 已是最新，据此清掉后台留下的过期提醒 */
-  onUpdateResult: (version: string | null) => void;
 }
 
 function SettingsPage({
   settings,
   update,
   version,
-  onToast,
+  updateStatus,
+  updateBusy,
+  onRunUpdate,
   updateVersion,
-  onUpdateResult,
 }: Props) {
-  const [progress, setProgress] = useState<UpdateProgress | null>(null);
-  const [busy, setBusy] = useState(false);
   // 界面字体：纯前端偏好，即时生效并持久化（见 src/font.ts），不经过后端 settings
   const [fontKey, setFontKeyState] = useState(() => getFontKey());
 
-  const onUpdate = async () => {
-    if (busy) return;
-    setBusy(true);
-    setProgress({ status: "checking", message: "正在检查更新…" });
-    await checkAndInstall((p) => {
-      setProgress(p);
-      if (p.status === "error") onToast({ kind: "err", text: p.message });
-      if (p.status === "no-update") onToast({ kind: "info", text: p.message });
-      // 手动检查的结论要回传外层，否则侧边栏那颗红点会一直按后台那份过期结果亮着：
-      // 查到新版本 → 点亮（用户已经在看，直接算已读）；确认已是最新 → 清掉。
-      if (p.status === "available") onUpdateResult(p.version ?? null);
-      else if (p.status === "no-update") onUpdateResult(null);
-    });
-    setBusy(false);
-  };
+  const onUpdate = () => onRunUpdate();
 
   /** 下载进度：percent 为 null = 总量未知 / 不在下载阶段（两者都不画条） */
-  const dl = downloadProgress(progress);
+  const dl = downloadProgress(updateStatus);
   const checkinOn = !!settings?.checkin_enabled;
 
   return (
@@ -187,24 +168,24 @@ function SettingsPage({
               <>
                 <button
                   className={`btn small${updateVersion ? " primary" : ""}`}
-                  disabled={busy}
+                  disabled={updateBusy}
                   onClick={() => void onUpdate()}
                 >
-                  <IconRefresh size={14} className={busy ? "spin" : undefined} />
-                  {busy ? "处理中…" : updateVersion ? "立即更新" : "检查更新"}
+                  <IconRefresh size={14} className={updateBusy ? "spin" : undefined} />
+                  {updateBusy ? "处理中…" : updateVersion ? "立即更新" : "检查更新"}
                 </button>
               </>
             }
           />
-          {progress && (
+          {updateStatus && (
             <div className="set-row in-expand">
               <div className="set-row-main">
                 <div
                   className={`upd-status${
-                    progress.status === "error" ? " err" : progress.status === "updated" ? " ok" : ""
+                    updateStatus.status === "error" ? " err" : updateStatus.status === "updated" ? " ok" : ""
                   }`}
                 >
-                  {progress.message}
+                  {updateStatus.message}
                 </div>
                 {/* 只有拿得到百分比才画条：总量未知时进度条没有可信的长度，
                     与其摆一条不确定态动画，不如干脆不画（下面照实报字节数）。

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Settings } from "../types";
 import { setAutostart, getAutostart, testNotify } from "../api";
-import { checkAndInstall, downloadProgress, type UpdateProgress } from "../updater";
+import { downloadProgress, type UpdateProgress } from "../updater";
 import { formatBytes, type ConfirmReq, type Toast } from "../common";
 import { FONT_OPTIONS, getFontKey, setFontKey } from "../font";
 import {
@@ -34,8 +34,10 @@ export function SettingsPage({
   onToast,
   askConfirm,
   onReloadSettings,
+  updateStatus,
+  updateBusy,
+  onRunUpdate,
   updateVersion,
-  onUpdateResult,
 }: {
   version: string;
   settings: Settings;
@@ -45,10 +47,13 @@ export function SettingsPage({
   askConfirm: (opts: Omit<ConfirmReq, "resolve">) => Promise<boolean>;
   /** 恢复流程会安全关闭智能接管并落盘，需要重拉一份 settings 覆盖本地草稿 */
   onReloadSettings: () => Promise<void>;
+  /** 全局更新状态（App 持有，下载是整机动作，切页进度不丢） */
+  updateStatus: UpdateProgress | null;
+  updateBusy: boolean;
+  /** 触发检查并安装（实现与状态都在 App 层） */
+  onRunUpdate: () => void;
   /** 后台轮询查到的版本号（就是点亮侧边栏红点的那条），这里用于打开页面就有提示 */
   updateVersion: string | null;
-  /** 把手动检查的结果回传外层：null = 已是最新，据此清掉后台留下的过期提醒 */
-  onUpdateResult: (version: string | null) => void;
 }) {
   const [auto, setAuto] = useState(settings.auto_checkin_on_start);
   // 界面字体：纯前端偏好，即时生效并持久化（见 src/font.ts），不经过后端 settings
@@ -82,9 +87,6 @@ export function SettingsPage({
   // 开机自启动是「操作系统状态」，不属于 settings.json，改一次立即生效
   const [autostart, setAutostartOn] = useState<boolean | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
-  // 应用更新：状态文本 + 下载进度
-  const [updateStatus, setUpdateStatus] = useState<UpdateProgress | null>(null);
-  const [updateBusy, setUpdateBusy] = useState(false);
 
   // 当前草稿：含其它页托管的字段（proxy_* / billing_account_ids 等），原样透传，
   // 每次改动都基于它合并后自动保存，避免覆盖「智能接管」页改过的值。
@@ -153,21 +155,7 @@ export function SettingsPage({
     }
   };
 
-  const doUpdate = async () => {
-    setUpdateBusy(true);
-    setUpdateStatus({ status: "checking", message: "正在检查更新…" });
-    try {
-      await checkAndInstall((p) => {
-        setUpdateStatus(p);
-        // 手动检查的结论要回传外层，否则侧边栏那颗红点会一直按后台那份过期结果亮着：
-        // 查到新版本 → 点亮（用户已经在看，直接算已读）；确认已是最新 → 清掉。
-        if (p.status === "available") onUpdateResult(p.version ?? null);
-        else if (p.status === "no-update") onUpdateResult(null);
-      });
-    } finally {
-      setUpdateBusy(false);
-    }
-  };
+  const doUpdate = () => onRunUpdate();
 
   // 下载进度：percent 为 null = 总量未知 / 不在下载阶段（两者都不画条）
   const dl = downloadProgress(updateStatus);

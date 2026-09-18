@@ -131,6 +131,34 @@
   animation: nav-dot-pulse 1.8s ease-in-out infinite;
 }
 
+/* ── 侧栏底部：应用更新全局状态条 ────────────────────────────
+   状态持在 App 层（下载是整机动作），侧栏底部常驻一条，切换页面进度不丢。
+   内部 .upd-* 复用 ui.css 的进度样式，此处只负责卡片容器与字号微调。 */
+.sidebar-update {
+  margin-top: auto;
+  padding: 11px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-soft);
+  border: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sidebar-update-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--primary-d);
+  letter-spacing: 0.2px;
+}
+.sidebar-update .upd-status {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  line-height: 1.35;
+}
+.sidebar-update .upd-row {
+  margin-top: 0;
+}
+
 /* ── 右侧主区：页头悬浮于内容之上 ───────────────────────────── */
 .main {
   flex: 1;

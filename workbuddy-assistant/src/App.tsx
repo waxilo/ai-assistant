@@ -22,9 +22,16 @@ import {
   brokerLink,
   brokerUnbind,
 } from "./api";
-import { accountLabel, tally, type ConfirmReq, type Toast } from "./common";
+import { accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
 import { bindCredits, seedCredits } from "./credits";
-import { nextUpdateNotice, probeUpdate, type UpdateNotice } from "./updater";
+import {
+  checkAndInstall,
+  downloadProgress,
+  nextUpdateNotice,
+  probeUpdate,
+  type UpdateNotice,
+  type UpdateProgress,
+} from "./updater";
 import { AccountsPage } from "./pages/AccountsPage";
 import { TakeoverPage } from "./pages/TakeoverPage";
 import { BriefingPage } from "./pages/BriefingPage";
@@ -108,6 +115,12 @@ export default function App() {
   const [busyRefresh, setBusyRefresh] = useState(false);
   /** 后台轮询发现的新版本（驱动侧边栏「设置」上的小红点） */
   const [updateNotice, setUpdateNotice] = useState<UpdateNotice>(null);
+  /**
+   * 应用更新：**全局任务状态**。持在 App 而非设置页 —— 下载是整机动作，切页不能丢；
+   * 侧边栏底部常驻一条进行中的进度条（见 .sidebar-update），error / no-update 走 toast。
+   */
+  const [updateStatus, setUpdateStatus] = useState<UpdateProgress | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
   const [modal, setModal] = useState<Modal>(null);
   const [toast, setToast] = useState<Toast>(null);
   const [confirmReq, setConfirmReq] = useState<ConfirmReq | null>(null);
@@ -220,6 +233,25 @@ export default function App() {
   const markUpdateSeen = useCallback(() => {
     setUpdateNotice((n) => (n && !n.seen ? { ...n, seen: true } : n));
   }, []);
+
+  /**
+   * 触发检查并安装 —— 实现与状态都在这一层，下载是整机动作，切页既不会中断也不会丢进度。
+   * 手动检查的结论同时回写 updateNotice：新版本点亮红点（用户已在看，算已读）、已是最新则清掉。
+   */
+  const runUpdate = useCallback(async () => {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    setUpdateStatus({ status: "checking", message: "正在检查更新…" });
+    await checkAndInstall((p) => {
+      setUpdateStatus(p);
+      if (p.status === "error") showToast({ kind: "err", text: p.message });
+      if (p.status === "no-update") showToast({ kind: "info", text: p.message });
+      if (p.status === "available")
+        setUpdateNotice({ version: p.version ?? "", seen: true });
+      else if (p.status === "no-update") setUpdateNotice(null);
+    });
+    setUpdateBusy(false);
+  }, [showToast, updateBusy]);
 
   // 启动时若开启“自动签到”，则对全部账号执行一次
   useEffect(() => {
@@ -512,6 +544,40 @@ export default function App() {
             </button>
           ))}
         </nav>
+
+        {/* 全局更新状态：检查/下载/安装进行中时在侧边栏底部常驻，切页不丢进度。
+            error / no-update 已由 runUpdate 弹 toast，不在这里占位。 */}
+        {updateStatus &&
+          (updateStatus.status === "checking" ||
+            updateStatus.status === "downloading" ||
+            updateStatus.status === "installing" ||
+            updateStatus.status === "updated") && (
+            <div className="sidebar-update">
+              <div className="sidebar-update-title">应用更新</div>
+              <div className="upd-status">{updateStatus.message}</div>
+              {(() => {
+                const dl = downloadProgress(updateStatus);
+                if (!dl) return null;
+                return (
+                  <div className="upd-row">
+                    {dl.percent !== null && (
+                      <div className="upd-progress-wrap">
+                        <div
+                          className="upd-progress-bar"
+                          style={{ width: `${dl.percent}%` }}
+                        />
+                      </div>
+                    )}
+                    <div className="upd-progress-text">
+                      {dl.percent === null
+                        ? `已下载 ${formatBytes(dl.downloaded)}`
+                        : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
       </aside>
 
       <div className="main">
@@ -662,10 +728,10 @@ export default function App() {
               onToast={showToast}
               askConfirm={askConfirm}
               onReloadSettings={reloadSettings}
+              updateStatus={updateStatus}
+              updateBusy={updateBusy}
+              onRunUpdate={() => void runUpdate()}
               updateVersion={updateNotice?.version ?? null}
-              onUpdateResult={(v) =>
-                setUpdateNotice(v ? { version: v, seen: true } : null)
-              }
             />
           )}
         </main>
