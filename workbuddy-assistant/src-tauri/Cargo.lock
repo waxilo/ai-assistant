@@ -5306,6 +5306,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
+ "minisign-verify",
  "regex",
  "reqwest 0.12.28",
  "serde",

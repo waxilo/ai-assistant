@@ -5042,6 +5042,7 @@ dependencies = [
  "cipher",
  "dirs 5.0.1",
  "hmac",
+ "minisign-verify",
  "p256",
  "rand 0.8.8",
  "rcgen",

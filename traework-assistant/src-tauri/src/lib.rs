@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod accel;
 mod accounts;
 mod briefing;
 mod broker;
@@ -180,6 +181,8 @@ pub fn run() {
             commands::credit_briefing,
             commands::credit_briefing_clear,
             commands::credit_briefing_enable,
+            // 加速更新下载（多镜像源 + 签名自验，见 accel.rs）
+            accel::update_accelerated,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

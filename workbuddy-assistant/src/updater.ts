@@ -1,4 +1,5 @@
 import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 
 export interface UpdateProgress {
@@ -162,7 +163,15 @@ export async function checkAndInstall(
           break;
       }
     };
-    await update.downloadAndInstall(onEvent);
+    // 用 Rust 侧 accel::update_accelerated 走「多镜像源加速」下载：插件默认只会用
+    // latest.json 里的 GitHub 直链下载（慢/常超时），且不暴露换 URL 的入口。
+    // 事件结构与插件 DownloadEvent 完全一致，onEvent 的 switch 可原样复用。
+    const channel = new Channel<DownloadEvent>();
+    channel.onmessage = onEvent;
+    await invoke("update_accelerated", {
+      rid: update.rid,
+      onEvent: channel,
+    });
   } catch (e) {
     onProgress({ status: "error", message: "更新失败：" + errMsg(e) });
     return;

@@ -32,6 +32,7 @@ dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+minisign-verify = "0.2"
 thiserror = "1"
 
 [profile.release]

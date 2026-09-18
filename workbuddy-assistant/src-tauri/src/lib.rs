@@ -1,3 +1,4 @@
+mod accel;
 mod accounts;
 mod auth_file;
 mod briefing;
@@ -22,21 +23,12 @@ use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Tauri updater 的 reqwest 默认走系统代理；本机 Clash 代理对 GitHub release-assets
-    // CDN 不稳定（HTTP 000 / 502），导致检查更新连 latest.json 都拉不下来。
-    // 启动时把 GitHub 相关域名加入 NO_PROXY，让更新器直连 GitHub。
-    const GITHUB_NO_PROXY: &str = "github.com,.github.com,githubusercontent.com,.githubusercontent.com";
-    match std::env::var("NO_PROXY") {
-        Ok(v) if !v.is_empty() => {
-            std::env::set_var("NO_PROXY", format!("{}, {}", v, GITHUB_NO_PROXY));
-        }
-        _ => {
-            std::env::set_var("NO_PROXY", GITHUB_NO_PROXY);
-        }
-    }
+    // 更新下载对齐 traework：不再向 NO_PROXY 注入 GitHub 域名来强制「绕开代理直连」。
+    // updater 的 reqwest 默认读系统代理（system-proxy 特性），本机直连
+    // release-assets 会被掐/超时；走系统代理反而更快更稳。真正需要提速时，
+    // 用 accel::update_accelerated 走加速镜像下载（见 accel.rs）。
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
+    let app = tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         // 用 LaunchAgent 而非 AppleScript，登录时静默启动、不弹窗
@@ -117,6 +109,8 @@ pub fn run() {
             stealth::takeover_events_clear,
             stealth::takeover_events,
             proxy::free_models,
+            // 加速更新下载（多镜像源 + 签名自验，见 accel.rs）
+            accel::update_accelerated,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
