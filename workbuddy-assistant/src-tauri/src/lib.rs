@@ -17,6 +17,7 @@ mod scheduler;
 mod stealth;
 mod tray;
 
+use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,6 +72,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // macOS：窗口收进托盘后摘掉 Dock 图标，唤回时再由托盘恢复
+                tray::set_dock_visible(window.app_handle(), false);
                 let _ = window.hide();
             }
         })

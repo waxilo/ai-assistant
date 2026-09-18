@@ -56,8 +56,10 @@ pub fn toggle_main(app: &AppHandle) {
         let visible = w.is_visible().unwrap_or(false);
         let focused = w.is_focused().unwrap_or(false);
         if visible && focused {
+            set_dock_visible(app, false);
             let _ = w.hide();
         } else {
+            set_dock_visible(app, true);
             let _ = w.show();
             let _ = w.set_focus();
         }
@@ -70,8 +72,28 @@ pub fn toggle_main(app: &AppHandle) {
 /// 故放行 dead_code 警告。
 #[allow(dead_code)]
 pub fn show_main(app: &AppHandle) {
+    set_dock_visible(app, true);
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();
     }
 }
+
+/// macOS：让 Dock 图标跟随主窗口显隐 —— 窗口在前台时保留，隐藏到托盘后摘掉
+/// （`ActivationPolicy::Accessory`，等价于 LSUIElement）。窗口隐藏后 Dock 里没有
+/// 图标，唤回只能走菜单栏托盘图标；定时签到 / 智能接管等后台逻辑不受影响。
+///
+/// 仅当「窗口隐藏」需要才摘：进程退出时 Dock 图标随进程消失，无需干预。
+/// Windows 无此概念，编译为空操作。
+#[cfg(target_os = "macos")]
+pub fn set_dock_visible(app: &AppHandle, visible: bool) {
+    let policy = if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    };
+    let _ = app.set_activation_policy(policy);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_dock_visible(_app: &AppHandle, _visible: bool) {}
