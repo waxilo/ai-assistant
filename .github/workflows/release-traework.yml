@@ -28,7 +28,7 @@ jobs:
         include:
           - platform: macos-latest
             target: universal-apple-darwin
-            bundles: app
+            bundles: app,dmg
           - platform: windows-latest
             target: ""
             bundles: nsis
@@ -132,11 +132,30 @@ jobs:
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: 收集安装包
+      - name: 收集安装包（重命名带上平台标识，.sig 随产物同步改名）
         shell: bash
         run: |
           mkdir -p dist
-          find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.app.tar.gz' -o -name '*.dmg' -o -name '*.sig' \) -exec cp {} dist/ \;
+          V="${{ steps.version.outputs.version }}"
+          # macOS：扩展名前插入 版本号+平台标（dmg 安装包，含 .sig）
+          for f in $(find artifacts/bundle-macos-latest -type f); do
+            base=$(basename "$f")
+            new="${base/.dmg/-macos-$V.dmg}"
+            new="${new/.app/-macos-$V.app}"
+            cp "$f" "dist/$new"
+          done
+          # Windows：重命名为 产品名_windows_版本.exe（含 .sig）
+          for f in $(find artifacts/bundle-windows-latest -type f); do
+            base=$(basename "$f")
+            product="${base%%_*}"
+            if [[ "$base" == *.sig ]]; then
+              ext="${base%.sig}"; ext="${ext##*.}"
+              cp "$f" "dist/${product}_windows_${V}.${ext}.sig"
+            else
+              ext="${base##*.}"
+              cp "$f" "dist/${product}_windows_${V}.${ext}"
+            fi
+          done
 
       - name: 生成 latest.json（v2 CLI 只产 .sig，manifest 需自行拼装）
         shell: bash
