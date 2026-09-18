@@ -1,1 +1,4 @@
 .DS_Store
+
+# --- WorkBuddy 工作区记忆：含个人上下文与项目笔记，仓库是 PUBLIC，勿入库 ---
+.workbuddy/
