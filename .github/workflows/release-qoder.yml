@@ -1,0 +1,179 @@
+# 构建 QoderAssistant（macOS universal + Windows NSIS）并发布到 ai-assistant 仓库的
+# GitHub Release，使应用内更新（@tauri-apps/plugin-updater）可用。
+#
+# 触发方式：
+#   1. 打 tag `qoder-v<版本>` 并推送（版本号以 tag 为准，覆盖 tauri.conf.json）
+#   2. 手动 workflow_dispatch（用 tauri.conf.json 里的版本号）
+#
+# 需要的仓库 Secrets：
+#   TAURI_SIGNING_PRIVATE_KEY            —— updater 签名私钥（`npm run tauri signer generate` 生成）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   —— 私钥密码，无密码可不配
+name: Release QoderAssistant
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["qoder-v*"]
+
+env:
+  APP_DIR: qoder-assistant
+  RELEASE_REPO: waxilo/ai-assistant
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: universal-apple-darwin
+            bundles: app,dmg
+          - platform: windows-latest
+            target: ""
+            bundles: nsis
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 添加 macOS 双架构 target
+        if: matrix.target != ''
+        shell: bash
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.APP_DIR }}/src-tauri
+
+      - name: 安装前端依赖
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: npm ci
+
+      - name: 确定版本号（tag 优先，否则读配置）
+        id: version
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          REF="$GITHUB_REF_NAME"
+          if [[ "$REF" == qoder-v* ]]; then
+            V="${REF#qoder-v}"
+          else
+            V=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 检查签名私钥
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+            echo "::error::缺少 TAURI_SIGNING_PRIVATE_KEY secret。"
+            echo '请先在本地跑 npx tauri signer generate 拿到私钥，'
+            echo "并把私钥（及密码）配到本仓库 Actions secrets。"
+            exit 1
+          fi
+
+      - name: Tauri build（带更新产物）
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          ARGS="--config {\"version\":\"${{ steps.version.outputs.version }}\"} --bundles ${{ matrix.bundles }}"
+          if [ -n "${{ matrix.target }}" ]; then
+            ARGS="$ARGS --target ${{ matrix.target }}"
+          fi
+          npx tauri build $ARGS
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.exe
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.msi
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.app.tar.gz
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.dmg
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/*.sig
+            ${{ env.APP_DIR }}/src-tauri/target/**/release/bundle/**/latest.json
+
+  release:
+    name: 发布到 waxilo/ai-assistant
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 确定版本号
+        id: version
+        shell: bash
+        run: |
+          REF="$GITHUB_REF_NAME"
+          if [[ "$REF" == qoder-v* ]]; then
+            V="${REF#qoder-v}"
+          else
+            V=$(node -p "require('./${{ env.APP_DIR }}/src-tauri/tauri.conf.json').version")
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 收集安装包（重命名带上平台标识，.sig 随产物同步改名）
+        shell: bash
+        run: |
+          mkdir -p dist
+          V="${{ steps.version.outputs.version }}"
+          # macOS：按扩展精确重命名为 产品名-macos-版本.{app.tar.gz|dmg}（含 .sig）
+          PRODUCT=$(node -p "require('./${{ env.APP_DIR }}/src-tauri/tauri.conf.json').productName")
+          for f in $(find artifacts/bundle-macos-latest -type f); do
+            base=$(basename "$f")
+            case "$base" in
+              *.app.tar.gz.sig) cp "$f" "dist/${PRODUCT}-macos-${V}.app.tar.gz.sig" ;;
+              *.app.tar.gz)     cp "$f" "dist/${PRODUCT}-macos-${V}.app.tar.gz" ;;
+              *.dmg.sig)        cp "$f" "dist/${PRODUCT}-macos-${V}.dmg.sig" ;;
+              *.dmg)            cp "$f" "dist/${PRODUCT}-macos-${V}.dmg" ;;
+            esac
+          done
+          # Windows：重命名为 产品名_windows_版本.exe（含 .sig）
+          for f in $(find artifacts/bundle-windows-latest -type f); do
+            base=$(basename "$f")
+            product="${base%%_*}"
+            if [[ "$base" == *.sig ]]; then
+              ext="${base%.sig}"; ext="${ext##*.}"
+              cp "$f" "dist/${product}_windows_${V}.${ext}.sig"
+            else
+              ext="${base##*.}"
+              cp "$f" "dist/${product}_windows_${V}.${ext}"
+            fi
+          done
+
+      - name: 生成 latest.json（v2 CLI 只产 .sig，manifest 需自行拼装）
+        shell: bash
+        run: node scripts/build-latest.mjs "${{ steps.version.outputs.version }}" qoder-latest dist "${{ env.RELEASE_REPO }}"
+
+      - name: 发布 Release（固定 tag，各应用各自独立，版本号随意演进）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          TAG="qoder-latest"
+          gh release delete "$TAG" --repo "${{ env.RELEASE_REPO }}" --yes || true
+          gh release create "$TAG" * \
+            --repo "${{ env.RELEASE_REPO }}" \
+            --title "QoderAssistant（自动构建）" \
+            --notes "版本 ${{ steps.version.outputs.version }}：macOS universal + Windows NSIS"

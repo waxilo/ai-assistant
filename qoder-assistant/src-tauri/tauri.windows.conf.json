@@ -1,0 +1,6 @@
+{
+  "bundle": {
+    "shortDescription": "Qoder multi-account checkin desktop assistant",
+    "longDescription": "Qoder Assistant: multi-account checkin, account import/export, token renewal, webhook notify, and GitHub Release auto-update."
+  }
+}

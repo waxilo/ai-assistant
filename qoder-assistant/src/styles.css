@@ -1,0 +1,26 @@
+/**
+ * 样式入口 —— 只做装配，不写任何规则。
+ *
+ * 拆分理由：原先单独一个 1901 行的 styles.css，改一处要在近两千行里翻找，
+ * 且「某个 class 到底定义在哪」只能靠搜索；同时它让跨页复用的规则与
+ * 单页专用的规则混在一起，是重复定义反复滋生的土壤。
+ *
+ * 分层（后者可覆盖前者，顺序不可随意调整）：
+ *   tokens     设计令牌：颜色 / 圆角 / 阴影 / 毛玻璃 / 动效 / 字阶。唯一可变量来源
+ *   base       重置、环境背景、排版、焦点、关键帧、入场节奏、reduced-motion
+ *   chrome     外壳：侧栏 / 页头 / 内容区 / 导航 / 按钮 / Toast
+ *   ui         通用件：卡片 / 表格 / 状态原子 / 表单 / 弹窗与遮罩 / 开关 / 进度
+ *   pages      页面专用：账号页概览、日志、接管、设置、网络急救、导入
+ *   responsive 窄窗口适配：全应用唯一的 @media (max-width) 归属地
+ *
+ * 约定：本文件与 tokens 之外各层内**不允许出现裸的颜色 / 圆角 / 阴影 /
+ * 时长字面量**，一律走 tokens.css 的语义令牌。新增页面样式先问：
+ * 「这是通用件还是某页独有？」——通用件放 ui，独有才放 pages。
+ * 改任何宽度相关的规则前先看 responsive.css 顶部的尺寸推导。
+ */
+@import "./styles/tokens.css";
+@import "./styles/base.css";
+@import "./styles/chrome.css";
+@import "./styles/ui.css";
+@import "./styles/pages.css";
+@import "./styles/responsive.css";

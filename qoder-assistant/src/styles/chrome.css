@@ -1,0 +1,413 @@
+/**
+ * 外壳层：应用骨架（侧栏 / 页头 / 内容区）、导航、按钮、Toast。
+ *
+ * 关键结构变化：页头从「占位的 flex 行」改成**悬浮在内容之上的玻璃层**，
+ * 内容区改为绝对定位并向上溢出到页头之下。这样滚动时内容会从毛玻璃页头
+ * 底下穿过 —— 侧栏与页头的 backdrop-filter 才有实际被模糊的对象。
+ * 之前两者都是不透明纯白、各自独占一行，玻璃效果无从体现。
+ */
+
+.app {
+  display: flex;
+  height: 100%;
+}
+
+/* ── 侧边导航栏：半透明玻璃 + 细描边 ───────────────────────── */
+.sidebar {
+  flex: 0 0 216px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px 14px;
+  z-index: 10;
+  background: var(--glass);
+  backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  border-right: 1px solid var(--hairline);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 2px 6px;
+  min-width: 0;
+}
+.logo {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, #5b86ff, var(--primary-d));
+  color: #fff;
+  box-shadow: 0 2px 8px var(--primary-ring), var(--hl);
+}
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+.brand-name {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.brand-ver {
+  font-size: var(--fs-micro);
+  color: var(--muted-2);
+  letter-spacing: 0.2px;
+  font-variant-numeric: var(--tnum);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+/* 导航项：选中态改用一条会「长出来」的强调条（scaleY 过渡），
+   比原来静态的 inset box-shadow 更有反馈感 */
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: var(--fs-cell);
+  font-family: inherit;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  position: relative;
+  transition: background var(--dur-2) var(--ease-out),
+    color var(--dur-2) var(--ease-out);
+}
+.nav-item::before {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 50%;
+  width: 3px;
+  height: 20px;
+  border-radius: 0 3px 3px 0;
+  background: var(--primary);
+  transform: translateY(-50%) scaleY(0);
+  opacity: 0;
+  transition: transform var(--dur-2) var(--ease-spring),
+    opacity var(--dur-2) var(--ease-out);
+}
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.66);
+  color: var(--text);
+}
+.nav-item.active {
+  background: var(--primary-soft);
+  color: var(--primary-d);
+  font-weight: 600;
+}
+.nav-item.active::before {
+  transform: translateY(-50%) scaleY(1);
+  opacity: 1;
+}
+.nav-icon {
+  width: 18px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  font-size: 14px;
+}
+/* 导航文案必须包成元素（理由同 `.status-pill .pill-text`）：侧栏在窄窗口下要
+   收成图标轨道，那时只剩它需要隐藏。顺便让它可省略，长文案不会把右侧圆点顶出去。 */
+.nav-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nav-dot {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.nav-dot.err {
+  background: var(--err);
+  animation: nav-dot-pulse 1.8s ease-in-out infinite;
+}
+
+/* ── 侧栏底部：应用更新全局状态条 ────────────────────────────
+   状态持在 App 层（下载是整机动作），侧栏底部常驻一条，切换页面进度不丢。
+   内部 .upd-* 复用 ui.css 的进度样式，此处只负责卡片容器与字号微调。 */
+.sidebar-update {
+  margin-top: auto;
+  padding: 11px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-soft);
+  border: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sidebar-update-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--primary-d);
+  letter-spacing: 0.2px;
+}
+.sidebar-update .upd-status {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  line-height: 1.35;
+}
+.sidebar-update .upd-row {
+  margin-top: 0;
+}
+
+/* ── 右侧主区：页头悬浮于内容之上 ───────────────────────────── */
+.main {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}
+.pagebar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  z-index: 5;
+  height: var(--pagebar-h);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 var(--page-pad);
+  background: var(--glass);
+  backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+  border-bottom: 1px solid var(--hairline);
+}
+/**
+ * 页头三段：左标题 / 中弹性空隙 / 右动作。
+ *
+ * 左右两段都必须 `flex: none` —— 默认的 `flex-shrink: 1` 会在空间不够时先压标题，
+ * 而 `<h2>` 里的中文可以任意断行，表现就是**标题被压成一列竖排的字**（宽度够时
+ * 完全看不出来，一缩窗口就破相）。要压缩就让 `.spacer` 先归零，再让
+ * responsive.css 去收胶囊与内边距，别让标题承担收缩。
+ */
+.pagebar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.pagebar-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  color: var(--primary-d);
+}
+.pagebar h2 {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  white-space: nowrap;
+}
+
+/* 状态胶囊：高度由 --pill-h 统一定义，与接管页的胶囊**结构上**同高，
+   而不是靠两条 padding 公式碰巧算成一样（那样一改就分叉） */
+.status-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--pill-h);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 0 11px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+/* ⚠️ 胶囊里的文案必须整体包在 `.pill-text` 里。
+   窄窗口下（responsive.css）靠隐藏它把胶囊收成「只剩一枚圆点」——裸的文本节点
+   CSS 选不中，包不起来就只能整枚胶囊一起藏掉，等于丢信息。 */
+.status-pill .pill-text {
+  display: inline;
+}
+.status-pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.status-pill.warn .dot {
+  background: var(--warn);
+}
+/* 页头右侧动作组：同样不许被压缩。按钮自身 `white-space: nowrap`，
+   一旦允许收缩，被压的就不是文字而是整排按钮的间距，视觉上更乱。 */
+.action-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.spacer {
+  flex: 1;
+}
+.count {
+  font-size: var(--fs-body);
+  color: var(--muted);
+}
+
+/* ── 按钮 ─────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-body);
+  font-weight: 500;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out),
+    transform var(--dur-1) var(--ease-out);
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--panel-2);
+}
+/* 按下时轻微下沉：给点击一个物理反馈，成本极低 */
+.btn:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn.primary {
+  background: linear-gradient(180deg, #4d7bff, var(--primary));
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(47, 87, 214, 0.3), var(--hl);
+}
+.btn.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--primary), var(--primary-d));
+  border-color: var(--primary-d);
+  box-shadow: 0 3px 10px var(--primary-ring);
+}
+.btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.btn.ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+  border-color: transparent;
+}
+.btn.danger {
+  color: var(--err);
+  border-color: var(--border);
+}
+.btn.danger:hover:not(:disabled) {
+  background: var(--err-soft);
+  border-color: var(--err-line);
+}
+/* 小号按钮：只有这一个类名（历史上还有一个完全重复的 .btn-sm，已合并） */
+.btn.small {
+  padding: 7px 12px;
+  font-size: var(--fs-sm);
+}
+.btn.block {
+  width: 100%;
+}
+/* 图标按钮（日志 / 删除等轻量操作，高度 32px） */
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out);
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+.icon-btn.icon-danger:hover:not(:disabled) {
+  background: var(--err-soft);
+  color: var(--err);
+  border-color: var(--err-line);
+}
+.spin {
+  animation: spin 0.7s linear infinite;
+}
+
+/* ── 内容区：绝对定位向上溢出到页头之下 ─────────────────────── */
+.content {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: calc(var(--pagebar-h) + 20px) var(--page-pad) 28px;
+}
+
+/* ── Toast ────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-body);
+  font-weight: 500;
+  color: #fff;
+  z-index: 90;
+  box-shadow: var(--shadow-lg);
+  animation: toast-in var(--dur-3) var(--ease-spring);
+}
+.toast-ok {
+  background: var(--ok);
+}
+.toast-err {
+  background: var(--err);
+}
+.toast-info {
+  background: var(--primary);
+}

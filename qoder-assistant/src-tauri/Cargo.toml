@@ -1,0 +1,55 @@
+[package]
+name = "qoder-assistant"
+version = "0.1.36"
+description = "Qoder 多账号签到桌面助手"
+authors = ["waxilo"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "qoder_assistant_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon：后台常驻托盘（关闭窗口不退出进程，定时签到/反代持续生效）
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# 文件对话框：账号导出 / 导入选路径用
+tauri-plugin-dialog = "2"
+# 开机自启动：定时签到只有应用在跑才可能触发，所以由应用自己注册登录启动项。
+# 只在 Rust 侧调用（`app.autolaunch()`），因此不需要前端 npm 包，也不需要额外 capability。
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+regex = "1"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+# PKCE：Qoder 登录用 S256 challenge（base64url(sha256(verifier))）
+sha2 = "0.10"
+minisign-verify = "0.2"
+thiserror = "1"
+# —— Qoder 本机凭据（auth.v1.dat）OSCrypt 解密/回写 ——
+# Chromium OSCrypt 在 Windows 上的两层：DPAPI 解出 32B AES 数据密钥 + AES-256-GCM 解数据
+aes-gcm = { version = "0.10", features = ["aes"] }
+aead = "0.5"
+rand = "0.8"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[dev-dependencies]
+# 目前测试仅用 std + tokio 自带能力，无额外 dev 依赖

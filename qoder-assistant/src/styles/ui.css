@@ -1,0 +1,1068 @@
+/**
+ * 通用 UI 层：页面容器、卡片、表格、状态原子、表单、弹窗/遮罩、开关、进度。
+ *
+ * 这一层是「同一个概念在任何页面都必须长得一样」的地方。页面只能组合这里的
+ * 东西并用修饰类描述语义，不得再写一套边框/圆角/底色。
+ */
+
+/* ── 页面容器：四页共用同一宽度策略与纵向节奏 ───────────────── */
+.panel-page {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+/**
+ * 卡片：全应用唯一的面板外观。
+ *
+ * 现在略带透明并吃环境光（backdrop-filter），配合顶边高光 --hl，
+ * 让它看起来是一块有厚度的玻璃板，而不是一张白色贴纸。
+ * 不透明度刻意停在 0.9：再低会削弱表格文字的对比度，工具类界面里可读性优先。
+ */
+.card {
+  background: var(--card-glass);
+  backdrop-filter: blur(var(--blur-sm)) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(140%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm), var(--hl);
+  transition: box-shadow var(--dur-2) var(--ease-out),
+    border-color var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
+}
+/* 可交互卡片（如汇总卡）：hover 时轻微抬升 */
+.card.hoverable:hover {
+  box-shadow: var(--shadow), var(--hl);
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+
+/* 卡片内的横向表头：标题（+ 副标题）在左，操作用 .spacer 推到右。
+   设置页那张左右分栏的卡片用 .set-card-head，两者只差布局、不差字体语言。 */
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.card-head h3 {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+.card-head-sub {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+}
+
+/* 说明条：图标 + 一段正文 —— 页面上（.set-intro）与弹窗里（.note）共用同一套解剖结构。
+   正文必须整体包在一个元素里（调用方用 <span>）—— 容器是 flex，裸的 <b>/<i> 会
+   各自变成一个 flex item，把一句话拆成竖排的几列（踩过：简报页说明条里的「完整一天」）。
+   ⚠️ 全应用只允许这两处定义。想再加第三种「说明文字」之前，先说清它和这两个的
+   本质区别是什么 —— 本轮统一掉的正是 4 种「说明文字」并存。 */
+.note,
+.set-intro {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: 1.6;
+}
+.note > span,
+.set-intro > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.note svg,
+.set-intro svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--primary);
+  opacity: 0.7;
+}
+/* 页面引导语：单行对齐更稳（页面上的说明一般只有 1–3 行） */
+.set-intro {
+  align-items: center;
+}
+.set-intro svg {
+  margin-top: 0;
+}
+/* 弹窗里的说明条：加底色与描边，把「说明」与「表单 / 列表」分开 */
+.note {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: var(--fs-cap);
+  line-height: 1.65;
+}
+.note.info {
+  border-color: var(--primary-line);
+  background: var(--primary-soft);
+  color: var(--text-2);
+}
+.note.warn {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--text-2);
+}
+.note.warn svg {
+  color: var(--warn-d);
+}
+.note.danger {
+  border-color: var(--err-line);
+  background: var(--err-soft);
+  color: var(--text-2);
+}
+.note.danger svg {
+  color: var(--err);
+}
+.note.ok {
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
+  color: var(--text-2);
+}
+.note.ok svg {
+  color: var(--ok-d);
+}
+
+/* 空态：图标 + 主文案 +（可选）补充说明。账号页与日志页共用同一排布。 */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: var(--fs-md);
+  line-height: 1.7;
+  text-align: center;
+  padding: 64px 20px;
+  margin: 0;
+  animation: fade-in var(--dur-3) var(--ease-out) both;
+}
+.empty svg {
+  color: var(--disabled);
+}
+.empty-sub {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  max-width: 380px;
+}
+
+/* ── 账号页：轻量统计概览 ─────────────────────────────────── */
+.summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+/* 汇总卡：组合 .card，这里只补内边距与内部排布 */
+.sum-card {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.sum-label {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+.sum-num {
+  font-size: var(--fs-stat);
+  font-weight: 650;
+  color: var(--text);
+  letter-spacing: -0.02em;
+  font-variant-numeric: var(--tnum);
+  line-height: 1.15;
+}
+.sum-num.ok {
+  color: var(--ok);
+}
+
+/* ── 数据表格：账号列表与签到日志共用同一套表头 / 行高 / Hover ── */
+.table-wrap {
+  /* 与 .card 组合：卡片负责外观，这里负责横向滚动 */
+  overflow-x: auto;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  font-size: var(--fs-cell);
+}
+.data-table thead th {
+  height: 44px;
+  padding: 0 18px;
+  text-align: left;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.data-table tbody td {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.data-table tbody tr {
+  transition: background var(--dur-1) var(--ease-out);
+}
+.data-table tbody tr:hover td {
+  background: var(--row-hover);
+}
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+/* 数值列：右对齐 + 等宽数字 */
+.data-table .num {
+  text-align: right;
+  font-variant-numeric: var(--tnum);
+}
+.data-table th.col-actions,
+.data-table td.col-actions {
+  text-align: right;
+}
+
+/* 账号列（账号页 / 日志页共用）：头像 + 名称 + 手机号 */
+.ac-cell-name {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.ac-avatar {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  color: var(--primary-d);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  box-shadow: var(--hl);
+}
+.ac-id {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.ac-name {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+/* 手机号：弱化的次级信息 */
+.ac-phone {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+}
+/* 积分：核心数据突出，低积分用弱橙提示 */
+.ac-balance {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: var(--tnum);
+}
+.ac-balance.low {
+  color: var(--warn);
+}
+/* 积分到期：过期用红色警示 */
+.ac-cell-expiry {
+  font-variant-numeric: var(--tnum);
+  color: var(--text);
+}
+.ac-expiry.expired {
+  color: var(--err);
+  font-weight: 600;
+}
+/* 积分过期 / token 过期的可点击变体：点开资源包列表 */
+.clk {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+/* 操作列：签到 + 图标按钮 */
+.ac-cell-actions {
+  white-space: nowrap;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  align-items: center;
+}
+.num-muted {
+  color: var(--muted);
+}
+
+/* ── 账号页的「一栏」：状态 + 说明 + 动作 ──────────────────────────────────
+   现在账号页顶部只剩这一条 —— **云端凭证池**（2026-09-18 撤掉了「今日权益」那条）。
+   留着这组类名而不是并回卡片，是因为它的形态「一个状态 + 一段说明 + 右侧一条出路」
+   仍然和统计卡不同：统计卡是纯数字，这里是「带动作的状态」。
+   没有 `-title` 之类的旧别名要兼容，所以撤掉第二条时不需要动坐标。
+
+   凭证池那一栏：三种形态各自只有一条出路（上传 / 绑定 → 复制 uuid / 解绑），
+   所以不做成「一个按钮在多种语义间切换」，而是把状态本身画出来。
+   它是**页面级的一栏**，不是表格里的一列：一池一个 uuid、池内一把闸，绑定只有
+   「全都绑了」和「全都没绑」两种状态。画到每一行上，会让人以为能逐个账号决定。 */
+.info-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+}
+.info-bar-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+.info-bar-title svg {
+  color: var(--muted);
+}
+/* 中间那段说明自己吃掉剩余宽度：右侧动作因此始终贴到卡片右边沿，
+   三种形态（无账号 / 单机 / 已绑定）下按钮的位置不会左右横跳 */
+.info-bar-note {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.info-bar-note.err {
+  color: var(--err);
+}
+.info-bar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-left: auto;
+}
+
+/* ── 胶囊 ──────────────────────────────────────────────────────────────────
+   账号页那枚 uuid。它是「可点的」——点一下把完整那串复制走。 */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--panel-2);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  font-variant-numeric: var(--tnum);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out);
+}
+.chip:hover {
+  background: var(--panel-3);
+  border-color: var(--border-hover);
+}
+.chip.mono {
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+}
+/* 已复制：从灰色拉出一档，一眼能看出「这一下真的生效了」 */
+.chip-ok {
+  background: var(--ok-soft);
+  border-color: var(--ok-line);
+  color: var(--ok-d);
+}
+
+/* 上传成功面板里那串 uuid：整行铺开、点击即全选。
+   它是唯一需要被搬到别的机器上去的东西，不跟别的文字挤在一行里 */
+.pool-uuid {
+  display: block;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+}
+
+/* ── 状态圆点：全应用唯一的「状态」表达 ───────────────────── */
+.status-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.status-dot .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+.status-dot.done {
+  color: var(--ok);
+}
+.status-dot.done .dot {
+  background: var(--ok);
+}
+.status-dot.pending .dot {
+  background: var(--disabled);
+}
+.status-dot.fail {
+  color: var(--err);
+}
+.status-dot.fail .dot {
+  background: var(--err);
+}
+.status-dot.inactive .dot {
+  background: var(--muted-2);
+}
+/* 「签到中」的呼吸光环：唯一允许无限循环的动画（表达进行中） */
+.status-dot.signing .dot {
+  background: var(--primary);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ── 中性标签 / 判定徽标：两者的分工必须保持 ───────────────── */
+/* .tag 只贴一个值（host / 文件名 / uid）；.badge 表达判定（成功 / 失败 / 残留） */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-cap);
+  color: var(--primary-d);
+  background: var(--primary-soft);
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.muted {
+  color: var(--muted);
+}
+.badge {
+  font-size: var(--fs-micro);
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+.badge-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.badge-already {
+  background: var(--primary-soft);
+  color: var(--primary-d);
+}
+.badge-idle {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.badge-err {
+  background: var(--err-soft);
+  color: var(--err);
+}
+
+/* ── 遮罩层 + 弹窗 ────────────────────────────────────────── */
+/* 弹窗打开时锁住内容区滚动（Dialog 组件给 body 挂这个状态类）。
+   注意锁的是 .content —— 本应用真正滚动的容器是它，body 本身从不滚动，
+   所以对 body 设 overflow 是无效操作。 */
+body.modal-open .content {
+  overflow: hidden;
+}
+
+/**
+ * 遮罩：半透明压暗 + 轻微模糊（让弹窗与背景产生景深分离），并淡入。
+ * 此前是纯 rgba 无动画，弹窗「啪」地出现、背景毫无层次。
+ */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: var(--page-pad);
+  background: rgba(18, 24, 38, 0.32);
+  backdrop-filter: blur(6px) saturate(120%);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  animation: overlay-in var(--dur-2) var(--ease-out) both;
+}
+/**
+ * 弹窗本体：**三段式外壳**（head / body / foot），全应用所有弹窗共用。
+ *
+ * 尺寸只有三档（tokens 里的 --modal-w-*）：sm 确认类 / md 默认 / lg 列表与表格。
+ * 头尾固定、**只有 body 滚动** —— 内容再长也不会把标题或操作按钮顶出视野
+ * （旧实现是 `.modal` 整体滚动 + `.modal-actions` 用负偏移贴底，标题会跟着滚走）。
+ * 左右内边距三段统一取 --modal-pad，头/身/底永远对齐。
+ */
+.modal {
+  display: flex;
+  flex-direction: column;
+  width: var(--modal-w-md);
+  max-width: 100%;
+  max-height: 86vh;
+  overflow: hidden;
+  background: var(--glass-strong);
+  backdrop-filter: blur(var(--blur-lg)) saturate(var(--saturate));
+  -webkit-backdrop-filter: blur(var(--blur-lg)) saturate(var(--saturate));
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl), var(--hl);
+  animation: dialog-in var(--dur-3) var(--ease-spring) both;
+}
+.modal-sm {
+  width: var(--modal-w-sm);
+}
+.modal-md {
+  width: var(--modal-w-md);
+}
+.modal-lg {
+  width: var(--modal-w-lg);
+}
+
+/* ── 头部：图标座 + 标题 +（可选）副标题 + 关闭 ── */
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 16px var(--modal-pad) 14px;
+  border-bottom: 1px solid var(--border);
+}
+/* 图标座：给每个弹窗一个「一眼认出这是什么」的锚点，同时承担语义色 */
+.modal-head-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-soft);
+  color: var(--primary-d);
+}
+.modal.tone-danger .modal-head-icon {
+  background: var(--err-soft);
+  color: var(--err);
+}
+.modal.tone-warn .modal-head-icon {
+  background: var(--warn-soft);
+  color: var(--warn-d);
+}
+.modal.tone-ok .modal-head-icon {
+  background: var(--ok-soft);
+  color: var(--ok-d);
+}
+.modal-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.modal-title h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.modal-sub {
+  margin: 5px 0 0;
+  font-size: var(--fs-cap);
+  line-height: 1.6;
+  color: var(--muted);
+}
+/* 关闭按钮：旧弹窗只能靠 Esc / 点遮罩关掉，界面上没有任何可见出口 */
+.modal-x {
+  flex: 0 0 auto;
+  margin: -4px -4px 0 2px;
+}
+
+/* ── 内容区：唯一滚动区 ── */
+.modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px var(--modal-pad) 20px;
+}
+/* 内容区统一纵向节奏：相邻块一律 12px。
+   让每个块自己写 margin，迟早出现「有的 10px 有的 16px」—— 那也是一种割裂。 */
+.modal-body > * + * {
+  margin-top: 12px;
+}
+/* 元信息（时间戳之类）是贴在上面那块后面的附注，间距要比常规块紧一档 */
+.modal-body > .modal-meta {
+  margin-top: 10px;
+}
+
+/* ── 底部：左「工具位」右「操作位」 ── */
+.modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 13px var(--modal-pad);
+  border-top: 1px solid var(--border);
+}
+.modal-foot-actions {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+/* 字段标签：只有**弹窗内**的表单需要「块级 + 次级色 + 下间距」。
+   刻意不再覆盖 .panel-page —— 那条规则会把页面上所有 label 一律变成块级
+   并加 12px 下边距，而接管页的「端口」「开关」本身就是 label，只能各自写
+   !important / 补偿边距顶回去。控件怎么排布应该由控件自己决定。 */
+.modal label {
+  display: block;
+  font-size: var(--fs-body);
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.modal label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+/* 复选框不受 `.modal input { width:100% }` 影响，否则会被拉成一整行宽、
+   勾选标记跑到中间（表现为「复选框居中 + 文字靠右」的错版） */
+.modal label.checkbox input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+/* 表单控件基础外观 —— **不含宽度**。宽度归容器决定。 */
+.modal input,
+.modal textarea,
+.modal select,
+.panel-page input,
+.panel-page textarea,
+.panel-page select {
+  margin-top: 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-body);
+  font-family: inherit;
+  color: var(--text);
+  background: var(--field);
+  resize: vertical;
+  transition: border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out), background-color var(--dur-1) var(--ease-out);
+}
+.modal input,
+.modal textarea,
+.modal select {
+  width: 100%;
+}
+/* 统一 select 下拉框：自定义箭头、一致背景、hover/focus 状态 */
+.modal select,
+.panel-page select {
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 32px;
+  background-color: var(--field);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23607085' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 16px 16px;
+}
+.modal select:hover,
+.panel-page select:hover {
+  background-color: #ffffff;
+  border-color: var(--border-hover);
+}
+.modal select:focus,
+.panel-page select:focus {
+  outline: none;
+  border-color: var(--primary);
+  background-color: #ffffff;
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+.modal select:disabled,
+.panel-page select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background-color: var(--panel-2);
+}
+.modal input:focus,
+.modal textarea:focus,
+.panel-page input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+.hint {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  line-height: 1.6;
+  margin: -4px 0 12px;
+}
+.form-err {
+  color: var(--err);
+  font-size: var(--fs-body);
+}
+/* ── 弹窗内的共享原子 ───────────────────────────────────────
+   这三种块以前在每个弹窗里各写一套：说明文字有 4 种长相
+   （.hint / .oauth-wait / .brief-note / .result-card），可勾选列表有 3 套
+   （.local-list / .acct-multi / .rl-list）。同一种东西长出好几张脸，
+   正是「弹窗之间看着割裂」的另一半来源。现在各只有一套。 */
+
+/* 正文段落（确认框的说明文字等） */
+.modal-text {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 1.75;
+  color: var(--text-2);
+  /* 文案里用换行分段（确认框的 body 就是 "
+
+" 分段），要让它真的换行 */
+  white-space: pre-line;
+}
+
+/* 元信息行：时间戳、来源这类附注 */
+.modal-meta {
+  margin: 0;
+  font-size: var(--fs-micro);
+  color: var(--muted-2);
+  font-variant-numeric: var(--tnum);
+}
+
+/* 汇总数字：弹窗里的 2–4 个关键数字并排。
+   刻意不用页面上那套 .sum-card —— 弹窗里再套卡片是双重边框，脏。 */
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 0;
+}
+.stat {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.stat-label {
+  display: block;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.stat-num {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  font-variant-numeric: var(--tnum);
+  letter-spacing: -0.01em;
+}
+
+/* 可勾选 / 可点列表：本机账号、扣费账号、限流模型三处共用 */
+.pick-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  max-height: min(46vh, 380px);
+  overflow-y: auto;
+}
+.pick-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  cursor: pointer;
+  transition: border-color var(--dur-1) var(--ease-out),
+    background var(--dur-1) var(--ease-out);
+}
+.pick-item:hover {
+  border-color: var(--border-hover);
+  background: var(--panel);
+}
+/* 勾选态统一用蓝；「免费 / 不可取消」这类锁定态用绿 —— 与 .badge 的语言一致 */
+.pick-item.picked {
+  border-color: var(--primary-line);
+  background: var(--primary-soft);
+}
+.pick-item.locked {
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
+  cursor: default;
+}
+.pick-item.static {
+  cursor: default;
+}
+/* 复选框复位：`.modal input` 会把它拉成一整行宽并加内边距 */
+.pick-item input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.pick-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* 账号单元格（common.tsx 的 AccountCell）放进列表行时要能撑开 */
+.pick-item .ac-cell-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pick-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: var(--fs-cell);
+  font-weight: 600;
+  color: var(--text);
+}
+/* 标识符型的名字（模型 id）用等宽，与 .ac-meta code.tok / .rl-name 一致 */
+.pick-name.mono {
+  font-family: var(--font-mono);
+}
+.pick-sub {
+  margin-top: 3px;
+  font-size: var(--fs-micro);
+  color: var(--muted-2);
+  overflow-wrap: anywhere;
+}
+.pick-tail {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pick-state {
+  font-size: var(--fs-micro);
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-3);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pick-item.picked .pick-state {
+  background: var(--primary-soft-2);
+  color: var(--primary-d);
+}
+/* 胶囊的语义色：`.ok` 用于「免费 / 已生效」，`.warn` 用于「付费」这类要花积分的选项 */
+.pick-state.ok {
+  background: var(--ok-soft-2);
+  color: var(--ok-d);
+}
+.pick-state.warn {
+  background: var(--warn-soft-2);
+  color: var(--warn-d);
+}
+
+/* 弹窗里的设置行（如「限流时在同一会话内换号」）：
+   页面的 .set-row 没有边框，单行放进弹窗会与上下块脱开，这里给它块状外观。 */
+.modal .set-row {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.modal .set-row-desc {
+  max-width: none;
+}
+/* 弹窗里的空态：页面的 .empty 上下留 64px，放进弹窗太空 */
+.modal .empty {
+  padding: 22px 12px;
+  font-size: var(--fs-body);
+}
+
+/* 表单里的一行「控件 + 说明」横排（设置页的测试推送那一行） */
+.opt-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 4px;
+  flex-wrap: wrap;
+}
+.hint.inline {
+  margin: 0;
+}
+/* OAuth 授权链接那一行（链接 + 重开按钮）：属于「弹窗内的一行代码块」，
+   与 .ac-meta 里 <code class="tok"> 是同一套外观语言 */
+.oauth-uri {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.oauth-uri code {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* token 预览（便于核对凭证） */
+.ac-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+.ac-meta code.tok {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background: var(--panel-2);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+}
+
+/* ── 自研确认框（替代 window.confirm）───────────────────────
+   它只负责「压在其他弹窗之上」这一件事：宽度走 size="sm"，正文走 .modal-text，
+   语义色走 tone="danger"。曾经它还有自己的 .confirm / .confirm-body 两套样式。 */
+.confirm-mask {
+  z-index: 80;
+}
+
+/* ── 拨动开关 ─────────────────────────────────────────────── */
+.switch {
+  position: relative;
+  display: inline-block;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+/* 弹窗内的开关兜底复位：`.modal input` 会加 margin-top/padding，它与 `.switch input`
+   特异性相同（0,1,1），现在靠「源序在后」才被压住——一旦 `.modal` 那组规则挪到本行
+   之后，开关的 input 就会变成 width:100% 的不可见覆盖层。显式复位，别依赖源序。 */
+.modal .switch input {
+  margin: 0;
+  padding: 0;
+}
+.switch .track {
+  display: block;
+  width: 36px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--track);
+  transition: background var(--dur-2) var(--ease-out);
+}
+.switch .thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  transition: transform var(--dur-2) var(--ease-spring);
+}
+.switch input:checked + .track {
+  background: var(--ok);
+}
+.switch input:checked + .track .thumb {
+  transform: translateX(16px);
+}
+.switch input:focus-visible + .track {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* ── 文本按钮（备份文件用它在文件管理器里定位）─────────────── */
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: var(--fs-cap);
+  color: var(--primary-d);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+.link-btn:hover {
+  color: var(--primary);
+}
+
+/* 保存中的小圆点（复用全局 spin 动画） */
+.spin-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--muted);
+  border-top-color: transparent;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+}
+
+/* ── 应用更新进度条 ───────────────────────────────────────── */
+.upd-row {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.upd-status {
+  font-size: var(--fs-body);
+  color: var(--text);
+}
+.upd-status.ok {
+  color: var(--ok);
+}
+.upd-status.err {
+  color: var(--err);
+}
+.upd-progress-wrap {
+  height: 6px;
+  background: var(--panel-3);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+.upd-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--primary), #6d92ff);
+  border-radius: var(--radius-pill);
+  transition: width var(--dur-2) var(--ease-out);
+}
+.upd-progress-text {
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  text-align: right;
+}

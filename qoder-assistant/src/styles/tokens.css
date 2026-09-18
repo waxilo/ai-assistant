@@ -1,0 +1,135 @@
+/**
+ * 设计令牌 —— 全应用唯一的「可变量」来源。
+ *
+ * 规则：本文件之外**不允许出现裸的颜色 / 圆角 / 阴影 / 时长字面量**。
+ * 历史上 styles.css 里散着 22 个绕过令牌的魔法色值（#9aa3b5 / #eaefff /
+ * #fdf3e2 / #d5dbe8 …），同一个「次级灰」在四个页面各写一遍略有差异的值，
+ * 这就是「页面之间看着不像一家」反复复发的根因。所有语义色一律成对出现：
+ *   --x       主值（文字 / 图标）
+ *   --x-soft  浅底（胶囊 / 提示块背景）
+ *   --x-line  描边（与 soft 配套的边框）
+ */
+
+:root {
+  /* ── 基础表面 ─────────────────────────────────────────── */
+  --bg: #f2f5fb; /* 环境底色：比纯白深一档，玻璃层才有东西可透 */
+  --panel: #ffffff; /* 不透明面板（打印 / 降级用） */
+  --panel-2: #f4f6fa; /* 面板内次级填充：表头、嵌套块 */
+  --panel-3: #eceff6; /* 更深一档填充：轨道、枚举底 */
+  --glass: rgba(255, 255, 255, 0.72); /* 玻璃表面（侧栏 / 页头） */
+  --glass-strong: rgba(255, 255, 255, 0.92); /* 玻璃表面（弹窗，需更高不透明度保可读） */
+  --card-glass: rgba(255, 255, 255, 0.9); /* 卡片：略带透明，能吃到环境光 */
+  --field: #fbfcfe; /* 输入框底 */
+  --row-hover: #f8fafe; /* 表格行 hover */
+  --track: #d5dbe8; /* 开关 / 进度条轨道 */
+
+  /* ── 文字 ─────────────────────────────────────────────── */
+  --text: #1b2330;
+  --text-2: #465065; /* 次级正文（比 muted 强、比 text 弱） */
+  --muted: #6b7488; /* 说明文字 */
+  --muted-2: #9aa3b5; /* 元信息 / 时间戳 / 代码路径 */
+  --disabled: #c2c8d4; /* 未激活态圆点、占位图标 */
+
+  /* ── 描边 ─────────────────────────────────────────────── */
+  --border: #e9ecf3;
+  --border-strong: #dfe4ee;
+  --border-hover: #c9d2e3;
+  --hairline: rgba(233, 236, 243, 0.9);
+
+  /* ── 品牌（蓝）─────────────────────────────────────────── */
+  --primary: #3b6cff;
+  --primary-d: #2f57d6;
+  --primary-soft: #eef2ff;
+  --primary-soft-2: #eaefff;
+  --primary-line: #b9c9f7;
+  --primary-ring: rgba(59, 108, 255, 0.14);
+
+  /* ── 成功 ─────────────────────────────────────────────── */
+  --ok: #2ea36b;
+  --ok-d: #1a7f55;
+  --ok-soft: #e9f6ef;
+  --ok-soft-2: #e3f6ea;
+  --ok-line: #cdeadd;
+
+  /* ── 警示 ─────────────────────────────────────────────── */
+  --warn: #c98a2b;
+  --warn-d: #9a6b00;
+  --warn-soft: #fbf4e8;
+  --warn-soft-2: #fdf3e2;
+  --warn-line: #f0dfc0;
+
+  /* ── 危险 ─────────────────────────────────────────────── */
+  --err: #d65b54;
+  --err-soft: #fceeec;
+  --err-soft-2: #fdecea;
+  --err-line: #f0c4c0;
+
+  /* ── 圆角：只有三档 + 胶囊，不许再出现第四种 ─────────────── */
+  --radius: 12px; /* 卡片 / 面板（对外契约：卡片恒为 12px） */
+  --radius-sm: 8px; /* 控件 / 卡片内子块 */
+  --radius-lg: 16px; /* 弹窗 / 大面积玻璃 */
+  --radius-pill: 999px;
+
+  /* ── 阴影：分层，越靠上层级越高 ─────────────────────────── */
+  --shadow-xs: 0 1px 1px rgba(20, 28, 46, 0.03);
+  --shadow-sm: 0 1px 2px rgba(20, 28, 46, 0.04), 0 1px 1px rgba(20, 28, 46, 0.03);
+  --shadow: 0 4px 16px rgba(20, 28, 46, 0.06);
+  --shadow-lg: 0 12px 32px rgba(20, 28, 46, 0.1);
+  --shadow-xl: 0 28px 70px rgba(20, 28, 46, 0.2);
+  /* 玻璃板顶边高光：让面板看起来有厚度，而不是一张贴纸 */
+  --hl: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+
+  /* ── 毛玻璃 ───────────────────────────────────────────── */
+  --blur-sm: 10px;
+  --blur: 20px;
+  --blur-lg: 28px;
+  --saturate: 180%;
+
+  /* ── 动效：时长三档 + 三条曲线 ─────────────────────────── */
+  --dur-1: 120ms; /* 颜色 / 描边等即时反馈 */
+  --dur-2: 200ms; /* hover、展开收起 */
+  --dur-3: 320ms; /* 入场、弹窗 */
+  --ease: 0.16s cubic-bezier(0.4, 0, 0.2, 1); /* 兼容旧用法（属性全称） */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); /* 默认：快出缓停 */
+  --ease-inout: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.42, 0.44, 1); /* 弹窗落定，略带回弹 */
+
+  /* ── 间距 ─────────────────────────────────────────────── */
+  --gap: 16px; /* 页面纵向节奏（四页共用） */
+  --page-pad: 24px; /* 内容区左右内边距 */
+  --pagebar-h: 60px;
+  /* 胶囊控件统一高度：页头状态胶囊与接管页摘要胶囊共用一个值。
+     以前两者各自写 padding，靠算式碰巧算出同高，改一处就分叉。 */
+  --pill-h: 30px;
+  --modal-pad: 22px; /* 弹窗左右内边距：头 / 身 / 底三段共用同一个值，改一处三段一起对齐 */
+  /* 弹窗宽度**只有三档**：sm 确认类 / md 默认 / lg 列表与表格。
+     以前是「默认 460 + .wide 640 + .confirm 380」三套散着写，同样形态（列表）
+     有时 460 有时 640 —— 「弹窗之间看着不像一家」有一半来自这里。 */
+  --modal-w-sm: 400px;
+  --modal-w-md: 560px;
+  --modal-w-lg: 720px;
+
+  /* ── 字阶（系统字体，靠字号/字重/字距建层级，不引字体文件）── */
+  --fs-micro: 11px;
+  --fs-xs: 11.5px;
+  --fs-cap: 12px;
+  --fs-sm: 12.5px;
+  --fs-body: 13px;
+  --fs-cell: 13.5px;
+  --fs-md: 14px;
+  --fs-lg: 20px;
+  --fs-stat: 22px;
+  /* 中文界面下等宽数字要显式开启，否则数值列会左右跳动 */
+  --tnum: "tnum" 1, "cv01" 1;
+}
+
+/* 字体栈：全部为系统字体（离线可用、零体积）。
+   历史问题：这里曾首选 "Inter"，但 index.html 从未加载任何字体，
+   该声明是死的 —— 与其假装有品牌字体，不如把系统字体的字阶做扎实。 */
+:root {
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Display",
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
+    "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}

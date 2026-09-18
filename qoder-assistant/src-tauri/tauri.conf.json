@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "QoderAssistant",
+  "version": "0.1.36",
+  "identifier": "com.waxilo.qoder-assistant",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Qoder 助手",
+        "width": 980,
+        "height": 660,
+        "minWidth": 760,
+        "minHeight": 480,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Qoder 多账号签到桌面助手",
+    "longDescription": "Qoder 助手：多账号一键/定时签到、登录新账号与导入本机账号、token 自动续签、webhook 通知、GitHub Release 自动更新。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/waxilo/ai-assistant/releases/download/qoder-latest/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5RjM1MTUxMDgxRjJBREMKUldUY0toOElVVkh6ZVpaOWo2YnU2aWhNQUphbVgyYmdjaDM4RnE2b0crK0VtR3BDMnNCb25CRGYK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}
