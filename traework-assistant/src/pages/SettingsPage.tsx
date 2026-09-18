@@ -4,7 +4,7 @@ import { downloadProgress, formatBytes, type UpdateProgress } from "../updater";
 import Switch from "../components/Switch";
 import { Row } from "../components/SettingsControls";
 import { FONT_OPTIONS, getFontKey, setFontKey } from "../font";
-import { IconCalendar, IconInfo, IconRefresh, IconType } from "../components/Icons";
+import { IconCalendar, IconInfo, IconType } from "../components/Icons";
 
 /**
  * 「设置」页：定时签到与失败通知。
@@ -153,58 +153,51 @@ function SettingsPage({
         </div>
         <div className="set-group">
           <Row
-            title="当前版本"
-            desc="更新从 GitHub Release 拉取已签名的新版本并自动安装、重启。"
-            ctrl={<span className="set-readonly">v{version || "…"}</span>}
-          />
-          <Row
-            title="检查更新"
+            title={version ? `当前版本 v${version}` : "当前版本"}
             desc={
               updateVersion
                 ? `后台已发现新版本 v${updateVersion}，点右侧按钮立即更新。`
                 : "应用会自动检查更新，发现新版本会在侧边栏「设置」上点亮一颗小红点。"
             }
             ctrl={
-              <>
-                <button
-                  className={`btn small${updateVersion ? " primary" : ""}`}
-                  disabled={updateBusy}
-                  onClick={() => void onUpdate()}
-                >
-                  <IconRefresh size={14} className={updateBusy ? "spin" : undefined} />
-                  {updateBusy ? "处理中…" : updateVersion ? "立即更新" : "检查更新"}
-                </button>
-              </>
+              <button
+                className={`btn small${updateVersion ? " primary" : ""}`}
+                disabled={updateBusy}
+                onClick={() => void onUpdate()}
+              >
+                {updateBusy ? "检查中…" : updateVersion ? "立即更新" : "检查更新"}
+              </button>
             }
           />
           {updateStatus && (
-            <div className="set-row in-expand">
-              <div className="set-row-main">
-                <div
-                  className={`upd-status${
-                    updateStatus.status === "error" ? " err" : updateStatus.status === "updated" ? " ok" : ""
-                  }`}
-                >
-                  {updateStatus.message}
-                </div>
-                {/* 只有拿得到百分比才画条：总量未知时进度条没有可信的长度，
-                    与其摆一条不确定态动画，不如干脆不画（下面照实报字节数）。
-                    下载完成/安装阶段 dl.percent 为 100，条走到头、等应用重启才像一条完整的进度。 */}
-                {dl && (
-                  <div className="upd-row">
-                    {dl.percent !== null && (
-                      <div className="upd-progress-wrap">
-                        <div className="upd-progress-bar" style={{ width: `${dl.percent}%` }} />
-                      </div>
-                    )}
-                    <div className="upd-progress-text">
-                      {dl.percent === null
-                        ? `已下载 ${formatBytes(dl.downloaded)}`
-                        : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
-                    </div>
-                  </div>
-                )}
+            <div className="upd-row">
+              <div
+                className={`upd-status ${
+                  updateStatus.status === "error"
+                    ? "err"
+                    : updateStatus.status === "updated"
+                    ? "ok"
+                    : ""
+                }`}
+              >
+                {updateStatus.message}
               </div>
+              {dl && (
+                <>
+                  {/* 只有拿得到百分比才画条：总量未知时进度条没有可信的长度，
+                      与其摆一条会自己动的不确定态，不如干脆不画（下面照实报字节数）。 */}
+                  {dl.percent !== null && (
+                    <div className="upd-progress-wrap">
+                      <div className="upd-progress-bar" style={{ width: `${dl.percent}%` }} />
+                    </div>
+                  )}
+                  <div className="upd-progress-text">
+                    {dl.percent === null
+                      ? `已下载 ${formatBytes(dl.downloaded)}`
+                      : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
+                  </div>
+                </>
+              )}
             </div>
           )}
         </div>

@@ -718,7 +718,7 @@ body.modal-open .content {
 }
 .upd-progress-bar {
   height: 100%;
-  background: linear-gradient(90deg, var(--primary-lite), var(--primary));
+  background: linear-gradient(90deg, var(--primary), #6d92ff);
   border-radius: var(--radius-pill);
   transition: width var(--dur-2) var(--ease-out);
 }
@@ -727,11 +727,6 @@ body.modal-open .content {
   color: var(--muted);
   text-align: right;
   font-variant-numeric: var(--tnum);
-}
-/* 总大小未知时的不确定态：一条滑块来回跑 */
-.upd-progress-bar.indet {
-  width: 40%;
-  animation: upd-slide 1.1s ease-in-out infinite;
 }
 
 /* ── 说明条（弹窗 .note）：图标 + 一段正文 ───────────────────

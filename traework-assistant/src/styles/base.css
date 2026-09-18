@@ -117,14 +117,6 @@ body {
     transform: translate(-50%, 0) scale(1);
   }
 }
-@keyframes upd-slide {
-  0% {
-    margin-left: -40%;
-  }
-  100% {
-    margin-left: 100%;
-  }
-}
 /* 页面入场：轻微上浮 */
 @keyframes rise {
   from {
