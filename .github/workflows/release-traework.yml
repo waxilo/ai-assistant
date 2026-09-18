@@ -137,12 +137,16 @@ jobs:
         run: |
           mkdir -p dist
           V="${{ steps.version.outputs.version }}"
-          # macOS：扩展名前插入 版本号+平台标（dmg 安装包，含 .sig）
+          # macOS：按扩展精确重命名为 产品名-macos-版本.{app.tar.gz|dmg}（含 .sig）
+          PRODUCT=$(node -p "require('./${{ env.APP_DIR }}/src-tauri/tauri.conf.json').productName")
           for f in $(find artifacts/bundle-macos-latest -type f); do
             base=$(basename "$f")
-            new="${base/.dmg/-macos-$V.dmg}"
-            new="${new/.app/-macos-$V.app}"
-            cp "$f" "dist/$new"
+            case "$base" in
+              *.app.tar.gz.sig) cp "$f" "dist/${PRODUCT}-macos-${V}.app.tar.gz.sig" ;;
+              *.app.tar.gz)     cp "$f" "dist/${PRODUCT}-macos-${V}.app.tar.gz" ;;
+              *.dmg.sig)        cp "$f" "dist/${PRODUCT}-macos-${V}.dmg.sig" ;;
+              *.dmg)            cp "$f" "dist/${PRODUCT}-macos-${V}.dmg" ;;
+            esac
           done
           # Windows：重命名为 产品名_windows_版本.exe（含 .sig）
           for f in $(find artifacts/bundle-windows-latest -type f); do
