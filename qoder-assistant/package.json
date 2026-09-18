@@ -1,7 +1,7 @@
 {
   "name": "qoder-assistant",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Qoder 助手（Tauri）：多账号签到、定时签到、token 自动续签",
   "scripts": {
@@ -9,6 +9,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "build:local": "tauri build --bundles app --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'",
     "build:dmg": "bash scripts/build-dmg.sh"
   },
   "dependencies": {

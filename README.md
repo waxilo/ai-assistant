@@ -42,9 +42,9 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
 
 | 应用 | 当前版本 | 版本线起点 |
 |---|---|---|
-| TraeWorkAssistant | `0.1.19` | 0.1.x（自身历史） |
-| WorkBuddyAssistant | `0.1.35` | 0.1.x（自身历史） |
-| QoderAssistant | `0.1.0` | **从 `0.1.0` 起算** |
+| TraeWorkAssistant | `0.1.20` | 0.1.x（自身历史） |
+| WorkBuddyAssistant | `0.1.36` | 0.1.x（自身历史） |
+| QoderAssistant | `0.1.1` | **从 `0.1.0` 起算** |
 
 QoderAssistant 曾以 `0.1.36` 首次发布 —— 那是照搬 WorkBuddy 当时 `0.1.35` 的结果，
 不是它自己的版本历史，于是「一个全新应用的首个版本号带着另一个应用的历史」，三个应用
