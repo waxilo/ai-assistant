@@ -111,6 +111,10 @@ pub struct PkgView {
     pub used: f64,
     /// 当前周期起点（`CycleStartTime`）：它变化意味着这个包翻了新周期
     pub cycle_start: String,
+    /// 本包到期时间（毫秒，`CycleEndTime`）；未知为 `None` —— 供前端「资源包列表」展示
+    pub expiry_ms: Option<i64>,
+    /// 本包剩余积分（`CycleCapacityRemainPrecise`）—— 展示用，与 `earliest_cycle_end`("余量>0") 口径一致
+    pub remaining: f64,
 }
 
 /// 台账里一个资源包的条目。数值只增不减（见模块头注释）。
@@ -126,6 +130,12 @@ pub struct PkgEntry {
     pub cycle_start: String,
     #[serde(default)]
     pub last_seen: String,
+    /// 本包到期时间（毫秒）；`None` = 未知。展示口径，latest-wins 覆盖，不取 max
+    #[serde(default)]
+    pub expiry_ms: Option<i64>,
+    /// 本包剩余积分；展示口径，latest-wins 覆盖，不取 max
+    #[serde(default)]
+    pub remaining: f64,
 }
 
 /// 单个账号的台账。
@@ -247,6 +257,8 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
                         used: v.used,
                         cycle_start: v.cycle_start.clone(),
                         last_seen: at.to_string(),
+                        expiry_ms: v.expiry_ms,
+                        remaining: v.remaining,
                     },
                 );
             }
@@ -277,6 +289,10 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
                 }
                 e.cycle_start = v.cycle_start.clone();
                 e.last_seen = at.to_string();
+                // 到期时间 / 剩余是**展示口径**，latest-wins 直接覆盖，不取 max：
+                // 包续期会推晚到期、消耗会使剩余下降，若被 max 卡住就永远停在旧值上了。
+                e.expiry_ms = v.expiry_ms;
+                e.remaining = v.remaining;
             }
         }
     }
@@ -494,6 +510,34 @@ pub struct CreditFact {
     pub at: String,
     /// 最早重置/过期时刻（毫秒）
     pub earliest_expiry_ms: Option<i64>,
+    /// 逐资源包明细（`{name, remaining, expiry_ms}`），供前端「资源包列表」展示
+    #[serde(default)]
+    pub packages: Vec<CreditPackage>,
+}
+
+/// 一个资源包的展示快照：只含「还有余量的包」（余量为 0 的包对用户没有意义）。
+#[derive(Serialize, Clone, Debug)]
+pub struct CreditPackage {
+    pub name: String,
+    pub remaining: f64,
+    pub expiry_ms: Option<i64>,
+}
+
+/// 从台账的逐包条目投影出展示用的资源包列表（过滤掉余量为 0 的包）。
+fn project_packages(a: &AcctLedger) -> Vec<CreditPackage> {
+    let mut out: Vec<CreditPackage> = a
+        .pkgs
+        .values()
+        .filter(|p| p.remaining > 0.0)
+        .map(|p| CreditPackage {
+            name: p.name.clone(),
+            remaining: p.remaining,
+            expiry_ms: p.expiry_ms,
+        })
+        .collect();
+    // 排序稳定：最早到期的排前面，无到期的排最后；方便前端直接吃第 0 项当「快过期」
+    out.sort_by_key(|p| p.expiry_ms.unwrap_or(i64::MAX));
+    out
 }
 
 /// 取某个账号的积分事实：台账里**存过读数**才有 (否则返回 `None`，
@@ -507,6 +551,7 @@ pub fn fact(led: &Ledger, id: &str) -> Option<CreditFact> {
         credits: a.credits,
         at: a.credits_at.clone(),
         earliest_expiry_ms: a.earliest_expiry_ms,
+        packages: project_packages(a),
     })
 }
 

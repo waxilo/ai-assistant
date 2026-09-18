@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Account, BrokerStatus } from "../types";
+import type { Account, BrokerStatus, CreditPackage } from "../types";
 import {
   AccountCell,
   EmptyState,
@@ -11,11 +11,13 @@ import {
   expiryCountdown,
   type SignState,
 } from "../common";
-import { creditsOf, expiryOf, totalCredits, useCredits } from "../credits";
+import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, useCredits } from "../credits";
+import { Dialog } from "../components/Dialog";
 import {
   IconCloud,
   IconFile,
   IconLink,
+  IconList,
   IconTrash,
   IconUnlink,
   IconUpload,
@@ -68,6 +70,8 @@ export function AccountsPage({
   // 订阅那个全局积分对象：后台一次采集（整点采样 / 刷新 / 签到）就会换掉它的引用，
   // 本页随之重渲染并显示新读数。hook 必须在任何提前 return 之前调用，所以挂在最上面。
   const book = useCredits();
+  // 当前被点开「资源包列表」的账号（null = 没有弹窗打开）
+  const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
 
   // 凭证池那一栏在**两种空态下都要在**：一台全新的机器正是「先绑定、再拿账号」的
   // 典型场景 —— 把它藏在「先有账号」之后，等于逼用户在一台空机器上没法接上已有的池。
@@ -106,6 +110,7 @@ export function AccountsPage({
   const credits = totalCredits(book, accounts);
 
   return (
+    <>
     <section className="panel-page">
       {poolBar}
 
@@ -150,6 +155,8 @@ export function AccountsPage({
               const bal = creditsOf(book, a.id);
               const low = bal != null && bal < 100;
               const e = expiryCountdown(expiryOf(book, a.id));
+              // 快过期汇总：最早到期（有余量）的资源包还有几天、挂着多少积分
+              const soon = soonestExpiry(book, a.id);
               const tok = expiryInfo(a.expires_at);
               return (
                 <tr key={a.id}>
@@ -166,10 +173,30 @@ export function AccountsPage({
                     )}
                   </td>
                   <td className="ac-cell-expiry num">
-                    {e.text === "—" ? (
-                      <span className="muted">—</span>
+                    {soon ? (
+                      <span
+                        className={"ac-expiry clk" + (soon.daysUntil < 0 ? " expired" : "")}
+                        title="点开看逐资源包列表；智能接管优先使用到期最早的积分"
+                        onClick={() => setPkgAccount(a)}
+                      >
+                        {soon.daysUntil < 0
+                          ? "已过期"
+                          : `${soon.daysUntil} 天后过期 ${formatCredits(soon.remaining)}`}
+                      </span>
+                    ) : e.text === "—" ? (
+                      <span
+                        className="muted clk"
+                        title="没有到期的额度信息，可点击查看资源包列表"
+                        onClick={() => setPkgAccount(a)}
+                      >
+                        查看资源包
+                      </span>
                     ) : (
-                      <span className={"ac-expiry" + (e.expired ? " expired" : "")}>
+                      <span
+                        className={"ac-expiry clk" + (e.expired ? " expired" : "")}
+                        title="点开看逐资源包列表；智能接管优先使用到期最早的积分"
+                        onClick={() => setPkgAccount(a)}
+                      >
                         {e.text}
                       </span>
                     )}
@@ -222,7 +249,70 @@ export function AccountsPage({
         </table>
       </div>
     </section>
+
+      {/* 逐资源包列表：从「积分过期」那一列点开，看每个额度包的名称/剩余/到期 */}
+      {pkgAccount && (
+        <Dialog
+          size="lg"
+          icon={<IconList size={16} />}
+          title={`${pkgAccount.name} 的资源包`}
+          onClose={() => setPkgAccount(null)}
+          footer={
+            <button className="btn" onClick={() => setPkgAccount(null)}>
+              关闭
+            </button>
+          }
+        >
+          <PkgListAccount book={book} account={pkgAccount} />
+        </Dialog>
+      )}
+    </>
   );
+}
+
+/**
+ * 资源包列表弹窗内容：一个账号的逐额度包（名称 / 剩余积分 / 到期）。
+ * `packages` 从全局积分对象里取，缺失时给一条空态提示。
+ */
+function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>; account: Account }) {
+  const packs = packagesOf(book, account.id) as CreditPackage[];
+  return packs.length === 0 ? (
+    <p className="note" style={{ margin: 0 }}>
+      这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
+    </p>
+  ) : (
+    <div className="table-wrap">
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>资源包</th>
+            <th className="num">剩余</th>
+            <th className="num">到期</th>
+          </tr>
+        </thead>
+        <tbody>
+          {[...packs]
+            .sort((a, b) => (a.expiry_ms ?? Infinity) - (b.expiry_ms ?? Infinity))
+            .map((p, i) => (
+              <tr key={i}>
+                <td>{p.name || "未命名额度包"}</td>
+                <td className="num">{formatCredits(p.remaining)}</td>
+                <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
+              </tr>
+            ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** 毫秒 → `YYYY-MM-DD`，资源包到期的完整日期展示 */
+function mmddyyyy(ms: number | null): string {
+  if (ms == null) return "未知";
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return "未知";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /** 毫秒时间戳 → 人话的「多久之前」。与 `common.relativeTime` 同一套档位，只是吃毫秒 */

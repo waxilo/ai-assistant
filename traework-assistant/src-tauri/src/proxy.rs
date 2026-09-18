@@ -2808,13 +2808,14 @@ mod tests {
     #[test]
     fn snapshot_staleness_drives_refetch() {
         assert!(snapshot_stale(None), "没有快照必须重取");
-        let fresh = accounts::CreditSnapshot::now(Some(150), false, None);
+        let fresh = accounts::CreditSnapshot::now(Some(150), false, None, Vec::new());
         assert!(!snapshot_stale(Some(&fresh)));
         let old = accounts::CreditSnapshot {
             credits: Some(1),
             unlimited: false,
             earliest_expiry_ms: None,
             fetched_at: "2000-01-01 00:00:00".into(),
+            packages: Vec::new(),
         };
         assert!(snapshot_stale(Some(&old)), "过期快照必须重取");
         let malformed = accounts::CreditSnapshot {
@@ -2822,6 +2823,7 @@ mod tests {
             unlimited: false,
             earliest_expiry_ms: None,
             fetched_at: "not a time".into(),
+            packages: Vec::new(),
         };
         assert!(snapshot_stale(Some(&malformed)), "时间戳无法解析时按过期处理");
     }

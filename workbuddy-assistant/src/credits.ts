@@ -73,6 +73,19 @@ export function expiryOf(book: CreditBook, id: string): number | null {
   return book[id]?.earliest_expiry_ms ?? null;
 }
 
+/** 某账号的逐资源包明细（空数组 = 没有或还没读到） */
+export function packagesOf(book: CreditBook, id: string) {
+  return book[id]?.packages ?? [];
+}
+
+/** 快过期提示：最早到期（非 null）的资源包，`{daysUntil, remaining}`；没有就返回 `null` */
+export function soonestExpiry(book: CreditBook, id: string) {
+  const pkgs = packagesOf(book, id).filter((p) => p.expiry_ms != null);
+  if (pkgs.length === 0) return null;
+  const p = pkgs[0];
+  return { daysUntil: Math.ceil((p.expiry_ms! - Date.now()) / 86_400_000), remaining: p.remaining };
+}
+
 /**
  * 最近一次读数时刻（全部账号里最新那条；一条都没有 → 空串）。
  *
@@ -129,7 +142,7 @@ function fresher(incoming: CreditFact, current: CreditFact | undefined): boolean
 function factOf(a: Account): CreditFact | null {
   if (a.credits) return a.credits;
   if (a.last?.balance == null) return null;
-  return { credits: a.last.balance, at: a.last.at, earliest_expiry_ms: null };
+  return { credits: a.last.balance, at: a.last.at, earliest_expiry_ms: null, packages: [] };
 }
 
 /**
@@ -165,6 +178,7 @@ export function mergeCredits(rows: CreditRow[]) {
       credits: r.credits,
       at: r.at,
       earliest_expiry_ms: r.earliest_expiry_ms,
+      packages: r.packages ?? [],
     };
     if (!fresher(incoming, next[r.id])) continue;
     next[r.id] = incoming;

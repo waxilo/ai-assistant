@@ -215,6 +215,17 @@ export interface CreditFact {
   at: string;
   /** 还有余量的资源包里最早的重置/过期时间（毫秒时间戳）；null = 未知 */
   earliest_expiry_ms: number | null;
+  /** 逐资源包明细（只含还有余量的包）；前端「资源包列表」弹窗展示用 */
+  packages: CreditPackage[];
+}
+
+/** 一个资源包的展示快照：名字 + 剩余积分 + 到期时间 */
+export interface CreditPackage {
+  name: string;
+  /** 本包剩余积分 */
+  remaining: number;
+  /** 本包到期时间（毫秒）；null = 未知 */
+  expiry_ms: number | null;
 }
 
 /**

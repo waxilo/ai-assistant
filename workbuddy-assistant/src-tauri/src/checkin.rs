@@ -422,6 +422,17 @@ fn parse_packages(body: &Value) -> Vec<PkgView> {
                 size,
                 used,
                 cycle_start,
+                // 展示用：到期时间（`CycleEndTime`）与账面剩余（`CycleCapacityRemainPrecise`）。
+                // 缺字段即视为未知，不因此整包丢掉（到期未知的包也能在列表里显示「剩余」）。
+                expiry_ms: a
+                    .get("CycleEndTime")
+                    .and_then(Value::as_str)
+                    .and_then(parse_cycle_end),
+                remaining: num_field(
+                    a,
+                    &["CycleCapacityRemainPrecise", "CycleCapacityRemain"],
+                )
+                .unwrap_or(0.0),
             })
         })
         .collect()

@@ -282,6 +282,12 @@
   color: var(--err);
   font-weight: 600;
 }
+/* 积分过期 / token 过期的可点击变体：点开资源包列表 */
+.clk {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
 /* 操作列：签到 + 图标按钮 */
 .ac-cell-actions {
   white-space: nowrap;

@@ -2155,6 +2155,7 @@ mod tests {
             credits,
             at: String::new(),
             earliest_expiry_ms: expiry_ms,
+            packages: vec![],
         }
     }
 

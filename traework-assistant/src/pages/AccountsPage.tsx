@@ -1,5 +1,5 @@
 import { memo, useMemo, useState } from "react";
-import type { Account, AcctStatus, BrokerStatus } from "../types";
+import type { Account, AcctStatus, BrokerStatus, CreditPackage } from "../types";
 import {
   AccountCell,
   EmptyState,
@@ -10,6 +10,7 @@ import {
   maskToken,
   stamp,
 } from "../common";
+import { Dialog } from "../components/Dialog";
 import {
   IconUsers,
   IconTrash,
@@ -17,6 +18,7 @@ import {
   IconUpload,
   IconLink,
   IconUnlink,
+  IconList,
 } from "../components/Icons";
 
 /**
@@ -213,6 +215,8 @@ type Credits = {
   at: string;
   /** 最早到期时间（毫秒）；未知为 null */
   expiry: number | null;
+  /** 逐额度包明细（名称 / 剩余 / 到期），供「资源包列表」弹窗 */
+  packages: CreditPackage[] | null;
 };
 
 /**
@@ -233,6 +237,7 @@ function creditsOf(a: Account, statuses: Record<string, AcctStatus>): Credits {
       stale: false,
       at: "",
       expiry: live.earliest_expiry_ms ?? a.credit_snapshot?.earliest_expiry_ms ?? null,
+      packages: live.packages ?? a.credit_snapshot?.packages ?? null,
     };
   }
   const snap = a.credit_snapshot;
@@ -243,9 +248,30 @@ function creditsOf(a: Account, statuses: Record<string, AcctStatus>): Credits {
       stale: true,
       at: snap.fetched_at || "",
       expiry: snap.earliest_expiry_ms ?? null,
+      packages: snap.packages ?? null,
     };
   }
-  return { value: null, unlimited: false, stale: false, at: "", expiry: null };
+  return {
+    value: null,
+    unlimited: false,
+    stale: false,
+    at: "",
+    expiry: null,
+    packages: null,
+  };
+}
+
+/**
+ * 最早到期的那个资源包还剩多少积分 —— 「N 天后过期」旁边的数量（需求：快到期提示展示
+ * 「2 天后过期 322 积分」）。取 `packages` 里 `expiry_ms` 最小的项的 `remaining`；未知或缺数据 → null。
+ */
+function earliestPkgRemaining(packages: CreditPackage[] | null): number | null {
+  if (!packages || packages.length === 0) return null;
+  let best: CreditPackage | null = null;
+  for (const p of packages) {
+    if (best === null || p.expiry_ms < best.expiry_ms) best = p;
+  }
+  return best ? best.remaining : null;
 }
 
 function AccountsPage({
@@ -261,10 +287,11 @@ function AccountsPage({
   onBrokerLink,
   onBrokerUnbind,
 }: Props) {
+  // 资源包列表弹窗：记录当前打开的是哪个账号；null = 未打开
+  const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
   const stats = useMemo(() => {
     const total = accounts.length;
     const checked = accounts.filter((a) => statuses[a.id]?.checked_in).length;
-    // 总积分 = **账号池里每个账号已有积分之和**（含只能拿到上次已知值的账号）。
     // 按**展示用的两位小数**累加，保证合计恰好等于列表里各行「积分」之和。
     let credits = 0;
     let known = 0;
@@ -381,12 +408,29 @@ function AccountsPage({
                       <span className="ac-credits">
                         {cr.unlimited ? "不限" : formatCredits(cr.value)}
                       </span>
-                      {/* 到期时间就是「智能接管先扣谁」的第一排序键，所以直接显示、不埋进 title */}
-                      {!cr.unlimited && cr.expiry ? (
-                        <span className={`sub${credCls}`} title="智能接管优先使用到期最早的积分">
-                          {days !== null && days < 0 ? "已过期" : `还有 ${days} 天后过期`}
-                        </span>
-                      ) : null}
+                      {/* 积分与过期合在一列：过期时间就是「智能接管先扣谁」的第一排序键，所以直接显示。
+                          有 `packages` 时整行可点击，点开逐资源包列表 */}
+                    {!cr.unlimited && cr.expiry ? (
+                      <span
+                        className={`sub ${credCls}`}
+                        title="智能接管优先使用到期最早的积分"
+                        onClick={() => setPkgAccount(a)}
+                      >
+                        {days !== null && days < 0
+                          ? "已过期"
+                          : `${days} 天后过期 ${
+                              earliestPkgRemaining(cr.packages) ?? ""
+                            }`.trim()}
+                      </span>
+                    ) : (
+                      <span
+                        className="sub"
+                        title="没有到期的额度信息，可点击查看资源包列表"
+                        onClick={() => setPkgAccount(a)}
+                      >
+                        查看资源包
+                      </span>
+                    )}
                     </td>
                     <td>
                       {st ? (
@@ -453,8 +497,75 @@ function AccountsPage({
 
       {/* 刷新状态的结果（「已刷新 N 个账号状态」/ 查询失败原因） */}
       {statusText && <p className="hint">{statusText}</p>}
+
+      {/* 逐资源包列表：从「积分/过期」那一列点开，看每个额度包的名称/剩余/到期 */}
+      {pkgAccount && (
+        <Dialog
+          size="lg"
+          icon={<IconList size={16} />}
+          title={`${pkgAccount.name} 的资源包`}
+          onClose={() => setPkgAccount(null)}
+          footer={
+            <button className="btn" onClick={() => setPkgAccount(null)}>
+              关闭
+            </button>
+          }
+        >
+          <PkgListAccount account={pkgAccount} statuses={statuses} />
+        </Dialog>
+      )}
     </>
   );
+}
+
+/**
+ * 资源包列表弹窗内容：一个账号的逐额度包（名称 / 剩余积分 / 到期）。
+ * `packages` 从实时状态（或快照兜底）取，缺失时给一条空态提示。
+ */
+function PkgListAccount({
+  account,
+  statuses,
+}: {
+  account: Account;
+  statuses: Record<string, AcctStatus>;
+}) {
+  const cr = creditsOf(account, statuses);
+  const packs = cr.packages ?? [];
+  return packs.length === 0 ? (
+    <p className="note" style={{ margin: 0 }}>
+      这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
+    </p>
+  ) : (
+    <div className="table-wrap">
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>资源包</th>
+            <th className="num">剩余</th>
+            <th className="num">到期</th>
+          </tr>
+        </thead>
+        <tbody>
+          {[...packs]
+            .sort((a, b) => a.expiry_ms - b.expiry_ms)
+            .map((p, i) => (
+              <tr key={i}>
+                <td>{p.name || "未命名额度包"}</td>
+                <td className="num">{formatCredits(p.remaining)}</td>
+                <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
+              </tr>
+            ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** 毫秒 → `YYYY-MM-DD`，资源包到期的完整日期展示 */
+function mmddyyyy(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 export default memo(AccountsPage);

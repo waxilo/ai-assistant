@@ -385,6 +385,7 @@ mod tests {
                 credits: Some(2957.83),
                 at: "2026-09-16 21:20:58".into(),
                 earliest_expiry_ms: Some(1_790_783_999_000),
+                packages: vec![],
             }),
         }
     }

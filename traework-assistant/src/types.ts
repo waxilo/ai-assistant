@@ -37,6 +37,8 @@ export interface CreditSnapshot {
   unlimited: boolean;
   /** 「还有余量的额度包」里最早的到期时间（毫秒）；未知为 null */
   earliest_expiry_ms: number | null;
+  /** 逐额度包明细（名称 / 剩余 / 到期），供「资源包列表」弹窗 */
+  packages?: CreditPackage[];
   fetched_at: string;
 }
 
@@ -128,7 +130,17 @@ export interface AcctStatus {
    * 「智能接管」选号的第一排序键就是它（先扣快到期的额度）。
    */
   earliest_expiry_ms?: number | null;
+  /** 逐额度包明细（名称 / 剩余 / 到期），供账号行「资源包列表」弹窗 */
+  packages?: CreditPackage[];
   message: string;
+}
+
+/** 一个额度包的展示快照：资源包列表弹窗里每行「名称 / 剩余积分 / 到期时间」 */
+export interface CreditPackage {
+  name: string;
+  remaining: number;
+  /** 到期时间（毫秒） */
+  expiry_ms: number;
 }
 
 // `RenewReport` / `RenewSource` 已随「手动续签」一起删除（2026-09-15）：

@@ -161,15 +161,27 @@ pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<checkin::Accoun
     let mut list = accounts::load_accounts(&dir);
     let mut out = Vec::new();
     let mut dirty = false;
+    let client = reqwest::Client::new();
     for account in list.iter_mut() {
         // ① 今日是否已签到（签到状态接口）
         let status = checkin::query_status(account).await;
         // ② 账号已有积分（entitlement 用量接口）；拉到就落盘，供界面展示与接管选号
-        if let Some(u) = checkin::fetch_ent_usage(account).await {
-            let next = accounts::CreditSnapshot::now(u.remaining, u.unlimited, u.earliest_expiry_ms);
+        let view = checkin::fetch_resource_view_with(&client, account).await;
+        // 失败时 `view` 是 Default（credits/unlimited/expiry 全空）—— 必须拦在这一步，
+        // 否则会把已有快照整体覆盖成 `None`。unlimited 账号的 credits 恒为 `None`，
+        // 所以不能只看 credits，三个字段任一有效即算拿到。
+        let got = view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
+        if got {
+            let packages = checkin::to_credit_packages(view.packages.clone());
+            let next = accounts::CreditSnapshot::now(
+                view.credits.map(|c| c.round() as i64),
+                view.unlimited,
+                view.earliest_expiry_ms,
+                packages,
+            );
             let prev = account.credit_snapshot.as_ref();
-            let changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms))
-                != Some((next.credits, next.unlimited, next.earliest_expiry_ms));
+            let changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms, p.packages.clone()))
+                != Some((next.credits, next.unlimited, next.earliest_expiry_ms, next.packages.clone()));
             if changed {
                 account.credit_snapshot = Some(next);
                 dirty = true;
@@ -184,6 +196,7 @@ pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<checkin::Accoun
             credits: snap.and_then(|s| s.credits),
             unlimited: snap.map(|s| s.unlimited).unwrap_or(false),
             earliest_expiry_ms: snap.and_then(|s| s.earliest_expiry_ms),
+            packages: snap.map(|s| s.packages.clone()).unwrap_or_default(),
         });
     }
     if dirty {
@@ -1114,7 +1127,7 @@ pub(crate) async fn fetch_samples(
         let view = checkin::fetch_resource_view_with(&client, a).await;
         readings.push(ledger::Reading {
             id: a.id.clone(),
-            packages: view.packages,
+            packages: view.packages.clone(),
             credits: view.credits,
             expiry_ms: view.earliest_expiry_ms,
         });
@@ -1126,14 +1139,16 @@ pub(crate) async fn fetch_samples(
             let got =
                 view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
             if got {
+                let packages = checkin::to_credit_packages(view.packages.clone());
                 let next = accounts::CreditSnapshot::now(
-                    view.credits.map(|c| c as i64),
+                    view.credits.map(|c| c.round() as i64),
                     view.unlimited,
                     view.earliest_expiry_ms,
+                    packages,
                 );
                 let prev = acct.credit_snapshot.as_ref();
-                let changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms))
-                    != Some((next.credits, next.unlimited, next.earliest_expiry_ms));
+                let changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms, p.packages.clone()))
+                    != Some((next.credits, next.unlimited, next.earliest_expiry_ms, next.packages.clone()));
                 if changed {
                     acct.credit_snapshot = Some(next);
                     dirty = true;

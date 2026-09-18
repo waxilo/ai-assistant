@@ -292,6 +292,9 @@
 .muted {
   color: var(--muted);
 }
+.num-muted {
+  color: var(--muted);
+}
 code {
   font-family: var(--font-mono);
   font-size: var(--fs-cap);
@@ -420,6 +423,10 @@ body.modal-open .content {
 /* 内容区统一纵向节奏：相邻块一律 12px */
 .modal-body > * + * {
   margin-top: 12px;
+}
+/* 元信息（时间戳之类）是贴在上面那块后面的附注，间距要比常规块紧一档 */
+.modal-body > .modal-meta {
+  margin-top: 10px;
 }
 
 /* ── 底部：左「工具位」右「操作位」 ── */
@@ -783,6 +790,42 @@ body.modal-open .content {
 }
 .note.ok svg {
   color: var(--ok-d);
+}
+
+/* 元信息行：时间戳、来源这类附注（报表明细弹窗里的「结算时刻」） */
+.modal-meta {
+  margin: 0;
+  font-size: var(--fs-micro);
+  color: var(--muted-2);
+  font-variant-numeric: var(--tnum);
+}
+
+/* 汇总数字：弹窗里的 2–4 个关键数字并排。
+   刻意不用页面上那套 .sum-card —— 弹窗里再套卡片是双重边框，脏。 */
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 0;
+}
+.stat {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.stat-label {
+  display: block;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.stat-num {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  font-variant-numeric: var(--tnum);
+  letter-spacing: -0.01em;
 }
 
 /* ── 云端凭证池：账号页顶部那一栏 ───────────────────────────

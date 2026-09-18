@@ -41,7 +41,6 @@ pub struct Account {
 }
 
 /// 账号**已有积分**快照。
-///
 /// 数据源是 `POST /trae/api/v2/pay/ide_user_ent_usage`（IDE 版 entitlement 用量），
 /// 由 `checkin::parse_ent_usage` 按官方 `hHe()` 汇总出「剩余可用积分」与「最快到期时间」。
 /// ⚠️ 这不是 `checkin_credits/status` 里的 `credits`——那个是**签到奖励**，两回事。
@@ -59,6 +58,22 @@ pub struct CreditSnapshot {
     pub earliest_expiry_ms: Option<i64>,
     /// 抓取时刻（本地 `YYYY-MM-DD HH:MM:SS`），用于判断快照是否过期
     pub fetched_at: String,
+    /// 逐额度包明细（名称 / 剩余 / 到期），供前端资源包列表；旧档缺该字段用空数组兜底
+    #[serde(default)]
+    pub packages: Vec<CreditPackage>,
+}
+
+/// 一个额度包的展示快照：名称 + 剩余积分 + 到期时间。
+///
+/// 给前端「资源包列表」弹窗用。`remaining`（剩余 = size − used）与 `expiry_ms`
+/// 都应在解析端折算好，这里只做纯展示结构，不参与计较（避免这里再引入换算口径）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CreditPackage {
+    pub name: String,
+    #[serde(default)]
+    pub remaining: i64,
+    #[serde(default)]
+    pub expiry_ms: i64,
 }
 
 impl CreditSnapshot {
@@ -66,12 +81,14 @@ impl CreditSnapshot {
         credits: Option<i64>,
         unlimited: bool,
         earliest_expiry_ms: Option<i64>,
+        packages: Vec<CreditPackage>,
     ) -> CreditSnapshot {
         CreditSnapshot {
             credits,
             unlimited,
             earliest_expiry_ms,
             fetched_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            packages,
         }
     }
 }

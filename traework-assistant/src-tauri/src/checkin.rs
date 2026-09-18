@@ -118,6 +118,10 @@ pub struct AccountStatus {
     /// 它就是「智能接管」选号的**第一排序键**（到期最早者优先，见 `proxy::pick_index`），
     /// 所以必须露到界面上，否则用户无法核对这条规则是否生效。
     pub earliest_expiry_ms: Option<i64>,
+    /// 逐额度包明细（名称 / 剩余 / 到期）：与 `Account.credit_snapshot.packages` 同一份，
+    /// 随实时状态一并下发，前端不必再合并两处取数。
+    #[serde(default)]
+    pub packages: Vec<crate::accounts::CreditPackage>,
     pub message: String,
 }
 
@@ -379,6 +383,15 @@ fn pack_expiry_ms(pack: &Value) -> Option<i64> {
     None
 }
 
+/// 从台账键（`{描述}@{到期毫秒}`，见 [`parse_packages`]）反解出到期毫秒时间戳。
+///
+/// 只在 `fetch_credit_snapshot` 投影逐包展示时用：该处拿到的已是 `ledger::PkgView`，
+/// 原始 `pack` 响应早已丢弃，到期时间只留在 key 尾巴上（`@` 之后那段毫秒）。
+fn pack_expiry_ms_from_key(key: &str) -> Option<i64> {
+    let ms = key.rsplit_once('@')?.1;
+    ms.parse::<i64>().ok().filter(|&v| v > 0)
+}
+
 /// 汇总 `ide_user_ent_usage` 响应 —— 逐行照搬官方 `hHe()`（`out/main.js`）：
 /// 遍历 `user_entitlement_pack_list`，对 `credits_limit > 0` 的包累加
 /// `max(credits_limit − usage.credits_amount, 0)`；`credits_limit == -1` 视为不限量。
@@ -558,7 +571,30 @@ pub fn parse_packages(v: &Value) -> Vec<crate::ledger::PkgView> {
         .collect()
 }
 
-/// 抓取积分快照（best-effort）：**账号已有积分** + 到期时间，供界面展示与接管选号。
+/// 把解析出的逐包台账输入投影成前端展示用的 `CreditPackage` 列表。
+///
+/// 只保留**还有余量**（size − used > 0）的包：用光的包到期再早也没有意义，
+/// 不该出现在「资源包列表」里让用户去盯一对没用的数字。到期时间从台账键
+/// （`{描述}@{到期毫秒}`）反解。
+pub fn to_credit_packages(packages: Vec<crate::ledger::PkgView>) -> Vec<crate::accounts::CreditPackage> {
+    packages
+        .into_iter()
+        .filter_map(|p| {
+            let remaining = (p.size - p.used).max(0.0) as i64;
+            if remaining <= 0 {
+                return None;
+            }
+            let expiry_ms = pack_expiry_ms_from_key(&p.key)?;
+            Some(crate::accounts::CreditPackage {
+                name: p.name,
+                remaining,
+                expiry_ms,
+            })
+        })
+        .collect()
+}
+
+/// 抓取积分快照（best-effort）：**账号已有积分** + 到期时间 + 逐包明细，供界面展示与接管选号。
 ///
 /// **失败也要落一个空快照**，否则每次新会话都会重打一次接口。
 /// 调用方若已有快照，应保留原有数值（见 `commands::checkin_status` / `proxy::choose_account`）。
@@ -566,12 +602,13 @@ pub async fn fetch_credit_snapshot(
     client: &reqwest::Client,
     account: &Account,
 ) -> crate::accounts::CreditSnapshot {
-    match fetch_ent_usage_with(client, account).await {
-        Some(u) => {
-            crate::accounts::CreditSnapshot::now(u.remaining, u.unlimited, u.earliest_expiry_ms)
-        }
-        None => crate::accounts::CreditSnapshot::now(None, false, None),
-    }
+    let view = fetch_resource_view_with(client, account).await;
+    crate::accounts::CreditSnapshot::now(
+        view.credits.map(|c| c.round() as i64),
+        view.unlimited,
+        view.earliest_expiry_ms,
+        to_credit_packages(view.packages),
+    )
 }
 
 /// 对一个账号执行签到。
