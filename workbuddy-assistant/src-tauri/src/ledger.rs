@@ -719,6 +719,9 @@ mod tests {
             size,
             used,
             cycle_start: cycle.into(),
+            // 既有用例都不关心这两项：到期时间未知，余量按「授予 − 已用」推
+            expiry_ms: None,
+            remaining: size - used,
         }
     }
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Account, FreeModelsReport, JournalEvent, Settings, StealthStatus } from "../types";
+import type { Account, ModelReport, JournalEvent, Settings, StealthStatus } from "../types";
 import {
   applySettings,
   takeoverEvents,
@@ -49,6 +49,18 @@ function normalizeBilling(list: string[], allIds: string[]): string[] {
 }
 
 /**
+ * 模型清单来源的展示文案，与后端那三层一一对应。
+ *
+ * 用表而不是嵌套三元：来源现在有四档，三元链会写成连自己都数不清的缩进。
+ */
+const SOURCE_LABEL: Record<ModelReport["source"], string> = {
+  fetched: "刚从 Qoder 模型目录拉取",
+  cache: "落盘快照（上次成功拉取的结果）",
+  local: "本机 Qoder 的记录（只含这台机器用过的模型）",
+  empty: "三层都没拿到",
+};
+
+/**
  * 「智能接管」页：顶部一条紧凑控制条（开关 + 状态 + 扣费账号 / 限流切换两颗摘要胶囊 + 端口），
  * 下方「接管动态」铺满剩余空间（列表内部滚动、滚动条隐藏）。
  * 多选类配置一律收进弹框、不在页面上直接铺开，避免把事件流挤没：
@@ -86,8 +98,8 @@ export function TakeoverPage({
   // 限流切换模型弹窗（草稿制：打开复制当前值，点「保存」才落库生效）
   const [mdlOpen, setMdlOpen] = useState(false);
   const [mdlDraft, setMdlDraft] = useState<string[] | null>(null);
-  // 模型清单：从网关动态拉取，弹窗列表与控制条摘要共用
-  const [fm, setFm] = useState<FreeModelsReport | null>(null);
+  // 模型清单：三层来源（Qoder 目录 / 落盘快照 / 本机痕迹），弹窗列表与控制条摘要共用
+  const [fm, setFm] = useState<ModelReport | null>(null);
   const [fmBusy, setFmBusy] = useState(false);
   // 限流切换模型勾选：用户额外启用的付费模型（免费模型恒生效，不进这里）
   const [rlModels, setRlModels] = useState<string[]>(settings.rate_limit_models);
@@ -608,7 +620,8 @@ export function TakeoverPage({
               选中的模型触发限流（429）时，代理会将该账号冷却 10 分钟、自动换备用账号重发同一请求，
               对话完全无感；换号按「积分最早过期」优先（先消耗快过期的额度）。
               0 积分（免费）模型默认全部生效、不可取消；付费模型勾选后同样生效。
-              列表从网关动态拉取（缓存 1 小时），腾讯增删模型后点「刷新」即可同步。
+              列表从 Qoder 模型目录动态拉取（缓存 1 小时）；拉不到时退回落盘快照、
+              再退回本机 Qoder 的记录，Qoder 增删模型后点「刷新」即可同步。
             </span>
           </p>
           <Row
@@ -622,19 +635,14 @@ export function TakeoverPage({
               />
             }
           />
-          {fm && (
-            <p className="modal-meta">
-              {fm.source === "fetched"
-                ? "来源：刚从网关拉取"
-                : fm.source === "cache"
-                ? "来源：缓存（1 小时内有效）"
-                : "来源：内置兜底列表（网关拉取失败，可点「刷新」重试）"}
-            </p>
-          )}
+          {fm && <p className="modal-meta">来源：{SOURCE_LABEL[fm.source]}</p>}
           {fm == null ? (
-            <p className="empty">加载中…（从网关拉取模型列表）</p>
+            <p className="empty">加载中…（从 Qoder 模型目录拉取）</p>
           ) : fm.models.length === 0 ? (
-            <p className="empty">暂未发现模型。</p>
+            <p className="empty">
+              暂未发现模型：Qoder 模型目录、落盘快照、本机记录三层都没拿到。
+              确认 Qoder 已登录、且本机跑过一次对话，再点右上角「刷新」。
+            </p>
           ) : (
             <ul className="pick-list">
               {fm.models.map((m) => {
@@ -665,15 +673,22 @@ export function TakeoverPage({
                       onClick={(e) => e.stopPropagation()}
                     />
                     <span className="pick-main">
-                      <span className="pick-name mono">{m.id}</span>
+                      {/* 有显示名就把名字放主行、id 退到副行；没有名字时只显示 id
+                          —— 缺名字就是缺，不编一个出来（后端取不到 name 会留空串） */}
+                      <span className={"pick-name" + (m.name ? "" : " mono")}>
+                        {m.name || m.id}
+                      </span>
+                      {m.name && <div className="pick-sub mono">{m.id}</div>}
                     </span>
                     <span className="pick-tail">
                       {/* 免费模型：一个胶囊说清「免费 + 默认生效」——
                           旧实现是「免费」胶囊 + 「默认」两个元素，说的是同一件事 */}
+                      {/* 倍率拿不到时说「倍率未知」，不说「付费」—— 本机痕迹那层给不出倍率，
+                          谎称付费会让人以为这些模型是收费的 */}
                       <span
                         className={"pick-state " + (m.free ? "ok" : "warn")}
                       >
-                        {m.free ? "免费 · 默认" : m.multiplier || "付费"}
+                        {m.free ? "免费 · 默认" : m.multiplier || "倍率未知"}
                       </span>
                     </span>
                   </li>

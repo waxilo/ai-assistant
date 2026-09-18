@@ -2,3 +2,6 @@
 
 # --- WorkBuddy 工作区记忆：含个人上下文与项目笔记，仓库是 PUBLIC，勿入库 ---
 .workbuddy/
+
+# --- 替换 /Applications 前的本机回滚副本，勿入库 ---
+.app-backup/

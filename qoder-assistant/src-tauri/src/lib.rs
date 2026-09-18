@@ -8,6 +8,7 @@ mod commands;
 mod http;
 mod ledger;
 mod logs;
+mod models;
 mod netfix;
 mod notify;
 mod oauth;
@@ -67,9 +68,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                // macOS：窗口收进托盘后摘掉 Dock 图标，唤回时再由托盘恢复
-                tray::set_dock_visible(window.app_handle(), false);
+                // macOS：窗口收进托盘后摘掉 Dock 图标，唤回时再由托盘恢复。
+                // 顺序不能反 —— 先 hide 再改策略，否则改策略那一刻窗口还看得见，
+                // 系统会忽略这次变更（详见 tray::set_dock_visible 的说明）。
                 let _ = window.hide();
+                tray::set_dock_visible(window.app_handle(), false);
             }
         })
         .invoke_handler(tauri::generate_handler![

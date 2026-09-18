@@ -12,9 +12,9 @@
 - **token 自动续签**：导入 / 无感登录时会一并保存 `refreshToken` 与 `expiresAt`。应用启动及常驻期间**每 12 小时**扫描一次，**剩余有效期不足 48 小时即自动换新凭证**（签到前另有兜底判定）；续签失败不阻断签到（仍用旧 token 试一次）。
 - **智能接管（Qoder 专用反代）**：在 `127.0.0.1:8789`（可改端口；避开同机 workbuddy-assistant 占用的 8787）起一个 Qoder 专用反代，开启后自动把 Qoder 的对话请求接管到本地——只在**勾选的扣费备选账号**里选号（未勾选的不允许扣费，全不勾 = 全部可用；会话粘滞 + 积分最早过期优先轮换）。页面下方有**接管动态时间线**：开启 / 关闭接管、每个会话开始使用哪个账号、代理错误，一目了然。详见 [智能接管](#智能接管qoder-专用)。
 - **账号获取（两条通道，无手工录入）**：
-  - **导入本机账号**：直接读 Qoder 写在本机的 `CodeBuddyExtension/Data/Public/auth/*.info`，**不需要应用运行、也不需要调试端口**，并且一次就能拿到 token + 昵称 + 手机号 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
-  - **登录新账号**：走官方 OAuth state 轮询（`/v2/plugin/auth/state` → 浏览器扫码 → `/v2/plugin/auth/token`），**不重启、不打断当前 Qoder、不改动本机登录文件**，能主动签发**任意新账号**的凭证与昵称/手机号。
-- **智能 host 推断**：根据 JWT 的 `iss` 字段自动判断该用 `qoder.cn` / `qoder.ai` / `codebuddy.cn` / `codebuddy.ai`。默认 Base URL 为内置常量，**界面不提供修改入口**（改错会让签到打到错误的域）。
+  - **导入本机账号**：直接读 Qoder 写在本机的凭据文件 `auth.v1.dat`（Windows 可解；macOS 的密钥在 Keychain 里、端外解不出，所以 macOS 上请走「登录新账号」），**不需要应用运行、也不需要调试端口**，Windows 上一次就能拿到 token + 昵称 + 手机号 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
+  - **登录新账号**：走 Qoder **设备授权流**（`/device/selectAccounts` → 浏览器扫码 → 轮询 `/api/v1/deviceToken/poll`），**不重启、不打断当前 Qoder、不改动本机登录文件**，能主动签发**任意新账号**的凭证与昵称（macOS 上这是唯一可行的通道）。
+- **上游只有一套域**：账号接口 `openapi.qoder.sh`、模型网关 `api2-v2.qoder.sh`、登录页 `qoder.com`，全部写死在代码里；**界面不提供修改入口**（改错会让请求打到不存在的域）。
 - **GitHub Release 自动更新**：内置 `tauri-plugin-updater`，点击「检查更新」即可从 Release 拉取并安装新版本。
 - **积分日报（按天 + 逐小时）**：按**自然日**统计积分消耗与新增，每天一条，展开可见**每小时**明细（总览柱状图 + 逐账号列表）。
   口径是资源包**累计量**的差值（`CapacityUsed` / `CapacitySize`），不是「抓余额算涨跌」——
@@ -55,7 +55,7 @@ QoderAssistant/
 │       ├── accounts.rs     # 多账号 JSON 存储（含 phone；文件权限 0600）
 │       ├── auth_file.rs    # 读本机 Qoder 登录文件（含昵称/手机号）
 │       ├── checkin.rs      # 签到 HTTP 逻辑 + host/iss 推断 + 结果判定 + 剩余积分查询
-│       ├── oauth.rs        # 「登录新账号」无感登录（OAuth state 轮询，纯 HTTP）
+│       ├── oauth.rs        # 「登录新账号」设备授权流（PKCE + 轮询，纯 HTTP）
 │       ├── refresh.rs      # token 续签（refresh token → 新 access token）
 │       ├── notify.rs       # 签到结果推送 webhook（GET ?message=，浏览器 UA + 3 次重试）
 │       ├── scheduler.rs    # 定时自动签到 + 自动续签扫描（后台线程，到点即触发 + 30 分钟补跑 + scheduler.log）
@@ -186,45 +186,58 @@ npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不�
 工具栏有两个入口：**登录新账号**（加新号）/ **导入本机账号**（读本机已登录的）。
 没有「+ 添加账号」——不支持手工粘贴 token，账号条目也不可编辑。
 
-### 1. 导入本机账号（最省事）
+### 1. 导入本机账号
 
-Qoder 登录成功后会自己把账号与凭证写到本机：
+Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据目录里：
 
 | 平台 | 路径 |
 | --- | --- |
-| macOS | `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/*.info` |
-| Windows | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info` |
+| macOS | `~/Library/Application Support/com.qoder.app.stable/auth.v1.dat` |
+| Windows | `%APPDATA%\com.qoder.app.stable\auth.v1.dat` |
 
-本工具直接读这个 JSON（`account.uid` / `nickname` / `phoneNumber` +
-`auth.accessToken` / `refreshToken` / `expiresAt` / `domain`），因此：
+它不是明文 JSON，而是 Electron `safeStorage`（Chromium **OSCrypt**）加密的二进制：
+`"v10"` 魔数 + nonce(12B) + AES-256-GCM 密文 + tag(16B)。AES 密钥由系统包一层后存在
+同目录的 `Local State`（`os_crypt.encrypted_key`）里：
+
+- **Windows**：`DPAPI` 前缀 + `CryptUnprotectData`（当前用户）即可解出密钥 → 工具能端外读出
+  `token` / `refreshToken` / 两个有效期 / `user.{id,name,phone}`，**一次拿全**；
+- **macOS**：密钥在 Keychain 里，**端外解不出** → 这条通道在 macOS 上不可用，
+  请直接走下面的「登录新账号」。
+
+因此：
 
 - **不需要 Qoder 正在运行**，也不用改启动方式（不涉及 `--remote-debugging-port`）；
-- **一次就能拿到 token + 昵称 + 手机号 + refresh token**，导入后账号条目自动带上手机号，
-  并且具备自动续签能力；
-- 列表会标出「当前登录」「有效期至 … / 剩 N 天 / 已过期」，可单条导入或「全部导入」；
-- token 由 Qoder 自己续期，读到的就是最新的那份（已存在的账号按手机号/token 识别后合并补全，不会重复添加）。
+- Qoder 是**单账号模型**：`auth.v1.dat` 只存当前登录那一个，切号 / 重登会覆盖它，
+  所以这里最多只列出 **1 条**，不是多账号列表；
+- 列表会标出「当前登录」「有效期至 … / 剩 N 天 / 已过期」；
+- 已存在的账号按 token / 昵称识别后合并补全，不会重复添加。
 
-> 只读，不写回、不外传。这条通道的可行性来自对 WorkDaddy 实现的核对——它切换账号、
-> 签到也全部基于这个文件，而不是从运行中的应用里抓包。
+> 只读，不写回、不外传。续签后的写回是另一条独立开关，见「token 续签」。
 
 ### 2. 登录新账号
 
-点工具栏「**登录新账号**」（独立入口，不再塞在导入弹窗里）。它走官方的 OAuth state 轮询，
-**不重启、不打断当前 Qoder，也不改动本机登录文件**，是加第二个 / 第三个账号最省事的路子：
+点工具栏「**登录新账号**」（独立入口，不在导入弹窗里）。走 Qoder 的**设备授权流（device flow）**
+—— 官方桌面端自己用的就是这套 —— **不重启、不打断当前 Qoder，也不改动本机登录文件**，
+是加第二个 / 第三个账号最省事的路子（macOS 上也是**唯一**可行的一条）：
 
-1. 选好**接口域**（国内版 `www.qoder.cn` / 国际版 `www.qoder.ai` / CodeBuddy 两个域）。
-   默认会自动跟随你「当前登录」账号所属的域。
-2. 点「打开授权页并开始」→ 本工具请求
-   `POST {host}/v2/plugin/auth/state?platform=qoder` 拿到 `state`，
-   并用**系统浏览器**打开返回的授权页（`{host}/login?platform=qoder&state=…`）。
-3. 在浏览器里完成登录（扫码即可）。本工具每 2 秒轮询一次
-   `GET {host}/v2/plugin/auth/token?state=…` ——
-   未授权时返回的是 `{"code":11217,"msg":"11217:login ing..."}`，**这是正常等待态，不是报错**。
-4. 授权完成后自动拉账号信息（`GET {host}/v2/plugin/login/account`，带 `Bearer` + `X-Domain`），
-   把**昵称 / 手机号 / uid** 一并显示出来；点「添加为账号」入库，或连点「再登一个」继续加号。
+1. 点「打开授权页并开始」→ 本工具本地生成 PKCE 材料（`verifier` / `challenge=S256` /
+   `nonce` / `machine_id`），再用**系统浏览器**打开：
+   `https://qoder.com/device/selectAccounts?challenge=…&challenge_method=S256&nonce=…&machine_id=…&client_id=…`
+   服务端会自己 302 到 `https://qoder.com/users/sign-in?biz_variant=qoder&oauth_callback=…`。
+2. 在浏览器里完成登录（扫码即可）。本工具每 2 秒轮询一次
+   `GET https://openapi.qoder.sh/api/v1/deviceToken/poll?nonce=…&verifier=…&challenge_method=S256`；
+   未授权时返回 `HTTP 404 {"errorCode":"NotFound"}` —— **这是正常等待态，不是报错**。
+3. 拿到 `token` + `refresh_token` 后自动拉 `GET /api/v1/userinfo`，把**昵称 / uid** 一并显示；
+   点「添加为账号」入库，或连点「再登一个」继续加号。
 
+> **只有一套域**：登录 `qoder.com`、接口 `openapi.qoder.sh`，都写死在代码里，没有「选域」这回事
+> （旧版的域下拉框已删除）。
+>
+> 授权链接里**不填** `redirect_uri`。官方填的是 `qoder-app://`，那是官方桌面端自己注册占用的
+> scheme（`lsregister` 里 `qoder-app:` 归 `/Applications/Qoder.app`）；照抄它会让浏览器在授权
+> 结束时把 **Qoder 桌面应用**拉起来。我们靠轮询取凭证，不需要浏览器回调。
+>
 > 10 分钟未完成授权会自动判定超时，重新点一次即可。
-> 各区域 host 不能混用——授权与签到都必须打到账号自己所属的域。
 
 ---
 
@@ -235,7 +248,8 @@ Qoder 登录成功后会自己把账号与凭证写到本机：
 
 - **自动续签（常驻）**：后台调度线程**启动后立刻扫一次，之后每 12 小时扫一遍**全部账号；
   只要剩余有效期**不足 48 小时**就调
-  `POST {host}/v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头 + `Bearer` 旧 token）
+  `POST https://openapi.qoder.sh/api/v1/deviceToken/refresh`
+  （`Authorization: Bearer <旧 token>` + JSON `{"refresh_token":"…"}`，另带 `Cosy-ClientType` 身份头）
   换新凭证并写回 `accounts.json`。续签与「定时签到」开关无关——它是保命操作，
   不该因为没设定时签到就被关掉。结果记 `scheduler.log`，前端弹提示并刷新列表。
 - **签到前兜底**：每次签到（手动 / 批量 / 定时）前也会再判一次阈值，避免「扫描刚过、签到时刚好过期」。

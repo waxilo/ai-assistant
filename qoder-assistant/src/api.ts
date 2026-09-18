@@ -15,7 +15,7 @@ import type {
   NetRestoreReport,
   StealthStatus,
   JournalEvent,
-  FreeModelsReport,
+  ModelReport,
 } from "./types";
 
 export const listAccounts = () => invoke<Account[]>("list_accounts");
@@ -131,11 +131,13 @@ export const takeoverEvents = () => invoke<JournalEvent[]>("takeover_events");
 export const clearTakeoverEvents = () => invoke<void>("takeover_events_clear");
 
 /**
- * 「限流切换」支持的免费模型列表（积分倍率 x0.00，从网关动态拉取，缓存 1 小时）。
- * refresh=true 时忽略缓存强制重拉。
+ * 「限流切换」的模型清单（三层来源：Qoder 官方目录 / 落盘快照 / 本机痕迹）。
+ *
+ * refresh=true 时忽略内存缓存强制重拉——但仍会依次退到后两层，
+ * 所以点一次「刷新」不会把界面刷成空的。
  */
 export const freeModels = (refresh: boolean) =>
-  invoke<FreeModelsReport>("free_models", { refresh });
+  invoke<ModelReport>("free_models", { refresh });
 
 /**
  * 积分简报的**日条目**（新的在前）。

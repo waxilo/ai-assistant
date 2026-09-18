@@ -12,8 +12,8 @@
 //!    换账号会丢上下文，必须粘住。新会话（粘滞过期或首次）才重新选。
 //! 2. **选账号**：谁的「还有余量的资源包」最早过期就用谁——把快过期的积分先消耗掉；
 //!    查不到过期时间的账号排最后，剩余积分为 0 的账号直接跳过（除非全员为 0）。
-//! 3. **限流无感切换**：免费模型（从网关 `/v2/enterprises/personal/models` 动态拉取
-//!    积分倍率，倍率为 0 即免费；1h 缓存，失败兜底 hy3）触发限流（429）时，把
+//! 3. **限流无感切换**：免费模型（清单与免费判定见 [`crate::models`] —— 三层来源：
+//!    Qoder 官方目录 / 落盘快照 / 本机痕迹，**绝不退回写死的模型名**）触发限流（429）时，把
 //!    **「该账号 × 该模型」**冷却到上游给出的重置时刻，换下一个账号重发同一请求
 //!    （上限 2 次切换）；冷却中的「账号 × 模型」在选号时优先跳过。付费模型的 429
 //!    原样透传。冷却的粒度与时间节点见 `RateKey` / `limit_until_ms`。
@@ -42,7 +42,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -88,20 +88,16 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("构建 HTTP 客户端失败")
 });
 
-/// 接管内部「主动查询」用的账号接口客户端：与签到 / 刷新**同一套身份**，并强制直连。
-///
-/// 不能用 [`CLIENT`]：那个是**透传**用的，只统一 UA、**绝不向请求注入身份头**
-/// （CLI 自己带的头必须原样过去）。而拉模型清单（`fetch_models_value`）与路由决策时
-/// 重拉积分快照（`choose_account`）是我们自己主动打腾讯的计费接口，需要完整的账号接口
-/// 头条——否则同一个接口会在「代理主动查」与「签到 / 刷新」两条路径上收到两套不同的头，
-/// 正是这个项目一直在消除的那种不一致。
-static API_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(crate::http::api_client_direct);
+// 本模块**不持有**「主动查询」客户端：模型清单连同免费判定都归 [`crate::models`]
+// （用 [`crate::http::api_client_direct`]），本模块只透传 —— 透传一律走 [`CLIENT`]，
+// 它只统一 UA、**绝不向请求注入身份头**（CLI 自己带的头必须原样过去）。
+// 原先这里那个 `API_CLIENT` 是给「自己拉模型清单」用的，随那段逻辑一起搬走后就没了使用者。
 
 /// 会话粘滞键：**会话 × 模型**。
 ///
 /// 带上模型是为了跟限流冷却的粒度对齐（见 `RateKey`）：粘滞的意义是「别在同一次对话
-/// 中途换账号」，而换号可能是被「某个模型的限流」逼出来的——辅助小模型（如 0 积分的
-/// hy3）吃 429 换了号，不该把主模型的后续请求也一起搬走。各模型各自粘，互不牵连。
+/// 中途换账号」，而换号可能是被「某个模型的限流」逼出来的——辅助小模型（0 积分那类）
+/// 吃 429 换了号，不该把主模型的后续请求也一起搬走。各模型各自粘，互不牵连。
 /// 模型未知（非对话请求）用空串占位，等价于原来按会话粘。
 fn sticky_key(conv: &str, model: Option<&str>) -> (String, String) {
     (conv.to_string(), model.unwrap_or_default().to_string())
@@ -127,7 +123,8 @@ const RATE_LIMIT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 限流冷却的存储键：**账号 × 模型**。
 ///
-/// 键必须带模型。实测（2026-09-14）：同一账号 `hy3` 吃 429 的同一时刻，主模型
+/// 键必须带模型。实测（2026-09-14，**WorkBuddy 时代**的抓包，模型名是那套网关的）：
+/// 同一账号 `hy3` 吃 429 的同一时刻，主模型
 /// `deepseek-v4.1-flash` 依然 200，上游文案也明说「您也可以切换其他模型继续使用」——
 /// 限流本来就是按「账号 × 模型」算的。按账号整体冷却会把它本来还能服务的模型一起赶走，
 /// 白白浪费一个额度充足的账号。
@@ -750,9 +747,11 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
             r.send().await
         });
 
-        // 免费模型集（动态拉取、1h 缓存；拿不到用内置兜底）
+        // 免费模型集：与接管页同一份（[`crate::models`] 的三层来源 + 1h 内存缓存）。
+        // 三层都拿不到就是**空集** ⇒ 只有流程里那些「上游 429 也原样透传」的模型不再自动换号；
+        // 这里不会退回任何写死的模型名。
         let free_set = if is_chat {
-            ensure_free_models(&host, &account.token)
+            ensure_free_models(&dir, &account.token)
         } else {
             HashSet::new()
         };
@@ -884,63 +883,18 @@ fn body_model(body: &[u8]) -> Option<String> {
         .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)))
 }
 
-/// 免费模型判定：不再写死模型名，从网关 `GET /v2/enterprises/personal/models`
-/// 动态拉取每个模型的积分倍率（`credits` 字段，如 "x0.00 credits"/"x0.05"），
-/// 倍率为 0 即免费。缓存 1 小时；拉取失败退回内置兜底（官方目录里 hy3 为
-/// x0.00，而 hy3-x 是 x0.05 **不免费**——所以绝不能用 `hy3` 前缀匹配）。
-const FREE_MODELS_TTL: Duration = Duration::from_secs(3600);
-const FALLBACK_FREE_MODELS: [&str; 1] = ["hy3"];
-
-/// 解析倍率字符串："x0.00 credits" / "x0.05" / "x0.79 credits" → 数字
-fn parse_multiplier(s: &str) -> Option<f64> {
-    s.trim()
-        .trim_start_matches('x')
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// 从 models 接口响应里提取免费模型 id 集（纯函数，便于单测）
-fn free_ids_from_value(v: &serde_json::Value) -> Option<HashSet<String>> {
-    let arr = v.get("data")?.get("models")?.as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(|m| {
-                let id = m.get("id")?.as_str()?.to_string();
-                let mult = m.get("credits")?.as_str().and_then(parse_multiplier)?;
-                (mult == 0.0).then_some(id)
-            })
-            .collect(),
-    )
-}
-
-/// 免费模型集缓存：(拉取成功时刻, 模型 id 集)
-fn free_models_cache() -> &'static Mutex<Option<(Instant, HashSet<String>)>> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, HashSet<String>)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
-}
-
-/// 惰性获取免费模型集：缓存有效直接用；过期则用当前账号 token 拉一次；
-/// 拉取失败用内置兜底（并保留旧缓存，避免每次请求都重试打接口）。
-fn ensure_free_models(host: &str, token: &str) -> HashSet<String> {
-    if let Ok(guard) = free_models_cache().lock() {
-        if let Some((at, set)) = guard.as_ref() {
-            if at.elapsed() < FREE_MODELS_TTL {
-                return set.clone();
-            }
-        }
-    }
-    let fresh = tauri::async_runtime::block_on(fetch_free_models(host, token));
-    match fresh {
-        Some(set) if !set.is_empty() => {
-            if let Ok(mut g) = free_models_cache().lock() {
-                *g = Some((Instant::now(), set.clone()));
-            }
-            set
-        }
-        _ => FALLBACK_FREE_MODELS.iter().map(|s| s.to_string()).collect(),
-    }
+/// 免费模型集，供路由判定限流切换。
+///
+/// 清单来自 [`crate::models`] —— **与接管页看到的是同一份**（三层来源：Qoder 官方目录 /
+/// 落盘快照 / 本机痕迹）。这里只把「免费的那些 id」挑出来，**不再自己维护一份缓存**：
+/// 两个消费方各存一份就一定会漂移，而「界面显示免费、路由却不切换」是最难查的那种错。
+///
+/// 这段原本打的是 CodeBuddy 的 `{base}/v2/enterprises/personal/models`，兜底写死腾讯的
+/// `hy3` —— 在 Qoder 上那条路径恒 404，于是永远退回兜底，把一个 Qoder 根本不认识的
+/// 模型名当成了免费模型。接口与兜底都已作废，理由见 [`crate::models`] 的模块说明。
+fn ensure_free_models(dir: &Path, token: &str) -> HashSet<String> {
+    let report = tauri::async_runtime::block_on(crate::models::load(dir, token, false));
+    crate::models::free_ids(&report.models)
 }
 
 /// 免费判定：精确匹配动态集合
@@ -958,142 +912,36 @@ fn is_rate_limited_model(
     is_free_model(model, free) || model.is_some_and(|m| enabled.iter().any(|e| e == m))
 }
 
-/// 单个模型的描述（供 UI 勾选限流切换范围）
-#[derive(serde::Serialize, Clone)]
-pub struct ModelInfo {
-    /// 模型 id（如 hy3 / hy3-x / deepseek-v3 …）
-    pub id: String,
-    /// 是否 0 积分免费模型（恒生效、UI 锁定勾选）
-    pub free: bool,
-    /// 积分倍率原始串（如 "x0.00" / "x0.05"），仅展示用
-    pub multiplier: String,
-}
+// 模型清单的类型、解析与三层来源都搬去了 [`crate::models`]（那边有完整说明）。
+// 这里原先还留着 `ModelInfo` / `FreeModelsReport` / `fetch_models_value` /
+// `fetch_free_models` / `model_info_from_value` 与两份进程内缓存 —— 它们打的是
+// CodeBuddy 的 `{base}/v2/enterprises/personal/models`、兜底是腾讯的 `hy3`，
+// 已随那条作废的接口一起删除。**不要再在这里重新长出第二份清单缓存**：
+// 界面与路由各存一份就一定会漂移。
 
-/// 「限流切换」支持的模型（供接管页勾选 + 手动刷新）
-#[derive(serde::Serialize)]
-pub struct FreeModelsReport {
-    /// 全模型列表（含免费与付费），免费排前、其余按 id 排序
-    pub models: Vec<ModelInfo>,
-    /// "fetched" = 刚从网关拉取；"cache" = 1 小时缓存内；"fallback" = 拉取失败用内置兜底
-    pub source: String,
-}
-
-/// 拉取整份 models 接口响应（一次 HTTP，路由用的免费集合与 UI 用的全模型都从它派生）
-async fn fetch_models_value(host: &str, token: &str) -> Option<serde_json::Value> {
-    let url = format!(
-        "{}/v2/enterprises/personal/models",
-        host.trim_end_matches('/')
-    );
-    let resp = API_CLIENT.get(&url).bearer_auth(token).send().await.ok()?;
-    resp.json().await.ok()
-}
-
-/// 免费模型集（动态拉取、1h 缓存；拿不到用内置兜底）：供路由判定限流切换
-async fn fetch_free_models(host: &str, token: &str) -> Option<HashSet<String>> {
-    fetch_models_value(host, token).await.and_then(|v| free_ids_from_value(&v))
-}
-
-/// 全模型描述列表（免费排前、其余按 id 排序），供 UI 勾选限流切换范围
-fn model_info_from_value(v: &serde_json::Value) -> Vec<ModelInfo> {
-    let Some(arr) = v
-        .get("data")
-        .and_then(|d| d.get("models"))
-        .and_then(|m| m.as_array())
-    else {
-        return Vec::new();
-    };
-    let mut out: Vec<ModelInfo> = arr
-        .iter()
-        .filter_map(|m| {
-            let id = m.get("id")?.as_str()?.to_string();
-            let multiplier = m
-                .get("credits")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let free = parse_multiplier(&multiplier).is_some_and(|x| x == 0.0);
-            Some(ModelInfo {
-                id,
-                free,
-                multiplier,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| match (a.free, b.free) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.id.cmp(&b.id),
-    });
-    out
-}
-
-/// UI 用的全模型缓存：(拉取成功时刻, 模型列表)
-fn all_models_cache() -> &'static Mutex<Option<(Instant, Vec<ModelInfo>)>> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, Vec<ModelInfo>)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
-}
-
-/// 免费模型列表（限流切换的生效范围）：优先读全模型缓存；`refresh=true` 或缓存过期时
-/// 用任一账号的 token 从网关重新拉取（倍率 x0.00 的模型恒生效，付费模型需用户勾选）。
-/// 接管页勾选 + 手动刷新。同时顺手刷新路由用的免费集合缓存。
+/// 「限流切换」模型清单：接管页展示 + 手动刷新。
+///
+/// 清单与免费判定都交给 [`crate::models`] —— 那边有内存缓存 / 落盘快照 / 本机痕迹三层，
+/// 且**与路由侧同源**（见 `ensure_free_models`）。这里只负责「给它一个真 token」：
+///
+/// - 先整池同步：绑了池之后本地那份 token 可能早被别的机器轮换掉了（用旧的会 401）；
+/// - token 临近过期先续签（单机路径；落盘版只在路由时做，这里仅求拉取成功）。
+///
+/// 三层都拿不到时回**空列表**（`source = "empty"`），由界面显示空态 ——
+/// 这里不再退回任何写死的模型名。
 #[tauri::command]
 pub async fn free_models(
     app: tauri::AppHandle,
     refresh: Option<bool>,
-) -> Result<FreeModelsReport, String> {
+) -> Result<crate::models::ModelReport, String> {
     let dir = crate::commands::try_data_dir(&app)?;
-    if !refresh.unwrap_or(false) {
-        if let Ok(guard) = all_models_cache().lock() {
-            if let Some((at, list)) = guard.as_ref() {
-                if at.elapsed() < FREE_MODELS_TTL {
-                    return Ok(FreeModelsReport {
-                        models: list.clone(),
-                        source: "cache".into(),
-                    });
-                }
-            }
-        }
-    }
-    let settings = accounts::load_settings(&dir);
-    // 拉模型列表也要先整池同步：这一路要拿一个真 token 去请求，而绑了池之后
-    // 本地那份 token 可能早被别的机器轮换掉了（用旧的会直接 401）。
     crate::commands::sync_pool_if_bound(&dir).await;
     let mut account = accounts::load_accounts(&dir)
         .into_iter()
         .find(|a| !a.token.is_empty())
         .ok_or_else(|| "暂无账号，无法拉取模型列表".to_string())?;
-    // token 临近过期就先续签（单机路径；不落盘也无妨：落盘版只在路由时做，
-    // 这里仅求拉取成功）
     let _ = commands::ensure_fresh_token(&mut account).await;
-    match fetch_models_value(&settings.default_base_url, &account.token).await {
-        Some(v) => {
-            let list = model_info_from_value(&v);
-            // 同步刷新路由用的免费集合缓存（倍率 x0.00 的 id）
-            if let Some(set) = free_ids_from_value(&v) {
-                if let Ok(mut g) = free_models_cache().lock() {
-                    *g = Some((Instant::now(), set));
-                }
-            }
-            if let Ok(mut g) = all_models_cache().lock() {
-                *g = Some((Instant::now(), list.clone()));
-            }
-            Ok(FreeModelsReport {
-                models: list,
-                source: "fetched".into(),
-            })
-        }
-        _ => Ok(FreeModelsReport {
-            models: FALLBACK_FREE_MODELS
-                .iter()
-                .map(|s| ModelInfo {
-                    id: s.to_string(),
-                    free: true,
-                    multiplier: "x0.00".into(),
-                })
-                .collect(),
-            source: "fallback".into(),
-        }),
-    }
+    Ok(crate::models::load(&dir, &account.token, refresh.unwrap_or(false)).await)
 }
 
 /// 不该回给客户端的响应头：逐跳头、reqwest 已代劳解压后失效的，
@@ -1636,31 +1484,24 @@ mod tests {
         // 请求体缺 model / 非法 JSON → 视为未知，不触发切换
         assert_eq!(body_model(b"{}"), None);
         assert_eq!(body_model(b"not json"), None);
-        assert_eq!(body_model(br#"{"model":"hy3"}"#).as_deref(), Some("hy3"));
+        assert_eq!(
+            body_model(br#"{"model":"qmodel_38max"}"#).as_deref(),
+            Some("qmodel_38max")
+        );
 
-        // 倍率解析：格式不统一（带/不带 "credits" 后缀）都要兼容
-        assert_eq!(parse_multiplier("x0.00 credits"), Some(0.0));
-        assert_eq!(parse_multiplier("x0.05"), Some(0.05));
-        assert_eq!(parse_multiplier(" x0.79 credits "), Some(0.79));
-        assert_eq!(parse_multiplier("credits"), None);
-
-        // 从接口响应提取免费模型集：倍率 0 才算，缺 credits 字段的不算
-        let sample = serde_json::json!({"data":{"models":[
-            {"id":"hy3","credits":"x0.00 credits"},
-            {"id":"hy3-x","credits":"x0.05"},
-            {"id":"auto"},
-            {"id":"glm-5.1","credits":"x0.79 credits"}
-        ]}});
-        let set = free_ids_from_value(&sample).unwrap();
-        assert!(set.contains("hy3"));
-        assert!(!set.contains("hy3-x"), "hy3-x 倍率 x0.05，不是免费模型");
-        assert!(!set.contains("auto"));
-        assert!(!set.contains("glm-5.1"));
-
-        // 判定走精确匹配
-        assert!(is_free_model(Some("hy3"), &set));
-        assert!(!is_free_model(Some("hy3-x"), &set));
+        // 免费集合怎么来的由 [`crate::models`] 负责（解析、倍率、三层来源都在那边测），
+        // 这里只验**判定**：精确匹配，且模型未知一律不切换（限流冷却本就按模型算）。
+        let set: HashSet<String> = ["qmodel_38max".to_string()].into_iter().collect();
+        assert!(is_free_model(Some("qmodel_38max"), &set));
+        assert!(!is_free_model(Some("qmodel_09pro"), &set));
         assert!(!is_free_model(None, &set));
+
+        // 除免费模型外，用户在设置里勾选的付费模型同样生效
+        let enabled = ["qmodel_09pro".to_string()];
+        assert!(is_rate_limited_model(Some("qmodel_09pro"), &set, &enabled));
+        assert!(is_rate_limited_model(Some("qmodel_38max"), &set, &enabled));
+        assert!(!is_rate_limited_model(Some("qmodel_other"), &set, &enabled));
+        assert!(!is_rate_limited_model(None, &set, &enabled));
     }
 
     #[test]
@@ -1691,7 +1532,7 @@ mod tests {
     fn sticky_session_reuses_the_same_account() {
         // 一次对话中途换账号会丢上下文，必须粘住
         let conv = "conv-abc";
-        let m = Some("hy3");
+        let m = Some("qmodel_38max");
         assert!(sticky_hit(conv, m).is_none(), "首次访问不该命中");
         sticky_put(conv, m, "acct-1".into());
         assert_eq!(sticky_hit(conv, m).as_deref(), Some("acct-1"));
@@ -1706,12 +1547,14 @@ mod tests {
     }
 
     /// 回归：粘滞与限流冷却同为「账号 × 模型」粒度。以前的实现只有会话一个维度，
-    /// 于是辅助小模型（0 积分的 hy3）吃一次 429 换号，就把整段对话连同主模型一起搬走。
+    /// 于是辅助小模型（0 积分那些）吃一次 429 换号，就把整段对话连同主模型一起搬走。
+    ///
+    /// 模型名只是占位：两边的差异（粒度）才是被测对象，名字取什么不影响结论。
     #[test]
     fn sticky_is_scoped_per_model() {
         let conv = "conv-multi";
-        let main = Some("deepseek-v4.1-flash");
-        let side = Some("hy3");
+        let main = Some("qmodel_main");
+        let side = Some("qmodel_side");
         sticky_put(conv, main, "acct-main".into());
         sticky_put(conv, side, "acct-side".into());
         assert_eq!(sticky_hit(conv, main).as_deref(), Some("acct-main"));
@@ -1730,7 +1573,7 @@ mod tests {
     #[test]
     fn sticky_entry_expires_after_ttl() {
         let conv = "conv-expire";
-        let m = Some("hy3");
+        let m = Some("qmodel_38max");
         sticky_put(conv, m, "acct-1".into());
         // 把最后命中时刻拨回 TTL 之前
         if let Ok(mut map) = sticky().lock() {
@@ -1746,9 +1589,12 @@ mod tests {
 
     // ---- 限流冷却：重置时刻解析 + 「账号 × 模型」粒度 ----
 
-    /// 线上真实抓到的 429 报文（2026-09-14 18:06，账号 waxiloao 用 hy3 触发，
-    /// 两个免费探测都打到它）。网关 `Server: APISIX/3.9.1` **不给 `Retry-After` 头**，
-    /// 重置时刻只写在这段中文文案里。
+    /// 线上真实抓到的 429 报文（2026-09-14 18:06，账号 waxiloao 触发，两个免费探测都打到它）。
+    /// 网关 `Server: APISIX/3.9.1` **不给 `Retry-After` 头**，重置时刻只写在这段中文文案里。
+    ///
+    /// ⚠️ 样本取自 **WorkBuddy 时代**的网关（那时本项目还是 clone）。Qoder 的 429 至今没抓到，
+    /// 文案格式**可能不同**，所以除了这条真实样本，另单独测了「无偏移文案」与三个响应头，
+    /// 且认不出来的情况始终由兜底时长（`RATE_LIMIT_FALLBACK`）在链尾接住。
     const REAL_429_BODY: &str = r#"{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-09-14 19:35:25 UTC+8 重置，您也可以切换其他模型继续使用。","requestId":"64bfbf60-0dcc-4480-8a41-6441ebe672c5"}"#;
 
     #[test]
@@ -1819,6 +1665,12 @@ mod tests {
         assert!(limit_until_ms(&[], b"<html>429 Too Many Requests</html>", 0).is_none());
     }
 
+    /// 冷却测试用的两个模型名占位。旧值是 WorkBuddy 那套网关的抓包里的名字，
+    /// 与 Qoder 无关；这里只要求「两个不同的模型」，名字取什么不影响结论。
+    const MAIN: &str = "qmodel_main";
+    /// 辅助小模型（0 积分那类）—— 限流粒度那一组的第二个维度
+    const SIDE: &str = "qmodel_side";
+
     #[test]
     fn cooldown_is_scoped_to_account_times_model_and_clamped() {
         if let Ok(mut m) = cooldown().lock() {
@@ -1830,19 +1682,19 @@ mod tests {
         let min_allowed = now + RATE_LIMIT_MIN.as_millis() as i64 - 2000;
         // 离谱地远（时钟偏差 / 文案写错）→ 夹到上限，不能把账号锁死
         assert!(
-            set_cooldown("acct", "hy3", i64::MAX, LimitSource::Body).until_ms <= max_allowed
+            set_cooldown("acct", SIDE, i64::MAX, LimitSource::Body).until_ms <= max_allowed
         );
         // 已经过去的时刻 → 至少保留下限，否则下一个请求立刻撞回同一个 429
-        assert!(set_cooldown("acct2", "hy3", 0, LimitSource::Body).until_ms >= min_allowed);
+        assert!(set_cooldown("acct2", SIDE, 0, LimitSource::Body).until_ms >= min_allowed);
 
         // 核心粒度：只封「这个账号 × 这个模型」
-        set_cooldown("acct3", "hy3", now + 3_600_000, LimitSource::Body);
-        assert!(cooling("acct3", Some("hy3")));
+        set_cooldown("acct3", SIDE, now + 3_600_000, LimitSource::Body);
+        assert!(cooling("acct3", Some(SIDE)));
         assert!(
-            !cooling("acct3", Some("deepseek-v4.1-flash")),
-            "同账号的其它模型不该被牵连——实测 hy3 吃 429 时主模型依然 200"
+            !cooling("acct3", Some(MAIN)),
+            "同账号的其它模型不该被牵连——实测该模型吃 429 的同时，主模型依然 200"
         );
-        assert!(!cooling("acct-other", Some("hy3")), "别的账号不受影响");
+        assert!(!cooling("acct-other", Some(SIDE)), "别的账号不受影响");
         assert!(!cooling("acct3", None), "模型未知（非对话请求）不参与冷却判定");
 
         // 过期记录顺手清掉，常年常驻不会攒垃圾
@@ -1851,7 +1703,7 @@ mod tests {
             m.insert(
                 RateKey {
                     account_id: "stale".into(),
-                    model: "hy3".into(),
+                    model: SIDE.into(),
                 },
                 CooldownEntry {
                     until_ms: now_ms() - 1,
@@ -1859,7 +1711,7 @@ mod tests {
                 },
             );
         }
-        assert!(!cooling("stale", Some("hy3")));
+        assert!(!cooling("stale", Some(SIDE)));
         assert!(
             cooldown().lock().map(|m| m.is_empty()).unwrap_or(false),
             "过期条目应被顺手清理"

@@ -11,14 +11,35 @@
 //!    machine_id = 读 Qoder 的 auth.machine-id（无则自生成 uuid v4）
 //! 2. 交给系统浏览器打开：
 //!    {authBaseUrl}/device/selectAccounts?challenge=&challenge_method=S256
-//!        &nonce=&machine_id=&client_id=&redirect_uri=qoder-app://
+//!        &nonce=&machine_id=&client_id=
 //!    —— 服务端自己会 302 到 {authBaseUrl}/users/sign-in?biz_variant=qoder&oauth_callback=…
-//!    所以**不需要**我们拼 sign-in 地址，也不需要注册 qoder-app:// 这个 scheme。
+//!    所以**不需要**我们拼 sign-in 地址。
+//!    ⚠️ 官方那条链接末尾还有 `&redirect_uri=qoder-app://`，那是它给自己注册的回调，
+//!    我们**不能照抄** —— 见下节。
 //! 3. 轮询（间隔 1s、总超时 300s）：
 //!    GET {openApiBaseUrl}/api/v1/deviceToken/poll?nonce=&verifier=&challenge_method=S256
 //!    404 = 用户还没点完（**正常等待态，不是错误**）；200 且带 token+refresh_token 即完成
 //! 4. GET {openApiBaseUrl}/api/v1/userinfo 取昵称/邮箱/头像（失败不致命，token 已经到手）
 //! ```
+//!
+//! # 为什么授权链接里**故意不带** `redirect_uri`
+//!
+//! 官方桌面端填的是 `qoder-app://`（asar 里 `authRedirectUris.stable`）。但那个 scheme
+//! 不是公共设施，是**官方应用自己注册占用的**：
+//!
+//! - `/Applications/Qoder.app/Contents/Info.plist` → `CFBundleURLSchemes = [qoder, qoder-app]`；
+//! - `lsregister -dump` → `Qoder` 这个 bundle 的 `claimed schemes: qoder-app:, qoder:`。
+//!
+//! 于是浏览器走完登录、服务端把用户送到设备流最后一步时，**系统会按 scheme 把 Qoder
+//! 桌面应用拉起来**。这不是巧合 —— Qoder 主进程里 `Ke.on("open-url")` 明确把 `qoder-app://`
+//! 当成它自己的登录回调（`o8 = () => authService.notifyLoginCallback()`），
+//! 「浏览器授权完 → 唤起客户端」本来就是它的设计。
+//!
+//! 结论：照抄官方的 `redirect_uri` = **借用了别人的回调地址**，代价是用户每在我们这里
+//! 登录一次，Qoder 桌面端就被拽到前台一次（2026-09-18 用户实报的就是这个现象）。
+//! 我们靠轮询取凭证、**不需要任何浏览器回调**，所以这个参数直接留空；官方实现同样
+//! 允许它为空（`...e.redirectUri ? { redirect_uri } : {}`），且实测「带 / 不带」在
+//! 授权入口表现完全一致（都是 302 到 sign-in，oauth_callback 里也不塞该参数）。
 //!
 //! 实测（2026-09-18）：`poll` 用假 nonce 打过去返回 `HTTP 404 {"errorCode":"NotFound"}`，
 //! `selectAccounts` 返回 `302` 到 sign-in 页 —— 端点与流程都对得上。
@@ -236,22 +257,26 @@ fn pkce_challenge(verifier: &str) -> String {
 /// 注意**不要自己再加 `/users/sign-in` 包装**：实测直接请求这个地址，服务端会自己
 /// `302` 到 `{AUTH_BASE}/users/sign-in?oauth_callback=…&directLogin=true`。
 /// 自己再包一层只会多一层转义、还可能与服务端的 `directLogin` 语义打架。
+///
+/// 也**不要**把官方那个 `redirect_uri` 补回来（理由见模块头那节）：它的值是
+/// `qoder-app://`，而系统按这个 scheme 拉起的是**官方桌面端**，不是我们。
 fn authorization_url(challenge: &str, nonce: &str, machine_id: &str) -> String {
     format!(
-        "{}/device/selectAccounts?challenge={}&challenge_method=S256&nonce={}&machine_id={}&client_id={}&redirect_uri={}",
+        "{}/device/selectAccounts?challenge={}&challenge_method=S256&nonce={}&machine_id={}&client_id={}",
         qoder_api::AUTH_BASE,
         urlencode(challenge),
         urlencode(nonce),
         urlencode(machine_id),
         urlencode(qoder_api::AUTH_CLIENT_ID),
-        urlencode(qoder_api::AUTH_REDIRECT_URI),
     )
 }
 
-/// 最小化的 URL 查询参数编码（只编码 v2 里 PKCE 材料会出现的字符集）。
+/// 最小化的 URL 查询参数编码（只编码授权链接里会出现的字符集）。
 ///
-/// 手写而不是引第三方：参与编码的只有 base64url 字符、uuid、以及固定的 client id /
-/// redirect uri（含 `:` 与 `/`），全在这个集合内，用一个函数保证各处一致。
+/// 手写而不是引第三方：参与编码的只有 base64url 字符（challenge）与 uuid
+/// （nonce / machine_id / client id），**全部是 URL 非保留字符** —— 也就是说当前
+/// 每一次调用都应当逐字原样返回。留着它，是因为「输入今天恰好安全」不是可以长期
+/// 依赖的前提；而单测会把这条前提钉住（授权链接里不该出现任何 `%`）。
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -496,8 +521,22 @@ mod tests {
         assert!(url.contains("nonce=9ecfb156-86c9-49b8-8563-a6cef3987f5c"));
         assert!(url.contains("machine_id=m1"));
         assert!(url.contains(qoder_api::AUTH_CLIENT_ID));
-        // `qoder-app://` 里的 `:` 与 `/` 必须被编码
-        assert!(url.contains("redirect_uri=qoder-app%3A%2F%2F"), "{url}");
+    }
+
+    /// 回归：授权链接里**绝不能**出现 `redirect_uri`。
+    ///
+    /// 官方那条链接的末尾是 `&redirect_uri=qoder-app://`，而系统按这个 scheme 拉起的是
+    /// **官方桌面端**（`lsregister` 里 `qoder-app:` 归 `/Applications/Qoder.app`）。
+    /// 一旦有人「照着官方补回来」，用户每在我们这里登录一次，Qoder 应用就被拽到前台一次。
+    #[test]
+    fn authorization_url_never_carries_a_redirect_uri() {
+        let url = authorization_url("c", "9ecfb156-86c9-49b8-8563-a6cef3987f5c", "m");
+        assert!(
+            !url.contains("redirect_uri") && !url.contains("qoder-app"),
+            "不许把官方桌面端的回调地址借过来：{url}"
+        );
+        // 顺带钉住「所有取值都是 URL 非保留字符」这个前提：真出现转义，说明有新输入混进来了
+        assert!(!url.contains('%'), "四个取值都该无需转义：{url}");
     }
 
     #[test]

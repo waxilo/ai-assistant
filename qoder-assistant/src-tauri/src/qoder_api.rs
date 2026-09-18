@@ -37,12 +37,6 @@ pub const AUTH_BASE: &str = "https://qoder.com";
 /// 登录用的公开 client id（`E8.authClientIds.prod`）。
 pub const AUTH_CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
 
-/// 设备授权流声明的回调 scheme（`E8.authRedirectUris.stable`）。
-///
-/// 本应用**不注册**这个 scheme：服务端只在它自己的状态机里记录它，
-/// 我们靠轮询取凭证，不需要浏览器回调到本进程。
-pub const AUTH_REDIRECT_URI: &str = "qoder-app://";
-
 /// 模型网关的默认上游（CLI `gtn()` 的 `prod` 分支）。
 ///
 /// 接管反代转发到这里；`QODER_MODEL_SERVER_HOST` 一旦被注入，CLI 就会改打本机。

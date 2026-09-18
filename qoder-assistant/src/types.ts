@@ -341,20 +341,28 @@ export interface JournalEvent {
 
 /** 「限流切换」模型列表中的单个模型 */
 export interface ModelInfo {
-  /** 模型 id，如 hy3 / hy3-x / deepseek-v3 … */
+  /** 给网关用的模型 id（Qoder 形如 qmodel_38max） */
   id: string;
+  /** 给人看的显示名（形如 Qwen3.8-Max）；取不到时为空串，界面退回显示 id */
+  name: string;
   /** 是否 0 积分免费模型（恒生效、UI 锁定勾选不可取消） */
   free: boolean;
-  /** 积分倍率原始串（如 "x0.00" / "x0.05"），仅展示用 */
+  /** 积分倍率原始串（如 "x0.00" / "x0.05"），仅展示用；空串 = 倍率未知 */
   multiplier: string;
 }
 
-/** 「限流切换」支持的模型列表（全模型，从网关动态拉取） */
-export interface FreeModelsReport {
+/**
+ * 「限流切换」模型清单（全模型，三层来源）。
+ *
+ * source 与后端一一对应：
+ * `fetched` = 刚从 Qoder 模型目录拉取；`cache` = 落盘快照；
+ * `local` = 本机 Qoder 痕迹；`empty` = 三层都没拿到（界面显示空态）。
+ * 这里**没有**「内置兜底」这一档 —— 兜底写死模型名正是旧实现认错模型的根源。
+ */
+export interface ModelReport {
   /** 免费排前、其余按 id 排序 */
   models: ModelInfo[];
-  /** fetched = 刚从网关拉取；cache = 1 小时缓存内；fallback = 拉取失败用内置兜底 */
-  source: "fetched" | "cache" | "fallback";
+  source: "fetched" | "cache" | "local" | "empty";
 }
 
 /**

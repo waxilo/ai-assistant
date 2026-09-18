@@ -854,6 +854,10 @@ body.modal-open .content {
   color: var(--muted-2);
   overflow-wrap: anywhere;
 }
+/* 副行放的是标识符（模型 id）时用等宽，与 .pick-name.mono 同一套字形 */
+.pick-sub.mono {
+  font-family: var(--font-mono);
+}
 .pick-tail {
   flex: 0 0 auto;
   display: flex;
