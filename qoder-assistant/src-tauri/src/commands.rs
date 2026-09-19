@@ -142,6 +142,37 @@ pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, St
     Ok(true)
 }
 
+/// 账号缺手机号时补一次（**只补空，绝不覆盖**）。
+///
+/// 为什么需要它：旧版认为 `/api/v1/userinfo` 不含手机号，于是「登录新账号」进来的账号
+/// 手机号恒空（更正见 `oauth::parse_userinfo`）。而手机号是跨机合并（`broker` 的身份锚点
+/// 第一顺位）与界面展示都要的东西，缺了就只能按昵称认人 —— 昵称是会改的。
+/// 新登录的账号现在登录那一刻就带手机号，这个函数是给**升级上来的老账号**补的。
+///
+/// 三条边界：
+/// - **只在为空时打这一下**：有值就不动（那个值可能正是云端合并键在用的）；
+/// - **失败静默**：拿不到就保持原样，绝不写入空串或占位；
+/// - **与续签各管各的**：它只认 `security_mobile`。
+///
+/// 返回值约定与 [`ensure_fresh_token`] 一致：`Ok(true)` = 账号字段有更新，调用方需落盘。
+pub(crate) async fn fill_phone_if_missing(account: &mut Account) -> Result<bool, String> {
+    if account.phone.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        return Ok(false);
+    }
+    let Some(v) =
+        crate::qoder_api::get_json(account.region, &account.token, "/api/v1/userinfo", &[]).await
+    else {
+        return Ok(false);
+    };
+    match oauth::parse_userinfo(&v) {
+        (_, _, Some(phone)) => {
+            account.phone = Some(phone);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// 绑定凭证池时先整池同步一轮再让调用方去读账号。
 ///
 /// ⚠️ **必须在 `load_accounts` 之前调用**：它会把云端那一份并进 `accounts.json`，
@@ -521,6 +552,28 @@ fn checkin_credit_readings(
         .collect()
 }
 
+/// 本次签到带回的**发放凭据到期时刻** → `(账号 id, 包键, 到期毫秒)`。
+///
+/// 签到为什么能拿到它：领取接口的响应里就有这一笔积分自己的 `expiresAt`，
+/// 而且**已领取时靠幂等回放同样能拿到**（见 `qoder_api::ClaimReceipt`、
+/// `checkin::do_checkin` 的 `Plan::Done` 分支）。它是「积分过期」列对**免费号**
+/// 唯一的日期来源 —— `/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵。
+///
+/// 与 [`checkin_credit_readings`] 同一套「只认本次签到过的账号」规则：`last` 里那条
+/// 记录属于某次具体签到，拿别的账号（或很旧）的 `last` 去写台账同样是「用旧记录覆盖新读数」。
+fn checkin_grant_expiries(accounts: &[Account], checked: &[String]) -> Vec<(String, String, i64)> {
+    accounts
+        .iter()
+        .filter(|a| checked.iter().any(|id| id == &a.id))
+        .filter_map(|a| {
+            let ms = a.last.as_ref()?.expires_at?;
+            // 落在「附加额度」那一栏：签到领的 100 Credits 在 usage 响应里就是那一格。
+            // 键取自 `usage`（唯一知道包结构的地方），不在这里写第二份字面量。
+            Some((a.id.clone(), crate::usage::KEY_ADDON.to_string(), ms))
+        })
+        .collect()
+}
+
 /// 把签到顺手读到的余额写进**积分台账**（唯一来源）。
 ///
 /// 单个签到与批量签到共用这一份 —— 否则「余额」又会多出一条各写各的路径，
@@ -534,13 +587,21 @@ fn checkin_credit_readings(
 /// 于是「10 点的余额」被盖上 9 点的时刻 —— 而积分简报的余额列只认「读数时刻
 /// 与被固化小时同小时」的读数，那一刻钟的余额就错了）。
 ///
-/// 签到这条路径没有逐包明细，所以只更新读数：不产生小时桶、也不碰最早过期时间
-/// （它不知道包的过期时间，顺手清掉只会让接管路由的排序依据丢一次）。
+/// 写两样东西，都是签到这条路径独有的产物：
+/// - **余额读数**（`apply_credits`）：只更新读数，不产生小时桶；
+/// - **发放凭据的到期时刻**（`note_grant_expiries`）：落在「附加额度」包上，
+///   并让 `earliest_expiry_ms` 把这份也算进去（接管路由按那个排序）。
+///   口径是「接口那份与凭据那份**取更早者**」，所以采样报的那份不会被弄丢；
+///   一个包都没有时不写，也不会凭空造出一个最早到期时间。
 fn record_checkin_credits(dir: &Path, accounts: &[Account], checked: &[String]) {
     let readings = checkin_credit_readings(accounts, checked);
     if !readings.is_empty() {
         // 落盘失败不影响签到结果：下一次任意拉取都会再写一遍
         let _ = ledger::store(dir).apply_credits(&readings);
+    }
+    let grants = checkin_grant_expiries(accounts, checked);
+    if !grants.is_empty() {
+        let _ = ledger::store(dir).note_grant_expiries(&grants);
     }
 }
 
@@ -615,6 +676,10 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
         }
         // 凭证临期的先续签，避免拿着过期 token 把「没积分」误判成「查不到」。
         let _ = ensure_fresh_token(&mut accounts[i]).await;
+        // 顺手给老账号补手机号（只在为空时打一下，见 [`fill_phone_if_missing`]）。
+        // 放在这里而不是签到路径：刷新本来就是「把该对齐的都对齐」的那一次，
+        // 而签到要多打一个请求、又不一定会被点到。
+        let _ = fill_phone_if_missing(&mut accounts[i]).await;
         // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账
         let view = checkin::fetch_resource_view(accounts[i].region, &accounts[i].token).await;
         readings.push(ledger::Reading {
@@ -1580,6 +1645,7 @@ mod tests {
                 credit: Some(100.0),
                 balance,
                 campaign_key: Some("act-20260918-899".into()),
+                expires_at: None,
                 at: at.into(),
             }),
             checked_today: None,
@@ -1624,5 +1690,29 @@ mod tests {
         ];
         let all: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
         assert!(checkin_credit_readings(&accounts, &all).is_empty());
+    }
+
+    /// 签到带回来的**发放凭据到期时刻**：只挑本次签到过的账号，且只挑真有那个值的。
+    ///
+    /// 与上面那个函数同一套「只认本次签到」的规则 —— 拿没签到账号的旧记录去写台账，
+    /// 等于把**上一笔**积分的到期时间当成这一笔记进去（而它只认更晚的值，
+    /// 于是那一笔永远不会被纠正）。
+    #[test]
+    fn checkin_grant_expiries_only_take_this_rounds_receipts() {
+        const MS: i64 = 1_792_384_855_460; // 2026-10-19T04:40:55.460Z（实测凭据）
+        let mut signed = acct_with_last("a1", "2026-09-19 13:16:49", Some(400.0));
+        signed.last.as_mut().unwrap().expires_at = Some(MS);
+        // 签到过，但这条记录没带回凭据（老响应 / 回放失败）→ 不写，也不编一个日期
+        let no_receipt = acct_with_last("a2", "2026-09-19 13:16:50", Some(100.0));
+        // 这一次没签到：它的 `last` 属于上一轮
+        let mut stale = acct_with_last("a3", "2026-09-18 09:00:00", Some(300.0));
+        stale.last.as_mut().unwrap().expires_at = Some(1_700_000_000_000);
+        let accounts = vec![signed, no_receipt, stale];
+
+        assert_eq!(
+            checkin_grant_expiries(&accounts, &["a1".to_string(), "a2".to_string()]),
+            vec![("a1".to_string(), crate::usage::KEY_ADDON.to_string(), MS)]
+        );
+        assert!(checkin_grant_expiries(&accounts, &[]).is_empty());
     }
 }

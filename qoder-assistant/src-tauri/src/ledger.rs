@@ -181,15 +181,37 @@ pub struct PkgEntry {
     /// 本包剩余积分；展示口径，latest-wins 覆盖，不取 max
     #[serde(default)]
     pub remaining: f64,
+    /// **发放凭据**给的到期时刻（毫秒）—— 与 `expiry_ms` 是两个来源，见 [`PkgEntry::expiry`]。
+    ///
+    /// `expiry_ms` 是「接口在额度概览里声明的到期」（`qoderUsage.expiresAt`，**整个账号
+    /// 只有一个值**，免费号还是「无期限」哨兵）；这个是「这一笔发放自己的到期」
+    /// （签到接口发放凭据里的 `expiresAt`，见 `qoder_api::ClaimReceipt`）。
+    ///
+    /// ⚠️ **它不被采样覆盖**：`expiry_ms` / `never_expires` 是 latest-wins 的展示字段，
+    /// 而这份值一旦由凭据写入就比采样那份更具体 —— 跟着采样一起被覆盖，
+    /// 就等于每次刷新都把「2026-10-19 到期」重新抹回「无期限」。
+    #[serde(default)]
+    pub grant_expiry_ms: Option<i64>,
 }
 
 impl PkgEntry {
     /// 到期口径：`(到期时刻, 是否永不过期)`。
     ///
-    /// 存在的理由是**旧台账**：哨兵值曾经被当普通时间戳存进来过（那正是界面上
+    /// 三个来源按「具体程度」排序，**先看发放凭据**：
+    /// 1. `grant_expiry_ms` —— 这一笔发放自己的到期（签到接口给的，免费号也有）；
+    /// 2. `never_expires` —— 服务端明说这一包不过期；
+    /// 3. `expiry_ms` —— 额度概览声明的到期（免费号那份是「无期限」哨兵，归一成未知）。
+    ///
+    /// 存在的理由之一仍是**旧台账**：哨兵值曾经被当普通时间戳存进来过（那正是界面上
     /// 「9999-12-31」的来源）。归一放在读取侧，旧文件就不必等下一次采样才显示对，
     /// 也不必为了一个显示字段升 schema 丢掉小时桶。
     fn expiry(&self) -> (Option<i64>, bool) {
+        // 凭据说的是「这一笔」，比概览那份笼统的到期更具体，所以优先。
+        // 它一旦给了有效信息（真实日期，或它自己明说不过期），就不再往下看。
+        let grant = normalize_expiry(self.grant_expiry_ms);
+        if grant.0.is_some() || grant.1 {
+            return grant;
+        }
         if self.never_expires {
             return (None, true);
         }
@@ -319,6 +341,10 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
                         expiry_ms: v.expiry_ms,
                         never_expires: v.never_expires,
                         remaining: v.remaining,
+                        // 采样进来的包天然没有发放凭据；凭据由签到路径单独写
+                        // （`note_grant_expiry`）。**注意下面 `Some(e)` 那条分支也不碰它** ——
+                        // 采样只改展示字段，凭据那份更具体的值必须活过每一次采样。
+                        grant_expiry_ms: None,
                     },
                 );
             }
@@ -362,8 +388,9 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
 
 /// 只记「剩余积分」读数 —— 给**没有逐包明细**的那条路径用（签到：只查一次汇总值）。
 ///
-/// 它刻意**不碰** `earliest_expiry_ms`：签到这条路径根本不知道包的过期时间，
-/// 顺手清掉它会让接管路由的排序依据丢一次。
+/// 它刻意**不碰** `earliest_expiry_ms`：这个函数只知道一个余额数字，不知道任何到期时间，
+/// 顺手清掉它会让接管路由的排序依据丢一次。签到确实能拿到一笔到期时间（发放凭据），
+/// 但那是**另一个**写点、另一个字段（[`note_grant_expiry`]）—— 两件事不混在一起。
 ///
 /// `credits` 为 `None`（这一轮没读到）时**整段不动**：读不到 ≠ 余额变成 0，
 /// 保留上一次读数比抹成一个假的 0 有用得多。
@@ -375,6 +402,54 @@ pub fn record_credits(led: &mut AcctLedger, credits: Option<f64>, at: &str) {
     led.credits_at = at.to_string();
 }
 
+/// 记下一次**发放凭据**给出的到期时刻（签到那条路径的产物，见 `qoder_api::ClaimReceipt`）。
+///
+/// 与 [`observe`] 的分工：`observe` 记的是「接口在额度概览里声明的到期」（每次采样都刷新），
+/// 这里记的是「这一笔发放自己的到期」—— **只有新的凭据能改写它**。两者分开存，
+/// 正是为了让采样（每小时跑）不会把凭据那份更具体的值冲掉。
+///
+/// 两个刻意的选择：
+/// - **只认更晚的值**：同一笔反复回放拿到的是同一个值（幂等），而下一笔必然是 30 天之后
+///   ——取较晚者既保住单调，也避免一次异常读数把到期时间提前到过去。代价是
+///   「活动把有效期改成 7 天」要等下一次发放才体现（那时它已是新的一笔，仍是较晚的那个）。
+/// - **让 `earliest_expiry_ms` 把这份凭据也算进去**（[`absorb_grant_earliest`]）：
+///   接管路由按它排序（「积分最早过期优先」），不并的话，这份新的到期时间在路由眼里
+///   根本不存在 —— 它只认 `record_view` 写过的那份。
+pub fn note_grant_expiry(led: &mut AcctLedger, pkg_key: &str, expiry_ms: i64) {
+    // 凭据里的哨兵（真出现的话）表示「这一笔没有期限」，归一后没有真实时刻 → 不记，
+    // 也**不能**把它降级成「不过期」：那会把包上原有的真实到期抹掉。
+    let Some(ms) = normalize_expiry(Some(expiry_ms)).0 else {
+        return;
+    };
+    let entry = led.pkgs.entry(pkg_key.to_string()).or_default();
+    if entry.grant_expiry_ms.map_or(true, |old| ms > old) {
+        entry.grant_expiry_ms = Some(ms);
+    }
+    absorb_grant_earliest(led);
+}
+
+/// 台账里「**发放凭据**给出的最早到期时刻」—— 只看还有余量的包。
+fn grant_earliest(led: &AcctLedger) -> Option<i64> {
+    led.pkgs
+        .values()
+        .filter(|p| p.remaining > 0.0)
+        .filter_map(|p| normalize_expiry(p.grant_expiry_ms).0)
+        .min()
+}
+
+/// 把「凭据给的到期」并进 `earliest_expiry_ms`（**只收更早的那个**）。
+///
+/// 为什么是「取更早」而不是「按台账里的包整份重算」：`earliest_expiry_ms` 的另一半来源是
+/// 接口（`record_view` 写的 `usage.earliest_expiry_ms`），而那份包含「服务端本轮返回的包」；
+/// 台账里却可能还留着**已经不再返回**的包（条目刻意不删，免得合计倒退）。
+/// 整份重算会把这些幽灵包算进来，让接管路由按一个早就不再发放的包排序。
+/// 取更早者则两头都保住：接口说的算、凭据说的也算，谁更早听谁的。
+fn absorb_grant_earliest(led: &mut AcctLedger) {
+    if let Some(g) = grant_earliest(led) {
+        led.earliest_expiry_ms = Some(led.earliest_expiry_ms.map_or(g, |cur| cur.min(g)));
+    }
+}
+
 /// 记录一次**完整**读数（余额 + 最早过期时间）。有逐包明细的路径走 [`observe`]，
 /// 它内部调用的就是这个 —— 两者是同一组字段的唯二写入点。
 fn record_view(led: &mut AcctLedger, credits: Option<f64>, expiry_ms: Option<i64>, at: &str) {
@@ -384,6 +459,10 @@ fn record_view(led: &mut AcctLedger, credits: Option<f64>, expiry_ms: Option<i64
     led.credits = credits;
     // 余额为零/未知时这里就是 None：路由该把它当「没存量」，而不是留着上一次的过期时间。
     led.earliest_expiry_ms = expiry_ms;
+    // 接口那份写完之后，**再把发放凭据那份并进来**：否则每一轮采样都会把
+    // 「签到积分 2026-10-19 到期」这句话抹掉，免费号就是这么丢的（它的接口那份恒为
+    // 「无期限」）。两处写入点最终都收口到 [`absorb_grant_earliest`]，口径只有一份。
+    absorb_grant_earliest(led);
     led.credits_at = at.to_string();
 }
 
@@ -706,6 +785,18 @@ impl Store {
         })
     }
 
+    /// 记下一批**发放凭据**的到期时刻（签到那条路径的产物，见 [`note_grant_expiry`]）。
+    ///
+    /// 每项是 `(账号 id, 包键, 到期毫秒)`。包键由调用方给：台账不认识「有哪些包」，
+    /// 只按键记账 —— 签到那笔落在「附加额度」那一栏（键是 `usage::KEY_ADDON`）。
+    pub fn note_grant_expiries(&self, items: &[(String, String, i64)]) -> std::io::Result<()> {
+        self.update(|led| {
+            for (id, key, ms) in items {
+                note_grant_expiry(led.accts.entry(id.clone()).or_default(), key, *ms);
+            }
+        })
+    }
+
     /// 某个账号的积分事实（只投影一条，不把整本台账搬出来）
     pub fn fact_of(&self, id: &str) -> Option<CreditFact> {
         self.read(|led| fact(led, id))
@@ -788,6 +879,87 @@ type ChangeHook = Box<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发放凭据给的到期时间落在附加额度包上，且**不被采样覆盖** ——
+    /// 这正是「免费号的『积分过期』列能显示真实日期」的全部机制。
+    ///
+    /// 免费号的用法响应里附加额度没有到期字段（概览那句「无期限」是哨兵、且只对计划额度
+    /// 成立），所以采样永远学不到这个日期；它只可能来自签到那一下的发放凭据。
+    #[test]
+    fn a_grant_receipt_supplies_the_expiry_that_sampling_never_learns() {
+        const EXPIRES: i64 = 1_792_384_855_460; // 2026-10-19T04:40:55.460Z（实测凭据）
+        let mut led = Ledger::default();
+        let mut addon = pkg("qoder:addon", 100.0, 0.0, "");
+        addon.remaining = 100.0;
+
+        // 第一次采样：有 100 分，但没有到期时间 → 「未知」
+        observe(
+            led.accts.entry("a1".into()).or_default(),
+            std::slice::from_ref(&addon),
+            Some(100.0),
+            None,
+            "2026-09-19 13:16:49",
+            Mode::Normal,
+        );
+        assert_eq!(fact(&led, "a1").unwrap().earliest_expiry_ms, None);
+
+        // 签到拿回发放凭据：这笔积分 30 天后到期
+        note_grant_expiry(led.accts.get_mut("a1").unwrap(), "qoder:addon", EXPIRES);
+        let f = fact(&led, "a1").unwrap();
+        assert_eq!(f.packages[0].expiry_ms, Some(EXPIRES), "凭据的日期要进展示");
+        assert!(!f.packages[0].never_expires, "有真实到期就该报日期");
+        assert_eq!(f.earliest_expiry_ms, Some(EXPIRES), "路由排序依据也要跟着更新");
+
+        // 下一轮采样（同一份 usage 响应）—— **凭据那份值不能被抹掉**
+        observe(
+            led.accts.get_mut("a1").unwrap(),
+            std::slice::from_ref(&addon),
+            Some(100.0),
+            None,
+            "2026-09-19 14:16:49",
+            Mode::Normal,
+        );
+        let f = fact(&led, "a1").unwrap();
+        assert_eq!(f.packages[0].expiry_ms, Some(EXPIRES), "采样只改展示字段，不能清掉凭据");
+        assert_eq!(f.earliest_expiry_ms, Some(EXPIRES));
+        assert_eq!(
+            led.accts["a1"].pkgs["qoder:addon"].expiry_ms,
+            None,
+            "采样字段本身保持原样（None），凭据是**另一个**字段"
+        );
+    }
+
+    /// 凭据只认更晚的到期时间，且凭据里的哨兵不该把包降级或抹掉已有日期。
+    ///
+    /// 「只认更晚」的理由：同一笔反复回放给同一个值（幂等），下一笔必然更晚；
+    /// 一次异常的小值会把到期时间提前到过去，那比不更新更糟。
+    #[test]
+    fn a_grant_receipt_only_moves_the_deadline_forward() {
+        const LATER: i64 = 1_793_000_000_000;
+        let mut led = Ledger::default();
+        let a = led.accts.entry("a1".into()).or_default();
+        a.pkgs.insert(
+            "qoder:addon".into(),
+            PkgEntry {
+                remaining: 100.0,
+                never_expires: true,
+                ..Default::default()
+            },
+        );
+        note_grant_expiry(a, "qoder:addon", LATER);
+        // 更早的一次（异常读数）不生效
+        note_grant_expiry(a, "qoder:addon", 1_700_000_000_000);
+        assert_eq!(a.pkgs["qoder:addon"].grant_expiry_ms, Some(LATER));
+        // 凭据说「不过期」：不写进这个字段，也不该把已有的真实日期抹掉
+        note_grant_expiry(a, "qoder:addon", NEVER_EXPIRES_MS);
+        assert_eq!(a.pkgs["qoder:addon"].grant_expiry_ms, Some(LATER));
+        assert_eq!(
+            a.pkgs["qoder:addon"].expiry(),
+            (Some(LATER), false),
+            "凭据的日期优先于包上那句「不过期」"
+        );
+        assert_eq!(a.earliest_expiry_ms, Some(LATER));
+    }
 
     fn pkg(key: &str, size: f64, used: f64, cycle: &str) -> PkgView {
         PkgView {

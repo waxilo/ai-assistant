@@ -69,8 +69,11 @@ fn checked_from_status(status: &str) -> Option<bool> {
 enum Plan<'a> {
     /// 现在可领 → 领它
     Claim(&'a Campaign),
-    /// 今天已经领过
-    Done,
+    /// 今天已经领过。
+    ///
+    /// **仍带上那条活动**：它的领取接口是幂等的，回放一次能取回当初那张发放凭据
+    /// （`grantId` + `expiresAt`）—— 那笔积分的到期时间只有在那里有。
+    Done(&'a Campaign),
     /// 当前没有可领的活动（`String` 是给人看的原因）
     Inactive(String),
 }
@@ -88,7 +91,7 @@ fn plan(view: &CampaignView) -> Plan<'_> {
         return Plan::Claim(c);
     }
     match view.daily_claim() {
-        Some(c) if c.claim_status == "CLAIMED" => Plan::Done,
+        Some(c) if c.claim_status == "CLAIMED" => Plan::Done(c),
         Some(c) => Plan::Inactive(format!("今日活动暂不可领（claimStatus={}）", c.claim_status)),
         // 当日那条根本不在了：最常见的解释是还没到刷新点（10:00 UTC+8 生成，可领 24 小时）
         None => Plan::Inactive("当前没有可领取的活动（每日 10:00 UTC+8 刷新后才会出现）".into()),
@@ -115,35 +118,63 @@ pub async fn do_checkin(account: &Account) -> CheckinRecord {
         };
     };
     match plan(&view) {
-        Plan::Done => CheckinRecord {
-            success: true,
-            already: true,
-            message: "今日已领取".into(),
-            ..blank(&at)
-        },
+        Plan::Claim(c) => claim(account, c, &at).await,
+        Plan::Done(c) => {
+            // 今天已领 —— **回放一次领取**，唯一目的是取回发放凭据里的到期时间。
+            //
+            // 为什么值得多打这一下：活动接口只声明「领取后 30 天有效」这条**规则**，
+            // 不告诉你当初是哪一天领的；而到期时间只在发放凭据（claim 响应）里。
+            // 少了它，「积分过期」列对免费号只能显示「不过期 / 未知」。
+            //
+            // 安全性依据（实测，2026-09-19）：对已领活动重打返回 `200` +
+            // `replayed: true`，`grantId` 与 `expiresAt` 与当初领取时逐字相同，
+            // **不产生重复发放**。所以它在这条路径上等价于一次只读查询，
+            // 且每天每账号至多发生一次（本函数由签到触发，而签到一天一次）。
+            //
+            // 失败一律不致命：拿不到到期时间只是少一个展示字段，不能把
+            // 「今天已领」这个既成事实报成失败。
+            let receipt = qoder_api::claim_campaign(account.region, &account.token, &c.id)
+                .await
+                .ok();
+            CheckinRecord {
+                success: true,
+                already: true,
+                message: "今日已领取".into(),
+                campaign_key: Some(c.key.clone()),
+                expires_at: receipt.and_then(|r| r.expires_at),
+                ..blank(&at)
+            }
+        }
         Plan::Inactive(why) => CheckinRecord {
             inactive: true,
             message: why,
             ..blank(&at)
         },
-        Plan::Claim(c) => claim(account, c, &at).await,
     }
 }
 
 /// 真正的那一下 `POST …/{campaignId}/claim`，外加一次余额补读。
+///
+/// 除了「领到了多少」，它还要把发放凭据里的 **`expiresAt`** 带回记录里去 ——
+/// 那是这**一笔**积分真正的到期时刻，也是「积分过期」列对免费号唯一能显示日期的来源。
 async fn claim(account: &Account, c: &Campaign, at: &str) -> CheckinRecord {
-    let amount = c.benefit.as_ref().map(|b| b.amount);
+    // 活动声明的数量（仅作兜底）：发放凭据里的 `benefit.amount` 是**实际发下来多少**，以它为准。
+    let declared = c.benefit.as_ref().map(|b| b.amount);
     let mut rec = match qoder_api::claim_campaign(account.region, &account.token, &c.id).await {
-        Ok(()) => CheckinRecord {
-            success: true,
-            message: match amount {
-                Some(a) => format!("已领取 {} Credits", trim_num(a)),
-                None => "已领取".to_string(),
-            },
-            credit: amount,
-            campaign_key: Some(c.key.clone()),
-            ..blank(at)
-        },
+        Ok(receipt) => {
+            let amount = receipt.amount.or(declared);
+            CheckinRecord {
+                success: true,
+                message: match amount {
+                    Some(a) => format!("已领取 {} Credits", trim_num(a)),
+                    None => "已领取".to_string(),
+                },
+                credit: amount,
+                campaign_key: Some(c.key.clone()),
+                expires_at: receipt.expires_at,
+                ..blank(at)
+            }
+        }
         Err(e) => {
             // 失败之后**复看一次状态**：409 常常意味着「另一个客户端刚把它领走了」，
             // 那一刻这条活动已经变成 CLAIMED。用事实判断「是不是已领」，
@@ -191,6 +222,7 @@ fn blank(at: &str) -> CheckinRecord {
         credit: None,
         balance: None,
         campaign_key: None,
+        expires_at: None,
         at: at.to_string(),
     }
 }
@@ -285,7 +317,12 @@ mod tests {
     #[test]
     fn plan_reports_already_claimed_as_done() {
         let v = view(vec![daily("c1", "act-1", "CLAIMED")]);
-        assert!(matches!(plan(&v), Plan::Done));
+        // 必须**带上那条活动**：签到要拿它回放一次领取，才能取回发放凭据里的到期时间。
+        // 少了这个字段，「已领」这条路径就再也拿不到到期时间了（免费号尤其明显）。
+        match plan(&v) {
+            Plan::Done(c) => assert_eq!(c.id, "c1"),
+            _ => panic!("已领的每日活动应当判成 Done"),
+        }
     }
 
     /// 回归：**「今天没有活动」不等于「已领」**。
@@ -302,7 +339,7 @@ mod tests {
         let only_details = view(vec![details("d1", "CLAIMED")]);
         match plan(&only_details) {
             Plan::Inactive(why) => assert!(why.contains("10:00"), "应把刷新点告诉用户：{why}"),
-            other => panic!("不该被当成已领：{}", matches!(other, Plan::Done)),
+            other => panic!("不该被当成已领：{}", matches!(other, Plan::Done(_))),
         }
 
         // 当日那条存在但状态既不是 CLAIMABLE 也不是 CLAIMED
@@ -380,5 +417,118 @@ mod tests {
             v.packages.len()
         );
         assert!(v.credits.is_some(), "应能解析出剩余积分");
+    }
+
+    /// 真实接口冒烟：**发放凭据**里的到期时间（`replayed` 那条路径）。
+    ///
+    /// ⚠️ 会发一次 `POST …/{campaignId}/claim`，但对象是**当天已领取**的那条活动 ——
+    /// 实测它返回 `200` + `replayed: true`，`grantId` / `expiresAt` 与当初领取时逐字相同，
+    /// **不产生重复发放**（这也是「回放可以当只读查询用」这条假设的唯一现场验证）。
+    /// 今天还没领时它**不代领**（那是签到的职责），只报告后跳过。
+    ///
+    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_grant_receipt`
+    #[tokio::test]
+    #[ignore = "真实网络调用，需本机已登录 Qoder；会发一次幂等 claim 回放"]
+    async fn smoke_real_grant_receipt() {
+        let list = crate::auth_file::discover_local_accounts().accounts;
+        let a = list.first().expect("本机应存在 Qoder 登录信息");
+        let v = qoder_api::fetch_campaigns(a.region, &a.token)
+            .await
+            .expect("活动接口应可用");
+        let Some(c) = v.daily_claim() else {
+            println!("当天没有每日活动，跳过");
+            return;
+        };
+        if c.claim_status != "CLAIMED" {
+            println!(
+                "今天还没领（claimStatus={}），本冒烟只验证回放，跳过",
+                c.claim_status
+            );
+            return;
+        }
+        let r = qoder_api::claim_campaign(a.region, &a.token, &c.id)
+            .await
+            .expect("已领的活动应当能回放");
+        println!(
+            "replayed={} status={} grant={} amount={:?}",
+            r.replayed, r.status, r.grant_id, r.amount
+        );
+        println!("claimedAt={:?} expiresAt(ms)={:?}", r.claimed_at, r.expires_at);
+        assert!(r.replayed, "对已领活动重打应当是回放，不是新发放");
+        let exp = r
+            .expires_at
+            .expect("回放响应必须带 expiresAt —— 这正是本次改造要取的那个数");
+        assert!(
+            exp > crate::timeutil::now_ms(),
+            "到期时间必须在未来：{exp}"
+        );
+    }
+
+    /// 真实链路冒烟：**免费号的「积分过期」列终于有日期**。
+    ///
+    /// 走完整的那条链，一步不省：真实 usage 采样（免费号那份里根本没有到期时间）→
+    /// 真实发放凭据 → 台账（`observe` + `note_grant_expiry`）→ 投影给界面的
+    /// `CreditFact`。断言最后那一份里，附加额度包带着凭据给的日期，
+    /// 而不是改造前的「不过期」或「未知」。
+    ///
+    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_free_account_expiry`
+    #[tokio::test]
+    #[ignore = "真实网络调用，需本机已登录 Qoder；会发一次幂等 claim 回放"]
+    async fn smoke_real_free_account_expiry_lands_in_the_ledger() {
+        use crate::ledger;
+        let list = crate::auth_file::discover_local_accounts().accounts;
+        let a = list.first().expect("本机应存在 Qoder 登录信息");
+
+        // 1) 采样：免费号这一步拿不到任何真实到期时间
+        let view = fetch_resource_view(a.region, &a.token).await;
+        let mut led = ledger::Ledger::default();
+        ledger::observe(
+            led.accts.entry("smoke".into()).or_default(),
+            &view.packages,
+            view.credits,
+            view.earliest_expiry_ms,
+            "2026-09-19 13:16:49",
+            ledger::Mode::Baseline,
+        );
+        println!("采样后 earliest={:?}", led.accts["smoke"].earliest_expiry_ms);
+
+        // 2) 发放凭据：这一笔积分自己的到期时间
+        let campaigns = qoder_api::fetch_campaigns(a.region, &a.token)
+            .await
+            .expect("活动接口应可用");
+        let c = campaigns.daily_claim().expect("当天应有每日活动");
+        if c.claim_status != "CLAIMED" {
+            println!("今天还没领（claimStatus={}），跳过", c.claim_status);
+            return;
+        }
+        let receipt = qoder_api::claim_campaign(a.region, &a.token, &c.id)
+            .await
+            .expect("已领的活动应当能回放");
+        let exp = receipt.expires_at.expect("回放必须带 expiresAt");
+        ledger::note_grant_expiry(
+            led.accts.get_mut("smoke").unwrap(),
+            crate::usage::KEY_ADDON,
+            exp,
+        );
+
+        // 3) 投影给界面的那一份
+        let f = ledger::fact(&led, "smoke").expect("采到过读数就该有投影");
+        for p in &f.packages {
+            println!(
+                "包：{} remaining={} expiry={:?} never={}",
+                p.name, p.remaining, p.expiry_ms, p.never_expires
+            );
+        }
+        assert!(
+            f.packages
+                .iter()
+                .any(|p| p.expiry_ms == Some(exp) && !p.never_expires),
+            "附加额度包应当带上凭据给的日期（这一条正是改造前缺的那个数）"
+        );
+        assert_eq!(
+            f.earliest_expiry_ms,
+            Some(exp),
+            "接管路由排序用的最早到期也要把它算进去"
+        );
     }
 }

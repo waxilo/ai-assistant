@@ -199,6 +199,7 @@ mod tests {
             credit: None,
             balance: None,
             campaign_key: None,
+            expires_at: None,
             at: String::new(),
         }
     }

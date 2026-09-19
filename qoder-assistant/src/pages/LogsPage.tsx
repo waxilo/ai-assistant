@@ -6,6 +6,7 @@ import {
   EmptyState,
   StatusDot,
   accountLabel,
+  expiryInfo,
   formatCredits,
   logStatus,
 } from "../common";
@@ -147,6 +148,15 @@ export function LogsPage({
                     </td>
                     <td className="num log-credit">
                       {l.credit != null ? "+" + formatCredits(l.credit) : "—"}
+                      {/* 这笔积分**自己的**到期时刻（来自发放凭据）。免费号的「积分过期」
+                          只有这一条来源（额度接口对它给的是「无期限」哨兵），所以放在这里
+                          而不是只留在资源包弹窗里。挂在额度下面、不新开一列：理由同上面
+                          那个活动键 —— 日志已经六列，再加就是静默截断。 */}
+                      {l.expires_at != null && (
+                        <span className="log-key mono" title="这笔积分的到期时间">
+                          至 {expiryInfo(l.expires_at).text}
+                        </span>
+                      )}
                     </td>
                     <td className="num log-balance col-secondary">
                       {l.balance != null ? formatCredits(l.balance) : "—"}

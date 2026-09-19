@@ -29,6 +29,10 @@ pub struct CheckinLog {
     /// 领的是哪一场活动（`campaignKey`）
     #[serde(default)]
     pub campaign_key: Option<String>,
+    /// 这笔积分的到期时刻（毫秒）；见 [`CheckinRecord::expires_at`]。
+    /// 老日志没有这个键（默认 `None`），读取侧按「未知」展示。
+    #[serde(default)]
+    pub expires_at: Option<i64>,
 }
 
 /// 最多保留的日志条数，超出后丢弃最旧的，避免无限膨胀
@@ -95,5 +99,6 @@ pub fn log_from_record(account: &Account, rec: &CheckinRecord) -> CheckinLog {
         credit: rec.credit,
         balance: rec.balance,
         campaign_key: rec.campaign_key.clone(),
+        expires_at: rec.expires_at,
     }
 }

@@ -20,6 +20,14 @@ export interface CheckinRecord {
   balance: number | null;
   /** 领的是哪一场活动（`campaignKey`，形如 act-20260918-899） */
   campaign_key: string | null;
+  /**
+   * 这笔签到的积分**自己的到期时刻**（毫秒）；取不到为 `null`。
+   *
+   * 来自领取接口发放凭据里的 `expiresAt` —— 已领取的账号靠**幂等回放**同样能拿到，
+   * 所以「今日已领」不等于「拿不到到期时间」。它是「积分过期」列对免费号唯一的日期来源：
+   * `/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵（见 `ledger::note_grant_expiry`）。
+   */
+  expires_at: number | null;
   at: string;
 }
 
@@ -365,6 +373,8 @@ export interface CheckinLog {
   balance: number | null;
   /** 领的是哪一场活动（`campaignKey`） */
   campaign_key: string | null;
+  /** 这笔积分的到期时刻（毫秒）；见 [`CheckinRecord.expires_at`] */
+  expires_at: number | null;
 }
 
 /** 「网络急救」里的一个可疑点 */

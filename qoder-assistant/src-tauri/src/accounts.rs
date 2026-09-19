@@ -37,6 +37,17 @@ pub struct CheckinRecord {
     /// 每天换一个，所以它同时是「这是哪一天的签到」的可核对凭据。
     #[serde(default)]
     pub campaign_key: Option<String>,
+    /// **这笔积分的真实到期时刻**（毫秒）。
+    ///
+    /// 来源是领取接口发放凭据里的 `expiresAt`（见 `qoder_api::ClaimReceipt`）——
+    /// 它比 `/sash/api/v2/me/usage` 的 `expiresAt` 更细：后者说的是**整个额度概览**的到期
+    /// （计划周期终点；免费号还是「无期限」哨兵），而这里是签到领到的**这一笔**。
+    ///
+    /// ⚠️ 已领的账号靠**幂等回放**同样能拿到（响应 `replayed: true`，见
+    /// `qoder_api::claim_campaign`），所以「今日已领」不再等于「拿不到到期时间」。
+    /// 真的取不到（老响应、网络失败）才是 `None` —— 界面据此显示「—」。
+    #[serde(default)]
+    pub expires_at: Option<i64>,
     pub at: String,
 }
 

@@ -56,6 +56,19 @@
 //!
 //! 归一化规则见 [`parse_view`]：**有逐包数组就用逐包，否则把两个槽位当两个包**。
 //!
+//! # ④ 两个槽位的到期口径**不一样**（2026-09-19 更正）
+//!
+//! `expiresAt` 是**整个额度概览**的到期（= 计划周期终点），它与 `userQuota` /
+//! `addOnQuota` 同级，旧代码因此把它同时当成两个槽位的到期。对计划额度这是对的；
+//! 对附加额度是**推断过头** —— 响应里附加额度根本没有自己的到期字段，而那句「不过期」
+//! （免费号上的哨兵）说的是**计划没有期限**。可签到赠送的那 100 Credits，官方自己
+//! 明确「领取后 30 天有效」（`benefit.validity = RELATIVE_DAYS/30`）。
+//!
+//! 于是现在的口径是：计划额度沿用 `expiresAt`；附加额度的 `never_expires` 恒 `false`，
+//! 真实到期由**发放凭据**（`POST …/{campaignId}/claim` 响应里的 `expiresAt`）补上，
+//! 见 [`crate::ledger::note_grant_expiry`]。凭据到位前如实显示「未知」——
+//! 那比「不过期」正确，因为后者会让人以为这批积分永远不会作废。
+//!
 //! # 与台账（`ledger`）的契约
 //!
 //! [`PkgView`] 的 `used` 必须是**周期内累计量**（台账靠「周期变了且 used 回退」判定翻周期），
@@ -82,8 +95,12 @@ const USAGE_PATH: &str = "/sash/api/v2/me/usage";
 /// **不能用「看起来更像名字」的字段当键**：个人版响应里两个槽位都没有 id，
 /// 而键必须跨采样稳定（台账按它认包），所以只能用语义槽位来当键。
 const KEY_PLAN: &str = "qoder:plan";
-/// 附加额度槽位的稳定键（同上）
-const KEY_ADDON: &str = "qoder:addon";
+/// 附加额度槽位的稳定键（同上）。
+///
+/// 公开给 crate 内：签到路径拿到**发放凭据**后，要把那笔积分的真实到期时间记到这个包上
+/// （`ledger::note_grant_expiry`），而「签到的 100 Credits 落在哪一格」这件事
+/// 只有本模块知道 —— 由调用方另写一份字面量，迟早会有一处写错。
+pub const KEY_ADDON: &str = "qoder:addon";
 
 /// 响应可能被包一层甚至两层的容器键，自顶向下按此顺序下钻。
 ///
@@ -216,8 +233,19 @@ fn packages_from_slots(usage: &Value) -> Vec<PkgView> {
             size: s.total,
             used: s.used,
             cycle_start: cycle,
+            // 到期时间先按概览给一个近似值（同一账号的额度周期），拿到发放凭据后
+            // 会被凭据里那份更具体的盖掉（见 `ledger::PkgEntry::expiry`）。
             expiry_ms: period_end,
-            never_expires,
+            // ⚠️ 「不过期」这句话**只对计划额度成立**：它来自概览的 `expiresAt`，
+            // 而那个值说的就是计划的周期终点。附加额度在响应里**没有自己的到期字段**，
+            // 照抄这句是**推断过头** —— 免费号上它是哨兵（「计划没有期限」），
+            // 而签到赠送的那 100 Credits 官方明确「领取后 30 天有效」
+            //（`benefit.validity = RELATIVE_DAYS/30`）。旧代码正是这么抄的，
+            // 于是界面对免费号显示「不过期」，比「未知」更错。
+            //
+            // 所以这里恒 `false`：真实到期等发放凭据补（`ledger::note_grant_expiry`），
+            // 补上之前如实显示「未知」。
+            never_expires: key == KEY_PLAN && never_expires,
             remaining: s.remaining,
         });
     }
@@ -394,9 +422,16 @@ mod tests {
       }
     }"#;
 
-    /// 免费号：只有加油包，到期时间是「永不过期」哨兵。三件事必须同时成立，
-    /// 缺一条界面就会又显示成 9999-12-31：① 空槽位不产出包；② 哨兵不进 `expiry_ms`；
-    /// ③ `earliest_expiry_ms` 不拿它当日期（否则接管会把它排成一千年后的「大限」）。
+    /// 免费号：只有加油包，`expiresAt` 是「永不过期」哨兵。四件事必须同时成立，
+    /// 缺一条界面就会说错话：① 空槽位不产出包；② 哨兵不进 `expiry_ms`；
+    /// ③ 那句「不过期」**只对计划额度成立**，附加额度不能跟着说 —— 它说的是
+    /// 「计划没有期限」，而签到赠送的 100 Credits 官方明确「领取后 30 天有效」；
+    /// ④ `earliest_expiry_ms` 不拿它当日期（否则接管会把它排成一千年后的「大限」）。
+    ///
+    /// 2026-09-19 更正第 ③ 条：旧版把附加额度也标成 `never_expires = true`，
+    /// 于是界面对免费号显示「不过期」。那比「未知」更错 —— 它会让人以为这批积分
+    /// 永远不会作废，而真实到期（实测 2026-10-19）由发放凭据补上，见
+    /// `ledger::note_grant_expiry`。
     #[test]
     fn a_free_account_reports_never_expires_instead_of_a_year_9999_date() {
         let v = parse(PERSONAL_FREE_NEVER_EXPIRES).expect("免费号也必须能解析出额度");
@@ -406,9 +441,32 @@ mod tests {
         let addon = &v.packages[0];
         assert_eq!(addon.key, KEY_ADDON);
         assert_eq!(addon.expiry_ms, None, "哨兵绝不能落进 expiry_ms");
-        assert!(addon.never_expires, "「不过期」必须被显式记下来");
+        assert!(
+            !addon.never_expires,
+            "「计划没有期限」≠「这笔赠送积分也不过期」：凭据到位前如实显示「未知」"
+        );
         assert_eq!(addon.cycle_start, "", "没有期限也就没有周期标识");
         assert_eq!(v.earliest_expiry_ms, None);
+    }
+
+    /// 「不过期」这条判定**没有**被上面那条测试顺手删掉：把哨兵放到一个真有额度的
+    /// 计划槽位上，它必须仍被显式记成 `never_expires`（否则界面会显示成 9999-12-31）。
+    ///
+    /// 少了这条，「把所有到期时间都吞成未知」那种改法也能让上一条测试变绿。
+    #[test]
+    fn the_never_expires_flag_survives_on_the_plan_slot_only() {
+        let free_plan = PERSONAL_REAL.replace(
+            "\"expiresAt\": 1790927528327",
+            "\"expiresAt\": 253402214400000",
+        );
+        assert_ne!(free_plan, PERSONAL_REAL, "替换必须真的生效，否则这条测试是空转的");
+        let v = parse(&free_plan).unwrap();
+        let plan = v.packages.iter().find(|p| p.key == KEY_PLAN).unwrap();
+        assert_eq!(plan.expiry_ms, None, "哨兵不进 expiry_ms");
+        assert!(plan.never_expires, "计划额度自己说不过期，这条要留着");
+        let addon = v.packages.iter().find(|p| p.key == KEY_ADDON).unwrap();
+        assert!(!addon.never_expires, "附加额度不跟着说不过期");
+        assert_eq!(v.earliest_expiry_ms, None, "两个包都没有真实到期日");
     }
 
     /// 反向断言：真日期不能被误判成「永不过期」。

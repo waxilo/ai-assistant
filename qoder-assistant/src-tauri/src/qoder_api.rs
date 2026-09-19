@@ -399,17 +399,86 @@ pub async fn fetch_campaigns(region: Region, token: &str) -> Option<CampaignView
     parse_campaigns(&get_json(region, token, CAMPAIGN_PATH, &[]).await?)
 }
 
+/// 一次领取的**发放凭据** —— `claim` 响应里与「这一笔积分」有关的那部分事实。
+///
+/// 它是「积分的有效期」在 Qoder 后端**唯一给到毫秒级日期**的地方：
+/// `/sash/api/v2/me/usage` 的 `expiresAt` 是**整个额度概览**的到期（计划周期终点，
+/// 免费号还是「无期限」哨兵），而这里的是**这一笔**积分的到期。
+///
+/// ```json
+/// { "grantId":"01a0b818-…","status":"CLAIMED","replayed":true,
+///   "benefit":{"kind":"CREDITS","amount":100,"validity":{"mode":"RELATIVE_DAYS","days":30}},
+///   "campaignId":"…","claimedAt":"2026-09-19T05:16:33.580914Z",
+///   "grantedAt":"2026-09-19T05:16:33.827758Z","expiresAt":"2026-10-19T05:16:33.580914Z" }
+/// ```
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimReceipt {
+    /// 发放记录 id（`grantId`）。同一笔反复回放都是同一个值 —— 界面不展示，
+    /// 但它是「两次响应说的是不是同一笔」的凭据，比时间戳可靠。
+    pub grant_id: String,
+    /// 服务端状态（成功即 `CLAIMED`）
+    pub status: String,
+    /// 这次是**回放**：这笔早领过了，响应只是把当初那张凭据又给了一遍（没有重复发放）。
+    pub replayed: bool,
+    /// 权益数量（`benefit.amount`）
+    pub amount: Option<f64>,
+    /// 这笔积分的**真实到期时刻**（毫秒）。源字段 `expiresAt` 是 ISO-8601 UTC 串
+    /// （`2026-10-19T05:16:33.580914Z`，微秒精度），经 `timeutil::norm_ts` 归一。
+    pub expires_at: Option<i64>,
+    /// 当初领取的时刻（`claimedAt`，ISO-8601 串原文）—— 展示用，不参与计算。
+    pub claimed_at: Option<String>,
+}
+
+/// 响应 → [`ClaimReceipt`]（纯函数）。
+///
+/// 只认必需的一件事：`status` 要在。其余字段缺失一律留空 ——
+/// 老版本响应没有 `grantId` / `expiresAt` 时，**不能**因此把整次领取判成失败
+/// （那会把「领到了但拿不到到期时间」误报成「没领到」）。
+pub fn parse_receipt(root: &Value) -> Option<ClaimReceipt> {
+    // 远端页也是这么解的：优先看 `data` 里那层
+    let inner = root.get("data").filter(|d| d.is_object()).unwrap_or(root);
+    let status = str_of(inner, &["status"])?.to_string();
+    Some(ClaimReceipt {
+        grant_id: str_of(inner, &["grantId", "grant_id"])
+            .unwrap_or_default()
+            .to_string(),
+        status,
+        replayed: bool_of(inner, &["replayed"]).unwrap_or(false),
+        amount: inner
+            .get("benefit")
+            .and_then(|b| num_of(b, &["amount"]))
+            .or_else(|| num_of(inner, &["amount"])),
+        expires_at: crate::timeutil::norm_ts(inner.get("expiresAt")),
+        claimed_at: str_of(inner, &["claimedAt", "claimed_at"]).map(str::to_string),
+    })
+}
+
 /// 领取一条活动的权益 —— **本模块唯一的写操作**。
 ///
 /// 契约来自远端活动页 `activity-iframe.js`（见逆向文档第 4 节）：
-/// `POST {CAMPAIGN_PATH}/{campaignId}/claim`、**无请求体**，响应（可能包一层 `data`）
-/// 里 `status == "CLAIMED"` 才算成功。其余一切（409 已领/不可领、429 太频繁、非 JSON）
-/// 都原样把原因带回去 —— 这是唯一会改变账号权益的接口，宁可让调用方看到原因，
-/// 也不要在这里自动重试或凭错误码猜结论。
+/// `POST {CAMPAIGN_PATH}/{campaignId}/claim`、**无请求体**，响应里 `status == "CLAIMED"`
+/// 才算成功。其余一切（不可领、429 太频繁、非 JSON）都原样把原因带回去 ——
+/// 这是唯一会改变账号权益的接口，宁可让调用方看到原因，也不要在这里自动重试或凭错误码猜结论。
+///
+/// # ⚠️ 已领取时它**不会** 409，而是**幂等回放**
+///
+/// 2026-09-19 实测更正：对当天那条 `claimStatus: "CLAIMED"` 的每日活动重打，返回的是
+/// **`HTTP 200`** + `{"status":"CLAIMED","replayed":true, …}`，`grantId` 与 `expiresAt`
+/// 与当初领取时**逐字相同**（`claimedAt + 30 天`），**没有**重复发放。旧注释里
+/// 「已领的活动再打只会拿到 409」是错的 —— 它曾让本应用完全放弃这条路径。
+///
+/// 因此这个函数同时是「领取」与「**取回发放凭据**」两个用途的同一个入口：
+/// 想要那笔积分的到期时间，不必等到当天首次领取，靠回放也能拿到。
+/// 调用方仍应只在需要时打（见 `checkin::do_checkin`：每天每账号至多一次）。
 ///
 /// `region` 必须来自账号自己：领错区域的接口只会拿到 401/404，而**打卡本身就是写操作**，
 /// 打偏了没有「重试一次就好」的余地。
-pub async fn claim_campaign(region: Region, token: &str, campaign_id: &str) -> Result<(), String> {
+pub async fn claim_campaign(
+    region: Region,
+    token: &str,
+    campaign_id: &str,
+) -> Result<ClaimReceipt, String> {
     // 路径参数直接拼进 URL，所以只放行 UUID 的字符集。正常响应里它是 UUID，
     // 但「服务端给什么就拼什么」是路径穿越的经典入口（`../` 会被当成路径分隔符）。
     if campaign_id.is_empty()
@@ -435,13 +504,12 @@ pub async fn claim_campaign(region: Region, token: &str, campaign_id: &str) -> R
     if !status.is_success() {
         return Err(format!("HTTP {} {}", status.as_u16(), excerpt));
     }
-    let body: Value = serde_json::from_str(&text)
-        .map_err(|_| format!("响应不是 JSON：{excerpt}"))?;
-    // 远端页也是这么解的：优先看 `data` 里那层
-    let inner = body.get("data").filter(|d| d.is_object()).unwrap_or(&body);
-    match str_of(inner, &["status"]) {
-        Some("CLAIMED") => Ok(()),
-        other => Err(format!("领取未被确认（status={:?}）", other.unwrap_or(""))),
+    let body: Value =
+        serde_json::from_str(&text).map_err(|_| format!("响应不是 JSON：{excerpt}"))?;
+    match parse_receipt(&body) {
+        Some(r) if r.status == "CLAIMED" => Ok(r),
+        Some(r) => Err(format!("领取未被确认（status={}）", r.status)),
+        None => Err(format!("领取未被确认（响应里没有 status）：{excerpt}")),
     }
 }
 
@@ -510,6 +578,69 @@ mod tests {
 
     fn v(s: &str) -> Value {
         serde_json::from_str(s).expect("fixture 必须是合法 JSON")
+    }
+
+    /// **实测响应原文**（2026-09-19，国内版免费号 `personal_standard`，对当天那条
+    /// 已领的每日活动重打）。字段一字未改，**只有 id 尾部清零脱敏**
+    /// （`grantId` / `campaignId` 与真实账号绑定；`campaignKey` 是全体用户共用的活动标识，
+    /// 保持原样，与 `CAMPAIGNS_REAL` 同一口径）。
+    const CLAIM_REPLAY_REAL: &str = r#"{
+      "grantId": "01a0b7f7-0000-0000-0000-000000000000",
+      "status": "CLAIMED",
+      "replayed": true,
+      "benefit": {"kind":"CREDITS","amount":100,
+                  "modelScope":{"modelSeries":{"key":"ALL_MODELS"}},
+                  "validity":{"mode":"RELATIVE_DAYS","days":30}},
+      "campaignId": "01a0b4aa-fbd4-720f-87bc-7eb1c6c9ddb6",
+      "campaignKey": "act-20260918-628",
+      "campaignVersion": 1,
+      "claimedAt": "2026-09-19T04:40:55.460619Z",
+      "grantedAt": "2026-09-19T04:40:55.722022Z",
+      "expiresAt": "2026-10-19T04:40:55.460619Z"
+    }"#;
+
+    /// 回放响应里能拿到**这笔积分自己的到期时刻** —— 这正是免费号缺的那一个数
+    /// （`/sash/api/v2/me/usage` 对它只给「无期限」哨兵）。
+    #[test]
+    fn claim_receipt_reads_the_grant_expiry_from_a_replayed_response() {
+        let v: Value = serde_json::from_str(CLAIM_REPLAY_REAL).unwrap();
+        let r = parse_receipt(&v).expect("有 status 就该解析出来");
+        assert_eq!(r.status, "CLAIMED");
+        assert!(r.replayed);
+        assert_eq!(r.amount, Some(100.0));
+        assert_eq!(r.claimed_at.as_deref(), Some("2026-09-19T04:40:55.460619Z"));
+        // 2026-10-19T04:40:55.460619Z（比 claimedAt 整整晚 30 天，与 benefit.validity 一致）
+        assert_eq!(r.expires_at, Some(1_792_384_855_460));
+        assert_eq!(
+            r.grant_id,
+            "01a0b7f7-0000-0000-0000-000000000000",
+            "grantId 必须原样带出来（它是「是不是同一笔」的凭据）"
+        );
+    }
+
+    /// 幂等回放的响应里**没有** `replayed` 之外的新字段也不能崩；反过来，
+    /// 老版本响应（无 `grantId` / `expiresAt`）**依旧算成功** ——
+    /// 那只是「拿不到到期时间」，不是「没领到」。
+    #[test]
+    fn claim_receipt_tolerates_missing_grant_fields() {
+        let v: Value = serde_json::json!({"status": "CLAIMED"});
+        let r = parse_receipt(&v).expect("status 在就算解析成功");
+        assert_eq!(r.status, "CLAIMED");
+        assert!(!r.replayed);
+        assert!(r.grant_id.is_empty());
+        assert_eq!(r.expires_at, None);
+        assert_eq!(r.amount, None);
+
+        // 被 `data` 包一层（网关/Mock 会这么干）
+        let wrapped: Value = serde_json::json!({"code": 0, "data": {
+            "status": "CLAIMED", "replayed": true, "expiresAt": "2026-10-19T05:16:33.580914Z"
+        }});
+        let r = parse_receipt(&wrapped).expect("下钻 data 后要能解析");
+        assert!(r.replayed);
+        assert_eq!(r.expires_at, Some(1_792_386_993_580));
+
+        // 没有 status → 认不出来（调用方会把它报成「领取未被确认」，而不是当成成功）
+        assert!(parse_receipt(&serde_json::json!({"grantId": "g"})).is_none());
     }
 
     #[test]
