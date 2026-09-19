@@ -436,6 +436,22 @@ pub(crate) fn sample_plan(
     }
 }
 
+/// 简报的推送窗口：**跨零点的那一跳**（`hour == 0`，即用户口径里的「24 点」），
+/// 或应用刚起来时补一次。
+///
+/// 为什么是这一跳才推得完整：23 点的桶在 23:5x 就采过样，而 `seal_hours` 只固化
+/// 「比当前小时早」的桶 —— 昨天要到 `today` 翻页、`hour` 归 0 的这一跳才收口。
+///
+/// 为什么不能挂在「这一跳固化出了东西」上（旧写法）：夜里那一小时没动静就固化不出
+/// 任何条目，推送跟着被吃掉，简报于是拖到白天下一次有动静才冒出来 —— 用户看到的
+/// 推送时刻是随机的。
+///
+/// `at_startup` 兜住「整夜关着 ⇒ 根本没有零点那一跳」：开机补推一次。桌面端没有
+/// 守护进程，应用没运行时刻表本身就无从执行，这是唯一的补偿。
+fn briefing_push_due(at_startup: bool, hour: u8) -> bool {
+    at_startup || hour == 0
+}
+
 /// 积分简报：**每小时结算一次**（时条目），并按设置每天推一条当天汇总。
 ///
 /// 两件事，各自独立判定：
@@ -455,7 +471,8 @@ pub(crate) fn sample_plan(
 /// 那一块。恢复运行后的第一次采样会把这段空白期攒下的增量整块记进「恢复后的那个小时」
 /// —— 这是台账的既有口径（界面上的说明照实写了这一条），丢掉它会让总消耗少算。
 ///
-/// 推送只推**已经走完的那一天**：时条目每小时都在结算，但「今天花了多少」要等当天
+/// 推送只推**已经走完的那一天**，且时刻固定在**跨零点那一跳**（即「24 点」，判定见
+/// [`briefing_push_due`]）：时条目每小时都在结算，但「今天花了多少」要等当天
 /// 结束才有定论，每小时推一条只会把通知刷成流水账。
 fn maybe_seal_briefing(app: &AppHandle, dir: &Path, settings: &Settings, at_startup: bool) {
     if !settings.briefing_enabled {
@@ -500,14 +517,17 @@ fn maybe_seal_briefing(app: &AppHandle, dir: &Path, settings: &Settings, at_star
     }
 
     let sealed = commands::seal_hours(&data_dir, &accounts, &today, hour, &now_s);
-    if sealed.is_empty() {
+    if !sealed.is_empty() {
+        log_event(dir, &format!("积分简报：固化 {} 个小时条目", sealed.len()));
+        let _ = app.emit(
+            BRIEFING_EVENT,
+            serde_json::json!({ "hours": sealed.len() }),
+        );
+    }
+
+    if !briefing_push_due(at_startup, hour) {
         return;
     }
-    log_event(dir, &format!("积分简报：固化 {} 个小时条目", sealed.len()));
-    let _ = app.emit(
-        BRIEFING_EVENT,
-        serde_json::json!({ "hours": sealed.len() }),
-    );
 
     // 每天最多推一条，且只推最近一个**已经走完**的日子。
     // 先落盘推送日期再推：推送失败也不该让同一份简报反复重推。
@@ -617,8 +637,16 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use chrono::NaiveDate;
 
+    #[test]
+    fn briefing_push_is_due_at_midnight_and_on_startup_only() {
+        assert!(briefing_push_due(false, 0), "跨零点那一跳（24 点）推");
+        assert!(!briefing_push_due(false, 1), "过了零点就不再补推");
+        assert!(!briefing_push_due(false, 9), "白天不推（旧写法：有动静才顺带推，时刻随机）");
+        assert!(briefing_push_due(true, 9), "整夜没运行 ⇒ 开机补推一次");
+    }
     fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 9, 12)
             .unwrap()

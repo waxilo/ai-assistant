@@ -489,7 +489,7 @@ export function SettingsPage({
               <Row
                 bare
                 title="积分简报生成后推送"
-                desc="每天结束后推一条当天汇总（时条目每小时结算，但全天数字要等当天走完）。简报本身的开关在「积分简报」页。"
+                desc="每天 24:00（跨零点那一刻）推一条当天汇总；应用当时没在运行，会在下次启动时补推。简报本身的开关在「积分简报」页。"
                 ctrl={
                   <Toggle
                     checked={notifyReport}
