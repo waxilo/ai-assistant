@@ -1013,6 +1013,18 @@ fn reinstate(region: Region, dir: &std::path::Path, port: u16) {
     }
 }
 
+/// 关闭接管撞「写不回官方原样」时的报错。
+///
+/// 这里**必须**继续拒掉这次保存：注入还在、反代却停了，客户端的对话就全部连向一个
+/// 没人监听的端口 —— 比开关拨不动恶劣得多。但只报「权限不够」等于把用户关在门外，
+/// 所以顺手把那条能直接粘进终端的还原命令一起端出去（路径里带空格，已引好）。
+fn disable_blocked(region: Region, e: String) -> String {
+    match crate::patch::restore_hint(region) {
+        Some(hint) => format!("{e}\n执行之后回到本页再点一次「关闭接管」。\n{hint}"),
+        None => e,
+    }
+}
+
 pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Result<Settings, String> {
     let dir = data_dir(app);
     let old = accounts::load_settings(&dir);
@@ -1058,7 +1070,9 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
         }
         (true, false) => {
             // 摘掉注入即可 —— 不碰任何客户端进程，正在进行的对话不受影响
-            crate::stealth::uninstall(old_region, &dir)?;
+            if let Err(e) = crate::stealth::uninstall(old_region, &dir) {
+                return Err(disable_blocked(old_region, e));
+            }
             if let Err(e) = accounts::save_settings(&dir, &next) {
                 reinstate(old_region, &dir, old.proxy_port);
                 return Err(e.to_string());

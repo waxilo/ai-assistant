@@ -287,8 +287,14 @@ fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
 /// 条目，只是默认关着）。
 ///
 /// 授权能否"记得住"取决于**签名身份**：本应用用固定自签证书签名（`QoderAssistant
-/// Self-Signed`，见 `scripts/make-signing-cert.sh`），DR 锚在叶证书哈希上，重新构建
-/// 多少次都匹配；换成 ad-hoc 构建（DR 只剩 cdhash）则会每次重建失效。
+/// Self-Signed`，见 `scripts/make-signing-cert.sh`），DR 锚在叶证书哈希上。
+///
+/// ⚠️ 但「锚在证书上」只保证**新申请的授权**跨构建有效。tccd 里那条记录存的是
+/// **申请那一刻**的 requirement —— 如果那条是在还挂着 ad-hoc 签名（DR 只有 cdhash）
+/// 的时候建起来的，之后换成证书签名就再也匹配不上，实测日志：
+/// `Failed to match existing code requirement for subject … and service
+/// kTCCServiceSystemPolicyAppBundles`。此时开关怎么拨都没用，必须**先删掉旧条目再重新
+/// 添加**，让系统按当前的 DR 重建记录。所以话术里两条都要写，别只写「把开关打开」。
 fn authorize_hint() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
     authorize_hint_for(app_bundle_of(&exe).as_deref(), &exe)
@@ -307,7 +313,9 @@ fn authorize_hint_for(app: Option<&Path>, exe: &Path) -> String {
                 "去「系统设置 → 隐私与安全性 → App 管理」把「{name}」的开关打开（{}）。\
                  这个服务**不会弹授权框**（系统只会在 tccd 里记一条拒绝），必须手动开、别等弹窗；\
                  列表里若没有本应用，点左下角「+」从 /Applications 添加。\
-                 打开后**重启本应用**才生效；本应用用固定证书签名，重新构建不会让授权失效。",
+                 如果条目**已经在**、开关也开着却仍然被拒，那是 tccd 里存的旧授权要求跟当前\
+                 构建不匹配（重新签名/换过签名方式之后会这样）—— 要先点「−」删掉旧条目，\
+                 再「+」重新添加。任一种改动之后都要**重启本应用**才生效。",
                 app.display()
             )
         }
@@ -320,11 +328,81 @@ fn authorize_hint_for(app: Option<&Path>, exe: &Path) -> String {
     }
 }
 
+/// 写产物（以及它的备份）—— 撞 `EPERM` 时**换 inode 重写**。
+///
+/// 直接 `fs::write` 是「原地改这个 inode」，而 macOS 15+ 在文件上记了一份
+/// `com.apple.provenance`：**这个文件归哪个代码身份写**。本应用重新构建 / 自更新之后
+/// cdhash 变了，于是「上一版构建注入的产物，这一版改不动」—— 表现就是那句
+/// `Operation not permitted`，而「App 管理」里开关明明是开着的，白查半天。
+///
+/// 换 inode 绕开的就是这一层：先写同目录的临时文件（新建的文件由**当前**身份取得归属），
+/// 再 `rename` 顶掉目标。顺序不能反 —— 先删后写会在删除成功、写入失败时把客户端的
+/// 产物整个丢掉；`rename` 是原子的，最坏情况只是留下一个没人读的临时文件。
+///
+/// 权限位要一起搬过去：那份产物是 `0755`，用默认 umask 新建会变成 `0644`。
+fn write_artifact(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match fs::write(path, bytes) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            write_via_temp(path, bytes).map_err(|_| e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn write_via_temp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mode = file_mode(path);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "worker".into());
+    let tmp = path.with_file_name(format!("{name}.qoderassistant-new"));
+    fs::write(&tmp, bytes)?;
+    if let Some(mode) = mode {
+        set_file_mode(&tmp, mode)?;
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+/// 权限位只在 unix 上有意义（Windows 的 ACL 不归我们管）。
+fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        fs::metadata(path).map(|m| m.permissions().mode()).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn set_file_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
 /// 把「写不进去」翻译成一句**用户能照做**的话。
 ///
-/// `EPERM`（`Operation not permitted`）在这里有**唯一**的常见来源：macOS 13+ 的
-/// 「App 管理」（App Management）—— 一个进程想修改**另一个已签名应用包**的内容，
-/// 必须先获得用户授权。系统既不提示、也不给 403，只丢一句 `Operation not permitted`，
+/// 走到这里说明连换 inode 的重写也被拒了。剩下的来源是 macOS 13+ 的「App 管理」
+/// （App Management）—— 一个进程想改**另一个已签名应用包**的内容，必须先获得用户授权。
+/// 系统既不提示、也不给 403，只丢一句 `Operation not permitted`，
 /// 很容易被当成「路径写错 / 文件只读」而白查半天。
 ///
 /// 这条消息会一路透到界面的接管状态里，所以它必须自带下一步动作，而不是只报错误码。
@@ -355,12 +433,12 @@ pub fn install_at(worker: &Path, region: Region, url: &str, ca_pem: &str) -> Res
     // 恰好就是这段注释要防的那件事。
     if !had_marker {
         let backup = backup_path(worker);
-        fs::write(&backup, &raw).map_err(|e| write_hint("备份原文件", &backup, &e))?;
+        write_artifact(&backup, raw.as_bytes()).map_err(|e| write_hint("备份原文件", &backup, &e))?;
     }
 
     let body = render(region, url, ca_pem)?;
     let stripped = strip(&raw);
-    fs::write(worker, format!("{body}{stripped}"))
+    write_artifact(worker, format!("{body}{stripped}").as_bytes())
         .map_err(|e| write_hint("写入 worker 产物", worker, &e))?;
     Ok(true)
 }
@@ -380,8 +458,38 @@ pub fn uninstall_at(worker: &Path) -> Result<bool, String> {
             worker.display()
         ));
     }
-    fs::write(worker, stripped).map_err(|e| write_hint("还原 worker 产物", worker, &e))?;
+    write_artifact(worker, stripped.as_bytes())
+        .map_err(|e| write_hint("还原 worker 产物", worker, &e))?;
     Ok(true)
+}
+
+/// 本应用写不回去时，给用户一条能直接粘进「终端」的还原命令。
+///
+/// 关闭接管这条路上，还原失败会把整次保存一起拒掉（故意的 —— 留下「客户端指着一个
+/// 已经不监听的端口」比开关拨不动恶劣得多）。代价是用户可能一直卡在「关不掉」，
+/// 所以报错必须自带出口，而不是只说「去开权限然后重来」。
+///
+/// 备份可以直接用：`install_at` 只在**文件没有我们的标记**时刷新备份，所以只要标记还在，
+/// 那份备份就是当前这份产物的官方原文（逐字节比对已验证）。备份不在时宁可不给命令，
+/// 也不能让人拿一份旧版客户端去覆盖新版。
+pub fn restore_hint(region: Region) -> Option<String> {
+    let worker = worker_path(region)?;
+    let backup = backup_path(&worker);
+    if !backup.is_file() {
+        return None;
+    }
+    Some(format!(
+        "或者直接在「终端」里执行这条命令还原（等价于本应用的摘除）：cp {} {}",
+        shell_quote(&backup),
+        shell_quote(&worker)
+    ))
+}
+
+/// 单引号包住，里面的单引号按 POSIX 的 `'\''` 写法转义。
+/// 客户端路径里带空格（`/Applications/Qoder CN.app/…`），不引起来那条命令是错的。
+fn shell_quote(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 // 这之上曾有一对 `patch::install(region, url, ca)` / `patch::uninstall(region)` 封装。
@@ -489,6 +597,76 @@ mod tests {
         let msg = write_hint("写入 worker 产物", Path::new("/nope/w.mjs"), &e);
         assert!(msg.contains("/nope/w.mjs"));
         assert!(!msg.contains("App 管理"), "别把找不到文件说成权限问题：{msg}");
+    }
+
+    /// 「本应用改不动这份产物」时得换 inode 重写。
+    ///
+    /// 这里用只读位当替身：真实场景是 macOS 的 `com.apple.provenance` 按 cdhash 记
+    /// 「这文件归谁写」，本应用重新构建之后就成了「上一版注入的产物，这一版写不回去」
+    /// —— 同样是 `fs::write` 被拒、而目录本身可写。两者的区别在界面上看不出来，
+    /// 所以兜底必须对这一整类成立，而不是只对某一种成因。
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_artifact_is_rewritten_through_a_new_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp_worker();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap());
+        assert!(fs::read_to_string(&p).unwrap().starts_with(MARK_BEGIN));
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o555,
+            "新建的文件要搬回原来的权限位：产物是 0755，默认 umask 会写成 0644"
+        );
+
+        assert!(uninstall_at(&p).unwrap());
+        assert_eq!(fs::read_to_string(&p).unwrap(), ORIGINAL, "还原必须逐字节一致");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 兜底也写不进去时：报**原来那个**错误，并且不许碰过目标文件。
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_fallback_reports_the_original_error_and_keeps_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp_worker();
+        install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+        let before = fs::read_to_string(&p).unwrap();
+        let dir = p.parent().unwrap();
+        // 文件写不动（触发兜底），目录也写不动（兜底建不出临时文件）
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let e = write_artifact(&p, b"x").unwrap_err();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), before);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_command_quotes_paths_that_contain_spaces() {
+        assert_eq!(
+            shell_quote(Path::new("/Applications/Qoder CN.app/w.mjs")),
+            "'/Applications/Qoder CN.app/w.mjs'"
+        );
+        assert_eq!(shell_quote(Path::new("/a/it's.mjs")), r"'/a/it'\''s.mjs'");
+    }
+
+    /// 没有备份就宁可不给命令：拿一份旧版客户端的原版去覆盖新版，比不给命令更糟。
+    #[test]
+    fn restore_hint_appears_only_once_a_backup_exists() {
+        let base = std::env::temp_dir().join(format!("qa-restore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        with_sdk_root(&base, || {
+            let p = plant_worker(&base, Region::Cn, ORIGINAL);
+            assert!(restore_hint(Region::Cn).is_none(), "还没注入过，没有可还原的东西");
+            install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+            let hint = restore_hint(Region::Cn).unwrap();
+            assert!(hint.contains("cp "), "{hint}");
+            assert!(hint.contains(".qoderassistant-orig' '"), "两个路径都要引起来：{hint}");
+        });
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
