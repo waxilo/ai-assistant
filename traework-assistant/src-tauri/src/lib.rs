@@ -135,7 +135,6 @@ pub fn run() {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
             });
-            let _notify = notify::Notifier::new();
             // 系统托盘：后台常驻入口
             tray::setup(app.handle()).expect("初始化系统托盘失败");
             Ok(())

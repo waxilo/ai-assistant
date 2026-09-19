@@ -13,9 +13,19 @@
 //! 所以只发 `message`，不要自作聪明换参数名。
 //!
 //! 通知永远只是「尽力而为」：失败只返回错误字符串，绝不影响签到主流程。
+//!
+//! # 品牌前缀
+//!
+//! 用户把**三款助手**（WorkBuddy / TraeWork / Qoder）的通知都接到同一个通道上，
+//! 于是每条推送都必须能一眼看出是谁发的。前缀在 [`BRAND`] 定义一次、由 [`send`]
+//! **统一施加**：调用点只管写正文，不要自己拼前缀，也就不存在「有的带、有的不带」。
 
 use crate::accounts::{Account, AccountView};
 use std::time::Duration;
+
+/// 通知品牌前缀。改名只改这一处（`summary_message` 等文案里不要再写应用名，
+/// 否则会变成「【Qoder 助手】Qoder 签到完成」这种重复）。
+pub const BRAND: &str = "【Qoder 助手】";
 
 /// 普通浏览器 UA。Cloudflare 按 UA 拦截脚本类客户端，缺了它必然 403。
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -32,10 +42,25 @@ fn excerpt(s: &str) -> String {
     }
 }
 
+/// 给通知正文盖上品牌前缀。
+///
+/// * 幂等：正文已经以 [`BRAND`] 开头时原样返回，免得出现两个前缀；
+/// * 空消息不加：否则会推出去一条只剩前缀、没有任何信息的通知。
+pub fn branded(message: &str) -> String {
+    let m = message.trim_start();
+    if m.is_empty() || m.starts_with(BRAND) {
+        m.to_string()
+    } else {
+        format!("{BRAND}{m}")
+    }
+}
+
 /// 把消息拼进 webhook 的 query（`?message=…`），负责百分号编码。
 ///
 /// 单独抽出来是为了可单测：中文、空格、`&`/`#` 都必须被正确转义，
 /// 否则签到结果里的失败原因会截断 URL。
+///
+/// 注意它**不加品牌前缀**——那是 [`send`] 的职责，这里保持「拼 URL」的纯粹。
 pub fn build_url(webhook: &str, message: &str) -> Result<String, String> {
     let raw = webhook.trim();
     if raw.is_empty() {
@@ -49,9 +74,9 @@ pub fn build_url(webhook: &str, message: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-/// 发送一条通知。返回可读的成功描述（含响应体片段）或最终失败原因。
+/// 发送一条通知（自动带上品牌前缀）。返回可读的成功描述（含响应体片段）或最终失败原因。
 pub async fn send(webhook: &str, message: &str) -> Result<String, String> {
-    let url = build_url(webhook, message)?;
+    let url = build_url(webhook, &branded(message))?;
     let client = reqwest::Client::builder()
         .user_agent(BROWSER_UA)
         .timeout(Duration::from_secs(20))
@@ -89,7 +114,7 @@ pub async fn send(webhook: &str, message: &str) -> Result<String, String> {
 /// 不预告的话，除了「签到完成」那一条之外，用户没有任何途径知道今天定在了几点，
 /// 只能等签完之后再回头看。
 pub fn target_preview(plan: &str, base: &str, window_minutes: u32) -> String {
-    format!("Qoder 今日签到时间：{plan}（设定 {base} + 随机时间窗 {window_minutes} 分钟）")
+    format!("今日签到时间：{plan}（设定 {base} + 随机时间窗 {window_minutes} 分钟）")
 }
 
 /// 「本次触发时刻」那一行，附在签到结果正文之后。
@@ -112,7 +137,7 @@ pub fn trigger_line(actual: &str, plan: &str, base: &str) -> String {
     format!("触发时刻 {actual}（今日随机 {plan}，设定 {base}）")
 }
 
-/// 把一批账号的签到结果汇总成一条人类可读的通知正文。
+/// 把一批账号的签到结果汇总成一条人类可读的通知正文（品牌前缀由 [`send`] 施加）。
 ///
 /// 全成功时只报数量；有失败时附上前 5 条失败明细（账号名 + 手机号 + 原因），
 /// 因为推送里最有价值的信息就是「哪个账号为什么没签到」。
@@ -138,7 +163,7 @@ pub fn summary_message(views: &[AccountView]) -> String {
         .collect();
 
     let mut s = format!(
-        "Qoder 签到完成：成功 {ok} / 已签 {already} / 失败 {}（共 {total} 个账号）",
+        "签到完成：成功 {ok} / 已签 {already} / 失败 {}（共 {total} 个账号）",
         failed.len()
     );
     if !failed.is_empty() {
@@ -250,6 +275,40 @@ mod tests {
         assert!(build_url("not a url", "m").unwrap_err().contains("无效"));
     }
 
+    /// 三款助手共用同一个通知通道，每条推送都要能一眼看出是谁发的。
+    #[test]
+    fn brands_every_message_exactly_once() {
+        assert_eq!(branded("签到完成"), "【Qoder 助手】签到完成");
+        // 幂等：调用点万一自己写了前缀，也不该变成两个
+        assert_eq!(branded("【Qoder 助手】签到完成"), "【Qoder 助手】签到完成");
+        // 空消息不硬凑一条只剩前缀、没有信息量的推送
+        assert_eq!(branded(""), "");
+        assert_eq!(branded("   "), "");
+    }
+
+    /// 前缀必须真的落进发出去的 query（顺带覆盖中文编码后的形态）。
+    #[test]
+    fn brand_reaches_the_webhook_query() {
+        let u = build_url("https://h/x", &branded(&summary_message(&[]))).unwrap();
+        let parsed = reqwest::Url::parse(&u).unwrap();
+        let msg = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "message")
+            .map(|(_, v)| v.to_string())
+            .unwrap();
+        assert!(msg.starts_with("【Qoder 助手】"), "{msg}");
+        assert!(msg.contains("签到完成"), "{msg}");
+    }
+
+    /// 正文自己带品牌词的话，前缀一加就成了「【X 助手】X 签到完成」——
+    /// 文案里不许再出现应用名（前缀是唯一的品牌出口）。
+    #[test]
+    fn summary_text_does_not_repeat_the_brand() {
+        let m = summary_message(&[acct("a", None, Some(rec(true, false, false, "签到成功")))]);
+        assert!(!m.contains("Qoder"), "{m}");
+        assert!(m.starts_with("签到完成"), "{m}");
+    }
+
     #[test]
     fn summary_reports_counts_when_all_good() {
         let accounts = vec![
@@ -319,6 +378,7 @@ mod tests {
         assert!(m.contains("今日签到时间：09:42"), "{m}");
         assert!(m.contains("设定 08:00"), "{m}");
         assert!(m.contains("随机时间窗 90 分钟"), "{m}");
+        assert_eq!(branded(&m), format!("{BRAND}{m}"));
     }
 
 
@@ -328,7 +388,7 @@ mod tests {
     #[ignore]
     async fn smoke_real_webhook_delivery() {
         let hook = "https://notify-hub-worker.sloan.dpdns.org/hook/z9sm8jfJNpWwfWsfGW1xlRiFV8t-t6WD";
-        let out = send(hook, "【测试】Qoder 助手 通知链路自检")
+        let out = send(hook, "【测试】通知链路自检")
             .await
             .unwrap_or_else(|e| panic!("webhook 发送失败: {e}"));
         // 站点成功响应形如 {"ok":true,"id":N,"delivered":true}

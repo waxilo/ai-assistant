@@ -1206,7 +1206,8 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, Str
 /// 发送一条测试通知，直接返回推送服务的原始响应（便于用户自查配置）
 #[tauri::command]
 pub async fn test_notify(webhook: String) -> Result<String, String> {
-    notify::send(&webhook, "【测试】Qoder 助手 · 通知配置正常").await
+    // 品牌前缀由 notify::send 统一施加，这里只写正文
+    notify::send(&webhook, "【测试】通知配置正常").await
 }
 
 /// 是否已注册开机自启动。

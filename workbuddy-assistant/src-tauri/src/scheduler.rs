@@ -606,7 +606,7 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
             if notify_on {
                 let _ = notify::send(
                     &settings.notify_webhook,
-                    &format!("WorkBuddy 定时签到异常：{e}\n{trigger}"),
+                    &format!("定时签到异常：{e}\n{trigger}"),
                 )
                 .await;
             }
