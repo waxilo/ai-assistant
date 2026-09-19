@@ -126,12 +126,56 @@ jobs:
 
           # 自签根 CA 必须被信任，否则 codesign 看不到任何可用身份。
           # 直接从 p12 里抽出 CA 证书，**不按 CN 查** —— 免得把「根证书叫什么名字」这种
-          # 细节写死在流程里（那份 CA 是整个仓库共用的）。
-          openssl pkcs12 -in "$P12" -cacerts -nokeys -passin "pass:$CERT_PASSWORD" -out "$CA"
+          # 细节写死在流程里（那份 CA 是整个仓库共用的，CN 是 `TraeWorkAssistant Local CA`）。
+          #
+          # ⚠️ 两个 openssl 的坑（v0.1.6 首次跑 CI 时踩到，8 分钟一轮才发现）：
+          #   本机导出 p12 的 openssl 是 **LibreSSL**，证书袋用 `pbeWithSHA1And40BitRC2-CBC`；
+          #   而 runner 上的 openssl 是 **OpenSSL 3**，默认不加载 legacy provider ⇒ 直接报
+          #   `Error outputting keys and certificates … Algorithm (RC2-40-CBC : 0)`。
+          #   OpenSSL 3 要 `-legacy`，LibreSSL 又不认这个开关 —— 所以两种形态各试一次。
+          #   判据不能只看退出码：失败时也可能留下半截文件，必须校验真的抽到了证书。
+          extract_ca() {
+            openssl pkcs12 $1 -in "$P12" -cacerts -nokeys -passin "pass:$CERT_PASSWORD" \
+              -out "$CA" 2>/dev/null || true
+            grep -q 'BEGIN CERTIFICATE' "$CA" 2>/dev/null
+          }
+
+          # 兜底策略（与 CN、与 openssl 的 p12 实现都无关）：钥匙串里此刻已经有根证书
+          # （`security import` 那条 p12 时一并导入），把它倒成 PEM，挑出其中的**根**。
+          # p12 导出时带 `-certfile ca.crt`，根一定在里面。
+          extract_ca_from_keychain() {
+            local all="$RUNNER_TEMP/all-certs.pem" f
+            security find-certificate -a -p "$KEYCHAIN" > "$all" 2>/dev/null || return 1
+            awk -v d="$RUNNER_TEMP" '/BEGIN CERTIFICATE/{n++} {if(n)print > (d "/cert" n ".pem")}' "$all"
+            for f in "$RUNNER_TEMP"/cert*.pem; do
+              [ -f "$f" ] || continue
+              # 认根用 `Basic Constraints: CA:TRUE`（叶证书是 CA:FALSE）。
+              # ⚠️ 别用「subject == issuer」：openssl 打印出来是 `subject= …` 与 `issuer= …`，
+              # **前缀就不同** ⇒ 这两个字符串永远不相等（本轮本地实测踩到，函数静默返回 1）。
+              if openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q 'CA:TRUE'; then
+                cp "$f" "$CA"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          extract_ca "" || extract_ca "-legacy" || extract_ca_from_keychain || {
+            echo "::error::从 p12 / 钥匙串里都抽不出根 CA，无法建立可信签名身份"
+            exit 1
+          }
+          echo "根 CA：$(openssl x509 -in "$CA" -noout -subject 2>/dev/null)"
           sudo security add-trusted-cert -d -r trustRoot -p codeSign \
             -k /Library/Keychains/System.keychain "$CA"
 
-          security find-identity -v -p codesigning "$KEYCHAIN"
+          # 导入 ≠ 可用：根 CA 没被信任时这里会是「0 valid identities found」，
+          # 而真正的报错要等到 tauri build 签名那一步才出现（更晚、更难查）。就地拦下。
+          IDENTITIES="$(security find-identity -v -p codesigning "$KEYCHAIN")"
+          echo "$IDENTITIES"
+          if echo "$IDENTITIES" | grep -q '0 valid identities found'; then
+            echo "::error::证书导入了但签名身份不可用 —— 多半是根 CA 没被信任"
+            exit 1
+          fi
           rm -f "$P12"
 
       - name: Tauri build（带更新产物）
