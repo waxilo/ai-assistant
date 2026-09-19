@@ -15,40 +15,40 @@
 //!
 //! | 层 | 来源 | 特点 |
 //! |---|---|---|
-//! | 1 | `GET {CATALOG_BASE}/api/v2/model/list` | Qoder 官方目录，最全；通了就落盘 |
-//! | 2 | `models-cache.json`（落盘快照） | 上次成功的结果，抗网络抖动与重启 |
+//! | 1 | `GET {infer_base}/algo/api/v2/model/list` | Qoder 官方目录，最全；通了就落盘 |
+//! | 2 | `models-cache-{region}.json`（落盘快照） | 上次成功的结果，抗网络抖动与重启 |
 //! | 3 | `~/.qoder` 的本地痕迹 | 纯本地、必定可用；只覆盖「真用过的」模型 |
 //!
 //! **三层都拿不到时返回空列表**，由界面显示空态。这里绝不再退回任何写死的模型名
 //! —— 那正是把 `hy3` 冒充成 Qoder 模型的根源。
 //!
-//! # 第 1 层为什么**基本永远**拉不到（2026-09-19 实测，别再重复排查）
+//! # 第 1 层的两把钥匙：`/algo` 前缀 与 COSY 自签（2026-09-19 实测）
 //!
-//! Qoder CLI 拉这个目录是 **status=200**（见 `~/.qoder-cn/logs/runs/*/qodercli.log` 的
-//! `operation=modelCatalogFetch`），所以「接口是好的」。但从**常规 HTTPS 客户端**
-//! 进去，两个区域都进不去，而且**失败形态各不相同**：
+//! 这一层先前被判成「对常规客户端不开放」，据此写下的结论（包括本模块头的旧版本、
+//! 以及「只能去 spawn 客户端 CLI 走控制协议」的方案）**都是错的**。真相是两处都缺了东西：
 //!
-//! | 区域 | 宿主 | 常规客户端结果 |
-//! |---|---|---|
-//! | 国际版 | `api3.qoder.sh` | **空 `404`**（任何路径、带不带认证都一样） |
-//! | 国内版 | `gateway.qoder.com.cn` | **`503`**（响应体是阿里云 ALB 的 HTML） |
+//! 1. **路径少了 `/algo` 前缀。** 客户端签名用的 path 是 `/api/v2/model/list`
+//!    （[`crate::cosy::signing_path`] 会剥掉它），但**发出去的 URL** 是
+//!    `{infer_base}/algo/api/v2/model/list`。少了前缀直接打到网关是 ALB 的 `503`
+//!    —— 看着像「网络契约拒绝第三方客户端」，其实只是走错了门。
+//!    （旧结论里那串「换 httpdns 落点 IP、换 HTTP 版本、换 UA 一律 503」的排查，
+//!    全部是在错的 URL 上做的。）
+//! 2. **认证不是 `Bearer dt-…`，是 COSY。** 与其余业务接口一样，凭据封在
+//!    `Authorization: Bearer COSY.…` + `Cosy-User/Key/Date` 四件套里 ——
+//!    而这套头我们本来就能自己签发（[`crate::cosy`]，接管换号靠的就是它）。
+//!    用普通 Bearer 打过去必然进不去。
 //!
-//! 国内版这一条是照着 CLI 自己的日志逐项复现后仍然失败的：用日志里那两个 httpdns
-//! 落点 IP（`120.24.46.217` / `120.76.131.237`）`--resolve`、HTTP/1.1 与 2、GET 与 POST、
-//! 带与不带 UA / 契约头，**一律 503**。也就是说拦的不是 DNS 也不是路径，而是 CLI
-//! 之外的客户端根本走不通那层网络契约。CLI 自己倒是把整份目录缓存在
-//! `<cli_dir>/.models/<uid>/catalog-v6`，但那是 `QMC\x01` 魔数开头的密文
-//! （熵 7.997 bits/byte），没有 CLI 手里的密钥解不开 —— 别去啃它。
+//! 两处都补齐后：`200`，**明文 JSON**，14 个模型、带 `price_factor`（积分倍率）
+//! 与 `promotion`（错峰折扣）。样本已落在快照的 `raw` 里。
+//! （这条是**国内版**实测；国际版走同一条代码路径、尚未验过，拉不到时自动退到
+//!   下面两层，所以不影响界面。`probe_real_catalog_fetch` 那条 ignored 测试两边都跑，
+//!   跑一次就有结论。）
 //!
-//! ## 由此推出的一条硬结论
-//!
-//! **凭证（token）对这份清单几乎没有价值。** 所以：
-//!
-//! - [`load`] 的 token 是 `Option<&str>` —— `None` 只是让第 1 层缺席，
-//!   不是错误。「这个区域还没有账号」是**常态**（用户只登了一边），
-//!   把它做成失败会让一个纯本地的查询在无账号时整个报错（这正是 `free_models`
-//!   早先那颗红字提示的来源）；
-//! - 真正兜住可用性的是第 2、3 层，第 1 层「能通就好、不通不阻塞」。
+//! 顺带两条实测结论，省得下次再试：
+//! - 客户端发的 `?Encode=1` **可以去掉**。签名只覆盖剥掉 query 的 path，所以去掉它
+//!   签名照样有效，而上游就不加密响应体了（带 `Encode=1` 也是 200，但这里没必要）。
+//! - 宿主取 [`Region::infer_base`]（CLI 日志里 `endpointType:"infer"` 的那个域），
+//!   **不是**早先猜的 `api3.qoder.sh`。
 //!
 //! # 与路由的契约
 //!
@@ -64,12 +64,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// 模型目录的宿主**不是常量**：两个区域的宿主不同 —— 国际版 `api3.qoder.sh`、
-// 国内版 `gateway.qoder.com.cn`（实测日志见 `region` 模块头）。
-// 上一版这里是一处写死的 `pub const CATALOG_BASE`，等于宣告「国内版永远拉不到目录」。
+// 模型目录的宿主**不是常量**：两个区域不同（国际版 / 国内版的 `infer_base`，
+// 见 `region` 模块与本模块头）。上一版这里是一处写死的 `pub const CATALOG_BASE`，
+// 等于宣告「另一套部署永远拉不到目录」。
 
-/// 模型目录路径（基址由 `region::Region::catalog_base` 按账号区域给出）
-const CATALOG_PATH: &str = "/api/v2/model/list";
+/// 模型目录的**发出去**的路径。
+///
+/// `/algo` 是网关的路由前缀，**必须有**（少了它 ALB 直接 503，见模块头）；
+/// 而 COSY 签名里用的是剥掉它之后的 path（[`crate::cosy::signing_path`] 负责剥）。
+/// 两者不一致不是 bug，是客户端自己的行为，这里照抄。
+const CATALOG_PATH: &str = "/algo/api/v2/model/list";
 
 /// 一次拉取的有效期。官方目录一天之内不会大改，1 小时足够跟手，
 /// 又不至于让接管页每次打开都打一次接口。
@@ -96,19 +100,23 @@ const SNAPSHOT_PREFIX: &str = "models-cache";
 /// 单个模型的描述。
 ///
 /// `id` 是**给网关用的**（Qoder 形如 `qmodel_38max`），`name` 是**给人看的**
-/// （形如 `Qwen3.8-Max`）。这一对字段是实测出来的：CLI 会话日志同一行里
-/// `data.model` 给 id、`data.hook_input.model` 给显示名。取不到 `name` 时留空串，
-/// 界面退回显示 `id` —— 而不是编一个名字。
+/// （形如 `Qwen3.8-Max`，目录里的 `display_name`）。走第 1 层时两者都是真值；
+/// 退到第 3 层（本机痕迹）时可能只有 id —— 那时 `name` 留空串，界面退回显示 `id`，
+/// 而不是编一个名字。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    /// 是否 0 积分免费模型（恒生效、UI 锁定勾选）
+    /// 是否 0 积分模型（恒生效、UI 锁定勾选）。判据是 `price_factor == 0`，见 [`free_of`]。
     pub free: bool,
-    /// 积分倍率原始串（如 `"x0.00 credits"`），仅展示用；空串 = 倍率未知
+    /// 积分倍率展示串（如 `"x0.2"`）；空串 = 倍率未知
     #[serde(default)]
     pub multiplier: String,
+    /// **折扣前**的倍率（错峰促销期间目录给的 `original_price_factor` /
+    /// `promotion.before_promotion_price_factor`）；空串 = 没有折扣，界面上就不画划线价
+    #[serde(default)]
+    pub original_multiplier: String,
 }
 
 /// 「限流切换」模型清单（供接管页展示与手动刷新）。
@@ -123,46 +131,25 @@ pub struct ModelReport {
     ///
     /// 与 [`source`](Self::source) 不重复：那个字段说的是「这份清单来自哪一层」，
     /// 这个说的是「第 1 层为什么没结果」。两件事用户都要知道才看得懂界面 ——
-    /// 光看「来源：本机 Qoder 的记录」会以为是网络抖动，于是反复点刷新；
-    /// 而真相是这接口对常规客户端不开放（见模块头），点多少次都一样。
+    /// 光看「来源：本机 Qoder 的记录」会以为是网络抖动，而不知道该去检查登录态。
     pub note: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// 解析：任何形态的响应 → 统一的模型列表
+// 解析：模型目录响应 → 统一的模型列表
 // ---------------------------------------------------------------------------
 
-/// 响应里可能装着模型数组的键，按序探测。
-///
-/// **为什么是探测而不是写死**：Qoder 这个接口的确切结构我们**还没拿到真实样本**
-/// —— `api3.qoder.sh` 从普通 DNS 入口一律 404（见模块头），只有走 httpdns 的 CLI
-/// 拿得到。所以宁可容错：与 `usage.rs` 的 `find_key` 同一套思路，
-/// **拿到样本之后再收紧**。
-///
-/// 注：一旦能落样，[`Snapshot::raw`] 会把它留下来。
-const ARRAY_KEYS: [&str; 6] = ["models", "list", "data", "result", "items", "modelList"];
-
-/// 模型 id 的候选键（Qoder 用 `qmodel_*` 形态）
-const ID_KEYS: [&str; 6] = ["id", "model", "key", "modelId", "model_id", "code"];
-
-/// 模型显示名的候选键
-const NAME_KEYS: [&str; 6] = [
-    "name",
-    "displayName",
-    "display_name",
-    "title",
-    "label",
-    "modelName",
-];
-
-/// 积分倍率的候选键
-const MULT_KEYS: [&str; 5] = [
-    "credits",
-    "multiplier",
-    "creditMultiplier",
-    "ratio",
-    "cost",
-];
+/// 下面四组键来自**真实响应样本**（第 1 层实测拉到的 14 条目录），不再是一堆
+/// 「万一长这样」的候选名 —— 原先那份探测表里 `credits` / `multiplier` / `ratio`
+/// 一个都不存在，所以就算接口通了也解析不出倍率（这正是界面上「倍率未知」的成因）。
+/// 每组留两个是驼峰写法：客户端解析自己那套时两种都认（`priceFactor??price_factor`），
+/// 说明服务端存在两种形态。
+const ID_KEYS: [&str; 2] = ["key", "model_key"];
+const NAME_KEYS: [&str; 2] = ["display_name", "name"];
+const PRICE_KEYS: [&str; 2] = ["price_factor", "priceFactor"];
+/// 折扣前倍率：目录里有两个来路 —— 顶层的 `original_price_factor`，
+/// 以及促销对象里的 `promotion.before_promotion_price_factor`（错峰活动走后者）。
+const ORIGINAL_PRICE_KEYS: [&str; 2] = ["original_price_factor", "originPriceFactor"];
 
 /// 从多个候选键里取第一个非空字符串
 fn pick_str<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -184,10 +171,7 @@ fn name_of(m: &Value, id: &str) -> String {
         .to_string()
 }
 
-/// 倍率 → 数字。
-///
-/// 形态实测有两种：数字（`0`）与字符串（`"x0.00 credits"` / `"x0.05"`）。
-/// 字符串取第一个 token 解析：`"x0.00 credits"` → `0.0`，`"credits"` → `None`。
+/// 倍率 → 数字。目录给的是数字（`0.2`），驼峰样本里也见过字符串，两种都收。
 fn parse_multiplier(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
@@ -202,84 +186,104 @@ fn parse_multiplier(v: &Value) -> Option<f64> {
     }
 }
 
-/// 倍率字段 → `(是否免费, 原始串)`。
-///
-/// **拿不到倍率一律判「不免费」**：猜错的代价不对称 —— 猜「免费」会让一个付费模型
-/// 在 429 时被无感换号，悄悄烧掉别的账号的积分；猜「不免费」只是少一次自动切换，
-/// 用户在界面勾一下就有了。
-fn free_of(m: &Value) -> (bool, String) {
-    for k in MULT_KEYS {
-        let Some(raw) = m.get(k) else { continue };
-        let Some(n) = parse_multiplier(raw) else { continue };
-        let text = match raw {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        return (n == 0.0, text);
+/// 倍率 → 展示串（`0.2` → `"x0.2"`，`0.0` → `"x0"`）。
+fn fmt_multiplier(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("x{}", n as i64)
+    } else {
+        format!("x{n}")
     }
-    (false, String::new())
 }
 
-/// 深度优先找一个「装着模型对象的数组」。
+/// 促销对象是否生效、生效时给出折扣前的倍率。
 ///
-/// 判据不是「键名对不对」而是「元素像不像模型」：数组里任一元素是对象且能取出 id
-/// 就算命中。这样无论响应是 `{data:{models:[…]}}` 还是 `{result:[…]}` 都能落到同一个出口。
-fn find_model_array(root: &Value) -> Option<&Vec<Value>> {
-    /// 下钻上限：响应体积不大，几层足够；写死是为了「既容错又不会无限下钻」
-    const MAX_DEPTH: usize = 4;
+/// 目录里错峰活动的形态是 `promotion: {active, discount_factor,
+/// before_promotion_price_factor, badge{en,zh}, window_start/window_end, …}`。
+/// 只取「折扣前」这一个数：界面上要的是「0.5× 划掉、显示 0.2×」，
+/// 而徽章文案、时区、活动窗口这些是运营内容，抄过来只会跟着版本漂。
+///
+/// `active` 要的是**值为 true**，不是「这个字段存在」：整个 `promotion` 对象是活动的
+/// 配置，活动关掉时服务端未必会把它抹掉，只看存不存在就会给一个不打折的模型画出划线价。
+fn promotion_original(m: &Value) -> Option<f64> {
+    let p = m.get("promotion")?;
+    p.get("active")
+        .and_then(Value::as_bool)
+        .filter(|active| *active)?;
+    p.get("before_promotion_price_factor")
+        .and_then(parse_multiplier)
+}
 
-    fn walk(v: &Value, depth: usize) -> Option<&Vec<Value>> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        match v {
-            Value::Array(arr) => {
-                if arr
-                    .iter()
-                    .take(4)
-                    .any(|m| m.is_object() && id_of(m).is_some())
-                {
-                    return Some(arr);
-                }
-                arr.iter().find_map(|x| walk(x, depth + 1))
-            }
-            Value::Object(map) => ARRAY_KEYS
-                .iter()
-                .filter_map(|k| map.get(*k))
-                .find_map(|child| walk(child, depth + 1)),
-            _ => None,
-        }
+/// 倍率字段 → `(是否免费, 当前倍率串, 折扣前倍率串)`。
+///
+/// # 免费判定为什么看 `price_factor` 而不是 `is_free`
+///
+/// 目录里**有**一个 `is_free` 字段，但它不是「0 积分」。实测样本：`qmodel_38max`
+/// 同时是 `is_free: true` 与 `price_factor: 0.2`，而客户端自己给它展示的仍是 `x0.2`
+/// —— 客户端的「Free」标签是另一条规则（`tags` 含 `limited_time_free` 才写 Free，
+/// 否则一律显示倍率）。拿 `is_free` 当免费用，等于把一个 0.2 倍率的模型在 429 时
+/// 无感换到别的账号上悄悄扣积分。
+///
+/// **拿不到倍率同样判「不免费」**：猜错的代价不对称 —— 猜「免费」多烧别人积分，
+/// 猜「不免费」只是少一次自动切换，用户在界面勾一下就有了。
+fn price_of(m: &Value) -> (bool, String, String) {
+    let Some(raw) = PRICE_KEYS.iter().find_map(|k| m.get(*k)).and_then(parse_multiplier) else {
+        return (false, String::new(), String::new());
+    };
+    let before = ORIGINAL_PRICE_KEYS
+        .iter()
+        .find_map(|k| m.get(*k))
+        .and_then(parse_multiplier)
+        .or_else(|| promotion_original(m))
+        .filter(|o| *o != raw);
+    (
+        raw == 0.0,
+        fmt_multiplier(raw),
+        before.map(fmt_multiplier).unwrap_or_default(),
+    )
+}
+
+/// 响应里的「模型数组」们 —— 顶层按 **scene 分组**（`chat` / `app` / `developer` /
+/// `assistant` / `inline` / `quest` / …，实测 11 个键，其中 `byok_*` 是空数组）。
+///
+/// 这里**跨 scene 合并**而不是挑一个：路由只回答「这个 id 能不能免费切」，
+/// 与用户从哪个入口发起无关，而各 scene 的条目实测同源同倍率。挑一个 scene 反而要
+/// 猜「接管该看哪个」（CLI 用 `chat`、桌面端用 `app`），猜错就是少一批模型。
+fn model_arrays(root: &Value) -> Vec<&Vec<Value>> {
+    match root {
+        Value::Object(map) => map
+            .values()
+            .filter_map(Value::as_array)
+            .filter(|a| !a.is_empty())
+            .collect(),
+        // 兜一种「顶层直接就是数组」的形态（接口哪天不按 scene 包时不至于整个空掉）
+        Value::Array(arr) if !arr.is_empty() => vec![arr],
+        _ => Vec::new(),
     }
-    walk(root, 0)
 }
 
 /// 响应 → 模型列表（免费排前、其余按 id 升序）。纯函数，便于单测。
 pub fn parse_list(root: &Value) -> Vec<ModelInfo> {
-    let Some(arr) = find_model_array(root) else {
-        return Vec::new();
-    };
-    let mut out: Vec<ModelInfo> = arr
-        .iter()
-        .filter_map(|m| {
-            let id = id_of(m)?.to_string();
-            let (free, multiplier) = free_of(m);
-            Some(ModelInfo {
-                name: name_of(m, &id),
-                id,
+    let mut out: Vec<ModelInfo> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for arr in model_arrays(root) {
+        for m in arr {
+            let Some(id) = id_of(m) else { continue };
+            if !seen.insert(id.to_string()) {
+                continue; // 同一个模型出现在多个 scene 里，只留先到的一条
+            }
+            let (free, multiplier, original_multiplier) = price_of(m);
+            out.push(ModelInfo {
+                name: name_of(m, id),
+                id: id.to_string(),
                 free,
                 multiplier,
-            })
-        })
-        .collect();
-    // 容错探测可能撞上嵌套的同名数组，同一个 id 出现多次时只留一条
+                original_multiplier,
+            });
+        }
+    }
     out.sort_by(|a, b| a.id.cmp(&b.id));
-    out.dedup_by(|a, b| a.id == b.id);
     // 免费排前：界面里「恒生效」的那些该在最显眼处
-    out.sort_by(|a, b| match (a.free, b.free) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.id.cmp(&b.id),
-    });
+    out.sort_by(|a, b| b.free.cmp(&a.free));
     out
 }
 
@@ -298,9 +302,10 @@ fn push_unique(found: &mut Vec<ModelInfo>, seen: &mut HashSet<String>, id: &str,
         found.push(ModelInfo {
             id: id.to_string(),
             name: name.to_string(),
-            // 本地痕迹给不出倍率 ⇒ 一律「不免费」（理由见 `free_of`）
+            // 本地痕迹给不出倍率 ⇒ 一律「不免费」（理由见 [`price_of`]）
             free: false,
             multiplier: String::new(),
+            original_multiplier: String::new(),
         });
     } else if !name.is_empty() {
         if let Some(m) = found.iter_mut().find(|m| m.id == id) {
@@ -510,14 +515,33 @@ fn save_snapshot(dir: &Path, region: Region, models: &[ModelInfo], raw: Option<&
 
 /// 从 Qoder 模型目录拉一次；成功即落盘（连原始响应一起），任何失败回 `None`。
 ///
-/// 用的是 [`crate::http::api_client_direct`]：这是**模型网关**的接口，
-/// 与 `openapi.qoder.sh` 那套（`qoder_api::client` 的 `Cosy-ClientType` 身份头）
-/// 不是一族，别把两套身份混到一条路径上。
-pub async fn fetch_remote(region: Region, dir: &Path, token: &str) -> Option<Vec<ModelInfo>> {
-    let url = format!("{}{CATALOG_PATH}", region.catalog_base());
+/// # 认证：自签 COSY，不是 `Bearer dt-…`
+///
+/// 这条路径与接管热路径用的是**同一个签名器**（[`crate::cosy::sign`]），差别只在
+/// 「没有客户端的原件可借环境特征」，所以走从零签的那一份。
+/// 拿普通 Bearer 打这里必然进不去（凭据不在头上，服务端解不出账号）。
+///
+/// 宿主是 [`Region::infer_base`]（CLI 日志里的 `endpointType:"infer"`），
+/// 且必须带 `/algo` 前缀 —— 两处都是踩过才知道的，详见模块头。
+pub async fn fetch_remote(
+    region: Region,
+    dir: &Path,
+    id: &crate::cosy::Identity,
+) -> Option<Vec<ModelInfo>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 签名里是**剥掉 `/algo` 与 query** 的 path（`signing_path` 负责），所以这里
+    // 直接把要发的 URL 路径交给它：两边天然一致。
+    let reb = crate::cosy::sign(id, CATALOG_PATH, b"", now)?;
+    let url = format!("{}{CATALOG_PATH}", region.infer_base());
     let resp = crate::http::api_client_direct()
         .get(&url)
-        .bearer_auth(token)
+        .header("authorization", reb.authorization.as_str())
+        .header("cosy-user", reb.user.as_str())
+        .header("cosy-key", reb.key.as_str())
+        .header("cosy-date", reb.date.as_str())
         .send()
         .await
         .ok()?;
@@ -529,7 +553,7 @@ pub async fn fetch_remote(region: Region, dir: &Path, token: &str) -> Option<Vec
     if list.is_empty() {
         // 拿到 200 却解析不出任何模型：**不落盘**。
         // 落一份空快照会把上一次的好数据覆盖掉，而这份空未必是真相
-        // （也可能是我们还没认对结构）。
+        // （也可能是接口改了结构、我们还没跟上）。
         return None;
     }
     save_snapshot(dir, region, &list, Some(&body));
@@ -571,47 +595,53 @@ fn offline_layers(region: Region, dir: &Path) -> (Vec<ModelInfo>, &'static str) 
 
 /// 「第 1 层为什么没有结果」→ 直接给界面看的一句话。
 ///
-/// **现算、不进缓存**：它取决于「这一次调用有没有凭证」，而那是会变的
+/// **现算、不进缓存**：它取决于「这一次调用有没有可用的签名身份」，而那是会变的
 /// （用户随时可能去登录）。把它塞进 [`memo`] 会让「刚登录完仍显示旧原因」活一小时。
-fn explain_not_fetched(region: Region, had_credential: bool) -> String {
-    if had_credential {
-        // 有凭证却没拉到：两个区域实测都进不去（国际版 404 / 国内版 503，见模块头）。
-        // 所以这里必须说「属常态」，否则用户会以为是自己网络的问题、反复点刷新。
-        "联网拉取没成功（该接口对常规客户端不开放，属常态）".to_string()
+fn explain_not_fetched(region: Region, had_identity: bool) -> String {
+    if had_identity {
+        // 有身份却没拉到：多半是网络或登录态（token 过期）。现在这条路是通的
+        // （见模块头），所以不再甩锅给「接口不开放」。
+        "联网拉取没成功（网络或登录态问题），本次显示的是缓存".to_string()
     } else {
-        format!("「{}」下还没有账号，本次没联网", region.label())
+        format!("「{}」下还没有可签名的账号，本次没联网", region.label())
     }
 }
 
 /// 取模型清单：内存缓存 → 网络 → 落盘快照 → 本机痕迹 → 空。
 ///
-/// `token` 为 `None`（该区域还没有可用账号）时**跳过网络层**，但清单照样给 ——
-/// 三层里有两层是纯本地的。把「没凭证」当失败是错的，理由见模块头。
+/// `identity` 为 `None`（该区域没有账号，或那个账号取不到 uid）时**跳过网络层**，
+/// 但清单照样给 —— 三层里有两层是纯本地的。把「没身份」当失败是错的：用户常常只登
+/// 一边，而接管页两个区域都要能打开。
 ///
 /// `refresh = true` 跳过内存缓存（对应接管页那颗「刷新」按钮：用户明确要求重拉，
 /// 就不该被 1 小时的缓存挡住）。注意它**只跳过内存缓存** —— 网络失败时仍然依次退到
 /// 后两层，否则点一次刷新就会把界面变成空的。
 ///
 /// 返回的 `source` / `note` 直接透给界面：前者说清单来自哪一层，后者说第 1 层为什么空。
-pub async fn load(region: Region, dir: &Path, token: Option<&str>, refresh: bool) -> ModelReport {
-    let had_credential = token.is_some();
+pub async fn load(
+    region: Region,
+    dir: &Path,
+    identity: Option<&crate::cosy::Identity>,
+    refresh: bool,
+) -> ModelReport {
+    let had_identity = identity.is_some();
     if !refresh {
         if let Ok(g) = memo().lock() {
             if let Some((r, cred, at, list, src)) = g.as_ref() {
-                if *r == region && *cred == had_credential && at.elapsed() < TTL {
+                if *r == region && *cred == had_identity && at.elapsed() < TTL {
                     return ModelReport {
                         models: list.clone(),
                         source: (*src).to_string(),
                         note: (*src != "fetched")
-                            .then(|| explain_not_fetched(region, had_credential)),
+                            .then(|| explain_not_fetched(region, had_identity)),
                     };
                 }
             }
         }
     }
 
-    let (models, source) = match token {
-        Some(t) => match fetch_remote(region, dir, t).await {
+    let (models, source) = match identity {
+        Some(id) => match fetch_remote(region, dir, id).await {
             Some(list) => (list, "fetched"),
             None => offline_layers(region, dir),
         },
@@ -619,10 +649,10 @@ pub async fn load(region: Region, dir: &Path, token: Option<&str>, refresh: bool
     };
 
     if let Ok(mut g) = memo().lock() {
-        *g = Some((region, had_credential, Instant::now(), models.clone(), source));
+        *g = Some((region, had_identity, Instant::now(), models.clone(), source));
     }
     ModelReport {
-        note: (source != "fetched").then(|| explain_not_fetched(region, had_credential)),
+        note: (source != "fetched").then(|| explain_not_fetched(region, had_identity)),
         models,
         source: source.to_string(),
     }
@@ -636,89 +666,175 @@ pub fn free_ids(models: &[ModelInfo]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn ids(list: &[ModelInfo]) -> Vec<&str> {
         list.iter().map(|m| m.id.as_str()).collect()
     }
 
-    /// 典型形态：外面包一层 `data`
-    #[test]
-    fn parses_wrapped_array() {
-        let v = serde_json::json!({"data":{"models":[
-            {"id":"qmodel_38max","name":"Qwen3.8-Max","credits":"x0.00 credits"},
-            {"id":"qmodel_09pro","name":"Qwen3-Pro","credits":"x0.79 credits"}
-        ]}});
-        let list = parse_list(&v);
-        assert_eq!(ids(&list), ["qmodel_38max", "qmodel_09pro"], "免费的要排前面");
-        assert!(list[0].free);
-        assert_eq!(list[0].name, "Qwen3.8-Max");
-        assert_eq!(list[0].multiplier, "x0.00 credits");
-        assert!(!list[1].free);
+    fn model(id: &str, name: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({"key": id, "display_name": name});
+        if let Some(map) = v.as_object_mut() {
+            if let Some(o) = extra.as_object() {
+                for (k, val) in o {
+                    map.insert(k.clone(), val.clone());
+                }
+            }
+        }
+        v
     }
 
-    /// 结构还没定，所以裸数组 / result 包一层 / data 直接是数组都要认
-    #[test]
-    fn tolerates_other_shapes() {
-        let bare = serde_json::json!([{"id":"qmodel_a","credits":0}]);
-        assert_eq!(ids(&parse_list(&bare)), ["qmodel_a"]);
-        assert!(parse_list(&bare)[0].free, "倍率写成数字 0 也要认");
-
-        let res = serde_json::json!({"result":{"list":[{"model":"qmodel_b"}]}});
-        assert_eq!(ids(&parse_list(&res)), ["qmodel_b"]);
-
-        let direct = serde_json::json!({"data":[{"key":"qmodel_c"}]});
-        assert_eq!(ids(&parse_list(&direct)), ["qmodel_c"]);
+    /// **真实响应的精简样本**（2026-09-19 实测拉到的那份，字段名一个都没改）。
+    ///
+    /// 顶层按 scene 分组，同一个模型出现在多个 scene 里。这份测试钉的是这次故障的
+    /// 正身：界面只有裸 id、倍率全显示「未知」—— 因为上一版探测的键名
+    /// （`id` / `name` / `credits`）在这份响应里**一个都不存在**。
+    fn real_fixture() -> Value {
+        serde_json::json!({
+            "app": [
+                model("auto", "Auto", json!({"price_factor": 0.5, "is_default": true})),
+                model("qmodel_38max", "Qwen3.8-Max", json!({
+                    "price_factor": 0.2, "is_free": true,
+                    "promotion": {"active": true, "before_promotion_price_factor": 0.5,
+                                  "badge": {"zh": "错峰折扣进行中"}}
+                })),
+                model("qfmodel", "Qwen3.8-Flash", json!({
+                    "price_factor": 0.0, "is_free": true, "original_price_factor": 0.1
+                }))
+            ],
+            // chat 与 app 内容同源（实测 14 个键、每个 scene 倍率一致）
+            "chat": [
+                model("qmodel_latest", "Qwen3.7-Max", json!({
+                    "price_factor": 0.1,
+                    "promotion": {"active": true, "before_promotion_price_factor": 0.5}
+                })),
+                model("auto", "Auto", json!({"price_factor": 0.5}))
+            ],
+            // 空的 scene 要跳过，不能被当成「一条模型」
+            "byok_teams": [],
+            "byok_enterprise": []
+        })
     }
 
-    /// 倍率缺失 ⇒ 判「不免费」：猜错的代价不对称（见 `free_of` 的说明）
+    /// 真实形态：跨 scene 合并 + 去重 + 免费排前，倍率与折扣前倍率都解析出来。
     #[test]
-    fn missing_multiplier_is_not_free() {
-        let v = serde_json::json!({"models":[{"id":"qmodel_x"},{"id":"qmodel_y","credits":"credits"}]});
-        let list = parse_list(&v);
-        assert_eq!(list.len(), 2);
-        assert!(list.iter().all(|m| !m.free));
-        assert!(list.iter().all(|m| m.multiplier.is_empty()));
+    fn parses_the_real_scene_grouped_catalog() {
+        let list = parse_list(&real_fixture());
+        assert_eq!(
+            ids(&list),
+            ["qfmodel", "auto", "qmodel_38max", "qmodel_latest"],
+            "免费的排最前，其余按 id 升序；重复的 auto 只留一条"
+        );
+        let m = |id: &str| list.iter().find(|x| x.id == id).unwrap();
+
+        let flash = m("qfmodel");
+        assert!(flash.free, "price_factor 0 ⇒ 免费");
+        assert_eq!(flash.name, "Qwen3.8-Flash");
+        assert_eq!(flash.multiplier, "x0");
+        assert_eq!(flash.original_multiplier, "x0.1", "划线价来自顶层 original_price_factor");
+
+        let max = m("qmodel_38max");
+        assert!(!max.free, "is_free 不是「0 积分」，拿它判免费会多扣别人积分（见 price_of）");
+        assert_eq!(max.multiplier, "x0.2");
+        assert_eq!(max.original_multiplier, "x0.5", "划线价来自 promotion.before_promotion_…");
+
+        assert_eq!(m("auto").multiplier, "x0.5");
+        assert_eq!(m("auto").original_multiplier, "", "没有折扣就是空串，界面不画划线价");
     }
 
-    /// 名字与 id 相同 ⇒ 不留重复的名字；同一个 id 出现两次只出一条
+    /// **没有倍率的模型一律判「不免费」**（猜错的代价不对称，见 [`price_of`]）。
     #[test]
-    fn dedups_and_drops_duplicate_name() {
-        let v = serde_json::json!({"models":[
-            {"id":"qmodel_d","name":"qmodel_d"},
-            {"id":"qmodel_d","name":"Qwen-D"}
+    fn a_model_without_a_price_is_not_free() {
+        let v = serde_json::json!({"chat": [
+            {"key": "qmodel_unknown"},
+            {"key": "qmodel_unparsable", "price_factor": "credits"}
         ]});
         let list = parse_list(&v);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "", "id 与 name 相同等于没名字");
-
-        let dup = serde_json::json!({"data":{"models":[{"id":"qmodel_e"}]},"list":[{"id":"qmodel_e"}]});
-        assert_eq!(ids(&parse_list(&dup)), ["qmodel_e"]);
+        assert_eq!(list.len(), 2, "认得出 id 就要进列表，哪怕倍率拿不到");
+        assert!(list.iter().all(|m| !m.free));
+        assert!(list.iter().all(|m| m.multiplier.is_empty()));
+        assert_eq!(free_ids(&list), HashSet::new(), "路由侧也不该自动切到它们");
     }
 
-    /// 认不出模型数组 ⇒ 空列表（**不是**退回某个写死的模型名）
+    /// 裸数组与驼峰两种形态都还要认：服务端历史上两种写法都出现过
+    /// （客户端自己解析时就是 `priceFactor ?? price_factor`）。
+    #[test]
+    fn tolerates_bare_array_and_camel_case() {
+        let bare = serde_json::json!([{"key": "qmodel_a", "priceFactor": 0.0}]);
+        let list = parse_list(&bare);
+        assert_eq!(ids(&list), ["qmodel_a"]);
+        assert!(list[0].free, "驼峰 + 数字 0 也要认");
+        assert_eq!(list[0].name, "", "没有 display_name 就不编名字");
+
+        let camel = serde_json::json!({"chat": [
+            {"model_key": "qmodel_b", "name": "Qwen-B", "priceFactor": 0.05,
+             "originPriceFactor": 0.5}
+        ]});
+        let list = parse_list(&camel);
+        assert_eq!(list[0].id, "qmodel_b");
+        assert_eq!(list[0].name, "Qwen-B", "只有 name 时也当显示名用");
+        assert_eq!(list[0].multiplier, "x0.05");
+        assert_eq!(list[0].original_multiplier, "x0.5");
+    }
+
+    /// 认不出模型 ⇒ 空列表（**不是**退回某个写死的模型名 —— 那正是 `hy3` 事故的根源）
     #[test]
     fn unrecognized_shape_yields_empty() {
         assert!(parse_list(&serde_json::json!({})).is_empty());
-        assert!(parse_list(&serde_json::json!({"code":0,"message":"ok"})).is_empty());
+        assert!(parse_list(&serde_json::json!({"code": 0, "message": "ok"})).is_empty());
         assert!(
-            parse_list(&serde_json::json!({"models":[{"no_id":1}]})).is_empty(),
-            "没有 id 的条目对网关没用"
+            parse_list(&serde_json::json!({"chat": [{"display_name": "没有 id 的条目"}]}))
+                .is_empty()
         );
+        assert!(parse_list(&serde_json::json!({"chat": [], "app": []})).is_empty());
+    }
+
+    /// 名字与 id 相同 ⇒ 不算「有独立的名字」；折扣与当前价相等 ⇒ 不画划线价
+    #[test]
+    fn drops_redundant_name_and_noop_discount() {
+        let v = serde_json::json!({"chat": [
+            {"key": "qmodel_d", "display_name": "qmodel_d", "price_factor": 0.3},
+            {"key": "qmodel_e", "price_factor": 0.2, "original_price_factor": 0.2},
+            {"key": "qmodel_f", "price_factor": 0.2,
+             "promotion": {"active": false, "before_promotion_price_factor": 0.9}}
+        ]});
+        let list = parse_list(&v);
+        assert_eq!(list[0].name, "", "id 与 name 相同等于没名字");
+        assert_eq!(list[1].original_multiplier, "", "折扣前后一样，画出来是噪音");
+        assert_eq!(list[2].original_multiplier, "", "promotion 没生效就不该报折扣");
     }
 
     #[test]
-    fn multiplier_parsing_accepts_both_forms() {
-        assert_eq!(parse_multiplier(&serde_json::json!("x0.00 credits")), Some(0.0));
-        assert_eq!(parse_multiplier(&serde_json::json!(" x0.79 ")), Some(0.79));
+    fn multiplier_forms_parse_and_format() {
         assert_eq!(parse_multiplier(&serde_json::json!(0.05)), Some(0.05));
+        assert_eq!(parse_multiplier(&serde_json::json!("x0.79")), Some(0.79));
+        assert_eq!(parse_multiplier(&serde_json::json!(" x0.00 credits ")), Some(0.0));
         assert_eq!(parse_multiplier(&serde_json::json!("credits")), None);
+        assert_eq!(parse_multiplier(&serde_json::json!(null)), None);
+
+        assert_eq!(fmt_multiplier(0.0), "x0");
+        assert_eq!(fmt_multiplier(1.0), "x1");
+        assert_eq!(fmt_multiplier(0.2), "x0.2");
+        assert_eq!(fmt_multiplier(0.04), "x0.04");
     }
 
     #[test]
     fn free_ids_only_takes_free_ones() {
         let list = vec![
-            ModelInfo { id: "a".into(), name: String::new(), free: true, multiplier: "x0.00".into() },
-            ModelInfo { id: "b".into(), name: String::new(), free: false, multiplier: "x0.05".into() },
+            ModelInfo {
+                id: "a".into(),
+                name: String::new(),
+                free: true,
+                multiplier: "x0".into(),
+                original_multiplier: String::new(),
+            },
+            ModelInfo {
+                id: "b".into(),
+                name: String::new(),
+                free: false,
+                multiplier: "x0.05".into(),
+                original_multiplier: String::new(),
+            },
         ];
         let set = free_ids(&list);
         assert!(set.contains("a"));
@@ -738,21 +854,37 @@ mod tests {
             id: "qmodel_s".into(),
             name: "Qwen-S".into(),
             free: true,
-            multiplier: "x0.00".into(),
+            multiplier: "x0".into(),
+            original_multiplier: "x0.1".into(),
         }];
         save_snapshot(&dir, Region::Global, &list, Some(&serde_json::json!({"raw":true})));
-        assert_eq!(load_snapshot(&dir, Region::Global), Some(list));
+        let back = load_snapshot(&dir, Region::Global);
+        assert_eq!(back, Some(list.clone()), "新字段要能过一遍落盘再读回来");
 
         // 原始响应要留下来（给日后收紧解析当样本）
         let text = std::fs::read_to_string(snapshot_path(&dir, Region::Global)).unwrap();
         assert!(text.contains("\"raw\""), "raw 样本应被保留");
         assert!(text.contains("at_ms"));
+        assert!(text.contains("original_multiplier"));
 
         std::fs::write(snapshot_path(&dir, Region::Global), b"{ not json").unwrap();
         assert!(
             load_snapshot(&dir, Region::Global).is_none(),
             "坏文件 → None，不 panic"
         );
+
+        // 老版本的快照（没有 original_multiplier）仍然要读得出来
+        let old_snapshot = json!({
+            "at_ms": 1,
+            "models": [{"id": "old", "free": false, "multiplier": "x0.5"}]
+        });
+        std::fs::write(
+            snapshot_path(&dir, Region::Global),
+            serde_json::to_string(&old_snapshot).unwrap(),
+        )
+        .unwrap();
+        let old = load_snapshot(&dir, Region::Global).expect("缺字段的老快照不能读成 None");
+        assert_eq!(old[0].original_multiplier, "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -767,7 +899,8 @@ mod tests {
             id: id.into(),
             name: id.into(),
             free: true,
-            multiplier: "x0.00".into(),
+            multiplier: "x0".into(),
+            original_multiplier: String::new(),
         };
         save_snapshot(&dir, Region::Global, &[mk("g")], None);
         save_snapshot(&dir, Region::Cn, &[mk("c")], None);
@@ -839,33 +972,27 @@ mod tests {
     #[test]
     #[ignore = "读本机 ~/.qoder，结果随环境变"]
     fn smoke_local_traces() {
-        println!("== 国际版（~/.qoder）==");
-        for m in &local_models(Region::Global) {
-            println!(
-                "  id={:<20} name={:<16} free={} multiplier={:?}",
-                m.id, m.name, m.free, m.multiplier
-            );
+        for region in Region::ALL {
+            let list = local_models(region);
+            println!("== {}（{} 条）==", region.label(), list.len());
+            for m in &list {
+                println!(
+                    "  id={:<20} name={:<16} free={} multiplier={:?}",
+                    m.id, m.name, m.free, m.multiplier
+                );
+            }
+            println!("免费集合 = {:?}", free_ids(&list));
         }
-        println!("== 国内版（~/.qoder-cn）==");
-        let list = local_models(Region::Cn);
-        println!("本机痕迹读到 {} 个模型：", list.len());
-        for m in &list {
-            println!(
-                "  id={:<20} name={:<16} free={} multiplier={:?}",
-                m.id, m.name, m.free, m.multiplier
-            );
-        }
-        println!("免费集合 = {:?}", free_ids(&list));
     }
 
-    /// **没有凭证不是错误。** 第 1 层缺席而已，清单照样给，并且必须说清为什么。
+    /// **没有可签名的账号不是错误。** 第 1 层缺席而已，清单照样给，并且必须说清为什么。
     ///
     /// 这条钉的是曾经的真实故障：`free_models` 在没有账号的区域直接返回
     /// `Err("xxx 下暂无账号，无法拉取模型列表")`。于是「只看一眼清单」——一件
     /// 纯本地、两层来源都不需要网络的事 —— 被一个与它无关的条件整个拦掉，
     /// 用户看到红字，而账号在另一个区域是登着的。
     #[tokio::test]
-    async fn a_region_without_a_credential_still_gets_a_list_and_a_reason() {
+    async fn a_region_without_an_identity_still_gets_a_list_and_a_reason() {
         let dir = std::env::temp_dir().join(format!("qoder-models-noc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -874,28 +1001,29 @@ mod tests {
             let fresh = load(region, &dir, None, true).await;
             let cached = load(region, &dir, None, false).await;
             for (r, which) in [(&fresh, "现算"), (&cached, "命中缓存")] {
-                assert_ne!(r.source, "fetched", "{which}：没凭证不可能来自拉取");
+                assert_ne!(r.source, "fetched", "{which}：没身份不可能来自拉取");
                 let note = r.note.as_deref().unwrap_or_else(|| {
-                    panic!("{which}：{} 下没凭证必须说明原因", region.label())
+                    panic!("{which}：{} 下没身份必须说明原因", region.label())
                 });
                 assert!(note.contains(region.label()), "{which}：原因要点名区域：{note}");
-                assert!(note.contains("还没有账号"), "{which}：{note}");
+                assert!(note.contains("没联网"), "{which}：要说清没走网络：{note}");
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 有落盘快照时：无凭证也要走到第 2 层（**不能**因为没账号就只给「空」），
+    /// 有落盘快照时：没身份也要走到第 2 层（**不能**因为没账号就只给「空」），
     /// 并且仍然把「第 1 层为什么空」讲清楚。
     #[tokio::test]
-    async fn a_snapshot_is_used_even_without_a_credential() {
+    async fn a_snapshot_is_used_even_without_an_identity() {
         let dir = std::env::temp_dir().join(format!("qoder-models-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let list = vec![ModelInfo {
             id: "qmodel_snap".into(),
             name: "Qwen-Snap".into(),
             free: true,
-            multiplier: "x0.00".into(),
+            multiplier: "x0".into(),
+            original_multiplier: String::new(),
         }];
         save_snapshot(&dir, Region::Cn, &list, None);
 
@@ -903,21 +1031,84 @@ mod tests {
         assert_eq!(r.source, "cache", "有快照就该用快照");
         assert_eq!(r.models, list);
         let note = r.note.expect("仍然要说清第 1 层为什么是空的");
-        assert!(note.contains("国内版") && note.contains("还没有账号"), "{note}");
+        assert!(note.contains("国内版") && note.contains("还没有"), "{note}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 界面看到的那句话分两种来路，且**必须区分**：没凭证是「去登录」，
-    /// 有凭证是「这接口就不给常规客户端用」（见模块头的实测）。
-    /// 混成一句话会让用户对着一个永远点不好的「刷新」按钮使劲。
+    /// 界面看到的那句话分两种来路，且**必须区分**：没身份是「去登录」，
+    /// 有身份是「这次没拉到，先显示缓存」。混成一句话会让用户对着一个
+    /// 与己无关的提示使劲，而不知道该检查登录态还是网络。
     #[test]
-    fn the_reason_distinguishes_no_credential_from_a_failed_fetch() {
-        let no_cred = explain_not_fetched(Region::Global, false);
+    fn the_reason_distinguishes_no_identity_from_a_failed_fetch() {
+        let no_id = explain_not_fetched(Region::Global, false);
         let failed = explain_not_fetched(Region::Cn, true);
-        assert!(no_cred.contains("国际版") && no_cred.contains("还没有账号"), "{no_cred}");
-        assert!(!no_cred.contains("常态"), "没凭证与「拉不到是常态」是两回事：{no_cred}");
-        assert!(failed.contains("常态"), "有凭证却拉不到必须说明这是常态：{failed}");
-        assert!(!failed.contains("还没有账号"), "{failed}");
+        assert!(no_id.contains("国际版") && no_id.contains("还没有"), "{no_id}");
+        assert!(!no_id.contains("缓存"), "没身份时可能压根没有缓存可显示：{no_id}");
+        assert!(!failed.contains("国内版"), "有身份那句不必点名区域：{failed}");
+        assert!(failed.contains("登录态") || failed.contains("网络"), "{failed}");
+        assert!(failed.contains("缓存"), "要告诉用户现在看的是缓存：{failed}");
+        assert!(!failed.contains("还没有"), "{failed}");
+    }
+
+    /// 真机冒烟（手动跑）：走**生产路径**那一份（[`fetch_remote`]）打真实网关。
+    ///
+    /// 与上面的 `smoke_local_traces` 分工：那条看第 3 层（本机痕迹），这条看第 1 层
+    /// （官方目录 + 自签 COSY + 解析 + 落盘快照）。跑完顺手把 `models-cache-cn.json`
+    /// 写进临时目录，可以直接 `cat` 出来核对字段。
+    ///
+    /// 需要：本机 `accounts.json` 里有一个该区域、token 仍有效的账号。
+    #[tokio::test]
+    #[ignore = "打真实网关，需要本机已导入账号"]
+    async fn probe_real_catalog_fetch() {
+        let accounts_dir = std::env::var("QODER_ASSISTANT_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(std::env::var("HOME").unwrap())
+                    .join("Library/Application Support/com.waxilo.qoder-assistant")
+            });
+        let dir = std::env::temp_dir().join(format!("qoder-catalog-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for region in Region::ALL {
+            let Some(acc) = crate::accounts::load_accounts(&accounts_dir)
+                .into_iter()
+                .filter(|a| a.region == region)
+                .find(|a| !a.token.is_empty())
+            else {
+                println!("{}：本机没有账号，跳过", region.label());
+                continue;
+            };
+            let client = crate::http::api_client_direct();
+            let gateway = region.infer_base();
+            let Some(id) =
+                crate::accounts::cosy_identity(&accounts_dir, &acc, &client, gateway).await
+            else {
+                println!("{}：拿不到签名身份（token 过期？）", region.label());
+                continue;
+            };
+            match fetch_remote(region, &dir, &id).await {
+                None => println!("{}：拉取失败", region.label()),
+                Some(list) => {
+                    println!("{}：拉到 {} 个模型", region.label(), list.len());
+                    for m in &list {
+                        println!(
+                            "  {:<16} {:<18} free={:<5} {}{}",
+                            m.id,
+                            m.name,
+                            m.free,
+                            m.multiplier,
+                            if m.original_multiplier.is_empty() {
+                                String::new()
+                            } else {
+                                format!("（原价 {}）", m.original_multiplier)
+                            }
+                        );
+                    }
+                    assert_eq!(load_snapshot(&dir, region).map(|v| v.len()), Some(list.len()));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

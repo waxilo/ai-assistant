@@ -516,6 +516,40 @@ pub fn set_cosy_uid(dir: &Path, account_id: &str, uid: &str) -> bool {
     changed && save_accounts(dir, &accounts).is_ok()
 }
 
+/// 账号 → COSY 签名身份（缺 `uid` 时联网补一次并落盘，与 [`set_cosy_uid`] 同一套惰性策略）。
+///
+/// 存在的理由是「**谁来签一个 COSY 请求，需要的三样东西都只在账号上**」：
+/// 接管热路径（[`crate::proxy`] 转发时换号）和我们自己发起的查询
+/// （[`crate::models`] 拉模型目录）都得先拿到 uid。这两处各写一份「有就用、没有就问一次
+/// 再落盘」，就会在补齐条件、失败处理上慢慢漂 —— 而漂掉的后果是「一边能签、另一边永远签不出」。
+///
+/// `client` / `gateway` 由调用方给：取 uid 打的是**接管区域的网关**（与业务请求同域，
+/// 避免跨域拿到两套账号 id），而两个调用方手上的客户端本来就不同（反代用透传客户端、
+/// 目录用直连客户端）。
+///
+/// 返回 `None` = 拿不到 uid（没登录、token 过期、网络不通）。调用方**不能**在半签状态下
+/// 发请求 —— 宁可原样透传或退到本地缓存。
+pub async fn cosy_identity(
+    dir: &Path,
+    account: &Account,
+    client: &reqwest::Client,
+    gateway: &str,
+) -> Option<crate::cosy::Identity> {
+    let uid = match account.cosy_uid.clone().filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => crate::cosy::fetch_uid(client, gateway, &account.token).await?,
+    };
+    if account.cosy_uid.as_deref() != Some(uid.as_str()) {
+        set_cosy_uid(dir, &account.id, &uid);
+    }
+    Some(crate::cosy::Identity {
+        uid,
+        name: account.name.clone(),
+        email: String::new(),
+        token: account.token.clone(),
+    })
+}
+
 pub fn load_settings(dir: &Path) -> Settings {
     let f = settings_file(dir);
     if !f.exists() {

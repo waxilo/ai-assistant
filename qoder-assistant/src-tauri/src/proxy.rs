@@ -1021,6 +1021,16 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             );
         }
 
+        // COSY 签名身份（uid + 名字 + 该账号的 dt- token）。**在闭包外先取一次**：
+        // 下面两处都要用 —— 重签发往上的请求、以及拉「免费模型集」。
+        // 它只在账号第一次被路由到时才联网（拿 uid 并落盘），平时是纯本地的一次字段读。
+        let cosy_id = tauri::async_runtime::block_on(accounts::cosy_identity(
+            &dir,
+            &account,
+            &CLIENT,
+            &host,
+        ));
+
         // 透传
         let upstream = tauri::async_runtime::block_on(async {
             let mut r = CLIENT.request(
@@ -1034,8 +1044,8 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             //
             // | 路径 | 客户端发什么 | 我们该做什么 |
             // |---|---|---|
-            // | 推理 `/model/v1/chat/completions` | `Bearer <该账号的 access token>` | **换成选中扣费账号的 token**（这就是接管） |
-            // | 目录/策略 `/algo/*`（模型清单、data policy） | WASM 按「机器 + 账号」现场生成的凭证 | **原样带走，一个字都不能动** |
+            // | 推理 `/model/v1/chat/completions` | `Bearer COSY.…`（或旧的 `Bearer <access token>`） | **换成选中扣费账号的凭证**（这就是接管） |
+            // | 目录/策略 `/algo/*`（模型清单、data policy） | WASM 按「机器 + 账号」现场生成的凭证 | 按这张表**应当**原样带走 —— 见下面 ⓪ 的「待办」 |
             //
             // 曾经这里是「只要不是 Bearer 就透传」—— 于是 `/algo/*` 的 Bearer 也被换成
             // 扣费账号的 token。后果不是「换号没生效」，是客户端**整个起不来**：网关回
@@ -1058,36 +1068,29 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             //
             // 重签失败（不是 COSY / 取不到 uid / body 非 UTF-8）一律回落到下面的
             // `auth_plan`：宁可原样透传，也绝不发一个半改的请求。
+            //
+            // ⚠️ **待办（上面那张表目前对这一条不成立）**：这里的判据只看凭证形态、
+            // 不看路径，所以 `/algo/*` 的 COSY 也会被重签。实测接管开着时客户端的
+            // `modelCatalogFetch` 有 6×403 / 9×200（调试日志 `proxy_auth` 里逐条可查），
+            // 与那张表「/algo 一个字都不能动」的结论对不上，嫌疑就在这一步。
+            // 要收敛只需给下面的 filter 加一个 `is_chat &&`。
+            // 界面那份模型清单**不依赖**客户端这条请求（`models::load` 自己签自己拉），
+            // 所以那样改不会让接管页变空。
             let cosy_rebuilt = match auth_in
                 .as_deref()
                 .filter(|v| cosy::is_cosy_authorization(v))
             {
                 None => None,
                 Some(v) => {
-                    let uid = match account.cosy_uid.clone().filter(|u| !u.is_empty()) {
-                        Some(u) => Some(u),
-                        // 该账号第一次被路由到：联网问一次 `/api/v3/user/status` 并落盘。
-                        None => match cosy::fetch_uid(&CLIENT, &host, &account.token).await {
-                            Some(u) => {
-                                accounts::set_cosy_uid(&dir, &account.id, &u);
-                                Some(u)
-                            }
-                            None => None,
-                        },
-                    };
-                    uid.and_then(|uid| {
-                        let id = cosy::Identity {
-                            uid,
-                            name: account.name.clone(),
-                            email: String::new(),
-                            token: account.token.clone(),
-                        };
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        cosy::rebuild(v, &id, &bare, body, now)
-                    })
+                    // 身份来自上面那一份（含「uid 缺就联网补一次并落盘」的惰性策略，
+                    // 与拉模型目录共用 [`accounts::cosy_identity`]）。
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    cosy_id
+                        .as_ref()
+                        .and_then(|id| cosy::rebuild(v, id, &bare, body, now))
                 }
             };
 
@@ -1161,8 +1164,10 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         // 免费模型集：与接管页同一份（[`crate::models`] 的三层来源 + 1h 内存缓存）。
         // 三层都拿不到就是**空集** ⇒ 只有流程里那些「上游 429 也原样透传」的模型不再自动换号；
         // 这里不会退回任何写死的模型名。
+        // 拿不到签名身份（该区域没账号 / uid 取不到）时**只是不走网络那层**，
+        // 缓存与本机痕迹照给 —— 热路径上不该因为一次网络失败就没有清单。
         let free_set = if is_chat {
-            ensure_free_models(&dir, account.region, &account.token)
+            ensure_free_models(&dir, account.region, cosy_id.as_ref())
         } else {
             HashSet::new()
         };
@@ -1344,12 +1349,12 @@ fn body_model(body: &[u8]) -> Option<String> {
 /// 这段原本打的是 CodeBuddy 的 `{base}/v2/enterprises/personal/models`，兜底写死腾讯的
 /// `hy3` —— 在 Qoder 上那条路径恒 404，于是永远退回兜底，把一个 Qoder 根本不认识的
 /// 模型名当成了免费模型。接口与兜底都已作废，理由见 [`crate::models`] 的模块说明。
-fn ensure_free_models(dir: &Path, region: Region, token: &str) -> HashSet<String> {
-    // 空 token 当「没有凭证」处理：带着空 Bearer 去请求只会白等一轮超时，
-    // 而结果一样是退到本地两层。调用点给的是真账号，这只是兜底。
-    let token = (!token.is_empty()).then_some(token);
-    let report =
-        tauri::async_runtime::block_on(crate::models::load(region, dir, token, false));
+fn ensure_free_models(
+    dir: &Path,
+    region: Region,
+    identity: Option<&crate::cosy::Identity>,
+) -> HashSet<String> {
+    let report = tauri::async_runtime::block_on(crate::models::load(region, dir, identity, false));
     crate::models::free_ids(&report.models)
 }
 
@@ -1394,8 +1399,8 @@ fn is_rate_limited_model(
 ///
 /// 绑了池先整池同步一轮（本地那份 token 可能早被别的机器换掉了）—— 这条留着。
 /// 但**不再调 `ensure_fresh_token`**：`free_models` 不落盘，而续签会轮换 refresh token，
-/// 于是「看一眼清单」可能把轮换出来的新凭证直接丢掉；换来的新 token 也拉不到目录
-/// （两个区域实测都进不去，见 [`crate::models`] 模块头）。净亏，删掉。
+/// 于是「看一眼清单」可能把轮换出来的新凭证直接丢掉。真过期了会怎样？第 1 层拿不到身份，
+/// 自动退到缓存与本机痕迹两层 —— 界面不空、也不赔上凭证。净亏，删掉。
 #[tauri::command]
 pub async fn free_models(
     app: tauri::AppHandle,
@@ -1407,14 +1412,20 @@ pub async fn free_models(
     // 缺省 = 设置里的接管目标区域（接管页默认看的就是它要接管的那一套）；
     // 前端显式传值时用于「换了区域但还没保存就先看看清单」。
     let region = region.unwrap_or_else(|| accounts::load_settings(&dir).takeover_region);
-    // 找得到就用它的 token 试一次第 1 层；找不到（或 token 是空的）就 `None`，
+    // 找得到账号就组出签名身份，试一次第 1 层；找不到（或 uid 取不到）给 `None`，
     // 让 [`crate::models::load`] 直接走本地两层 —— 那不是错误。
-    let token = accounts::load_accounts(&dir)
+    let account = accounts::load_accounts(&dir)
         .into_iter()
         .filter(|a| a.region == region)
-        .find(|a| !a.token.is_empty())
-        .map(|a| a.token);
-    Ok(crate::models::load(region, &dir, token.as_deref(), refresh.unwrap_or(false)).await)
+        .find(|a| !a.token.is_empty());
+    let identity = match &account {
+        Some(a) => {
+            accounts::cosy_identity(&dir, a, &crate::http::api_client_direct(), region.infer_base())
+                .await
+        }
+        None => None,
+    };
+    Ok(crate::models::load(region, &dir, identity.as_ref(), refresh.unwrap_or(false)).await)
 }
 
 /// 不该回给客户端的响应头：逐跳头、reqwest 已代劳解压后失效的，

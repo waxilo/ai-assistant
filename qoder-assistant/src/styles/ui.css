@@ -954,6 +954,13 @@ body.modal-open .content {
   background: var(--warn-soft-2);
   color: var(--warn-d);
 }
+/* 错峰折扣：折扣前的倍率划掉摆在前面，胶囊读作「~~x0.5~~ x0.2」。
+   只留折扣后的数字，用户分不清这是常价还是活动价。 */
+.pick-was {
+  margin-right: 5px;
+  text-decoration: line-through;
+  opacity: 0.62;
+}
 
 /* 弹窗里的设置行（如「限流时在同一会话内换号」）：
    页面的 .set-row 没有边框，单行放进弹窗会与上下块脱开，这里给它块状外观。 */

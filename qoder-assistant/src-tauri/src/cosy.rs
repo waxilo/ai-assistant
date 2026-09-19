@@ -58,6 +58,7 @@ XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----";
 
 /// 重签所需的目标账号身份。
+#[derive(Clone)]
 pub struct Identity {
     /// Qoder 侧账号 id（`/api/v3/user/status` 的 `id`）—— **不是** `Account::id`。
     pub uid: String,
@@ -167,6 +168,21 @@ pub fn rebuild(
     now_secs: i64,
 ) -> Option<Rebuilt> {
     rebuild_with_secret(orig_authorization, id, target, body, now_secs, random_secret())
+}
+
+/// 一份「够用的假 Authorization」：[`rebuild_with_secret`] 只从原头里**借用**环境特征
+/// （`version` / `cosyVersion` / `ideVersion`），借用完就整个重算，所以这三个值给默认的即可。
+const SYNTHETIC_ORIG: &str = "Bearer COSY.\
+eyJ2ZXJzaW9uIjoidjEiLCJyZXF1ZXN0SWQiOiIiLCJpbmZvIjoiIiwiY29zeVZlcnNpb24iOiIxLjAuMCIsImlkZVZlcnNpb24iOiIifQ==\
+.sig";
+
+/// **从零**签一整套 COSY 头（不需要客户端先把请求送到反代）。
+///
+/// 与 [`rebuild`] 的区别只在「环境特征从哪来」：接管热路径上借用客户端那份，
+/// 我们**自己发起**的查询（拉模型目录）没有份可借，就用 [`SYNTHETIC_ORIG`] 里的默认值。
+/// 算法、凭据、签名完全同一条，所以服务端看不出两类请求的差别。
+pub fn sign(id: &Identity, target: &str, body: &[u8], now_secs: i64) -> Option<Rebuilt> {
+    rebuild_with_secret(SYNTHETIC_ORIG, id, target, body, now_secs, random_secret())
 }
 
 /// 生成对称密钥 `A`：**16 个 ASCII 字符**（8 随机字节的 hex），既是 AES-128 密钥也是 IV。

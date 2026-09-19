@@ -18,8 +18,7 @@
 //! | `productId` | `qoder` | `qoder-cn` |
 //! | 登录 / 授权 | `https://qoder.com` | `https://qoder.cn` |
 //! | OpenAPI（额度 / 活动权益 / 用户） | `https://openapi.qoder.sh` | `https://openapi.qoder.com.cn` |
-//! | 模型网关（接管转发目标） | `https://api2-v2.qoder.sh` | `https://gateway.qoder.com.cn` |
-//! | 模型目录（`/api/v2/model/list`） | `https://api3.qoder.sh` | `https://gateway.qoder.com.cn` |
+//! | 模型网关（接管转发目标 **与** 模型目录） | `https://api2-v2.qoder.sh` | `https://gateway.qoder.com.cn` |
 //! | CLI 配置目录 | `~/.qoder` | `~/.qoder-cn` |
 //! | 桌面端数据目录 | `com.qoder.app.stable` | `com.qodercn.app.stable` |
 //! | macOS 应用 | `/Applications/Qoder.app` | `/Applications/Qoder CN.app` |
@@ -115,25 +114,19 @@ impl Region {
         }
     }
 
-    /// 模型网关：接管反代把 CLI 的对话请求转发到它。
+    /// 模型网关：接管反代把 CLI 的对话请求转发到它，**模型目录也在同一个域**
+    /// （`GET {infer_base}/algo/api/v2/model/list`，见 `models` 模块头）。
     ///
     /// 国际版取的是 CLI `gtn()` 的 `prod` 分支（`api2-v2`，与桌面端 asar 里那个
     /// `api2.qoder.sh` 不是同一个 —— 实测能用的是前者，接管线一直用它）；
     /// 国内版两边都是 `gateway.qoder.com.cn`。
+    ///
+    /// 这里曾经另有一个 `catalog_base()`（国际版写成 `api3.qoder.sh`）—— 那是早先
+    /// 一次没验证过的猜测。国内版实测目录就在本函数的域上（`models` 模块头），
+    /// 国际版走同一条代码路径；留两个常量只会让「哪一天对不上」变成两个答案。
     pub fn infer_base(self) -> &'static str {
         match self {
             Region::Global => "https://api2-v2.qoder.sh",
-            Region::Cn => "https://gateway.qoder.com.cn",
-        }
-    }
-
-    /// 模型目录基址（`GET {catalog_base}/api/v2/model/list`）。
-    ///
-    /// 两个区域**不是同一个域**：国际版在 `api3.qoder.sh`，国内版在
-    /// `gateway.qoder.com.cn`（实测日志见模块头）。
-    pub fn catalog_base(self) -> &'static str {
-        match self {
-            Region::Global => "https://api3.qoder.sh",
             Region::Cn => "https://gateway.qoder.com.cn",
         }
     }
@@ -330,10 +323,9 @@ mod tests {
         assert_eq!(Region::Global.openapi_base(), "https://openapi.qoder.sh");
         assert_eq!(Region::Cn.openapi_base(), "https://openapi.qoder.com.cn");
         assert_eq!(Region::Cn.infer_base(), "https://gateway.qoder.com.cn");
-        assert_eq!(Region::Cn.catalog_base(), "https://gateway.qoder.com.cn");
-        // 模型目录的国际版不在 openapi 上（在 api3），别顺手统一
-        assert_eq!(Region::Global.catalog_base(), "https://api3.qoder.sh");
-        assert_ne!(Region::Global.catalog_base(), Region::Global.openapi_base());
+        assert_eq!(Region::Global.infer_base(), "https://api2-v2.qoder.sh");
+        // 国际版的推理网关（模型目录也在它上面）与 openapi 不是同一个域，别顺手统一
+        assert_ne!(Region::Global.infer_base(), Region::Global.openapi_base());
     }
 
     /// 本地目录：CLI 目录与桌面端数据目录都必须按区域分开。

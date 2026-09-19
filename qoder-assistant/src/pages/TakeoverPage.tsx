@@ -983,6 +983,10 @@ export function TakeoverPage({
                       <span
                         className={"pick-state " + (m.free ? "ok" : "warn")}
                       >
+                        {/* 活动价要把原价划出来：光看 x0.2 分不清常价还是错峰折扣 */}
+                        {m.original_multiplier && (
+                          <s className="pick-was">{m.original_multiplier}</s>
+                        )}
                         {m.free ? "免费 · 默认" : m.multiplier || "倍率未知"}
                       </span>
                     </span>
