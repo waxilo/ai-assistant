@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy-assistant"
-version = "0.1.36"
+version = "0.1.37"
 description = "WorkBuddy 多账号签到桌面助手"
 authors = ["waxilo"]
 edition = "2021"
