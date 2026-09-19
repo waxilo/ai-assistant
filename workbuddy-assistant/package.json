@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-assistant",
   "private": true,
-  "version": "0.1.38",
+  "version": "0.1.39",
   "type": "module",
   "description": "WorkBuddy 助手（Tauri）：多账号签到、定时签到、token 自动续签",
   "scripts": {

@@ -1,7 +1,7 @@
 {
   "name": "traework-assistant",
   "private": true,
-  "version": "0.1.22",
+  "version": "0.1.23",
   "type": "module",
   "description": "TraeWork 助手（Tauri）：多账号签到、定时签到、token 自动续签、池化网关",
   "scripts": {
