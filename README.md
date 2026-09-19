@@ -27,7 +27,7 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
 
 1. 改版本号（四处必须对齐，否则应用内版本号会显示错）：
    `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json`、`package-lock.json`
-2. 打 tag 推送：`traework-v0.1.20` / `workbuddy-v0.1.36` / `qoder-v0.1.1`（版本以 tag 为准）
+2. 打 tag 推送：`traework-v0.1.20` / `workbuddy-v0.1.36` / `qoder-v0.1.2`（版本以 tag 为准）
 3. CI 构建两个平台 → 由 `scripts/build-latest.mjs` 用 `.sig` 生成 `latest.json`
    （v2 的 `tauri build` 不产 manifest）→ delete+recreate 各自的固定 tag Release
 
@@ -44,7 +44,7 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
 |---|---|---|
 | TraeWorkAssistant | `0.1.20` | 0.1.x（自身历史） |
 | WorkBuddyAssistant | `0.1.36` | 0.1.x（自身历史） |
-| QoderAssistant | `0.1.1` | **从 `0.1.0` 起算** |
+| QoderAssistant | `0.1.2` | **从 `0.1.0` 起算** |
 
 QoderAssistant 曾以 `0.1.36` 首次发布 —— 那是照搬 WorkBuddy 当时 `0.1.35` 的结果，
 不是它自己的版本历史，于是「一个全新应用的首个版本号带着另一个应用的历史」，三个应用
