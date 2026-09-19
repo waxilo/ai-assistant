@@ -4,6 +4,7 @@ import {
   applySettings,
   takeoverEvents,
   clearTakeoverEvents,
+  revealDebugLog,
   saveSettings,
   stealthStatus,
   freeModels,
@@ -16,7 +17,13 @@ import { IconBolt, IconInfo, IconUser } from "../components/Icons";
 import { Row, Toggle } from "../components/SettingsControls";
 import { Dialog } from "../components/Dialog";
 
-/** 事件类型 → 界面标签与配色 */
+/**
+ * 事件类型 → 界面标签与配色。
+ *
+ * 这张表**只认对客通知**。请求级细节（`proxy_auth` / `proxy_request` /
+ * `proxy_bad_request`…）压根不会送到前端 —— 它们在写入侧就分流去了调试日志文件。
+ * 如果哪天这里又收到一个技术事件，说明后端的分流漏了，label 会退化成「事件」。
+ */
 function eventKind(e: JournalEvent): {
   label: string;
   cls: "on" | "off" | "route" | "failover" | "restart" | "err";
@@ -26,20 +33,19 @@ function eventKind(e: JournalEvent): {
       return { label: "开启接管", cls: "on" };
     case "uninstall":
       return { label: "关闭接管", cls: "off" };
+    // 「本次对话由账号 X 提供」—— 整个页面最要紧的一条：它回答「这轮对话扣的是谁」
+    case "session_start":
+      return { label: "本次对话", cls: "route" };
     case "route_start":
       return { label: "开始使用账号", cls: "route" };
     case "failover":
       return { label: "限流切换", cls: "failover" };
     case "restart_qoder":
       return { label: "重启 Qoder", cls: "restart" };
+    // 真故障：连不上上游 / 响应中断。用户能感知，所以它必须出现在这里。
     case "proxy_upstream_error":
     case "proxy_stream_error":
-    case "proxy_conn_setup_failed":
-    case "proxy_bad_request":
-      return { label: "代理错误", cls: "err" };
-    // 客户端连上后迟迟不发请求头（此前会被误判成 400，现改为 408 + 本事件）
-    case "proxy_head_stalled":
-      return { label: "请求卡住", cls: "err" };
+      return { label: "接管异常", cls: "err" };
     default:
       return { label: "事件", cls: "restart" };
   }
@@ -207,7 +213,7 @@ export function TakeoverPage({
   const doClearEvents = async () => {
     const ok = await askConfirm({
       title: "清空接管动态",
-      body: "将删除全部接管事件记录（开启/关闭/账号启用/错误），此操作不可恢复。继续？",
+      body: "将删除界面上的全部通知（开启/关闭/每次对话的账号/异常），此操作不可恢复。调试日志不受影响。继续？",
       okText: "清空",
       danger: true,
     });
@@ -218,6 +224,20 @@ export function TakeoverPage({
       onToast({ kind: "ok", text: "接管动态已清空" });
     } catch (e) {
       onToast({ kind: "err", text: "清空失败：" + String(e) });
+    }
+  };
+
+  /**
+   * 在文件管理器里定位调试日志。
+   *
+   * 界面上只留对客通知，于是「这个请求到底怎么被处理的」必须有地方可查 —— 就是它。
+   * 排查时先看这里，别指望界面上有。
+   */
+  const doRevealLog = async () => {
+    try {
+      await revealDebugLog();
+    } catch (e) {
+      onToast({ kind: "err", text: "打开调试日志失败：" + String(e) });
     }
   };
 
@@ -693,9 +713,16 @@ export function TakeoverPage({
         <div className="card-head">
           <h3>接管动态</h3>
           <span className="card-head-sub">
-            开启 / 关闭 / 每个会话用哪个账号 / 异常。开启接管时自动重置，本轮记录不会丢
+            只说你需要知道的：开关动作、每次对话用的哪个账号、异常。请求级细节在调试日志里
           </span>
           <span className="spacer" />
+          <button
+            className="btn small ghost"
+            title="在文件管理器里定位调试日志（每个请求的路径、鉴权、上游状态都记在里面）"
+            onClick={() => void doRevealLog()}
+          >
+            查看日志
+          </button>
           <button
             className="btn small ghost"
             disabled={feedBusy}
@@ -707,7 +734,7 @@ export function TakeoverPage({
           <button
             className="btn small ghost"
             disabled={events.length === 0}
-            title="删除全部接管事件记录，不可恢复"
+            title="清空界面上的通知（调试日志不受影响）"
             onClick={() => void doClearEvents()}
           >
             清空
@@ -715,7 +742,8 @@ export function TakeoverPage({
         </div>
         {events.length === 0 ? (
           <p className="hint">
-            暂无事件。开启接管并产生对话后，这里会记录每一次账号启用与开关动作。
+            暂无通知。开启接管并对话后，这里会出现「本次对话由账号 X 提供」这类记录；
+            要查某个请求具体怎么被处理的，点「查看日志」。
           </p>
         ) : (
           <ul className="evt-list">

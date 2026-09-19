@@ -74,6 +74,33 @@ const LEASE_FILE: &str = "stealth.json";
 /// 一次性 `--print` 进程**（跑完即退），没有长驻 host，也就不存在跨重启的 env 缓存。
 const JOURNAL_FILE: &str = "takeover-journal.jsonl";
 
+/// 接管调试日志（纯文本、一行一条）。**请求级细节全在这里**：反代收到的每个路径、
+/// 鉴权形态、完整请求头、上游状态码、连接断在哪一步。
+///
+/// 为什么要与 [`JOURNAL_FILE`] 分成两份：那份是**对客通知**（界面直接显示），只留
+/// 「开关动了 / 这轮对话用了哪个账号 / 真出事了」；而排查要的是「客户端到底发了什么」，
+/// 它既不适合端给用户看、又必须一条不漏。两份同锁写入，时间线可以逐条对齐。
+const DEBUG_LOG_FILE: &str = "takeover-debug.log";
+
+/// 调试日志的软上限。超了从头部裁掉旧内容（留最近一半）——
+/// 一轮长会话里每个请求都要写一行（还带请求头），不设上限它就是无限增长的。
+const DEBUG_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 只进调试日志、不进界面时间线的事件名。
+///
+/// 新代码里这些事件已经改走 [`debug_append`]，压根不会写进 journal —— 这张表是给
+/// **升级前留下的那份 journal**兜底的：不清空它，界面也不会再冒出技术细节。
+/// （`proxy_request` 是「反代确实收到过请求」的内部证据，历史上就从不展示。）
+const DEBUG_ONLY_EVENTS: &[&str] = &[
+    "proxy_auth",
+    "proxy_request",
+    "proxy_bad_request",
+    "proxy_head_stalled",
+    "proxy_upstream_status",
+    "proxy_conn_closed",
+    "proxy_conn_setup_failed",
+];
+
 /// 一条接管事件
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct JournalEvent {
@@ -131,20 +158,43 @@ fn make_event(event: &str, detail: &str) -> JournalEvent {
     }
 }
 
-/// 追加一条事件。失败一律静默：日志是诊断辅助，绝不能反过来影响接管本身。
+/// 追加一条**对客通知**：界面「接管动态」会显示它，同时抄一份进调试日志
+/// （调试时看一个文件就够，不必两份对照）。
 ///
-/// **不设条数上限**。曾经的「只留最近 200 条」会让 `proxy_request` 这类高频内部证据
-/// 把真正要看的事件挤出窗口，表现成「接管动态自己清空了」。改为把日志与**一次接管
-/// 会话**绑定：开启接管时整份重置（见 [`journal_append_reset`]），会话之内一条不丢。
+/// 文案只讲「发生了什么、要不要管」—— 路径、env 键名、鉴权形态、会话 id 这类
+/// 排查细节一律走 [`debug_append`]，别混进来：界面上一旦开始讲这些，
+/// 用户就再也找不到「这轮对话扣的是哪个账号」那条真正要看的信息了。
+///
+/// 失败一律静默：日志是诊断辅助，绝不能反过来影响接管本身。
+///
+/// **不设条数上限**。曾经的「只留最近 200 条」会让高频内部证据把真正要看的事件挤出
+/// 窗口，表现成「接管动态自己清空了」。改为把日志与**一次接管会话**绑定：
+/// 开启接管时整份重置（见 [`journal_append_reset`]），会话之内一条不丢。
 pub fn journal_append(data_dir: &Path, event: &str, detail: &str) {
-    write_events(data_dir, &[make_event(event, detail)], false);
+    let ev = make_event(event, detail);
+    let _guard = lock_journal();
+    write_events(data_dir, &[ev], false);
+    append_debug_raw(data_dir, "user", event, detail);
+}
+
+/// 追加一条**仅调试**的细节：只进调试日志文件，界面永远看不到。
+///
+/// 判定标准很简单：如果这条信息用户看了不知道该做什么、而排障时少了它会卡住，
+/// 那它就是调试信息。
+pub fn debug_append(data_dir: &Path, event: &str, detail: &str) {
+    let _guard = lock_journal();
+    append_debug_raw(data_dir, "debug", event, detail);
 }
 
 /// 同 [`journal_append`]，但**先丢弃全部历史**。
 ///
-/// 用在「开启接管」这一刻：日志描述的就是本轮会话，上一轮的话题已经结束。
+/// 用在「开启接管」这一刻：两份日志描述的都是本轮会话，上一轮的话题已经结束。
 pub fn journal_append_reset(data_dir: &Path, event: &str, detail: &str) {
-    write_events(data_dir, &[make_event(event, detail)], true);
+    let ev = make_event(event, detail);
+    let _guard = lock_journal();
+    write_events(data_dir, &[ev], true);
+    reset_debug_log(data_dir);
+    append_debug_raw(data_dir, "user", event, detail);
 }
 
 /// 落盘。`truncate = true` 先清空历史，否则纯追加。
@@ -152,6 +202,10 @@ pub fn journal_append_reset(data_dir: &Path, event: &str, detail: &str) {
 /// 用纯追加而非「读全量 → 改 → 整体重写」：取消上限之后，后者每次追加的代价随文件
 /// 长度线性增长（还附带一遍全量 JSON 解析），长会话会把每个反代请求越拖越慢。追加是
 /// O(1)，顺带还绕开了 Windows 上 `rename` 会因文件被展示层占用而失败的问题。
+///
+/// ⚠️ 本函数**不加锁** —— 调用方必须已经持有 `JOURNAL_LOCK`。加锁被提到公开入口，
+/// 是因为一次调用要写两份文件（journal + 调试日志），必须整体串行；若各自加锁，
+/// 两次拿锁之间会插进别的线程，两份日志的时间线就对不上了。
 fn write_events(data_dir: &Path, events: &[JournalEvent], truncate: bool) {
     let body: String = events
         .iter()
@@ -161,7 +215,6 @@ fn write_events(data_dir: &Path, events: &[JournalEvent], truncate: bool) {
     if body.is_empty() {
         return;
     }
-    let _guard = lock_journal();
     if fs::create_dir_all(data_dir).is_err() {
         return;
     }
@@ -182,6 +235,76 @@ fn write_events(data_dir: &Path, events: &[JournalEvent], truncate: bool) {
     }
     // 一次 write_all 写完整条：单条记录远小于一个扇区，读者不会看到半条
     let _ = f.write_all(body.as_bytes());
+}
+
+pub fn debug_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(DEBUG_LOG_FILE)
+}
+
+/// 调试日志的一行：
+///
+/// ```text
+/// 2026-09-19 17:47:44.123 [user ] install      | 接管已开启（国内版）…
+/// 2026-09-19 17:47:44.456 [debug] proxy_auth   | 反代收到 POST /algo/… | 鉴权 …
+/// ```
+///
+/// 前缀是给 `grep '\[debug\]'` 用的：想知道「界面上这条通知背后到底发生了什么」，
+/// 按事件名在同一份文件里往下翻就行 —— 对客通知在调试日志里也有一份。
+///
+/// ⚠️ 同样不加锁，调用方持 `JOURNAL_LOCK`。
+fn append_debug_raw(data_dir: &Path, audience: &str, event: &str, detail: &str) {
+    if fs::create_dir_all(data_dir).is_err() {
+        return;
+    }
+    let path = debug_log_path(data_dir);
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    let Ok(mut f) = opts.open(&path) else {
+        return;
+    };
+    let line = format!(
+        "{} [{audience:5}] {event:20} | {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        one_line(detail)
+    );
+    let _ = f.write_all(line.as_bytes());
+    drop(f);
+    trim_debug_log(&path);
+}
+
+/// 调试日志是**一行一条**（`tail` / `grep` 才有意义）。detail 里可能带换行
+/// （比如坏请求要附上收到的头部前缀），转成字面量 `\n`，别把一条拆成多行。
+fn one_line(s: &str) -> String {
+    s.replace("\r\n", "\\n").replace(['\r', '\n'], "\\n")
+}
+
+/// 超软上限就从头部裁掉旧内容（留最近一半，按行边界切）。内容本身不丢语义：
+/// 每行都自带时间戳与事件名。
+fn trim_debug_log(path: &Path) {
+    let Ok(meta) = fs::metadata(path) else { return };
+    if meta.len() <= DEBUG_LOG_MAX_BYTES {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else { return };
+    // 半个字节位置可能落在多字节字符中间（中文 3 字节）→ 先挪到字符边界
+    let mut at = text.len() / 2;
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    // 再往后找到第一个换行：别把一条记录劈成两半
+    let cut = text[at..]
+        .find('\n')
+        .map(|i| at + i + 1)
+        .unwrap_or(text.len());
+    let _ = fs::write(path, &text[cut..]);
+}
+
+/// 调试日志整份清空（开启接管时用）。
+fn reset_debug_log(data_dir: &Path) {
+    if fs::create_dir_all(data_dir).is_err() {
+        return;
+    }
+    let _ = fs::write(debug_log_path(data_dir), "");
 }
 
 /// 文件是否为空、或以换行结尾（空文件视为「干净」，无需补换行）。
@@ -386,9 +509,17 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
         data_dir,
         "install",
         &format!(
-            "接管已开启（{}）：端点已注入 {}（env.{}={url}），\
-             并注入了本机 CA 以信任本地 TLS；扣费备选：{names}{note}",
-            region.label(),
+            "接管已开启（{}）：对话请求已改由本应用转发，扣费备选：{names}{note}",
+            region.label()
+        ),
+    );
+    // 落点路径 / env 键名 / 端点值只在排查时有用，端到界面上既占地方又答非所问 ——
+    // 它们进调试日志。上面那条 reset 刚清过文件，所以这是新一轮的第一条细节。
+    debug_append(
+        data_dir,
+        "install_target",
+        &format!(
+            "端点已注入 {}（env.{}={url}），并注入了本机 CA 以信任本地 TLS",
             target.display(),
             region.endpoint_env_key().unwrap_or("")
         ),
@@ -416,9 +547,16 @@ pub fn uninstall(region: Region, data_dir: &Path) -> Result<(), String> {
         journal_append(
             data_dir,
             "uninstall",
-            &format!(
-                "接管已关闭（{label}）：worker 产物已还原成官方原样，客户端下一次会话恢复直连"
-            ),
+            &format!("接管已关闭（{label}）：客户端已恢复直连，下一次对话不再经过本应用"),
+        );
+        // 「还原了哪个文件的哪一段」只有排查时用得上
+        debug_append(
+            data_dir,
+            "uninstall_target",
+            &match target_file(region) {
+                Some(t) => format!("已从 {} 精确剥离注入段（逐字节还原官方原样）", t.display()),
+                None => "客户端产物不存在，没有可剥离的注入段".to_string(),
+            },
         );
     }
     let _ = fs::remove_file(lease_path(data_dir));
@@ -607,9 +745,12 @@ pub fn stealth_status(app: tauri::AppHandle) -> Result<StealthStatus, String> {
     Ok(status(region, &dir))
 }
 
-/// 接管事件流（新的在前）：开启 / 关闭 / 开始使用账号 / 错误。
-/// `proxy_request` 是「端点确实被用过」的内部证据（网络救急与排查都靠它），
-/// 账号/会话信息已由「开始使用账号」事件承载，展示层过滤掉避免重复刷屏。
+/// 接管通知流（新的在前）：开启 / 关闭 / 这轮对话用了哪个账号 / 限流切换 / 真故障。
+///
+/// **这里只出对客通知**。请求级细节（收到了哪个路径、鉴权是什么形态、上游回了几多）
+/// 走 [`debug_append`] 落 `takeover-debug.log`，界面上一个都不显示 ——
+/// 那道过滤在**写入侧**，本函数只对升级前的旧 journal 做一次兜底（见
+/// [`DEBUG_ONLY_EVENTS`]）。
 ///
 /// 这里曾有一步 `merge_install_restart`：把「开启接管」与紧随其后的「重启 Qoder」
 /// 合并成一条，免得同一个动作在时间线上占两格。切换拓扑不再重启客户端之后，
@@ -620,15 +761,74 @@ pub fn takeover_events(app: tauri::AppHandle) -> Vec<JournalEvent> {
     let Ok(dir) = crate::commands::try_data_dir(&app) else {
         return Vec::new();
     };
-    let mut out = journal_read(&dir)
+    visible_events(journal_read(&dir))
+}
+
+/// 从落盘的 journal 里挑出**给用户看**的那部分（新的在前）。
+///
+/// 抽成纯函数是为了能在单测里把「技术细节一个都不许漏到界面上」钉死 ——
+/// 这道过滤只在**读取侧**对升级前的旧 journal 生效；新写入的调试事件压根不进这个文件。
+fn visible_events(events: Vec<JournalEvent>) -> Vec<JournalEvent> {
+    let mut out: Vec<JournalEvent> = events
         .into_iter()
-        .filter(|e| e.event != "proxy_request")
-        .collect::<Vec<_>>();
+        .filter(|e| !DEBUG_ONLY_EVENTS.contains(&e.event.as_str()))
+        .collect();
     out.reverse();
     out
 }
 
-/// 清空接管动态（不可恢复）：把事件日志文件截断为空。
+/// 在文件管理器里定位**接管调试日志**（请求级细节都在那份文件里）。
+///
+/// 界面上只留对客通知，于是「客户端到底发了什么」必须有地方可查 —— 就是它。
+/// 文件不存在时先建一个空的：用户点这个按钮的目的正是「我想看看里面有什么」，
+/// 而 `open -R` 对一个不存在的路径会直接报错。
+#[tauri::command]
+pub fn reveal_debug_log(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = crate::commands::try_data_dir(&app)?;
+    let path = debug_log_path(&dir);
+    if !path.exists() {
+        if fs::create_dir_all(&dir).is_err() {
+            return Err("无法创建应用数据目录".to_string());
+        }
+        let _ = fs::write(&path, "");
+    }
+    reveal_in_file_manager(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    // `-R` = 在 Finder 里选中该文件（而不是拿某个 App 打开它）
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开日志位置失败：{e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开日志位置失败：{e}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    let dir = path.parent().unwrap_or(path);
+    std::process::Command::new("xdg-open")
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开日志位置失败：{e}"))
+}
+
+/// 清空接管动态（不可恢复）：把**对客通知**那份文件截断为空。
+///
+/// 调试日志**故意不跟着清** —— 它是排查材料，而界面上这个按钮的本意只是「把看过的
+/// 通知划掉」，误点一下就丢掉全部请求级细节是不可接受的代价。它自己在开启接管时重置。
 #[tauri::command]
 pub fn takeover_events_clear(app: tauri::AppHandle) -> Result<(), String> {
     let dir = crate::commands::try_data_dir(&app)?;
@@ -968,8 +1168,18 @@ mod tests {
                 vec!["install", "uninstall"],
                 "只记真实发生的变更：{events:?}"
             );
-            assert!(events[0].detail.contains(&format!("127.0.0.1:{}", default_port(&data))));
+            // 对客通知说人话：哪个客户端、扣谁的钱
+            assert!(events[0].detail.contains("国内版"), "{}", events[0].detail);
             assert!(events[1].detail.contains("国内版"));
+            // 而「写到了哪个文件、用的哪个 env 键、端点值是什么」是排查细节 ——
+            // 它们必须还在，只是搬到了调试日志里（界面上看不到）。
+            let log = fs::read_to_string(debug_log_path(&data)).unwrap();
+            assert!(
+                log.contains(&format!("127.0.0.1:{}", default_port(&data))),
+                "调试日志要留下真实注入的端点：{log}"
+            );
+            assert!(log.contains("QODERCN_SERVER_ENDPOINT"), "{log}");
+            assert!(log.contains("[debug]"), "调试事件要能被 grep 出来：{log}");
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }
@@ -990,6 +1200,70 @@ mod tests {
         assert_eq!(all[0].detail, "e0", "最旧的必须还在，且顺序不变");
         assert_eq!(all[n - 1].detail, format!("e{}", n - 1));
 
+        let _ = fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    /// 分级契约：调试事件**只进日志文件**，界面时间线一个都不许出现。
+    ///
+    /// 这条曾经真的坏过：`proxy_auth` 原先走的是对客通道，于是接管动态整屏都是
+    /// 「反代收到 POST /algo/…（鉴权：Bearer COSY.eyJ…）」，而用户真正要看的
+    /// 「这轮对话扣的是哪个账号」被淹在中间、一条都没有。
+    #[test]
+    fn debug_events_never_reach_the_ui_feed() {
+        let (_sdk, data) = sandbox();
+        journal_append(&data, "install", "接管已开启（国内版）");
+        debug_append(&data, "proxy_auth", "收到 POST /algo/xxx | 鉴权 Bearer COSY.eyJ…");
+        debug_append(&data, "proxy_conn_closed", "客户端连上后未发数据即断开");
+
+        let raw = journal_read(&data);
+        assert_eq!(
+            raw.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
+            vec!["install"],
+            "调试事件不该写进对客 journal：{raw:?}"
+        );
+
+        // 两份都要在调试日志里 —— 排查时看一个文件就够，不必两份对照
+        let log = fs::read_to_string(debug_log_path(&data)).unwrap();
+        assert!(log.contains("proxy_auth"), "{log}");
+        assert!(log.contains("proxy_conn_closed"), "{log}");
+        assert!(log.contains("[user ] install"), "对客通知要带受众标记：{log}");
+        assert!(log.contains("[debug] proxy_auth"), "调试事件要带受众标记：{log}");
+
+        // 读取侧还要兜住**升级前**那份 journal（里面混着 proxy_auth）
+        fs::write(
+            journal_path(&data),
+            concat!(
+                r#"{"at_ms":1,"at":"","event":"install","detail":"开"}"#,
+                "\n",
+                r#"{"at_ms":2,"at":"","event":"proxy_auth","detail":"旧版混进来的细节"}"#,
+                "\n",
+                r#"{"at_ms":3,"at":"","event":"session_start","detail":"本次对话由账号「A」提供"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let shown: Vec<String> = visible_events(journal_read(&data))
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["session_start", "install"],
+            "界面只看对客通知，且新的在前"
+        );
+
+        let _ = fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    /// 调试日志是**一行一条**：detail 里的换行必须转义，否则 `tail` / `grep` 全乱
+    /// （坏请求那条要附收到的头部前缀，一定带换行）。
+    #[test]
+    fn debug_log_stays_one_line_per_entry() {
+        let (_sdk, data) = sandbox();
+        debug_append(&data, "proxy_bad_request", "第一行\n第二行");
+        let log = fs::read_to_string(debug_log_path(&data)).unwrap();
+        assert_eq!(log.lines().count(), 1, "一条记录只能占一行：{log}");
+        assert!(log.contains(r"第一行\n第二行"), "{log}");
         let _ = fs::remove_dir_all(data.parent().unwrap());
     }
 

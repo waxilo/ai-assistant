@@ -830,6 +830,61 @@ fn head_prefix(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..buf.len().min(512)]).to_string()
 }
 
+/// 鉴权头的**形态**（不记原文）：够分辨「客户端这次用的是 COSY 还是裸 token」，
+/// 又不至于把凭据本身写进日志文件。
+fn auth_shape(v: Option<&str>) -> String {
+    let Some(v) = v else {
+        return "无".to_string();
+    };
+    let (scheme, rest) = v.split_once(' ').unwrap_or((v, ""));
+    if rest.is_empty() {
+        return scheme.to_string();
+    }
+    let head: String = rest.chars().take(8).collect();
+    format!("{scheme} {head}…（{}B）", rest.len())
+}
+
+/// 请求头的可读快照（写进调试日志）。
+///
+/// ⚠️ 它会**落盘成明文文件**，所以凭据类头只留字节数：`authorization` / `cookie` /
+/// `cosy-*` 一律不写值。其余头原样记 —— 「客户端到底带了什么」是排查「某个字段为什么
+/// 拿不到」时唯一不必再猜的东西（本轮就在它上面吃过亏：会话 id 头一条都没有）。
+fn header_dump(req: &Request) -> String {
+    const SENSITIVE: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "cosy-key",
+        "cosy-user",
+        "cosy-date",
+        "x-api-key",
+    ];
+    if req.headers.is_empty() {
+        return "（无）".to_string();
+    }
+    req.headers
+        .iter()
+        .map(|(k, v)| {
+            if SENSITIVE.contains(&k.to_ascii_lowercase().as_str()) {
+                format!("{k}=<{}B>", v.len())
+            } else {
+                format!("{k}={}", clip(v, 120))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 按**字符**截断（不是字节）—— 中文头值按字节切会切出乱码
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
+}
+
 /// 处理一条已建立的连接。
 ///
 /// 泛型化（而不是写死 `TcpStream`）是为了同时容纳两种承载：端点覆盖强制 https，
@@ -848,14 +903,26 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
     // 1. 读完请求头（+ body）
     let (req, buf) = match read_head(&mut stream) {
         HeadRead::Ready(req, buf) => (req, buf),
+        HeadRead::Broken(buf) if buf.is_empty() => {
+            // 连上后又一个字节都没发就断开 —— **这是常态，不是故障**：客户端连接池的
+            // 预热/清理每次会话收尾都会来一条（2026-09-19 实测：每轮对话结束时都跟着一条）。
+            // 所以这里**什么都不回**：对方已经关了，回 400 只会留下一条看着像故障的记录
+            // （它曾经真的把界面刷成红字「代理错误」）。只在调试日志里留个脚印。
+            stealth::debug_append(
+                &dir,
+                "proxy_conn_closed",
+                "客户端连上后未发数据即断开（连接池预热/清理，正常现象）",
+            );
+            return;
+        }
         HeadRead::Broken(buf) => {
-            // 读到一半断开。线上最常见的是 **0 字节**：客户端连上但还没发出请求就断开——
-            // 这绝不等于「请求非法」，所以把字节数写进日志，让这种事一眼可辨。
-            let _ = stealth::journal_append(
+            // 真读了半截才断：请求确实不完整，回 400 是对的。字节数与头部前缀是排查
+            // 「客户端到底想发什么」的唯一线索，进调试日志。
+            let _ = stealth::debug_append(
                 &dir,
                 "proxy_bad_request",
                 &format!(
-                    "请求未读完或不合法，回 400（已收 {} 字节）：\n{}",
+                    "请求读取中断，回 400（已收 {} 字节）：{}",
                     buf.len(),
                     head_prefix(&buf)
                 ),
@@ -866,11 +933,11 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         HeadRead::Stalled(buf, kind) => {
             // 连上了但一直没把请求发完。与 400 严格分开：400 = 请求语法错，408 = 没等到请求。
             // 若这里出现 `WouldBlock` 而字节数为 0，说明连接没被复位成阻塞——就是本文件最上面那个坑。
-            let _ = stealth::journal_append(
+            let _ = stealth::debug_append(
                 &dir,
                 "proxy_head_stalled",
                 &format!(
-                    "读请求卡住（{kind:?}），回 408（已收 {} 字节）：\n{}",
+                    "读请求卡住（{kind:?}），回 408（已收 {} 字节）：{}",
                     buf.len(),
                     head_prefix(&buf)
                 ),
@@ -928,12 +995,26 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             return;
         };
         if ban.is_empty() && (is_chat || is_chat_generation(&bare)) {
-            // 内部证据事件：证明「反代确实收到了模型请求」，时间线展示层会过滤。
-            stealth::journal_append(
+            // 对客通知：界面上最该有的一条 —— 「这轮对话扣的是哪个账号」。
+            // 去重口径见 `should_announce_session`。
+            if should_announce_session(&account, model.as_deref()) {
+                stealth::journal_append(
+                    &dir,
+                    "session_start",
+                    &format!(
+                        "本次对话由账号「{}」提供（模型：{}）",
+                        account.name,
+                        model.as_deref().unwrap_or("未知")
+                    ),
+                );
+            }
+            // 内部证据：证明「反代确实收到过模型请求」。界面不显示，但网络救急与排查
+            // 都靠它 —— 它必须一条不漏地留在调试日志里。
+            stealth::debug_append(
                 &dir,
                 "proxy_request",
                 &format!(
-                    "反代收到模型请求（扣费账号：{}，模型：{}）",
+                    "收到模型请求：账号「{}」 模型 {}",
                     account.name,
                     model.as_deref().unwrap_or("未知")
                 ),
@@ -1039,27 +1120,27 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             // 诊断留痕：只在「目录/策略」与「推理」这两类**接管真正关心**的请求上写一行。
             // 它把「客户端发了什么」与「我们怎么处理」钉在同一个时间点上 —— 上一轮在
             // 「客户端到底带没带签名」上只能靠反推，代价是一整轮排障。
+            //
+            // ⚠️ 这是**调试**事件，不进界面：它曾经往「接管动态」里发，于是整屏都是
+            // 「反代收到 POST /algo/…（鉴权：Bearer COSY.eyJ…）」，而用户要看的那条
+            // 「这轮对话扣的是哪个账号」反倒被淹掉了。
             if is_chat || bare.starts_with("/algo/") {
-                let shape = match auth_in.as_deref() {
-                    None => "无".to_string(),
-                    Some(v) => {
-                        let (scheme, rest) = v.split_once(' ').unwrap_or((v, ""));
-                        let head: String = rest.chars().take(8).collect();
-                        format!("{scheme} {head}…")
-                    }
-                };
                 let ts = if header_value(&req, "x-client-timestamp").is_some() {
                     "有"
                 } else {
                     "无"
                 };
-                stealth::journal_append(
+                // 请求头一并记下：客户端到底带了哪些头（有没有会话 id、有没有时间戳）
+                // 一向只能靠反推，代价是一整轮排障。敏感头只记长度。
+                stealth::debug_append(
                     &dir,
                     "proxy_auth",
                     &format!(
-                        "反代收到 {} {}（鉴权：{shape}；X-Client-Timestamp：{ts}）→ {auth_action}",
+                        "收到 {} {} | 鉴权 {} | X-Client-Timestamp {ts} → {auth_action} | 头: {}",
                         req.method,
-                        bare.split('?').next().unwrap_or(bare)
+                        bare.split('?').next().unwrap_or(bare),
+                        auth_shape(auth_in.as_deref()),
+                        header_dump(&req),
                     ),
                 );
             }
@@ -1159,7 +1240,21 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             }
             Err(e) => {
                 let msg = format!("upstream error: {e}");
-                stealth::journal_append(&dir, "proxy_upstream_error", &msg);
+                // 这是**真故障**（压根没连上上游）→ 对客说一句人能懂的话，
+                // 地址与错误原文留在调试日志里。
+                stealth::journal_append(
+                    &dir,
+                    "proxy_upstream_error",
+                    &format!(
+                        "无法连接 Qoder 服务（账号「{}」）：请检查本机网络或代理设置",
+                        account.name
+                    ),
+                );
+                stealth::debug_append(
+                    &dir,
+                    "proxy_upstream_detail",
+                    &format!("{host}{path} → {msg}"),
+                );
                 respond(&mut stream, 502, "text/plain", msg.as_bytes(), &[]);
                 return;
             }
@@ -1410,9 +1505,11 @@ fn stream_response(
     path: &str,
 ) {
     let status = resp.status().as_u16();
-    // 诊断用：上游返回 4xx/5xx 时落盘，便于区分「代理自己回的 400」与「上游 400 透传」
+    // 诊断用：上游返回 4xx/5xx 时落盘，便于区分「代理自己回的 400」与「上游 400 透传」。
+    // **只进调试日志**：这类错误客户端自己会在对话界面里报出来，接管动态里再复述一遍
+    // 就是纯噪音（而且失败请求一多就会把时间线冲掉）。
     if status >= 400 {
-        let _ = stealth::journal_append(
+        let _ = stealth::debug_append(
             dir,
             "proxy_upstream_status",
             &format!("上游返回 {status}：{host}{path}"),
@@ -1461,7 +1558,17 @@ fn stream_response(
         }
     });
     if let Some(msg) = read_error {
-        stealth::journal_append(dir, "proxy_stream_error", &format!("[{path}] {msg}"));
+        // 流断了**用户能感知**（回答会中途停住）→ 说清是谁的问题、要不要管；
+        // 路径与错误原文给调试日志。
+        stealth::journal_append(
+            dir,
+            "proxy_stream_error",
+            &format!(
+                "对话响应中断（账号「{}」）：上游连接提前结束，重试即可；反复出现请看调试日志",
+                account.name
+            ),
+        );
+        stealth::debug_append(dir, "proxy_stream_detail", &format!("[{path}] {msg}"));
     }
     let _ = write_chunk_end(stream);
 }
@@ -1555,6 +1662,37 @@ fn sticky_put(conv: &str, model: Option<&str>, account_id: String) -> bool {
         return changed;
     }
     false
+}
+
+/// 「本次对话由账号 X 提供」这条**对客通知**的去重窗口。
+///
+/// 为什么不能靠会话 id 去重：`CONV_HEADER`（`X-Conversation-Id`）实测**客户端并不带** ——
+/// 2026-09-19 那轮对话的 6 个请求一个都没带，于是 `sticky_*` 在实际流量里从未命中，
+/// 「开始使用账号」事件一条都没产出过（界面上恰恰缺了最该有的那条信息）。
+/// 退化成时间窗：同账号同模型在 [`SESSION_GAP`] 内只通知一次。
+/// 宁可少报也不能每请求一条 —— 对客时间线一刷屏就等于没有。
+const SESSION_GAP: Duration = Duration::from_secs(5 * 60);
+
+/// 上一次「本次对话由账号 X 提供」通知：(时刻, 账号 id, 模型)
+static LAST_SESSION: LazyLock<Mutex<Option<(Instant, String, String)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 这次模型请求要不要在界面上通知「本次对话由账号 X 提供」。
+fn should_announce_session(account: &accounts::Account, model: Option<&str>) -> bool {
+    let model = model.unwrap_or("").to_string();
+    let Ok(mut slot) = LAST_SESSION.lock() else {
+        // 锁被毒化时宁可漏报一条：多报会让用户以为账号在来回换，比少报更误导
+        return false;
+    };
+    let repeated = slot
+        .as_ref()
+        .map(|(at, id, m)| id == &account.id && m == &model && at.elapsed() < SESSION_GAP)
+        .unwrap_or(false);
+    if repeated {
+        return false;
+    }
+    *slot = Some((Instant::now(), account.id.clone(), model));
+    true
 }
 
 /// 台账里的积分读数是否过期（决定新会话要不要重新打资源接口）。

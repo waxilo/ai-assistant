@@ -146,10 +146,17 @@ export const stealthStatus = () => invoke<StealthStatus>("stealth_status");
 /** 可选区域清单（国际版 / 国内版）：界面上「区域」的唯一来源 */
 export const regions = () => invoke<RegionOption[]>("regions");
 
-/** 接管事件流（新的在前）：开启 / 关闭 / 开始使用账号 / 错误 */
+/**
+ * 接管通知流（新的在前）：开启 / 关闭 / 每次对话用的哪个账号 / 限流切换 / 真故障。
+ *
+ * **只有对客通知**。请求级细节（收到了哪个路径、鉴权是什么形态、上游回了几多）
+ * 走后端的调试日志文件，见 `revealDebugLog`。
+ */
 export const takeoverEvents = () => invoke<JournalEvent[]>("takeover_events");
-/** 清空接管动态（不可恢复） */
+/** 清空接管动态（不可恢复；不影响调试日志） */
 export const clearTakeoverEvents = () => invoke<void>("takeover_events_clear");
+/** 在文件管理器里定位接管调试日志（请求级细节都在那个文件里） */
+export const revealDebugLog = () => invoke<void>("reveal_debug_log");
 
 /**
  * 「限流切换」的模型清单（三层来源：Qoder 官方目录 / 落盘快照 / 本机痕迹）。

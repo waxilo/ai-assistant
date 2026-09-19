@@ -128,6 +128,8 @@ pub fn run() {
             stealth::stealth_status,
             stealth::takeover_events_clear,
             stealth::takeover_events,
+            // 界面上只讲对客通知，请求级细节在调试日志文件里 —— 这是打开它的入口
+            stealth::reveal_debug_log,
             proxy::free_models,
             // 加速更新下载（多镜像源 + 签名自验，见 accel.rs）
             accel::update_accelerated,

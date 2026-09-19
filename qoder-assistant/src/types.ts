@@ -434,14 +434,19 @@ export interface StealthStatus {
   note: string;
 }
 
-/** 接管事件流的一条记录（takeover-journal.jsonl） */
+/**
+ * 接管通知流的一条记录（takeover-journal.jsonl）。
+ *
+ * 这里**只有对客通知**：`install` / `uninstall` / `session_start`（本次对话由哪个账号
+ * 提供）/ `route_start` / `failover` / `proxy_upstream_error` / `proxy_stream_error`。
+ * 请求级细节（`proxy_auth`、`proxy_request`、连接被掐断…）不在这份数据里 ——
+ * 它们在调试日志 `takeover-debug.log`（界面点「查看日志」定位）。
+ *
+ * 历史日志里还可能见到 `restart_qoder`（产它的代码已删除，展示层仍认得它）。
+ */
 export interface JournalEvent {
   at_ms: number;
   at: string;
-  /**
-   * install / uninstall / route_start / proxy_upstream_error / …
-   * （历史日志里还可能见到 `restart_qoder`：产它的代码已删除，展示层仍认得它）
-   */
   event: string;
   detail: string;
 }
