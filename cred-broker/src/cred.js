@@ -93,6 +93,24 @@ function actorOf(request, body) {
 
 // ── 条目 ──────────────────────────────────────────────────────────────────
 
+/** 两套部署的落盘标识。**就是持久化格式，不能改名**（改名 = 老条目全变「区域未知」） */
+const REGIONS = new Set(["global", "cn"]);
+
+/**
+ * 这一条属于哪套部署。
+ *
+ * 顺序 = 显式 `region` 字段 → **key 的 `xx:` 前缀** → 国际版。
+ * 前缀优先于字段，是因为字段有过一段「服务端根本没存」的历史（见下面的注记）：
+ * 那时写进池里的 `region` 早已丢失，唯一还活着的区域信息就只剩 key 前缀。
+ * 两个都没有（两套部署出现之前的裸 key）只能是国际版 —— 那时也只有国际版。
+ */
+export function regionOf(raw, key) {
+  const explicit = str(raw?.region).toLowerCase();
+  if (REGIONS.has(explicit)) return explicit;
+  const prefix = str(key).split(":", 1)[0].toLowerCase();
+  return REGIONS.has(prefix) ? prefix : "global";
+}
+
 /**
  * 规范化一条账号凭证。
  *
@@ -101,6 +119,12 @@ function actorOf(request, body) {
  *
  * `key` 是跨机身份锚点，选取顺序 = 显式 key → 手机号 → 昵称 → 本地 id。
  * 客户端的合并是**并集**，全靠这个 key 认人；本地独有的账号一条都不会被删。
+ *
+ * ⚠️ **`region` 必须原样往返回去**（2026-09-19 修）。这一条函数曾经把它丢掉，
+ * 于是云端从不存区域，客户端拿回任何条目都落成「国际版」—— 同一条国内版凭证
+ * 只要在池里被当成新账号收养一次，就会在界面上凭空多出一个「国际版」的重复账号，
+ * 且因为区域不同，之后再怎么导入都不会与真身合并。区域与 key 是**两个独立字段**：
+ * key 里的前缀只是历史包袱，不能当作区域本身（老条目靠它回填）。
  */
 export function normalizeItem(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -113,6 +137,7 @@ export function normalizeItem(raw) {
   const key = str(raw.key) || phone || name || localId;
   if (!key) return null;
   return {
+    region: regionOf(raw, key),
     key,
     name,
     phone,
@@ -135,10 +160,17 @@ export function normalizeItems(list) {
   return [...byKey.values()].slice(0, MAX_ITEMS);
 }
 
+/**
+ * 从落库的 payload 里取条目。
+ *
+ * **出口与入口共用同一套规范化**（`normalizeItems`）：D1 里的 `payload` 是不透明 JSON，
+ * 历史行是在「区域还不进池」的年代写下的，读时再规范化一遍，老条目就能在**读的那一刻**
+ * 把区域按 key 前缀补回来 —— 不必等下一次提交，也不必写迁移脚本。
+ */
 function parseItems(payload) {
   try {
     const parsed = JSON.parse(payload ?? "[]");
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? normalizeItems(parsed) : [];
   } catch {
     return [];
   }

@@ -444,3 +444,35 @@ test("前后空白被抹掉，避免「同一个 key 因为空格被当成两个
   assert.equal(it.access_token, "at");
   assert.equal(it.name, "n");
 });
+
+// ── 区域：曾经被整条丢掉，后果是「凭空多一个国际版重复账号」 ──────────────
+
+test("normalizeItem：显式 region 原样保留（两套部署的条目必须各自带区域）", () => {
+  const cn = normalizeItem({ key: "cn:191", access_token: "t", region: "cn" });
+  const gl = normalizeItem({ key: "global:191", access_token: "t", region: "global" });
+  assert.equal(cn.region, "cn");
+  assert.equal(gl.region, "global");
+});
+
+test("normalizeItem：没有 region 字段时按 key 的 xx: 前缀回填（老数据的唯一线索）", () => {
+  assert.equal(normalizeItem({ key: "cn:191", access_token: "t" }).region, "cn");
+  assert.equal(normalizeItem({ key: "global:191", access_token: "t" }).region, "global");
+  // 两套部署出现之前的裸 key 只能是国际版
+  assert.equal(normalizeItem({ key: "191", access_token: "t" }).region, "global");
+});
+
+test("normalizeItem：显式 region 非法 / 大小写不规范时也不丢区域", () => {
+  assert.equal(normalizeItem({ key: "cn:k", access_token: "t", region: "CN" }).region, "cn");
+  assert.equal(normalizeItem({ key: "cn:k", access_token: "t", region: "火星版" }).region, "cn");
+});
+
+test("落库的旧条目在读出口就被补上区域（不必等下一次提交）", async () => {
+  const env = createEnv();
+  // 老格式：payload 里没有 region（服务端当年就是不存它）
+  const uuid = await newPool(env, [
+    { key: "cn:19174256652", name: "n", phone: "19174256652", access_token: "at", refresh_token: "rt" },
+  ]);
+  const r = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.equal(r.status, 200);
+  assert.equal(r.data.items[0].region, "cn");
+});
