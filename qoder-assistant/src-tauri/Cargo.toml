@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # tray-icon：后台常驻托盘（关闭窗口不退出进程，定时签到/反代持续生效）
 tauri = { version = "2", features = ["tray-icon"] }
+# 单实例守卫：托盘常驻后用户再点图标会起第二个进程（Windows 上尤其明显）。
+tauri-plugin-single-instance = "2.4.4"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 # 文件对话框：账号导出 / 导入选路径用

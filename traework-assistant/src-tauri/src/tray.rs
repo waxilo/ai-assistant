@@ -72,8 +72,9 @@ pub fn toggle_main(app: &AppHandle) {
 
 /// 显示主窗口并聚焦。
 ///
-/// 目前由 `RunEvent::Reopen`（macOS 点击 Dock 图标）调用，Windows 上无调用点，
-/// 故放行 dead_code 警告。
+/// 调用点：托盘菜单「显示主窗口」、macOS 点 Dock 图标（`RunEvent::Reopen`）、
+/// 以及**第二个实例被守卫挡掉时**（`lib.rs` 的 single-instance 回调）——
+/// 后两个都要能把「最小化」的窗口一起拉回来，所以这里带 `unminimize()`。
 ///
 /// 先把 Dock 图标还回来再 `show()` —— 顺序与「收进托盘」相反，理由见
 /// [`set_dock_visible`]。
@@ -82,6 +83,7 @@ pub fn show_main(app: &AppHandle) {
     set_dock_visible(app, true);
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
+        let _ = w.unminimize();
         let _ = w.set_focus();
     }
 }

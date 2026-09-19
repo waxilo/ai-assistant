@@ -28,7 +28,15 @@ pub fn run() {
     // release-assets 会被掐/超时；走系统代理反而更快更稳。真正需要提速时，
     // 用 accel::update_accelerated 走加速镜像下载（见 accel.rs）。
 
-    let app = tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build())
+    let app = tauri::Builder::default()
+        // **必须第一个注册**：守卫生效时后起的实例在这里直接退出，走不到 `setup()`，
+        // 也就不会起第二个调度线程、不会抢反代端口、不会重复改客户端侧的文件。
+        // 两个实例共享同一份 `settings.json` 和同一个反代端口，谁后起谁把前一个的状态盖掉。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 再次点击图标 = 「把已有窗口拿到前面来」，而不是再开一份
+            tray::show_main(app);
+        }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         // 用 LaunchAgent 而非 AppleScript，登录时静默启动、不弹窗
