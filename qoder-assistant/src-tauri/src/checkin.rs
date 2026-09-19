@@ -531,4 +531,91 @@ mod tests {
             "接管路由排序用的最早到期也要把它算进去"
         );
     }
+
+    /// 一次性**补录**：给历史上那几笔领取回放到期时间，写进本机台账。
+    ///
+    /// 为什么要有这一条：本机的签到记录里 `expires_at` 全是 null —— 那几笔领发生在
+    /// 「记录发放凭据」这套代码上线之前，于是界面上「附加额度 · 到期」只能显示「未知」。
+    /// 领取接口幂等（见 [`crate::qoder_api::claim_campaign`]），回放一次就能把日期补上，
+    /// 写入走的正是生产写点 [`crate::ledger::Store::note_grant_expiries`]。
+    ///
+    /// ⚠️ **只处理「今天已领」的账号**：没领会落进 [`do_checkin`] 的领取分支，
+    /// 那是真的往账号上发额度 —— 不在「补录」这件事的授权范围里，所以直接跳过。
+    ///
+    /// 运行：`cargo test --lib -- --ignored --nocapture backfill_grant_expiry`
+    #[tokio::test]
+    #[ignore = "真实网络调用（幂等回放）+ 写本机台账"]
+    async fn backfill_grant_expiry_from_replay() {
+        use crate::ledger;
+        use std::path::PathBuf;
+
+        let dir = std::env::var("QODER_ASSISTANT_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(std::env::var("HOME").unwrap())
+                    .join("Library/Application Support/com.waxilo.qoder-assistant")
+            });
+        let mut grants: Vec<(String, String, i64)> = Vec::new();
+        for a in crate::accounts::load_accounts(&dir)
+            .into_iter()
+            .filter(|a| !a.token.is_empty())
+        {
+            let Some(view) = qoder_api::fetch_campaigns(a.region, &a.token).await else {
+                println!("跳过 {}：活动接口不可用（网络或登录态）", a.name);
+                continue;
+            };
+            let status = view
+                .daily_claim()
+                .map(|c| c.claim_status.clone())
+                .unwrap_or_default();
+            if status != "CLAIMED" {
+                println!("跳过 {}：今天没领（claimStatus={status:?}），只补录不代领", a.name);
+                continue;
+            }
+            let rec = do_checkin(&a).await;
+            let Some(ms) = rec.expires_at else {
+                println!("跳过 {}：回放没带回 expiresAt（{}）", a.name, rec.message);
+                continue;
+            };
+            println!(
+                "{}：到期 {}（{}），登记到账本",
+                a.name,
+                as_date(ms),
+                ms
+            );
+            grants.push((a.id.clone(), crate::usage::KEY_ADDON.to_string(), ms));
+        }
+        assert!(
+            !grants.is_empty(),
+            "一个账号都没补上 —— 别把「没写」当成成功"
+        );
+
+        let store = ledger::store(&dir);
+        store
+            .note_grant_expiries(&grants)
+            .expect("台账写入失败（权限 / 磁盘）");
+        for (id, _, ms) in &grants {
+            let f = store.fact_of(id).expect("刚写过就该有投影");
+            for p in &f.packages {
+                println!("  投影：{} 包 {} 剩余={} 到期={:?}", id, p.name, p.remaining, p.expiry_ms);
+            }
+            assert!(
+                f.packages
+                    .iter()
+                    .any(|p| p.expiry_ms == Some(*ms) && !p.never_expires),
+                "{id} 的附加额度要带上补录的日期"
+            );
+        }
+    }
+
+    /// 毫秒 → 本地日期串（只给上面那条补录日志用）
+    fn as_date(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map(|d| {
+                d.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "?".into())
+    }
 }
