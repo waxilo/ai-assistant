@@ -17,6 +17,7 @@
 //! 家目录是**参数**而不是到处调 `dirs::home_dir()`：这样整条恢复流程能在临时目录里跑完
 //! 单测，不会碰到用户真实配置（见文末 tests）。
 
+use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
@@ -99,12 +100,18 @@ pub struct NetRestoreReport {
 // 扫描位置（家目录一律由调用方传入）
 // ---------------------------------------------------------------------------
 
-/// Qoder 可能写「服务端点」的配置文件
+/// Qoder 可能写「服务端点」的配置文件 —— **两套部署各扫一份**。
+///
+/// 只扫 `~/.qoder` 是上一版的做法：国内版（`~/.qoder-cn`）会被整块漏掉，于是
+/// 「诊断说一切正常、国内版明明连不上」这种最难查的状态就能一直存在。
+/// `.codebuddy` 保留在列表里 —— 那是更早一代的目录，清理时要一起清。
 fn config_files(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(".qoder").join("settings.json"),
-        home.join(".codebuddy").join("settings.json"),
-    ]
+    let mut out: Vec<PathBuf> = Region::ALL
+        .iter()
+        .map(|r| home.join(r.cli_dir_name()).join("settings.json"))
+        .collect();
+    out.push(home.join(".codebuddy").join("settings.json"));
+    out
 }
 
 /// 可能导出全局环境变量的 shell 启动脚本
@@ -405,11 +412,27 @@ fn stale_cli_cache(events: &[crate::stealth::JournalEvent], desktop_start_ms: i6
     None
 }
 
+/// **任意一个**官方客户端的进程启动时刻，取最早的那个。
+///
+/// 它用来回答「桌面端是不是比那批残留事件更晚起来」。两个客户端可能同时在跑，
+/// 取最早 = 最保守的判断（更不容易把残留误判成已经清干净）。
+///
+/// 旧版这里的正则是 `^/Applications/Qoder.app/Contents/MacOS/Electron$` —— 一个进程
+/// 都匹配不到（见 `region` 模块），所以这条判断实际上从来没有生效过。
 fn qoder_start_ms() -> Option<i64> {
-    let out = Command::new("pgrep")
-        .args(["-f", "^/Applications/Qoder.app/Contents/MacOS/Electron$"])
-        .output()
-        .ok()?;
+    let mut earliest: Option<i64> = None;
+    for region in Region::ALL {
+        let Some(ms) = process_start_ms(&region.macos_process_pattern()) else {
+            continue;
+        };
+        earliest = Some(earliest.map_or(ms, |cur: i64| cur.min(ms)));
+    }
+    earliest
+}
+
+/// `pgrep -f <正则>` 取第一个 pid，再由 `ps -o lstart=` 换算成毫秒时间戳
+fn process_start_ms(pattern: &str) -> Option<i64> {
+    let out = Command::new("pgrep").args(["-f", pattern]).output().ok()?;
     let pid = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
     if pid.is_empty() {
         return None;
@@ -432,7 +455,11 @@ fn qoder_start_ms() -> Option<i64> {
 fn desktop_stale_takeover(home: &Path, data_dir: &Path) -> Option<NetIssue> {
     let events = crate::stealth::journal_read(data_dir);
     let removed_at = stale_cli_cache(&events, qoder_start_ms()?)?;
-    if crate::stealth::current_endpoint(home).is_some() {
+    // 两个区域任一还挂着端点，就说明「已经摘干净」这个前提不成立
+    if Region::ALL
+        .iter()
+        .any(|r| crate::stealth::current_endpoint(home, *r).is_some())
+    {
         return None;
     }
     let at = chrono::DateTime::from_timestamp_millis(removed_at)
@@ -676,7 +703,7 @@ fn restore_impl(home: &Path, data_dir: &Path, touch_launchd: bool) -> NetRestore
     steps.extend(proxy_steps);
 
     // 2) 摘掉接管端点（会还原成装载前的值，并删掉租约文件）
-    match crate::stealth::uninstall(home, data_dir) {
+    match crate::stealth::uninstall_all(home, data_dir) {
         Ok(()) => {
             if crate::stealth::load_lease(data_dir).is_none() {
                 steps.push(NetStep {
@@ -806,7 +833,10 @@ mod tests {
         ));
         let home = base.join("home");
         let data = base.join("data");
-        fs::create_dir_all(home.join(".qoder")).unwrap();
+        // 两套部署的目录都建出来（区域化之后诊断要扫两边）
+        for region in Region::ALL {
+            fs::create_dir_all(home.join(region.cli_dir_name())).unwrap();
+        }
         fs::create_dir_all(&data).unwrap();
         (home, data)
     }
@@ -979,7 +1009,7 @@ mod tests {
     #[test]
     fn live_stealth_takeover_is_reported_as_healthy_not_pollution() {
         let (home, data) = sandbox();
-        crate::stealth::install(&home, &data, 8787).unwrap();
+        crate::stealth::install(&home, Region::Global, &data, 8787).unwrap();
 
         let rep = diagnose(&home, &data);
         let hit = rep
@@ -997,7 +1027,7 @@ mod tests {
     #[test]
     fn stale_stealth_takeover_is_reported_as_blocker() {
         let (home, data) = sandbox();
-        crate::stealth::install(&home, &data, 8787).unwrap();
+        crate::stealth::install(&home, Region::Global, &data, 8787).unwrap();
 
         // 把心跳拨到很早以前，模拟应用被 kill -9 后再没起来
         let lease = crate::stealth::lease_path(&data);
@@ -1027,9 +1057,9 @@ mod tests {
         let mut s = crate::accounts::load_settings(&data);
         s.proxy_enabled = true;
         crate::accounts::save_settings(&data, &s).unwrap();
-        crate::stealth::install(&home, &data, 8787).unwrap();
+        crate::stealth::install(&home, Region::Global, &data, 8787).unwrap();
         assert_eq!(
-            crate::stealth::current_endpoint(&home).as_deref(),
+            crate::stealth::current_endpoint(&home, Region::Global).as_deref(),
             Some("http://127.0.0.1:8787")
         );
 
@@ -1040,7 +1070,7 @@ mod tests {
         let after = crate::accounts::load_settings(&data);
         assert!(!after.proxy_enabled, "接管开关必须被关掉");
         assert_eq!(
-            crate::stealth::current_endpoint(&home),
+            crate::stealth::current_endpoint(&home, Region::Global),
             None,
             "端点要摘干净"
         );

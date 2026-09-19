@@ -2,9 +2,16 @@
 //!
 //! # 为什么必须独立成模块
 //!
-//! 智能接管 = 让 Qoder 桌面端的所有对话请求自动走本应用的反代。实现上只能是
-//! 往 `~/.qoder/settings.json` 的 `env.CODEBUDDY_BASE_URL` 写值 —— 而这**正是**
+//! 智能接管 = 让官方客户端的所有对话请求自动走本应用的反代。实现上只能是
+//! 往**被接管那个区域**的 CLI 配置里写 `env.CODEBUDDY_BASE_URL` —— 而这**正是**
 //! 历史上把整个 Qoder 搞到 502 断网的那个动作（`netfix.rs` 的清理目标）。
+//!
+//! # 区域（[`Region`]）
+//!
+//! 两套部署各有自己的 `settings.json`（`~/.qoder` / `~/.qoder-cn`），所以本模块的
+//! **每一个入口都必须带区域**：装错目录的后果不是报错，而是「界面显示接管已开启、
+//! 实际一个请求都没被接管」。租约也把区域记下来 —— 卸载 / 清扫时手里只有租约，
+//! 而「该动哪个目录」正是它决定的。
 //!
 //! 所以「能装」不是本事，「保证一定能卸」才是。本模块用**租约 + 心跳**把这件事钉死：
 //!
@@ -17,7 +24,9 @@
 //! `netfix` 扫到 `env.CODEBUDDY_BASE_URL` 时会来问本模块「这是自己人吗」：
 //! 租约新鲜 → 正常工作中，不算问题；租约过期 → 僵尸残留，照常判为会断网。
 //! 这样「一键恢复」清掉的是真残留，不会把正在工作的接管误伤掉。
+//! 它同样是**逐区域**问的：两个区域各可能装一份，一个是工作中的、另一个是残留。
 
+use crate::region::Region;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -31,8 +40,10 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// 超过这么久没有心跳，就认定接管方已经不在了
 pub const LEASE_TTL: Duration = Duration::from_secs(30);
 
-/// 写进 Qoder 配置的变量名（与 netfix 的 `ENV_KEYS[0]` 一致）
-pub const ENV_KEY: &str = "CODEBUDDY_BASE_URL";
+// 这里曾有 `pub const ENV_KEY = "CODEBUDDY_BASE_URL"`。变量名现在由
+// [`Region::takeover_env_key`] 给出（两个区域目前共用同一个键，共用理由与那条
+// 不确定性都写在它的注释里），本模块只消费、不再自己持有一份 ——
+// 两处各写一份就等于「区域差异」又多了一个会静默漂移的副本。
 
 const LEASE_FILE: &str = "stealth.json";
 
@@ -164,6 +175,11 @@ fn is_clean_tail(f: &mut fs::File) -> bool {
 /// 接管租约。落在**本应用**的数据目录里，不进 Qoder 的配置。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Lease {
+    /// **这个租约装在哪个区域上**。卸载 / 清扫时手里只有租约，而「该动哪个
+    /// `settings.json`」只有它知道，所以区域必须随租约落盘。
+    /// 老租约没有这个字段 → `#[serde(default)]` 落成国际版（那个字段出现之前只有国际版）。
+    #[serde(default)]
+    pub region: Region,
     /// 写进配置的端点值，如 `http://127.0.0.1:8789`
     pub url: String,
     pub port: u16,
@@ -220,17 +236,23 @@ fn url_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// 装卸的目标配置文件。只动 `.qoder`，不碰 `.codebuddy`（那是旧版目录）。
-fn target_config(home: &Path) -> PathBuf {
-    home.join(".qoder").join("settings.json")
+/// 装卸的目标配置文件：**被接管那个区域**的 CLI 配置
+/// （`~/.qoder/settings.json` / `~/.qoder-cn/settings.json`）。
+///
+/// 只动 `region.cli_dir_name()` 给的那个目录，不碰 `.codebuddy`（更早一代的旧目录）。
+/// `home` 仍然作为参数显式传入（而不是在函数里 `dirs::home_dir()`）：测试要指向
+/// 一个临时家目录，而「能不能被测」正是这类写别人配置的代码最需要的属性。
+fn target_config(home: &Path, region: Region) -> PathBuf {
+    home.join(region.cli_dir_name()).join("settings.json")
 }
 
-/// 把一个值写进 `settings.json` 的 `env.CODEBUDDY_BASE_URL`。
+/// 把一个值写进 `settings.json` 的 `env.<region.takeover_env_key()>`。
 /// `value` 为 None 表示删除该键（`env` 空了就连 `env` 一起删）。
 ///
 /// 用 `Value` 精确改而不是整份重写：那份文件里有 `sandbox` / `claw` / `enabledPlugins`
 /// 等我们不认识的键，绝不能顺手清掉。
-fn set_endpoint(path: &Path, value: Option<&str>) -> Result<(), String> {
+fn set_endpoint(path: &Path, region: Region, value: Option<&str>) -> Result<(), String> {
+    let key = region.takeover_env_key();
     let text = if path.exists() {
         fs::read_to_string(path).map_err(|e| format!("读取配置失败：{e}"))?
     } else {
@@ -254,12 +276,12 @@ fn set_endpoint(path: &Path, value: Option<&str>) -> Result<(), String> {
             let env = env
                 .as_object_mut()
                 .ok_or_else(|| "配置里的 env 不是对象，未改动。".to_string())?;
-            env.insert(ENV_KEY.to_string(), Value::String(val.to_string()));
+            env.insert(key.to_string(), Value::String(val.to_string()));
         }
         None => {
             let empty = match obj.get_mut("env").and_then(Value::as_object_mut) {
                 Some(env) => {
-                    env.remove(ENV_KEY);
+                    env.remove(key);
                     env.is_empty()
                 }
                 None => false,
@@ -274,39 +296,44 @@ fn set_endpoint(path: &Path, value: Option<&str>) -> Result<(), String> {
     crate::netfix::write_atomic(path, &format!("{out}\n")).map_err(|e| format!("写入失败：{e}"))
 }
 
-/// 读取配置里当前的端点值
-pub fn current_endpoint(home: &Path) -> Option<String> {
-    let text = fs::read_to_string(target_config(home)).ok()?;
+/// 读取**指定区域**的配置里当前的端点值（另一个区域装了什么都不影响这个答案）
+pub fn current_endpoint(home: &Path, region: Region) -> Option<String> {
+    let text = fs::read_to_string(target_config(home, region)).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     v.get("env")
         .and_then(Value::as_object)
-        .and_then(|e| e.get(ENV_KEY))
+        .and_then(|e| e.get(region.takeover_env_key()))
         .and_then(Value::as_str)
         .map(|s| s.to_string())
 }
 
-/// **装**：把端点写进 Qoder 配置，并落下租约。
+/// **装**：把端点写进**指定区域**的 CLI 配置，并落下租约。
 ///
-/// 幂等：已装着且目标端口一致 → 只续一次心跳，不重复写文件。
-pub fn install(home: &Path, data_dir: &Path, port: u16) -> Result<(), String> {
+/// 幂等：已装着、且区域与端口都一致 → 只续一次心跳，不重复写文件。
+///
+/// 区域不一致时**先按旧租约卸干净**再装新的：换区域等于换一个客户端接管，
+/// 旧目录上那份配置必须一起摘掉，否则那个客户端会一直指向本机端口，
+/// 而我们这边已经不为它服务了。
+pub fn install(home: &Path, region: Region, data_dir: &Path, port: u16) -> Result<(), String> {
     let url = url_for_port(port);
 
     if let Some(mut lease) = load_lease(data_dir) {
-        if lease.port == port && lease.url == url {
+        if lease.region == region && lease.port == port && lease.url == url {
             lease.heartbeat_ms = now_ms();
             let _ = save_lease(data_dir, &lease);
             // 值可能被别的程序改过，这里保证它仍是我们期望的那个
-            if current_endpoint(home).as_deref() != Some(url.as_str()) {
-                set_endpoint(target_config(home).as_path(), Some(&url))?;
+            if current_endpoint(home, region).as_deref() != Some(url.as_str()) {
+                set_endpoint(target_config(home, region).as_path(), region, Some(&url))?;
             }
             return Ok(());
         }
-        // 端口变了：先按旧租约卸干净，再装新的
-        let _ = uninstall(home, data_dir);
+        // 区域或端口变了：先按旧租约卸干净，再装新的
+        let _ = uninstall(home, lease.region, data_dir);
     }
 
-    let previous = current_endpoint(home);
+    let previous = current_endpoint(home, region);
     let lease = Lease {
+        region,
         url: url.clone(),
         port,
         pid: std::process::id(),
@@ -316,7 +343,7 @@ pub fn install(home: &Path, data_dir: &Path, port: u16) -> Result<(), String> {
     };
     // 先落租约再改配置：中途崩了也留有记录，sweep 能收尾
     save_lease(data_dir, &lease).map_err(|e| format!("写入租约失败：{e}"))?;
-    set_endpoint(target_config(home).as_path(), Some(&url))?;
+    set_endpoint(target_config(home, region).as_path(), region, Some(&url))?;
     // 事件里带上扣费备选名单，界面时间线能直接回答「开启时当前账号池是什么」
     let settings = crate::accounts::load_settings(data_dir);
     let names = billing_account_names(data_dir, &settings.billing_account_ids);
@@ -331,7 +358,12 @@ pub fn install(home: &Path, data_dir: &Path, port: u16) -> Result<(), String> {
     journal_append_reset(
         data_dir,
         "install",
-        &format!("接管已开启：端点写入 env.{ENV_KEY}={url}；扣费备选：{names}{note}"),
+        &format!(
+            "接管已开启（{}）：端点写入 {} 的 env.{}={url}；扣费备选：{names}{note}",
+            region.label(),
+            target_config(home, region).display(),
+            region.takeover_env_key()
+        ),
     );
     Ok(())
 }
@@ -340,42 +372,53 @@ pub fn install(home: &Path, data_dir: &Path, port: u16) -> Result<(), String> {
 ///
 /// 安全起见：只有当配置里的值**仍是我们写进去的那个**才动手；
 /// 被别人改过就不碰，避免把用户的配置改坏。
-pub fn uninstall(home: &Path, data_dir: &Path) -> Result<(), String> {
-    uninstall_with_note(home, data_dir, None)
+pub fn uninstall(home: &Path, region: Region, data_dir: &Path) -> Result<(), String> {
+    uninstall_with_note(home, region, data_dir, None)
 }
 
 /// 同 [`uninstall`]，但在关闭事件里追加一句备注（如「已重启 Qoder 清除长驻
 /// CLI host 环境」），避免同一动作拆成两条同秒事件刷屏。
-pub fn uninstall_with_note(home: &Path, data_dir: &Path, note: Option<&str>) -> Result<(), String> {
+pub fn uninstall_with_note(
+    home: &Path,
+    region: Region,
+    data_dir: &Path,
+    note: Option<&str>,
+) -> Result<(), String> {
     let lease = load_lease(data_dir);
-    let path = target_config(home);
+    let path = target_config(home, region);
+    let label = region.label();
     if !path.exists() {
         let _ = fs::remove_file(lease_path(data_dir));
         return Ok(());
     }
 
-    let current = current_endpoint(home);
+    let current = current_endpoint(home, region);
     let mut changed = false;
     match (&lease, &current) {
-        (Some(lease), Some(cur)) if cur == &lease.url => {
-            // 正常路径：还原成装载前的值
+        // 租约确实装在这个区域、且值还是我们写进去的 → 正常路径：还原成装载前的值
+        (Some(lease), Some(cur)) if lease.region == region && cur == &lease.url => {
             match lease.previous.as_deref() {
-                Some(prev) => set_endpoint(&path, Some(prev))?,
-                None => set_endpoint(&path, None)?,
+                Some(prev) => set_endpoint(&path, region, Some(prev))?,
+                None => set_endpoint(&path, region, None)?,
             }
             changed = true;
         }
-        // 没租约、或值已被改动：只在我们能确认端口归属时才清
-        (_, Some(cur)) if *cur == url_for_port(crate::accounts::load_settings(data_dir).proxy_port) => {
-            set_endpoint(&path, None)?;
+        // 没租约、或值已被改动：只在我们能确认端口归属时才清。
+        // 端口是**全局唯一**的（整个应用只有一个反代端口），所以「值等于我们的端口」
+        // 就足以判定这条是我们写的 —— 不看租约是为了兜住「租约文件被删了」那种残留。
+        (_, Some(cur))
+            if *cur == url_for_port(crate::accounts::load_settings(data_dir).proxy_port) =>
+        {
+            set_endpoint(&path, region, None)?;
             changed = true;
         }
         _ => {}
     }
     if changed {
+        let base = format!("接管已关闭（{label}）：端点已从该区域的配置摘除，客户端恢复直连");
         let detail = match note {
-            Some(n) => format!("接管已关闭：端点已从 Qoder 配置摘除，Qoder 恢复直连；{n}"),
-            None => "接管已关闭：端点已从 Qoder 配置摘除，Qoder 恢复直连".to_string(),
+            Some(n) => format!("{base}；{n}"),
+            None => base,
         };
         journal_append(data_dir, "uninstall", &detail);
     }
@@ -383,21 +426,63 @@ pub fn uninstall_with_note(home: &Path, data_dir: &Path, note: Option<&str>) -> 
     Ok(())
 }
 
-/// **清扫僵尸**：启动时调用。
+/// **把两个区域上「我们装的」端点全部摘掉**（一键网络恢复用）。
 ///
+/// 先按租约走正常卸载（能把值还原成装载前的样子），再把其余区域上「值等于我们自己
+/// 反代端口」的孤儿残留一并清掉。两个客户端都可能被上一轮接管过，只清一个区域
+/// 会留下另一个客户端继续指向已经不存在的本机端口。
+///
+/// 返回第一个错误（清理会尽量做完，不会因为一个区域失败就半途而废）。
+pub fn uninstall_all(home: &Path, data_dir: &Path) -> Result<(), String> {
+    let lease_region = load_lease(data_dir).map(|l| l.region);
+    let mut first_err: Option<String> = None;
+    if let Some(region) = lease_region {
+        if let Err(e) = uninstall(home, region, data_dir) {
+            first_err = Some(e);
+        }
+    }
+    let ours = url_for_port(crate::accounts::load_settings(data_dir).proxy_port);
+    for region in Region::ALL {
+        if Some(region) == lease_region {
+            continue;
+        }
+        if current_endpoint(home, region).as_deref() == Some(ours.as_str()) {
+            if let Err(e) = set_endpoint(&target_config(home, region), region, None) {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// **清扫僵尸**：启动时调用。
 /// 上一轮可能是崩溃退出的（`kill -9`、系统重启、端口被抢），此时配置里还留着
 /// 指向本机的端点而反代已经不在 —— 这就是断网现场。一律卸掉。
+///
+/// **两个区域都扫**：上一轮接管的是哪一个不一定还查得到（租约可能一起丢了，
+/// 或者用户中途换过区域），而残留留在任何一个区域上都会让那个客户端断网。
+/// 判据统一是「值等于我们自己的反代端口」—— 端口全局唯一，所以不会误伤
+/// 另一个应用（如 workbuddy-assistant）写在同一个文件里的端点。
 pub fn sweep(home: &Path, data_dir: &Path) {
-    let Some(lease) = load_lease(data_dir) else {
-        // 没有租约但配置里却指向我们的端口 → 更危险的孤儿残留
-        let port = crate::accounts::load_settings(data_dir).proxy_port;
-        if current_endpoint(home).as_deref() == Some(url_for_port(port).as_str()) {
-            let _ = set_endpoint(&target_config(home), None);
+    let port = crate::accounts::load_settings(data_dir).proxy_port;
+    let ours = url_for_port(port);
+    let lease = load_lease(data_dir);
+    for region in Region::ALL {
+        // 租约指向本区域：按死活判断，死了就按正常路径卸载（能还原用户原值）
+        if lease.as_ref().is_some_and(|l| l.region == region) {
+            let live = lease.as_ref().is_some_and(is_alive);
+            if !live {
+                let _ = uninstall(home, region, data_dir);
+            }
+            continue;
         }
-        return;
-    };
-    if !is_alive(&lease) {
-        let _ = uninstall(home, data_dir);
+        // 没租约（或租约记的是别的区域）但配置里却指向我们的端口 → 孤儿残留，直接摘
+        if current_endpoint(home, region).as_deref() == Some(ours.as_str()) {
+            let _ = set_endpoint(&target_config(home, region), region, None);
+        }
     }
 }
 
@@ -410,6 +495,8 @@ pub struct StealthStatus {
     pub installed: bool,
     /// 租约是否新鲜（心跳还在跳）
     pub alive: bool,
+    /// 这份状态描述的是**哪个区域**的接管 —— 界面要据此显示「正在接管：国内版」
+    pub region: Region,
     pub port: u16,
     pub url: String,
     /// 人话说明当前状态与下一步该做什么
@@ -417,25 +504,57 @@ pub struct StealthStatus {
 }
 
 /// 综合「设置 + 租约 + 配置实际值」给出状态。只读，不改动任何东西。
-pub fn status(home: &Path, data_dir: &Path) -> StealthStatus {
+///
+/// `region` 由调用方给（正常路径 = `settings.takeover_region`），这样界面在
+/// **切换区域但还没保存**时也能预览目标区域的状态，而不是必须先把设置写坏。
+pub fn status(home: &Path, region: Region, data_dir: &Path) -> StealthStatus {
     let settings = crate::accounts::load_settings(data_dir);
     let port = settings.proxy_port;
     let url = url_for_port(port);
     let lease = load_lease(data_dir);
-    let alive = lease.as_ref().is_some_and(is_alive);
-    let installed = current_endpoint(home).as_deref() == Some(url.as_str());
+    // 租约必须**也属于这个区域**才算「我们的」：另一个区域的旧租约还在心跳期时，
+    // 不能让它把当前区域的状态说成「已装载」。
+    let alive = lease
+        .as_ref()
+        .is_some_and(|l| l.region == region && is_alive(l));
+    let installed = current_endpoint(home, region).as_deref() == Some(url.as_str());
 
+    let label = region.label();
     let note = match (settings.proxy_enabled, installed, alive) {
-        (false, _, _) => "未开启。开启后 Qoder 的对话请求会自动走本应用反代，按最旧积分优先选账号。".into(),
-        (true, true, true) => "接管生效中。模型请求经本机代理分流；启停或换端口会自动安全重启长驻 CLI host。".into(),
+        (false, _, _) => format!(
+            "未开启。开启后 {label} 客户端的对话请求会自动走本应用反代，按最旧积分优先选账号。"
+        ),
+        (true, true, true) => format!(
+            "接管生效中（{label}）。模型请求经本机代理分流；启停或换区域会自动安全重启长驻 CLI host。"
+        ),
         (true, true, false) => "配置里有端点，但心跳已停 —— 接管进程可能已退出，请点「停止接管」清理。".into(),
-        (true, false, _) => "正在装载：稍等几秒后刷新；若一直卡在这里，检查 ~/.qoder/settings.json 是否可写。".into(),
+        (true, false, _) => format!(
+            "正在装载：稍等几秒后刷新；若一直卡在这里，检查 {} 是否可写。",
+            target_config(home, region).display()
+        ),
+    };
+    // 「接管开着、签到也都正常，只有对话全部 503」只有一个成因：被接管那个区域里
+    // 一个账号都没有（路由只在同区域的账号里选）。这句话必须由状态本身说出来，
+    // 而不是让用户去翻日志猜。
+    let note = if settings.proxy_enabled
+        && !crate::accounts::load_accounts(data_dir)
+            .iter()
+            .any(|a| a.region == region)
+    {
+        format!(
+            "{note} ⚠️ 当前没有任何{}账号：接管时对话请求会全部 503，\
+             先在「账号」页登录或导入一个该区域的账号。",
+            region.label()
+        )
+    } else {
+        note
     };
 
     StealthStatus {
         enabled: settings.proxy_enabled,
         installed,
         alive,
+        region,
         port,
         url,
         note,
@@ -470,11 +589,13 @@ fn billing_account_names(data_dir: &Path, selected: &[String]) -> String {
     format!("{}（未选中的不扣费）", names.join("、"))
 }
 
-/// 查询接管状态（只读）
+/// 查询接管状态（只读）。区域取自设置里的 `takeover_region` ——
+/// 「当前在接管哪一个」本来就是设置的一部分，不该由前端各传一份。
 #[tauri::command]
 pub fn stealth_status(app: tauri::AppHandle) -> Result<StealthStatus, String> {
     let dir = crate::commands::try_data_dir(&app)?;
-    Ok(status(&home_dir()?, &dir))
+    let region = crate::accounts::load_settings(&dir).takeover_region;
+    Ok(status(&home_dir()?, region, &dir))
 }
 
 /// 接管事件流（新的在前）：开启 / 关闭 / 开始使用账号 / 重启 / 错误。
@@ -553,13 +674,21 @@ mod tests {
         ));
         let home = base.join("home");
         let data = base.join("data");
-        fs::create_dir_all(home.join(".qoder")).unwrap();
+        // 两套部署的目录都建出来：区域化之后测试要在两边都能落文件
+        for region in Region::ALL {
+            fs::create_dir_all(home.join(region.cli_dir_name())).unwrap();
+        }
         fs::create_dir_all(&data).unwrap();
         (home, data)
     }
 
+    /// 往**国际版**的配置里写内容（绝大多数用例只关心一套部署）。
     fn write_cfg(home: &Path, json: &str) {
-        fs::write(target_config(home), json).unwrap();
+        write_cfg_in(home, Region::Global, json);
+    }
+
+    fn write_cfg_in(home: &Path, region: Region, json: &str) {
+        fs::write(target_config(home, region), json).unwrap();
     }
 
     #[test]
@@ -567,16 +696,16 @@ mod tests {
         let (home, data) = sandbox();
         write_cfg(&home, r#"{"sandbox":{"a":1},"env":{"OTHER":"keep"}}"#);
 
-        install(&home, &data, 8787).unwrap();
-        assert_eq!(current_endpoint(&home).as_deref(), Some("http://127.0.0.1:8787"));
-        let text = fs::read_to_string(target_config(&home)).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Global).as_deref(), Some("http://127.0.0.1:8787"));
+        let text = fs::read_to_string(target_config(&home, Region::Global)).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["sandbox"]["a"], Value::from(1), "不认识的键必须原样保留");
         assert_eq!(v["env"]["OTHER"], Value::from("keep"));
 
-        uninstall(&home, &data).unwrap();
-        assert_eq!(current_endpoint(&home), None, "端点必须被摘掉");
-        let v2: Value = serde_json::from_str(&fs::read_to_string(target_config(&home)).unwrap()).unwrap();
+        uninstall(&home, Region::Global, &data).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Global), None, "端点必须被摘掉");
+        let v2: Value = serde_json::from_str(&fs::read_to_string(target_config(&home, Region::Global)).unwrap()).unwrap();
         assert!(v2["env"].get("CODEBUDDY_BASE_URL").is_none());
         // env 里还有用户的 OTHER，所以它不能整个消失——只能摘掉我们那一键
         assert_eq!(v2["env"]["OTHER"], Value::from("keep"));
@@ -590,10 +719,10 @@ mod tests {
         let (home, data) = sandbox();
         write_cfg(&home, r#"{"env":{"CODEBUDDY_BASE_URL":"https://my.own.gateway"}}"#);
 
-        install(&home, &data, 8787).unwrap();
-        uninstall(&home, &data).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
+        uninstall(&home, Region::Global, &data).unwrap();
         assert_eq!(
-            current_endpoint(&home).as_deref(),
+            current_endpoint(&home, Region::Global).as_deref(),
             Some("https://my.own.gateway"),
             "卸载必须还原成用户原本的值，而不是删掉"
         );
@@ -604,8 +733,8 @@ mod tests {
     #[test]
     fn sweep_clears_stale_lease_left_by_a_crash() {
         let (home, data) = sandbox();
-        install(&home, &data, 8787).unwrap();
-        assert_eq!(current_endpoint(&home).as_deref(), Some("http://127.0.0.1:8787"));
+        install(&home, Region::Global, &data, 8787).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Global).as_deref(), Some("http://127.0.0.1:8787"));
 
         // 模拟崩溃：把心跳拨回很久以前，就像应用被 kill -9 后再也没起来
         let mut lease = load_lease(&data).unwrap();
@@ -614,7 +743,7 @@ mod tests {
         assert!(!is_alive(&lease), "过期租约必须判定为不存活");
 
         sweep(&home, &data);
-        assert_eq!(current_endpoint(&home), None, "僵尸端点必须被清掉");
+        assert_eq!(current_endpoint(&home, Region::Global), None, "僵尸端点必须被清掉");
         assert!(!lease_path(&data).exists());
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
@@ -623,10 +752,10 @@ mod tests {
     #[test]
     fn sweep_keeps_a_live_lease() {
         let (home, data) = sandbox();
-        install(&home, &data, 8787).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
         sweep(&home, &data);
         assert_eq!(
-            current_endpoint(&home).as_deref(),
+            current_endpoint(&home, Region::Global).as_deref(),
             Some("http://127.0.0.1:8787"),
             "心跳新鲜的接管不能被清扫掉"
         );
@@ -646,7 +775,7 @@ mod tests {
         );
 
         sweep(&home, &data);
-        assert_eq!(current_endpoint(&home), None, "无租约的孤儿端点要清掉");
+        assert_eq!(current_endpoint(&home, Region::Global), None, "无租约的孤儿端点要清掉");
 
         // 反过来：**别人**的端口不能被我们顺手清掉。
         // 8787 是同机 workbuddy-assistant 的反代端口，清它等于把另一个应用的接管打断。
@@ -657,7 +786,7 @@ mod tests {
         );
         sweep(&home, &data);
         assert_eq!(
-            current_endpoint(&home).as_deref(),
+            current_endpoint(&home, Region::Global).as_deref(),
             Some(format!("http://127.0.0.1:{others}").as_str()),
             "别人的端口不是我们的残留，不该动"
         );
@@ -668,12 +797,12 @@ mod tests {
     #[test]
     fn install_is_idempotent_and_retargets_on_port_change() {
         let (home, data) = sandbox();
-        install(&home, &data, 8787).unwrap();
-        install(&home, &data, 8787).unwrap();
-        assert_eq!(current_endpoint(&home).as_deref(), Some("http://127.0.0.1:8787"));
+        install(&home, Region::Global, &data, 8787).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Global).as_deref(), Some("http://127.0.0.1:8787"));
 
-        install(&home, &data, 8899).unwrap();
-        assert_eq!(current_endpoint(&home).as_deref(), Some("http://127.0.0.1:8899"));
+        install(&home, Region::Global, &data, 8899).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Global).as_deref(), Some("http://127.0.0.1:8899"));
         assert_eq!(load_lease(&data).unwrap().port, 8899);
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
@@ -684,10 +813,10 @@ mod tests {
         // 连续换端口时，previous 必须是「最初的」那个值，而不是上一次我们写进去的
         let (home, data) = sandbox();
         write_cfg(&home, r#"{"env":{"CODEBUDDY_BASE_URL":"https://original"}}"#);
-        install(&home, &data, 8787).unwrap();
-        install(&home, &data, 8899).unwrap();
-        uninstall(&home, &data).unwrap();
-        assert_eq!(current_endpoint(&home).as_deref(), Some("https://original"));
+        install(&home, Region::Global, &data, 8787).unwrap();
+        install(&home, Region::Global, &data, 8899).unwrap();
+        uninstall(&home, Region::Global, &data).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Global).as_deref(), Some("https://original"));
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }
@@ -696,8 +825,8 @@ mod tests {
     fn refuses_to_touch_unparsable_config() {
         let (home, data) = sandbox();
         write_cfg(&home, "{not json");
-        assert!(install(&home, &data, 8787).is_err());
-        assert_eq!(fs::read_to_string(target_config(&home)).unwrap(), "{not json");
+        assert!(install(&home, Region::Global, &data, 8787).is_err());
+        assert_eq!(fs::read_to_string(target_config(&home, Region::Global)).unwrap(), "{not json");
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }
@@ -706,11 +835,11 @@ mod tests {
     fn journal_records_real_changes_only() {
         let (home, data) = sandbox();
         // 没装过就卸载：不该留下事件（噪声会让诊断误判）
-        uninstall(&home, &data).unwrap();
+        uninstall(&home, Region::Global, &data).unwrap();
         assert!(journal_read(&data).is_empty());
 
-        install(&home, &data, 8787).unwrap();
-        uninstall(&home, &data).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
+        uninstall(&home, Region::Global, &data).unwrap();
         let events = journal_read(&data);
         assert_eq!(
             events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
@@ -778,7 +907,7 @@ mod tests {
         journal_append(&data, "uninstall", "上一轮：接管已关闭");
         assert_eq!(journal_read(&data).len(), 2);
 
-        install(&home, &data, 8787).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
         let events = journal_read(&data);
         assert_eq!(events.len(), 1, "开启接管应清空历史：{events:?}");
         assert_eq!(events[0].event, "install");
@@ -797,9 +926,9 @@ mod tests {
     #[test]
     fn idempotent_reinstall_keeps_the_current_session() {
         let (home, data) = sandbox();
-        install(&home, &data, 8787).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
         journal_append(&data, "route_start", "本轮：使用账号 A");
-        install(&home, &data, 8787).unwrap();
+        install(&home, Region::Global, &data, 8787).unwrap();
         let events = journal_read(&data);
         assert_eq!(
             events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
@@ -866,6 +995,110 @@ mod tests {
         assert_eq!(actual, expected, "并发追加丢事件（缺条目见上方集合差异）");
         assert_eq!(all.len(), threads * per_thread, "并发追加出现重复条目");
         assert!(all.iter().all(|e| e.event == "proxy_request"), "事件名被串改");
+
+        let _ = fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    // ── 区域 ──────────────────────────────────────────────────────────────
+
+    /// 装进哪个区域 = 写进哪个目录。装错目录**不会报错**，只会让界面显示
+    /// 「接管已开启」而实际一个请求都没被接管 —— 所以这条要钉死。
+    #[test]
+    fn install_targets_the_config_of_the_chosen_region_only() {
+        let (home, data) = sandbox();
+        // 端口取设置里的默认值：`status` 判定 installed 时比的就是它
+        let port = crate::accounts::load_settings(&data).proxy_port;
+        install(&home, Region::Cn, &data, port).unwrap();
+
+        assert_eq!(
+            current_endpoint(&home, Region::Cn).as_deref(),
+            Some(format!("http://127.0.0.1:{port}").as_str())
+        );
+        assert_eq!(
+            current_endpoint(&home, Region::Global),
+            None,
+            "国内版接管不能顺手改国际版的配置"
+        );
+        assert!(home.join(".qoder-cn").join("settings.json").exists());
+        assert!(
+            !home.join(".qoder").join("settings.json").exists(),
+            "国际版的配置文件不该被凭空创建"
+        );
+
+        // 状态也是逐区域的：同一时刻国际版是「没装」、国内版是「装了」
+        let g = status(&home, Region::Global, &data);
+        assert!(!g.installed);
+        assert_eq!(g.region, Region::Global);
+        let c = status(&home, Region::Cn, &data);
+        assert!(c.installed);
+        assert_eq!(c.region, Region::Cn);
+
+        let _ = fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    /// 换区域 = 从旧区域的配置里摘掉、再写进新区域。旧那份**必须**一起摘，
+    /// 否则那个客户端会一直指向本机端口，而我们这边已经不为它服务了。
+    #[test]
+    fn switching_region_moves_the_endpoint_instead_of_duplicating_it() {
+        let (home, data) = sandbox();
+        install(&home, Region::Global, &data, 8787).unwrap();
+        install(&home, Region::Cn, &data, 8787).unwrap();
+
+        assert_eq!(
+            current_endpoint(&home, Region::Global),
+            None,
+            "换到国内版后，国际版那份端点必须被摘掉"
+        );
+        assert_eq!(
+            current_endpoint(&home, Region::Cn).as_deref(),
+            Some("http://127.0.0.1:8787")
+        );
+        assert_eq!(load_lease(&data).unwrap().region, Region::Cn);
+
+        // 再卸一次：只动国内版
+        uninstall(&home, Region::Cn, &data).unwrap();
+        assert_eq!(current_endpoint(&home, Region::Cn), None);
+        assert!(!lease_path(&data).exists());
+
+        let _ = fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    /// 卸载只认**租约上那个区域**：给错区域不能把另一个区域（用户自己的）配置改坏。
+    #[test]
+    fn uninstall_does_not_touch_the_other_regions_config() {
+        let (home, data) = sandbox();
+        write_cfg_in(
+            &home,
+            Region::Global,
+            r#"{"env":{"CODEBUDDY_BASE_URL":"https://user.own.gateway"}}"#,
+        );
+        write_cfg_in(&home, Region::Cn, "{}");
+        install(&home, Region::Cn, &data, 8787).unwrap();
+
+        uninstall(&home, Region::Cn, &data).unwrap();
+        assert_eq!(
+            current_endpoint(&home, Region::Global).as_deref(),
+            Some("https://user.own.gateway"),
+            "用户自己写在国际版配置里的端点不能被连带清掉"
+        );
+
+        let _ = fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    /// 清扫要照顾**两个区域**：上一轮接管的是哪一个不一定还查得到（租约可能
+    /// 一起丢了），而残留留在任何一个区域上都会让那个客户端断网。
+    #[test]
+    fn sweep_cleans_orphans_in_both_regions() {
+        let (home, data) = sandbox();
+        let port = crate::accounts::load_settings(&data).proxy_port;
+        let ours = format!(r#"{{"env":{{"CODEBUDDY_BASE_URL":"http://127.0.0.1:{port}"}}}}"#);
+        write_cfg_in(&home, Region::Global, &ours);
+        write_cfg_in(&home, Region::Cn, &ours);
+
+        sweep(&home, &data);
+
+        assert_eq!(current_endpoint(&home, Region::Global), None);
+        assert_eq!(current_endpoint(&home, Region::Cn), None);
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }

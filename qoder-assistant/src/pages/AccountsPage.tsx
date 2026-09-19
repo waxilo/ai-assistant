@@ -6,6 +6,7 @@ import {
   StatusDot,
   copyText,
   formatCredits,
+  packageExpiry,
   signState,
   expiryInfo,
   expiryCountdown,
@@ -176,7 +177,11 @@ export function AccountsPage({
               return (
                 <tr key={a.id}>
                   <td>
-                    <AccountCell name={a.name} phone={a.phone} />
+                    <AccountCell
+                      name={a.name}
+                      phone={a.phone}
+                      region={a.region}
+                    />
                   </td>
                   <td className="num">
                     {bal != null ? (
@@ -190,11 +195,16 @@ export function AccountsPage({
                   <td className="ac-cell-expiry num">
                     {soon ? (
                       <span
-                        className={"ac-expiry clk" + (soon.daysUntil < 0 ? " expired" : "")}
+                        className={
+                          "ac-expiry clk" +
+                          (soon.kind === "dated" && soon.daysUntil < 0 ? " expired" : "")
+                        }
                         title="点开看逐资源包列表；智能接管优先使用到期最早的积分"
                         onClick={() => setPkgAccount(a)}
                       >
-                        {soon.daysUntil < 0
+                        {soon.kind === "never"
+                          ? `不过期 ${formatCredits(soon.remaining)}`
+                          : soon.daysUntil < 0
                           ? "已过期"
                           : `${soon.daysUntil} 天后过期 ${formatCredits(soon.remaining)}`}
                       </span>
@@ -296,6 +306,14 @@ export function AccountsPage({
 /**
  * 资源包列表弹窗内容：一个账号的逐额度包（名称 / 剩余积分 / 到期）。
  * `packages` 从全局积分对象里取，缺失时给一条空态提示。
+ *
+ * **不在这里排序**：顺序由后端定好（有到期日 → 永不过期 → 未知，
+ * 见 `ledger::project_packages`）。前端再排一次就是同一条规则的第二份实现，
+ * 而且「未来日期」与「未来永远不会过期」谁在前，两边一定会给出不同答案。
+ *
+ * 「到期」列走 [`packageExpiry`]：它把「不过期」「未知」与真日期分开说 ——
+ * 上一版这里是对 `expiry_ms` 直接 `new Date()`，于是把服务端表示不过期的
+ * `9999-12-31` 哨兵原样印了出来。
  */
 function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>; account: Account }) {
   const packs = packagesOf(book, account.id) as CreditPackage[];
@@ -314,28 +332,17 @@ function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>
           </tr>
         </thead>
         <tbody>
-          {[...packs]
-            .sort((a, b) => (a.expiry_ms ?? Infinity) - (b.expiry_ms ?? Infinity))
-            .map((p, i) => (
-              <tr key={i}>
-                <td>{p.name || "未命名额度包"}</td>
-                <td className="num">{formatCredits(p.remaining)}</td>
-                <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
-              </tr>
-            ))}
+          {packs.map((p, i) => (
+            <tr key={i}>
+              <td>{p.name || "未命名额度包"}</td>
+              <td className="num">{formatCredits(p.remaining)}</td>
+              <td className="num num-muted">{packageExpiry(p).text}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
     </div>
   );
-}
-
-/** 毫秒 → `YYYY-MM-DD`，资源包到期的完整日期展示 */
-function mmddyyyy(ms: number | null): string {
-  if (ms == null) return "未知";
-  const d = new Date(ms);
-  if (isNaN(d.getTime())) return "未知";
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /** 毫秒时间戳 → 人话的「多久之前」。与 `common.relativeTime` 同一套档位，只是吃毫秒 */

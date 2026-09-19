@@ -15,6 +15,7 @@ mod oauth;
 mod proxy;
 mod qoder_api;
 mod refresh;
+mod region;
 mod rng;
 mod scheduler;
 mod stealth;
@@ -94,6 +95,8 @@ pub fn run() {
             commands::broker_unbind,
             commands::broker_state,
             commands::get_settings,
+            // 区域清单（国际版 / 国内版）：界面下拉的唯一来源
+            commands::regions,
             commands::save_settings,
             commands::apply_settings,
             commands::test_notify,

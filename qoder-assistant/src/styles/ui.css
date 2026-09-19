@@ -263,6 +263,28 @@
   font-size: var(--fs-cap);
   color: var(--muted);
 }
+/* 账号的次级行：手机号 + 区域标签并排一行（见 common.tsx 的 AccountCell） */
+.ac-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+/* 窄窗口下要让手机号先被截断，而不是把区域标签挤出单元格 */
+.ac-sub .ac-phone {
+  min-width: 0;
+}
+/* 区域标签（国际版 / 国内版）：账号的「身份证」，只贴一个值 ——
+   所以用 .tag 的语言，不用表达判定的 .badge */
+.ac-region {
+  flex: 0 0 auto;
+  font-size: var(--fs-micro);
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
 /* 积分：核心数据突出，低积分用弱橙提示 */
 .ac-balance {
   font-size: 15px;
@@ -778,6 +800,48 @@ body.modal-open .content {
 }
 
 /* 可勾选 / 可点列表：本机账号、扣费账号、限流模型三处共用 */
+/* ── 「导入本机账号」的逐区域读取情况 ─────────────────────────
+   两个版本各一行：读到了用成功色，没读到就把**原因**写在右边。
+   只写一句「请先登录一次」是不够的 —— 「没读到」至少三种原因
+   （没登录 / 钥匙串里没条目 / 解密失败），而最容易猜错的结论就是"我没登录"。 */
+.probe-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.probe-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: var(--fs-cap);
+  line-height: 1.6;
+}
+.probe-item.ok {
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
+}
+/* 区域名必须是**一个整块**：它是 flex 子项，不加这两条会被右侧长文案挤成
+   「国际 / 版」两行（实测截图里就是这样）。 */
+.probe-item > .badge {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+/* 说明里含绝对路径，窄窗口下必须能折断，否则会把弹窗顶宽 */
+.probe-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.probe-item.ok .probe-detail {
+  color: var(--text-2);
+}
 .pick-list {
   list-style: none;
   margin: 0;

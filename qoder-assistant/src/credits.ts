@@ -78,12 +78,36 @@ export function packagesOf(book: CreditBook, id: string) {
   return book[id]?.packages ?? [];
 }
 
-/** 快过期提示：最早到期（非 null）的资源包，`{daysUntil, remaining}`；没有就返回 `null` */
-export function soonestExpiry(book: CreditBook, id: string) {
-  const pkgs = packagesOf(book, id).filter((p) => p.expiry_ms != null);
-  if (pkgs.length === 0) return null;
-  const p = pkgs[0];
-  return { daysUntil: Math.ceil((p.expiry_ms! - Date.now()) / 86_400_000), remaining: p.remaining };
+/**
+ * 账号页「积分过期」那一列的取值。
+ *
+ * 三种结果就是资源包到期的三态，**用 `kind` 区分而不是用 `daysUntil === null`**：
+ * 「不过期」与「未知」在界面上的文案完全不同（一个说「不过期」，一个说「未知」），
+ * 混成一个 null 就必然有一边被说错 —— 之前那个 9999 年的假日期就是这么来的。
+ */
+export type SoonestExpiry =
+  | { kind: "dated"; daysUntil: number; remaining: number }
+  | { kind: "never"; remaining: number };
+
+/**
+ * 快过期提示：最早到期（非 null）的资源包。
+ *
+ * 排序已由后端定好（有到期日 → 永不过期 → 未知，见 `ledger::project_packages`），
+ * 所以这里只需看第一个「有到期日」的包；一个都没有时，再看有没有永不过期的。
+ * 全都没有 → `null`，调用方退回「查看资源包」那条提示。
+ */
+export function soonestExpiry(book: CreditBook, id: string): SoonestExpiry | null {
+  const pkgs = packagesOf(book, id);
+  const dated = pkgs.find((p) => p.expiry_ms != null);
+  if (dated) {
+    return {
+      kind: "dated",
+      daysUntil: Math.ceil((dated.expiry_ms! - Date.now()) / 86_400_000),
+      remaining: dated.remaining,
+    };
+  }
+  const never = pkgs.find((p) => p.never_expires);
+  return never ? { kind: "never", remaining: never.remaining } : null;
 }
 
 /**

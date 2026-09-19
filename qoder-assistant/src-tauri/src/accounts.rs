@@ -1,4 +1,5 @@
 use crate::ledger;
+use crate::region::Region;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,17 @@ pub struct Account {
     /// 手机号（展示用标识，手动录入，可空）
     #[serde(default)]
     pub phone: Option<String>,
+    /// **这个账号属于哪套部署**（国际版 / 国内版，见 [`Region`]）。
+    ///
+    /// 这是账号的**身份属性**，不是「可选覆盖」：同一个手机号在两套部署里是两个
+    /// 完全不同的账号（两套后端、两份 token、各自的活动权益）。所以「导入合并」的
+    /// 识别键是 **（区域, 手机号）**，而不是手机号本身 —— 用手机号单键匹配，
+    /// 会把国内版的账号合并进国际版那条记录里，token 一换就再也签不到到。
+    ///
+    /// 老 `accounts.json` 没有这个字段 → `#[serde(default)]` 落成 [`Region::Global`]：
+    /// 这个字段出现之前，能导进来的只有国际版账号。
+    #[serde(default)]
+    pub region: Region,
     pub token: String,
     /// 续签用的 refresh token（导入本机账号 / 无感登录时一并带上；老账号为 None）
     #[serde(default)]
@@ -136,8 +148,21 @@ pub fn load_account_views(dir: &Path) -> Vec<AccountView> {
 /// 仍能反序列化（不会整个文件被判为非法而回退成默认值）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
-    #[serde(default = "default_base_url")]
-    pub default_base_url: String,
+    /// **接管目标区域**：智能接管作用于哪一套官方客户端。
+    ///
+    /// 它同时决定三件事，所以必须是**显式选择**、不能靠磁盘猜：
+    /// ① 端点写进哪个 CLI 配置目录（`~/.qoder/settings.json` / `~/.qoder-cn/settings.json`）；
+    /// ② 反代把对话请求转发到哪个模型网关（各区域的 `infer_base`）；
+    /// ③ 反代的扣费账号只在该区域里选 —— 跨区域的 token 在对方网关上无效。
+    ///
+    /// 「两个官方客户端可以同时装着」是常态，而「现在该接管哪一个」是用户的意图，
+    /// 不是能从文件系统推断出来的事实。
+    ///
+    /// ⚠️ 这一项**取代了旧的 `default_base_url`**：那个字段先是模板残留的 CodeBuddy
+    /// 域名（靠迁移改成 Qoder 的），随后又被当成「上游可覆盖」留着，而前端从来没有
+    /// 它的入口。上游其实由区域唯一决定，留一个可写字段只会多一处「改错了不报错」。
+    #[serde(default)]
+    pub takeover_region: Region,
     #[serde(default)]
     pub auto_checkin_on_start: bool,
     /// 是否开启「每天定时自动签到」
@@ -236,7 +261,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            default_base_url: default_base_url(),
+            takeover_region: Region::default(),
             auto_checkin_on_start: false,
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
@@ -294,13 +319,10 @@ pub fn normalize_time(input: &str) -> Option<String> {
     Some(format!("{h:02}:{m:02}"))
 }
 
-fn default_base_url() -> String {
-    // 模型网关的上游：Qoder CLI 的 `Btn()` 拼的是
-    // `https://api2-v2.qoder.sh/model/v1/chat/completions`。
-    // 模板里这里是 CodeBuddy 的 `copilot.tencent.com`，已作废
-    // （见 `basedata/20260918_Qoder接管机制逆向.md` 第 5 节）。
-    crate::qoder_api::INFER_BASE.to_string()
-}
+// 这里曾有 `fn default_base_url()` —— 把「模型网关上游」做成了一个可配置字段，
+// 还配了一条把 CodeBuddy 域名迁过来的迁移。上游现在由 [`Region::infer_base`]
+// 按区域唯一决定（见 `Settings::takeover_region`），设置里不再有这一项；
+// 老 `settings.json` 里的 `default_base_url` 键会被 serde 直接忽略。
 
 /// 默认定时签到时刻：**10:00**，对齐服务端的活动刷新点。
 ///
@@ -373,13 +395,9 @@ pub fn load_settings(dir: &Path) -> Settings {
 /// 不迁移的话，那台机器会一直按老规则跑，而新装的机器却是对的 ——
 /// 同一份代码两种行为，且没有任何一处报错。
 fn migrate_settings(s: &mut Settings) {
-    // 1) 上游域名：从模板改名过来的机器里写死了 CodeBuddy 的域名。
-    let stale = s.default_base_url.trim().is_empty()
-        || s.default_base_url.contains("copilot.tencent.com")
-        || s.default_base_url.contains("codebuddy.");
-    if stale {
-        s.default_base_url = default_base_url();
-    }
+    // 1) 原先这里有一条「把 CodeBuddy 的上游域名改成 Qoder 的」迁移 —— 随
+    //    `default_base_url` 字段本身一起删掉了（字段没了，迁移就无从谈起）。
+    //    新增的 `takeover_region` 由 serde 默认成国际版，不需要迁移。
 
     // 2) 定时签到时刻：只迁那一个确切的历史默认值。`09:07` 在 Qoder 上落在
     //    活动刷新（10:00 UTC+8）之前的夹缝里，每天都领不到（理由见
@@ -427,6 +445,7 @@ mod tests {
     fn a_view_with_credits() -> AccountView {
         AccountView {
             account: Account {
+                region: Region::Global,
                 id: "a1".into(),
                 name: "主号".into(),
                 phone: Some("190****9775".into()),
@@ -492,24 +511,19 @@ mod tests {
         }
     }
 
-    /// 迁移：从模板改名过来的机器里写死了 CodeBuddy 的上游域名 ——
-    /// `#[serde(default)]` 对「键在、值过时」无能为力，必须显式迁。
+    /// 升级路径：老 `settings.json` 里那个 `default_base_url` 键**必须还能读出来**
+    /// —— 字段已经删了，读到时直接忽略；新字段 `takeover_region` 落成国际版。
+    ///
+    /// 这条断言钉的是「删字段不会让整份配置报废」：serde 默认容忍未知键，
+    /// 但哪天给 `Settings` 加上 `deny_unknown_fields`，老用户的配置就会**整份回退成默认值**
+    /// （定时时刻、通知开关、风控开关全丢），而那看起来只会像「升级后设置全没了」。
     #[test]
-    fn migrate_rewrites_the_stale_codebuddy_base_url() {
-        let mut s = Settings {
-            default_base_url: "https://copilot.tencent.com".into(),
-            ..Settings::default()
-        };
-        migrate_settings(&mut s);
-        assert_eq!(s.default_base_url, crate::qoder_api::INFER_BASE);
-
-        // 用户自己填的地址不能动
-        let mut s = Settings {
-            default_base_url: "https://my-gateway.example/v1".into(),
-            ..Settings::default()
-        };
-        migrate_settings(&mut s);
-        assert_eq!(s.default_base_url, "https://my-gateway.example/v1");
+    fn settings_with_the_removed_base_url_key_still_load() {
+        let old = r#"{"default_base_url":"https://copilot.tencent.com","auto_checkin_on_start":true,"schedule_time":"08:30"}"#;
+        let s: Settings = serde_json::from_str(old).expect("多出未知键不该让整份配置报废");
+        assert!(s.auto_checkin_on_start);
+        assert_eq!(s.schedule_time, "08:30", "同一份配置里的其它值必须保留");
+        assert_eq!(s.takeover_region, Region::Global, "新增字段缺省 = 国际版");
     }
 
     /// 迁移：`09:07` 是 CodeBuddy 时代的默认定时签到时刻，在 Qoder 上**落在活动刷新
@@ -542,8 +556,8 @@ mod tests {
         // 老版本只写了这两个字段，新增的定时/通知字段必须走默认值而不是让整份配置报废
         let old = r#"{"default_base_url":"https://x","auto_checkin_on_start":true}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
-        assert_eq!(s.default_base_url, "https://x");
         assert!(s.auto_checkin_on_start);
+        assert_eq!(s.takeover_region, Region::Global, "接管目标区域缺省 = 国际版");
         assert!(!s.schedule_enabled);
         // 默认时刻对齐活动刷新点（10:00 UTC+8），不是 CodeBuddy 时代的 09:07
         assert_eq!(s.schedule_time, "10:00");

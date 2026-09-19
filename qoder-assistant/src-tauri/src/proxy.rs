@@ -36,6 +36,7 @@ use crate::accounts;
 use crate::checkin::fetch_resource_view;
 use crate::commands;
 use crate::ledger;
+use crate::region::Region;
 use crate::stealth;
 use chrono;
 use regex::Regex;
@@ -394,7 +395,10 @@ pub fn spawn(app: tauri::AppHandle) {
             stealth::sweep(&home, &dir);
         }
 
-        let mut installed_port: Option<u16> = None;
+        // 当前装着端点的是**哪个区域 + 哪个端口**。区域必须一起记：
+        // 只记端口的话，用户换区域时这个循环会以为「已经装好了」，
+        // 新区域的配置文件永远不会被写上，而界面显示「接管生效中」。
+        let mut installed: Option<(Region, u16)> = None;
         let mut disabled_cleaned = false;
         loop {
             let Ok(dir) = commands::try_data_dir(&app) else {
@@ -403,9 +407,14 @@ pub fn spawn(app: tauri::AppHandle) {
             };
             let settings = accounts::load_settings(&dir);
             if !settings.proxy_enabled {
-                if !disabled_cleaned || installed_port.take().is_some() {
+                if !disabled_cleaned || installed.take().is_some() {
                     if let Some(home) = dirs::home_dir() {
-                        if let Err(e) = stealth::uninstall(&home, &dir) {
+                        // 摘**租约上那个区域**的：设置里的区域可能刚被改过，
+                        // 而真正写在磁盘上的是租约记的那一个。
+                        let region = stealth::load_lease(&dir)
+                            .map(|l| l.region)
+                            .unwrap_or(settings.takeover_region);
+                        if let Err(e) = stealth::uninstall(&home, region, &dir) {
                             eprintln!("[proxy] 摘除接管端点失败：{e}");
                         }
                     }
@@ -417,18 +426,19 @@ pub fn spawn(app: tauri::AppHandle) {
 
             disabled_cleaned = false;
             let port = settings.proxy_port;
+            let region = settings.takeover_region;
             match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(listener) => {
                     let Some(home) = dirs::home_dir() else {
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     };
-                    if let Err(e) = stealth::install(&home, &dir, port) {
+                    if let Err(e) = stealth::install(&home, region, &dir, port) {
                         eprintln!("[proxy] 安装接管端点失败：{e}");
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
-                    installed_port = Some(port);
+                    installed = Some((region, port));
                     // 监听必须非阻塞，才能在 accept 之余顺带轮询配置；
                     // 但 accept 出来的连接会被 Windows 传染非阻塞，必须逐连接复位——见 configure_conn
                     let _ = listener.set_nonblocking(true);
@@ -437,7 +447,11 @@ pub fn spawn(app: tauri::AppHandle) {
                     loop {
                         if last_cfg.elapsed() >= CONFIG_POLL {
                             let current = accounts::load_settings(&dir);
-                            if !current.proxy_enabled || current.proxy_port != port {
+                            // 区域也参与判定：换了区域就退出去重装（端口可能没变）
+                            if !current.proxy_enabled
+                                || current.proxy_port != port
+                                || current.takeover_region != region
+                            {
                                 break;
                             }
                             last_cfg = Instant::now();
@@ -459,9 +473,9 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                 }
                 Err(e) => {
-                    if installed_port.take().is_some() {
+                    if installed.take().is_some() {
                         if let Some(home) = dirs::home_dir() {
-                            let _ = stealth::uninstall(&home, &dir);
+                            let _ = stealth::uninstall(&home, region, &dir);
                         }
                     }
                     eprintln!("[proxy] 无法监听 127.0.0.1:{port}：{e}");
@@ -690,7 +704,10 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let settings = accounts::load_settings(&dir);
-    let host = settings.default_base_url;
+    // 转发目标由**接管区域**唯一决定（国际版 `api2-v2.qoder.sh` / 国内版
+    // `gateway.qoder.com.cn`）。这里曾经读 `settings.default_base_url` —— 那是个
+    // 既没人能改、内容还是模板残留的字段，已随区域模型一起删掉。
+    let host = settings.takeover_region.infer_base().to_string();
     let bare = normalize_target(&req.target);
     let path = upstream_path(bare).to_string();
     let is_chat = bare == "/chat/completions";
@@ -751,7 +768,7 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
         // 三层都拿不到就是**空集** ⇒ 只有流程里那些「上游 429 也原样透传」的模型不再自动换号；
         // 这里不会退回任何写死的模型名。
         let free_set = if is_chat {
-            ensure_free_models(&dir, &account.token)
+            ensure_free_models(&dir, account.region, &account.token)
         } else {
             HashSet::new()
         };
@@ -892,8 +909,12 @@ fn body_model(body: &[u8]) -> Option<String> {
 /// 这段原本打的是 CodeBuddy 的 `{base}/v2/enterprises/personal/models`，兜底写死腾讯的
 /// `hy3` —— 在 Qoder 上那条路径恒 404，于是永远退回兜底，把一个 Qoder 根本不认识的
 /// 模型名当成了免费模型。接口与兜底都已作废，理由见 [`crate::models`] 的模块说明。
-fn ensure_free_models(dir: &Path, token: &str) -> HashSet<String> {
-    let report = tauri::async_runtime::block_on(crate::models::load(dir, token, false));
+fn ensure_free_models(dir: &Path, region: Region, token: &str) -> HashSet<String> {
+    // 空 token 当「没有凭证」处理：带着空 Bearer 去请求只会白等一轮超时，
+    // 而结果一样是退到本地两层。调用点给的是真账号，这只是兜底。
+    let token = (!token.is_empty()).then_some(token);
+    let report =
+        tauri::async_runtime::block_on(crate::models::load(region, dir, token, false));
     crate::models::free_ids(&report.models)
 }
 
@@ -922,26 +943,43 @@ fn is_rate_limited_model(
 /// 「限流切换」模型清单：接管页展示 + 手动刷新。
 ///
 /// 清单与免费判定都交给 [`crate::models`] —— 那边有内存缓存 / 落盘快照 / 本机痕迹三层，
-/// 且**与路由侧同源**（见 `ensure_free_models`）。这里只负责「给它一个真 token」：
+/// 且**与路由侧同源**（见 `ensure_free_models`）。
 ///
-/// - 先整池同步：绑了池之后本地那份 token 可能早被别的机器轮换掉了（用旧的会 401）；
-/// - token 临近过期先续签（单机路径；落盘版只在路由时做，这里仅求拉取成功）。
+/// # 这个命令**不要求本区域有账号**
 ///
-/// 三层都拿不到时回**空列表**（`source = "empty"`），由界面显示空态 ——
-/// 这里不再退回任何写死的模型名。
+/// 三层来源里两层是纯本地的，「没账号」只该让第 1 层缺席，不该让整件事失败
+/// （`note` 里会写明原因，界面照常显示清单）。
+///
+/// 早先这里是 `load_accounts(..).find(..).ok_or_else(|| "xx 下暂无账号，无法拉取模型列表")`，
+/// 后果是：用户只登了一边的账号时，接管页每次打开都弹一条与事实无关的红字 ——
+/// 而那个区域他们本来就没打算用（真正要接管的是另一边，页面上换个区域就好了）。
+/// 一个纯本地查询被一个无关条件整个拦掉，是最没信息量的一种失败。详见 [`crate::models`]。
+///
+/// # 顺手删掉的续签
+///
+/// 绑了池先整池同步一轮（本地那份 token 可能早被别的机器换掉了）—— 这条留着。
+/// 但**不再调 `ensure_fresh_token`**：`free_models` 不落盘，而续签会轮换 refresh token，
+/// 于是「看一眼清单」可能把轮换出来的新凭证直接丢掉；换来的新 token 也拉不到目录
+/// （两个区域实测都进不去，见 [`crate::models`] 模块头）。净亏，删掉。
 #[tauri::command]
 pub async fn free_models(
     app: tauri::AppHandle,
     refresh: Option<bool>,
+    region: Option<Region>,
 ) -> Result<crate::models::ModelReport, String> {
     let dir = crate::commands::try_data_dir(&app)?;
     crate::commands::sync_pool_if_bound(&dir).await;
-    let mut account = accounts::load_accounts(&dir)
+    // 缺省 = 设置里的接管目标区域（接管页默认看的就是它要接管的那一套）；
+    // 前端显式传值时用于「换了区域但还没保存就先看看清单」。
+    let region = region.unwrap_or_else(|| accounts::load_settings(&dir).takeover_region);
+    // 找得到就用它的 token 试一次第 1 层；找不到（或 token 是空的）就 `None`，
+    // 让 [`crate::models::load`] 直接走本地两层 —— 那不是错误。
+    let token = accounts::load_accounts(&dir)
         .into_iter()
+        .filter(|a| a.region == region)
         .find(|a| !a.token.is_empty())
-        .ok_or_else(|| "暂无账号，无法拉取模型列表".to_string())?;
-    let _ = commands::ensure_fresh_token(&mut account).await;
-    Ok(crate::models::load(&dir, &account.token, refresh.unwrap_or(false)).await)
+        .map(|a| a.token);
+    Ok(crate::models::load(region, &dir, token.as_deref(), refresh.unwrap_or(false)).await)
 }
 
 /// 不该回给客户端的响应头：逐跳头、reqwest 已代劳解压后失效的，
@@ -1247,6 +1285,15 @@ async fn choose_account(
     if all.is_empty() {
         return None;
     }
+    // **只在被接管那个区域的账号里选**。跨区域的 token 在对方网关上无效，
+    // 送过去只会吃一个 401 —— 而界面上看起来是「这些账号怎么都不好使」，
+    // 完全看不出是「选错了区域」。过滤放在最前面：后面的粘滞、冷却、排序
+    // 都只该看见本区域的候选。
+    let region = settings.takeover_region;
+    let all: Vec<_> = all.into_iter().filter(|a| a.region == region).collect();
+    if all.is_empty() {
+        return None;
+    }
     // 这里**不给账号配积分读数**：路由排序直接用台账本身（见下方 `store.fact_of`），
     // 在这儿再配一份投影就是第二个会漂移的口径 —— 而漂移正是这次要消掉的东西。
     let candidates = billing_candidates(&all, &settings.billing_account_ids);
@@ -1290,7 +1337,7 @@ async fn choose_account(
         if !snapshot_stale(snaps[i].as_ref().map(|f| f.at.as_str())) {
             continue;
         }
-        let view = fetch_resource_view(&acct.token).await;
+        let view = fetch_resource_view(acct.region, &acct.token).await;
         readings.push(ledger::Reading {
             id: acct.id.clone(),
             packages: view.packages,
@@ -1430,6 +1477,7 @@ mod tests {
     #[test]
     fn billing_candidates_restricts_to_selected_accounts() {
         let mk = |id: &str| crate::accounts::Account {
+            region: Region::Global,
             id: id.into(),
             name: id.into(),
             phone: None,
@@ -1455,6 +1503,7 @@ mod tests {
     #[test]
     fn available_candidates_skips_cooling_unless_all_cooling() {
         let mk = |id: &str| crate::accounts::Account {
+            region: Region::Global,
             id: id.into(),
             name: id.into(),
             phone: None,
@@ -1853,6 +1902,7 @@ mod tests {
         let mut server = down.accept().unwrap().0;
 
         let acct = accounts::Account {
+            region: Region::Global,
             id: "acct-e2e".into(),
             name: "端到端".into(),
             phone: None,
@@ -1959,6 +2009,7 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", down_port)).unwrap();
         let mut server = down.accept().unwrap().0;
         let acct = accounts::Account {
+            region: Region::Global,
             id: "acct-e2e".into(),
             name: "端到端".into(),
             phone: None,

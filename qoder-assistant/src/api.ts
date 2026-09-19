@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
   Settings,
-  LocalAccount,
+  LocalScan,
   OAuthStart,
   OAuthPoll,
   CheckinLog,
@@ -16,6 +16,7 @@ import type {
   StealthStatus,
   JournalEvent,
   ModelReport,
+  RegionOption,
 } from "./types";
 
 export const listAccounts = () => invoke<Account[]>("list_accounts");
@@ -38,16 +39,24 @@ export const checkinAll = () => invoke<Account[]>("checkin_all");
 /** 一键刷新：不打签到接口，重拉并持久化全部账号的积分快照 / 签到状态 / 积分余量 */
 export const refreshAll = () => invoke<Account[]>("refresh_all");
 
-/** 首选通道：读本机 Qoder 登录文件（auth/*.info），含昵称与手机号 */
+/**
+ * 首选通道：读本机 Qoder 凭据文件（`auth.v1.dat`），含昵称与手机号。
+ *
+ * 返回的不只是账号列表，还有**每个区域各自的读取情况**（见 [`LocalScan`]）——
+ * 所以调用方不能再假设「空数组 = 两个版本都没登录」。
+ */
 export const discoverLocalAccounts = () =>
-  invoke<LocalAccount[]>("discover_local_accounts");
+  invoke<LocalScan>("discover_local_accounts");
 
 /**
  * 「无感登录」第一步：申请一次设备授权会话，拿到授权链接。
  *
- * **不收域参数**：Qoder 只有一套 Global 域，地址由后端 `qoder_api` 唯一决定。
+ * `region` 必填：两套部署是**互不相通**的（账号、积分、活动各自独立），
+ * 同一个 `authClientId` 在两边都对，但只有发起方知道用户在点哪个入口。
+ * 返回值里带回同一个 `region`，导入时原样送回去。
  */
-export const oauthStart = () => invoke<OAuthStart>("oauth_start");
+export const oauthStart = (region: string) =>
+  invoke<OAuthStart>("oauth_start", { region });
 
 /** 「无感登录」第二步：轮询授权结果；done=false 表示仍需继续轮询 */
 export const oauthPoll = (loginId: string) =>
@@ -122,8 +131,11 @@ export const netRestore = () => invoke<NetRestoreReport>("net_restore");
 /** 在系统文件管理器里定位某个文件（用于查看备份） */
 export const revealPath = (path: string) => invoke<void>("reveal_path", { path });
 
-/** 查询智能接管状态（只读） */
+/** 查询智能接管状态（只读）。描述的是设置里那个接管目标区域 */
 export const stealthStatus = () => invoke<StealthStatus>("stealth_status");
+
+/** 可选区域清单（国际版 / 国内版）：界面上「区域」的唯一来源 */
+export const regions = () => invoke<RegionOption[]>("regions");
 
 /** 接管事件流（新的在前）：开启 / 关闭 / 开始使用账号 / 重启 / 错误 */
 export const takeoverEvents = () => invoke<JournalEvent[]>("takeover_events");
@@ -135,9 +147,13 @@ export const clearTakeoverEvents = () => invoke<void>("takeover_events_clear");
  *
  * refresh=true 时忽略内存缓存强制重拉——但仍会依次退到后两层，
  * 所以点一次「刷新」不会把界面刷成空的。
+ *
+ * `region` 省略时用设置里的接管目标区域。它必须能显式传：模型目录与落盘快照
+ * 都是**按区域**的（国际版在 `api3.qoder.sh`，国内版在 `gateway.qoder.com.cn`），
+ * 接管页要能在还没保存设置之前就预览目标区域的模型清单。
  */
-export const freeModels = (refresh: boolean) =>
-  invoke<ModelReport>("free_models", { refresh });
+export const freeModels = (refresh: boolean, region?: string) =>
+  invoke<ModelReport>("free_models", { refresh, region: region ?? null });
 
 /**
  * 积分简报的**日条目**（新的在前）。

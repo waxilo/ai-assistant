@@ -465,10 +465,12 @@ pub fn upsert(hours: &mut Vec<HourEntry>, entry: HourEntry) {
 
 #[cfg(test)]
 mod tests {
+    use crate::region::Region;
     use super::*;
 
     fn account(id: &str, name: &str) -> Account {
         Account {
+            region: Region::Global,
             id: id.into(),
             name: name.into(),
             phone: None,

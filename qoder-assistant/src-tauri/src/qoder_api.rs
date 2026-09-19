@@ -20,27 +20,19 @@
 //! `parse_*` 只吃 `&Value`、可单测；`fetch_*` 负责网络，失败一律 `Option::None` / 默认值，
 //! 绝不 panic、也绝不影响调用方主流程。响应原文（实测）直接当 fixture 进单测。
 
+use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
-/// Qoder Global 稳定版 OpenAPI 基址（`E8.environments.prod.openApiBaseUrl`）。
-///
-/// 额度、套餐、活跃、热力图、账号信息全在这里，**不是** `www.qoder.cn`。
-pub const OPENAPI_BASE: &str = "https://openapi.qoder.sh";
-
-/// 登录服务基址（`E8.environments.prod.authBaseUrl`）。
-///
-/// 设备授权流的两个地址（`/device/selectAccounts` 与 `/users/sign-in`）都在它下面。
-pub const AUTH_BASE: &str = "https://qoder.com";
-
-/// 登录用的公开 client id（`E8.authClientIds.prod`）。
-pub const AUTH_CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
-
-/// 模型网关的默认上游（CLI `gtn()` 的 `prod` 分支）。
-///
-/// 接管反代转发到这里；`QODER_MODEL_SERVER_HOST` 一旦被注入，CLI 就会改打本机。
-pub const INFER_BASE: &str = "https://api2-v2.qoder.sh";
+// 这里曾经有四个 `pub const &str` 基址（`OPENAPI_BASE` / `AUTH_BASE` / `AUTH_CLIENT_ID`
+// / `INFER_BASE`）。它们在「Qoder 只有一个域」的前提下还算收敛，但**Qoder 其实有两套
+// 部署**（国际版 `qoder.com` 与国内版 `qoder.cn`，域、CLI 目录、官方客户端全不同，
+// 实测见 `region` 模块头）。四个常量留下的形态是「每加一个区域就要在四处各补一次」，
+// 而少补一处不报错、只表现成「另一个区域的请求打到错的域上」。
+//
+// 所以基址、client id、模型目录、本地目录、进程名**一律改由 `Region` 提供**：
+// 账号带着自己的区域，每个请求现场取基址。模块里不再有任何域常量。
 
 /// 单次请求的超时。额度类接口都很小，慢就是不正常。
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -80,18 +72,28 @@ pub fn client() -> reqwest::Client {
         .expect("构建 Qoder HTTP 客户端失败")
 }
 
-/// 发一个带鉴权的 GET，拿 JSON。任何失败（网络 / 非 2xx / 非 JSON）都回 `None`。
+/// 发一个带鉴权的 GET（打 **OpenAPI**，基址取 [`Region::openapi_base`]），拿 JSON。
+/// 任何失败（网络 / 非 2xx / 非 JSON）都回 `None`。
+///
+/// `region` 必填、且**必须来自账号自己**：它是「这个 token 属于哪套部署」的唯一凭据。
+/// 传错不会报错，只会稳定拿到 401（另一套部署不认识这个 token），
+/// 表现成「某个账号突然什么都查不到」。
 ///
 /// `query` 里值为空的项会被跳过 —— 调用方因此可以无脑塞 `("product", product)`，
 /// 不必自己判断「这个接口要不要带它」。
-pub async fn get_json(token: &str, path: &str, query: &[(&str, &str)]) -> Option<Value> {
+pub async fn get_json(
+    region: Region,
+    token: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Option<Value> {
     let pairs: Vec<(&str, &str)> = query
         .iter()
         .copied()
         .filter(|(_, v)| !v.is_empty())
         .collect();
     let resp = client()
-        .get(format!("{OPENAPI_BASE}{path}"))
+        .get(format!("{}{path}", region.openapi_base()))
         .query(&pairs)
         .bearer_auth(token)
         .send()
@@ -392,9 +394,9 @@ pub fn parse_campaigns(root: &Value) -> Option<CampaignView> {
     })
 }
 
-/// 拉活动状态。失败回 `None`。
-pub async fn fetch_campaigns(token: &str) -> Option<CampaignView> {
-    parse_campaigns(&get_json(token, CAMPAIGN_PATH, &[]).await?)
+/// 拉活动状态（打账号所属区域的 OpenAPI）。失败回 `None`。
+pub async fn fetch_campaigns(region: Region, token: &str) -> Option<CampaignView> {
+    parse_campaigns(&get_json(region, token, CAMPAIGN_PATH, &[]).await?)
 }
 
 /// 领取一条活动的权益 —— **本模块唯一的写操作**。
@@ -404,7 +406,10 @@ pub async fn fetch_campaigns(token: &str) -> Option<CampaignView> {
 /// 里 `status == "CLAIMED"` 才算成功。其余一切（409 已领/不可领、429 太频繁、非 JSON）
 /// 都原样把原因带回去 —— 这是唯一会改变账号权益的接口，宁可让调用方看到原因，
 /// 也不要在这里自动重试或凭错误码猜结论。
-pub async fn claim_campaign(token: &str, campaign_id: &str) -> Result<(), String> {
+///
+/// `region` 必须来自账号自己：领错区域的接口只会拿到 401/404，而**打卡本身就是写操作**，
+/// 打偏了没有「重试一次就好」的余地。
+pub async fn claim_campaign(region: Region, token: &str, campaign_id: &str) -> Result<(), String> {
     // 路径参数直接拼进 URL，所以只放行 UUID 的字符集。正常响应里它是 UUID，
     // 但「服务端给什么就拼什么」是路径穿越的经典入口（`../` 会被当成路径分隔符）。
     if campaign_id.is_empty()
@@ -415,7 +420,10 @@ pub async fn claim_campaign(token: &str, campaign_id: &str) -> Result<(), String
         return Err(format!("campaignId 形态异常，拒绝拼路径：{campaign_id:?}"));
     }
     let resp = client()
-        .post(format!("{OPENAPI_BASE}{CAMPAIGN_PATH}/{campaign_id}/claim"))
+        .post(format!(
+            "{}{CAMPAIGN_PATH}/{campaign_id}/claim",
+            region.openapi_base()
+        ))
         .bearer_auth(token)
         .send()
         .await
@@ -628,9 +636,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "真实网络调用，需本机已登录 Qoder"]
     async fn smoke_real_campaigns() {
-        let list = crate::auth_file::discover_local_accounts();
+        let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
-        let c = fetch_campaigns(&a.token).await.expect("活动接口应可用");
+        let c = fetch_campaigns(a.region, &a.token)
+            .await
+            .expect("活动接口应可用");
         println!(
             "showCampaign={} claimable={} url={:?}",
             c.show_campaign, c.claimable, c.campaign_url

@@ -38,6 +38,7 @@
 //! 对不上的副本。`broker.json` 里只有 `pool_uuid` —— 有它就等于绑定了。
 
 use crate::accounts::{self, Account};
+use crate::region::Region;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -264,6 +265,11 @@ pub struct SyncReport {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct PoolItem {
+    /// **这条凭证属于哪套部署**。跨机器搬运时区域必须跟着走：两套部署可以有
+    /// 同一个手机号的两个不同账号，只靠手机号认人会把它们合成一个。
+    /// 老云端数据没有这个字段 → `#[serde(default)]` 落成国际版（那时只有国际版）。
+    #[serde(default)]
+    pub region: Region,
     /// 跨机身份锚点（手机号 → 昵称 → 本地 id）
     pub key: String,
     pub name: String,
@@ -275,10 +281,25 @@ pub struct PoolItem {
     pub updated_at: Option<i64>,
 }
 
-/// 跨机认人的锚点：**手机号 → 昵称 → 本地 id**。
+/// 池里那条 key 的**区域前缀**（`global:` / `cn:`）。
+fn region_prefix(region: Region) -> String {
+    format!("{}:", region.key())
+}
+
+/// 跨机认人的锚点：**区域 + （手机号 → 昵称 → 本地 id）**。
 ///
-/// 手机号最稳（token 会轮换、昵称会改、本地 id 每台机器都不一样），所以排第一。
+/// 身份那三段的选择理由不变：手机号最稳（token 会轮换、昵称会改、本地 id 每台机器
+/// 都不一样），所以排第一。
+///
+/// 区域必须进 key：同一个手机号在两套部署里是**两个不同的账号**，只用手机号做 key
+/// 会让它们互相覆盖 —— 云端先写进去的那条被后上传的挤掉，表现是「国内版账号刚同步
+/// 上去就没了」，而两台机器都各自觉得自己是对的。
 pub fn item_key_of(account: &Account) -> String {
+    format!("{}{}", region_prefix(account.region), item_identity_of(account))
+}
+
+/// key 里「人」的那一段（不含区域前缀）。
+fn item_identity_of(account: &Account) -> String {
     if let Some(p) = account.phone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return p.to_string();
     }
@@ -288,8 +309,34 @@ pub fn item_key_of(account: &Account) -> String {
     account.id.clone()
 }
 
+/// 把来自云端的 key 归一化成**当前格式**（带区域前缀）后再比对。
+///
+/// 老版本写进云端的 key 是裸身份（那时只有国际版），统一补上 `global:` ——
+/// 不补的话，同一条账号会被当成新账号再存一份，界面上直接变成两个。
+pub fn normalize_pool_key(key: &str) -> String {
+    let k = key.trim();
+    if Region::ALL
+        .iter()
+        .any(|r| k.starts_with(&region_prefix(*r)))
+    {
+        return k.to_string();
+    }
+    format!("{}{}", region_prefix(Region::Global), k)
+}
+
+/// 去掉区域前缀，取回「人」那一段 —— 给「池里没带名字时用 key 生成账号名」用。
+/// 直接用整条 key 会生成 `账号-global` 这种把区域也当成人名的名字。
+fn key_identity(key: &str) -> &str {
+    let k = key.trim();
+    Region::ALL
+        .iter()
+        .find_map(|r| k.strip_prefix(&region_prefix(*r)))
+        .unwrap_or(k)
+}
+
 pub fn to_item(account: &Account) -> PoolItem {
     PoolItem {
+        region: account.region,
         key: item_key_of(account),
         name: account.name.clone(),
         phone: account.phone.clone().unwrap_or_default(),
@@ -304,16 +351,16 @@ pub fn to_item(account: &Account) -> PoolItem {
 /// 池里的一条 → 本机新账号（本地还没有这个 key 时用）
 pub fn account_from_item(item: &PoolItem) -> Account {
     let name = if item.name.trim().is_empty() {
-        format!(
-            "账号-{}",
-            &item.key.chars().take(6).collect::<String>()
-        )
+        // 名字取自 key 的**身份段**（见 `key_identity`）：整条 key 带了区域前缀，
+        // 直接截前 6 个字符会得到 `账号-global` 这种把人名写成区域的名字。
+        format!("账号-{}", &key_identity(&item.key).chars().take(6).collect::<String>())
     } else {
         item.name.clone()
     };
     Account {
         id: uuid::Uuid::new_v4().to_string(),
         name,
+        region: item.region,
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
@@ -394,7 +441,7 @@ pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
         }
         match accounts
             .iter_mut()
-            .find(|a| item_key_of(a) == item.key.trim())
+            .find(|a| item_key_of(a) == normalize_pool_key(&item.key))
         {
             Some(a) => {
                 if adopt(a, item) {
@@ -422,7 +469,7 @@ pub fn union_pool(cloud: &[PoolItem], local: &[Account]) -> Vec<PoolItem> {
         if key.trim().is_empty() {
             continue;
         }
-        if !pool.iter().any(|i| i.key.trim() == key) {
+        if !pool.iter().any(|i| normalize_pool_key(&i.key) == key) {
             pool.push(to_item(acct));
         }
     }
@@ -700,14 +747,15 @@ pub async fn unbind() -> Result<BrokerStatus, String> {
     };
     let dir = data_dir().ok_or_else(|| "凭证池状态未初始化".to_string())?;
 
+    // 归一化后再比：云端那份可能是「区域前缀出现之前」写下的裸 key
     let cloud_keys: HashSet<String> = cloud
         .iter()
-        .map(|i| i.key.trim().to_string())
+        .map(|i| normalize_pool_key(&i.key))
         .filter(|k| !k.is_empty())
         .collect();
     let mut accounts = accounts::load_accounts(&dir);
     let before = accounts.len();
-    accounts.retain(|a| !cloud_keys.contains(item_key_of(a).trim()));
+    accounts.retain(|a| !cloud_keys.contains(&item_key_of(a)));
     if accounts.len() != before {
         // 落盘失败就整体拒绝：摘了 uuid 但账号没删掉，等于静默失败，让用户以为已经解绑了
         accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
@@ -814,7 +862,10 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             Ok(()) => {
                 refreshed += 1;
                 // 把新的凭证写回池里那一份（保持并集：池里别的条目原样带回去）
-                if let Some(slot) = pool.iter_mut().find(|i| i.key.trim() == item_key_of(acct)) {
+                if let Some(slot) = pool
+                    .iter_mut()
+                    .find(|i| normalize_pool_key(&i.key) == item_key_of(acct))
+                {
                     *slot = to_item(acct);
                 } else {
                     pool.push(to_item(acct));
@@ -893,8 +944,22 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
 mod tests {
     use super::*;
 
+    /// 造账号：`acct` = 国际版（绝大多数用例只关心一套部署）。
     fn acct(name: &str, phone: Option<&str>, token: &str) -> Account {
+        acct_in(Region::Global, name, phone, token)
+    }
+
+    /// 国内版账号（区域不同则**不是**同一条凭证，见 `item_key_of`）
+    fn acct_in(region: Region, name: &str, phone: Option<&str>, token: &str) -> Account {
+        let mut a = acct_base(name, phone, token);
+        a.region = region;
+        a
+    }
+
+    fn acct_base(name: &str, phone: Option<&str>, token: &str) -> Account {
         Account {
+            // 占位：真正要国内版时由 `acct_in` 覆盖
+            region: Region::Global,
             id: format!("id-{name}"),
             name: name.into(),
             phone: phone.map(str::to_string),
@@ -910,6 +975,7 @@ mod tests {
 
     fn item(key: &str, token: &str, expires: Option<i64>) -> PoolItem {
         PoolItem {
+            region: Region::Global,
             key: key.into(),
             name: key.into(),
             phone: key.into(),
@@ -925,14 +991,23 @@ mod tests {
 
     #[test]
     fn key_prefers_phone_then_name_then_local_id() {
-        assert_eq!(item_key_of(&acct("n", Some("138"), "t")), "138");
-        assert_eq!(item_key_of(&acct("n", None, "t")), "n");
-        assert_eq!(item_key_of(&acct("", None, "t")), "id-");
+        assert_eq!(item_key_of(&acct("n", Some("138"), "t")), "global:138");
+        assert_eq!(item_key_of(&acct("n", None, "t")), "global:n");
+        assert_eq!(item_key_of(&acct("", None, "t")), "global:id-");
+        // 国内版账号与同手机号的国际版账号**不是同一个 key** —— 池里必须各占一格
+        assert_eq!(
+            item_key_of(&acct_in(Region::Cn, "n", Some("138"), "t")),
+            "cn:138"
+        );
+        // 老云端写下的裸 key 归一到国际版，不会凭空多出一个账号
+        assert_eq!(normalize_pool_key("138"), "global:138");
+        assert_eq!(normalize_pool_key("cn:138"), "cn:138");
+        assert_eq!(normalize_pool_key(" global:138 "), "global:138");
     }
 
     #[test]
     fn blank_phone_falls_through_to_name() {
-        assert_eq!(item_key_of(&acct("n", Some("   "), "t")), "n");
+        assert_eq!(item_key_of(&acct("n", Some("   "), "t")), "global:n");
     }
 
     // ── 采纳规则 ────────────────────────────────────────────────────────
@@ -1021,6 +1096,54 @@ mod tests {
         assert_eq!(accs[1].phone.as_deref(), Some("222"));
     }
 
+    /// 同一个手机号在两套部署里是两条凭证：池里必须各占一格。
+    /// 挤在一格里 = 后上传的那条把前一条顶掉（「国内版账号刚同步上去就没了」）。
+    #[test]
+    fn the_same_phone_in_two_regions_occupies_two_pool_slots() {
+        let g = acct("n", Some("138"), "t-g");
+        let c = acct_in(Region::Cn, "n", Some("138"), "t-c");
+        assert_ne!(item_key_of(&g), item_key_of(&c));
+
+        let pool = union_pool(&[], &[g.clone(), c.clone()]);
+        assert_eq!(pool.len(), 2, "两套部署的同手机号不能挤在一格里");
+        assert!(pool.iter().any(|i| i.key == "global:138"));
+        assert!(pool.iter().any(|i| i.key == "cn:138"));
+        assert_eq!(
+            pool.iter().find(|i| i.key == "cn:138").unwrap().region,
+            Region::Cn
+        );
+
+        // 搬回本机：区域跟着回来，而不是全变成国际版
+        let mut local = Vec::new();
+        merge_into(&mut local, &pool);
+        assert_eq!(local.len(), 2);
+        assert_eq!(local.iter().filter(|a| a.region == Region::Cn).count(), 1);
+    }
+
+    /// 老云端数据：key 是裸手机号、没有 `region` 字段。搬回本机时应当落成国际版，
+    /// 且**不会**因为 key 格式变了而在本地多出一个同手机号的账号。
+    #[test]
+    fn a_legacy_cloud_item_maps_onto_the_local_global_account() {
+        let mut local = vec![acct("n", Some("138"), "t")];
+        // 老云端形态：裸 key、没有 region 字段、没有 updated_at。
+        // 有效期比本机更晚 = 云端那份是更新的一次轮换，才走得到「采纳」。
+        let legacy = PoolItem {
+            key: "138".into(),
+            name: "n".into(),
+            phone: "138".into(),
+            access_token: "t2".into(),
+            refresh_token: String::new(),
+            expires_at: Some(i64::MAX),
+            rt_expires_at: None,
+            updated_at: None,
+            region: Region::Global,
+        };
+        let changed = merge_into(&mut local, &[legacy]);
+        assert_eq!(local.len(), 1, "老 key 应归一到国际版，而不是新建一个账号");
+        assert_eq!(changed, 1, "凭证本身还是要更新");
+        assert_eq!(local[0].token, "t2");
+    }
+
     #[test]
     fn merge_skips_items_without_a_key() {
         let mut accs = vec![acct("a", Some("111"), "t1")];
@@ -1040,7 +1163,7 @@ mod tests {
             a
         };
         let as_item = to_item(&original);
-        assert_eq!(as_item.key, "19098779775");
+        assert_eq!(as_item.key, "global:19098779775");
         assert_eq!(as_item.access_token, "at");
 
         // 另一台机器收到这一条：本地没有 → 建一个新账号，字段逐项相等
@@ -1049,7 +1172,7 @@ mod tests {
         assert_eq!(born.refresh_token.as_deref(), Some("rt"));
         assert_eq!(born.expires_at, Some(1_760_000_000_000));
         assert_eq!(born.rt_expires_at, Some(1_770_000_000_000));
-        assert_eq!(item_key_of(&born), "19098779775", "两机认的是同一个 key");
+        assert_eq!(item_key_of(&born), "global:19098779775", "两机认的是同一个 key");
         assert_eq!(born.name, "waxiloao");
     }
 
@@ -1081,7 +1204,7 @@ mod tests {
         ];
         let pool = union_pool(&cloud, &local);
         assert_eq!(pool.len(), 2, "本机新增的账号必须进正文");
-        assert_eq!(pool[1].key, "222");
+        assert_eq!(pool[1].key, "global:222");
         assert_eq!(pool[1].access_token, "local-b");
     }
 

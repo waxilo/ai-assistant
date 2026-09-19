@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import type { Account, CheckinLog } from "./types";
 import { IconUser } from "./components/Icons";
+import { regionLabel, useRegions } from "./regions";
 
 /**
  * 跨页面共享的 UI 基础件：类型、展示助手与状态原子。
@@ -209,20 +210,36 @@ export function logStatus(log: CheckinLog): { tone: DotTone; label: string } {
 export function AccountCell({
   name,
   phone,
+  region,
 }: {
   name: string;
   phone?: string | null;
+  /**
+   * 账号所属区域（`global` / `cn`）。**不传就不显示区域标签** ——
+   * 签到日志与简报里没有这个字段，那里也就不该凭空补一个出来。
+   */
+  region?: string | null;
 }) {
   const initial = /^\d/.test(name) ? null : name.slice(0, 1);
   const shown = maskPhone(name);
   const alt = phone ? maskPhone(phone) : "";
+  // 区域名取自后端清单；清单还没到货时为 null ⇒ 不显示标签（而不是显示一个空胶囊）
+  const badge = regionLabel(useRegions(), region);
+  // 手机号与名称相同时不再重复
+  const sub = alt && alt !== shown ? alt : "";
   return (
     <div className="ac-cell-name">
       <span className="ac-avatar">{initial ?? <IconUser size={16} />}</span>
       <div className="ac-id">
         <span className="ac-name">{shown}</span>
-        {/* 手机号与名称相同时不再重复一行 */}
-        {alt && alt !== shown && <span className="ac-phone">{alt}</span>}
+        {/* 次级行：手机号 + 区域并排。两者都是「这个账号是谁」的补充信息，
+            所以同一行；一个都没有就整行不渲染，不留空行。 */}
+        {(sub || badge) && (
+          <span className="ac-sub">
+            {sub && <span className="ac-phone">{sub}</span>}
+            {badge && <span className="ac-region">{badge}</span>}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -272,4 +289,30 @@ export function expiryCountdown(
   const days = Math.ceil((ms - Date.now()) / 86_400_000);
   if (days <= 0) return { text: "已过期", expired: true };
   return { text: `还有 ${days} 天后过期`, expired: false };
+}
+
+/** 资源包到期的三种状态（界面文案由 [`packageExpiry`] 统一给） */
+export type ExpiryTone = "dated" | "never" | "unknown";
+
+/**
+ * 资源包到期展示 —— 三态**唯一**的文案出口。
+ *
+ * `YYYY-MM-DD` / 「不过期」/ 「未知」都从这儿出，页面不再各自 `new Date(ms)`：
+ * 上一版就是在页面里直接渲染时间戳，把服务端表示「永不过期」的
+ * `9999-12-31` 哨兵原样印了出来。哨兵现在在后端就被归一了
+ *（`ledger::normalize_expiry`），这里再把剩下两种「没有日期」的情形说人话。
+ */
+export function packageExpiry(p: {
+  expiry_ms: number | null;
+  never_expires: boolean;
+}): { text: string; tone: ExpiryTone } {
+  if (p.never_expires) return { text: "不过期", tone: "never" };
+  if (p.expiry_ms == null) return { text: "未知", tone: "unknown" };
+  const d = new Date(p.expiry_ms);
+  if (isNaN(d.getTime())) return { text: "未知", tone: "unknown" };
+  const q = (n: number) => String(n).padStart(2, "0");
+  return {
+    text: `${d.getFullYear()}-${q(d.getMonth() + 1)}-${q(d.getDate())}`,
+    tone: "dated",
+  };
 }

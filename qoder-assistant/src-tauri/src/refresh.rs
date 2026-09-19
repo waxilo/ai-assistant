@@ -48,8 +48,10 @@ pub struct Refreshed {
 /// 取两天余量能保证「即使连续几天没开应用、扫描又恰好错过」，token 也不会中途失效。
 pub const REFRESH_THRESHOLD_MS: i64 = 48 * 60 * 60 * 1000;
 
-/// 续签端点基准域名（`/api/v1/deviceToken/refresh` 打到 openapi）
-const OPENAPI_HOST: &str = crate::auth_file::OPENAPI_HOST;
+// 这里曾有 `const OPENAPI_HOST = crate::auth_file::OPENAPI_HOST`（固定指向国际版的
+// openapi 域）。续签基址现在由 `region::Region::openapi_base` 按**账号自己的区域**
+// 给出 —— 见 `refresh` 的 `region` 参数。国内版的续签同样是 `/api/v1/deviceToken/refresh`，
+// 只是域换成 `openapi.qoder.com.cn`（路径同构，实测两域都存在该路由）。
 
 /// Qoder 客户端类型：desktop app（`clientType:10, businessProduct:app, sessionType:app`）
 const COSY_CLIENT_TYPE: &str = "10";
@@ -101,9 +103,15 @@ fn str_of(v: &Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// 发起一次续签。Qoder 续签固定打 openapi 域，与账号来源无关。
-pub async fn refresh(token: &str, refresh_token: &str) -> Result<Refreshed, String> {
-    let url = format!("{OPENAPI_HOST}/api/v1/deviceToken/refresh");
+/// 发起一次续签。`region` 取**账号自己的**区域 —— 续签打的是该区域的 openapi 域：
+/// 用另一套部署换回来的 token 在账号所属的网关上无效，而续签失败会表现成
+/// 「这个账号突然签到全失败」，与网络问题的症状一模一样。
+pub async fn refresh(
+    region: crate::region::Region,
+    token: &str,
+    refresh_token: &str,
+) -> Result<Refreshed, String> {
+    let url = format!("{}/api/v1/deviceToken/refresh", region.openapi_base());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -197,13 +205,13 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn smoke_real_refresh_endpoint() {
-        let list = crate::auth_file::discover_local_accounts();
+        let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
         let rt = a
             .refresh_token
             .clone()
             .expect("登录文件里应带 refresh token");
-        let r = refresh(&a.token, &rt)
+        let r = refresh(a.region, &a.token, &rt)
             .await
             .unwrap_or_else(|e| panic!("续签失败: {e}"));
         println!(

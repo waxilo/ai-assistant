@@ -35,6 +35,25 @@
 //! ② **团队 / 企业版**——有逐包的 `dedicatedResourcePackages[]`（字段 `id`/`name`/`total`/
 //! `used`/`remaining`/`expiresAt`），这才是上一版代码写死要找的东西。
 //!
+//! # ③ 免费账号的 `expiresAt` 是「永不过期」哨兵，不是日期
+//!
+//! 2026-09-19 实测（国内版免费号，`userType: "personal_standard"`）：
+//!
+//! ```json
+//! { "qoderUsage": {
+//!     "expiresAt": 253402214400000,                        // ← 9999-12-31T00:00:00Z
+//!     "userQuota":  { "total": 0,   "used": 0, "remaining": 0 },   // 空槽位：不产出包
+//!     "addOnQuota": { "total": 100, "used": 0, "remaining": 100 } } }
+//! ```
+//!
+//! 同一个账号 `GET /api/v2/user/plan` 给的是 `{"plan_tier_name":"Free",
+//! "is_paid_plan":false,"end_date":0}` —— **`end_date: 0` 与 `expiresAt: 253402214400000`
+//! 是同一个意思的两套写法**：没有期限。
+//!
+//! 上一版拿它当普通毫秒时间戳用，于是界面上出现「到期 9999-12-31」与
+//! 「2922776 天后过期 100」。判定与归一现在只在 [`crate::ledger::normalize_expiry`] 一处，
+//! 本模块只负责调用；「永不过期」有独立的表示法，绝不会落进 `expiry_ms`。
+//!
 //! 归一化规则见 [`parse_view`]：**有逐包数组就用逐包，否则把两个槽位当两个包**。
 //!
 //! # 与台账（`ledger`）的契约
@@ -50,9 +69,10 @@
 //!   虚报一次「用量归零」（不可查）。
 
 use crate::ledger::PkgView;
+use crate::region::Region;
 use serde_json::Value;
 
-/// Qoder usage 的路径（基址由 [`crate::qoder_api::OPENAPI_BASE`] 统一持有）。
+/// Qoder usage 的路径（基址由 [`Region::openapi_base`] 按账号区域给出）。
 ///
 /// 带不带 `product=app` 官方客户端都会发，这里显式带上以与官方语义对齐。
 const USAGE_PATH: &str = "/sash/api/v2/me/usage";
@@ -169,7 +189,15 @@ fn read_slot(usage: &Value, key: &str) -> Option<Slot> {
 /// `cycle_start` 的取值理由见模块头「与台账的契约」：计划额度用周期终点当周期标识，
 /// 附加额度留空（没有依据就不断言周期变化）。
 fn packages_from_slots(usage: &Value) -> Vec<PkgView> {
-    let period_end = usage.get("expiresAt").and_then(as_ms);
+    // `expiresAt` 与 `userQuota` / `addOnQuota` **同级**，即整个额度概览的到期时刻，
+    // 所以两个槽位都用它 —— 这一条本来就对。
+    //
+    // 错的是把它当日期：没付费的账号（`plan_tier_name: "Free"`）这里放的是
+    // 「永不过期」哨兵 253402214400000（实测，对应 `/api/v2/user/plan` 的
+    // `end_date: 0`）。上一版就这样把 9999-12-31 一路送进了界面。
+    // 归一交给 `ledger::normalize_expiry`，本模块不再自己判哨兵。
+    let (period_end, never_expires) =
+        crate::ledger::normalize_expiry(usage.get("expiresAt").and_then(as_ms));
     let plan_cycle = period_end.map(|ms| ms.to_string()).unwrap_or_default();
     let mut out = Vec::new();
     for (key, name, slot, cycle) in [
@@ -189,6 +217,7 @@ fn packages_from_slots(usage: &Value) -> Vec<PkgView> {
             used: s.used,
             cycle_start: cycle,
             expiry_ms: period_end,
+            never_expires,
             remaining: s.remaining,
         });
     }
@@ -198,7 +227,8 @@ fn packages_from_slots(usage: &Value) -> Vec<PkgView> {
 /// 团队形态：`dedicatedResourcePackages[]` → 逐包明细。
 ///
 /// 映射规则：`key` ← `id`、`name` ← `name`、`size` ← `total`、`used` ← `used`、
-/// `remaining` ← `remaining`、`expiry_ms` ← `expiresAt`（毫秒时间戳）。
+/// `remaining` ← `remaining`、`expiry_ms` ← `expiresAt`（毫秒时间戳，经
+/// [`crate::ledger::normalize_expiry`] 归一 —— 个别包也会是「永不过期」哨兵）。
 ///
 /// `cycle_start` 置空：该形态的 `used` 是包的累计用量，没有「本周期」概念，
 /// 因此不给周期标识（累计量只增，台账不会误判翻周期）。
@@ -218,13 +248,16 @@ fn packages_from_dedicated(root: &Value) -> Vec<PkgView> {
             let total = obj.get("total").and_then(as_f64).unwrap_or(0.0);
             let used = obj.get("used").and_then(as_f64).unwrap_or(0.0);
             let remaining = obj.get("remaining").and_then(as_f64).unwrap_or(0.0);
+            let (expiry_ms, never_expires) =
+                crate::ledger::normalize_expiry(obj.get("expiresAt").and_then(as_ms));
             Some(PkgView {
                 key,
                 name,
                 size: total,
                 used,
                 cycle_start: String::new(),
-                expiry_ms: obj.get("expiresAt").and_then(as_ms),
+                expiry_ms,
+                never_expires,
                 remaining,
             })
         })
@@ -271,10 +304,12 @@ pub fn parse_view(root: &Value) -> Option<ResourceView> {
 /// 拉一次 Qoder 额度总览。
 ///
 /// best-effort：网络错误 / 非 JSON / 字段缺失 / 无包都回 [`ResourceView::default()`]，
-/// 绝不影响调用方的主流程。`token` 就是登录态里的 access token
+/// 绝不影响调用方的主流程。`region` 取**账号自己的**区域 —— 两套部署的额度互不相通，
+/// 打错域只会稳定 401；`token` 是登录态里的 access token
 /// （来自 auth.v1.dat 的当前账号）。
-pub async fn fetch_usage(token: &str) -> ResourceView {
-    let Some(body) = crate::qoder_api::get_json(token, USAGE_PATH, &[("product", "app")]).await
+pub async fn fetch_usage(region: Region, token: &str) -> ResourceView {
+    let Some(body) =
+        crate::qoder_api::get_json(region, token, USAGE_PATH, &[("product", "app")]).await
     else {
         return ResourceView::default();
     };
@@ -322,6 +357,93 @@ mod tests {
         "isPlanQuotaProrated": false
       }
     }"#;
+
+    /// **实测响应**（2026-09-19，国内版免费号 `personal_standard`）——逐字照抄，
+    /// 只把 `userId` 换掉了。
+    ///
+    /// 与 [`PERSONAL_REAL`] 只差一处，但那一处是致命的：`expiresAt` 是
+    /// 「永不过期」哨兵（`/api/v2/user/plan` 那边对应 `end_date: 0`），
+    /// 而 `userQuota` 全零 —— 于是整个账号只有那个 100 分的加油包。
+    /// 上一版据此在「资源包列表」里显示「到期 9999-12-31」。
+    const PERSONAL_FREE_NEVER_EXPIRES: &str = r#"{
+      "displayMode": "qoder",
+      "qoderUsage": {
+        "userId": "019eb647-0000-0000-0000-000000000000",
+        "userType": "personal_standard",
+        "usageType": "credits",
+        "totalUsagePercentage": 0,
+        "isQuotaExceeded": false,
+        "expiresAt": 253402214400000,
+        "upgradeUrl": "https://qoder.com/pricing?client=qoder",
+        "userQuota": {
+          "total": 0,
+          "used": 0,
+          "remaining": 0,
+          "percentage": 0,
+          "unit": "credits"
+        },
+        "addOnQuota": {
+          "total": 100,
+          "used": 0,
+          "remaining": 100,
+          "percentage": 0,
+          "unit": "credits",
+          "detailUrl": "https://qoder.com/account/usage"
+        },
+        "isPlanQuotaProrated": false
+      }
+    }"#;
+
+    /// 免费号：只有加油包，到期时间是「永不过期」哨兵。三件事必须同时成立，
+    /// 缺一条界面就会又显示成 9999-12-31：① 空槽位不产出包；② 哨兵不进 `expiry_ms`；
+    /// ③ `earliest_expiry_ms` 不拿它当日期（否则接管会把它排成一千年后的「大限」）。
+    #[test]
+    fn a_free_account_reports_never_expires_instead_of_a_year_9999_date() {
+        let v = parse(PERSONAL_FREE_NEVER_EXPIRES).expect("免费号也必须能解析出额度");
+        assert_eq!(v.credits, Some(100.0));
+        assert_eq!(v.packages.len(), 1, "userQuota 全零 ⇒ 不该多出一条 0/0 的假包");
+
+        let addon = &v.packages[0];
+        assert_eq!(addon.key, KEY_ADDON);
+        assert_eq!(addon.expiry_ms, None, "哨兵绝不能落进 expiry_ms");
+        assert!(addon.never_expires, "「不过期」必须被显式记下来");
+        assert_eq!(addon.cycle_start, "", "没有期限也就没有周期标识");
+        assert_eq!(v.earliest_expiry_ms, None);
+    }
+
+    /// 反向断言：真日期不能被误判成「永不过期」。
+    /// 少了这条，「把所有到期日都吞掉」那种改法也能让上面那条测试变绿。
+    #[test]
+    fn a_real_deadline_is_not_mistaken_for_never_expiring() {
+        let v = parse(PERSONAL_REAL).unwrap();
+        let plan = v.packages.iter().find(|p| p.key == KEY_PLAN).unwrap();
+        assert_eq!(plan.expiry_ms, Some(1_790_927_528_327));
+        assert!(!v.packages.iter().any(|p| p.never_expires));
+        assert_eq!(v.earliest_expiry_ms, Some(1_790_927_528_327));
+    }
+
+    /// 团队形态的单个包同样可能是永不过期的（`expiresAt` 也是哨兵），
+    /// 而且「最早到期」只该看那个有真实期限的包。
+    #[test]
+    fn dedicated_packages_can_also_be_never_expiring() {
+        let v = parse(
+            r#"{"qoderUsage":{"dedicatedResourcePackages":[
+                 {"id":"rp-1","name":"永久包","total":10,"used":0,"remaining":10,
+                  "expiresAt":253402214400000},
+                 {"id":"rp-2","name":"期限包","total":10,"used":0,"remaining":10,
+                  "expiresAt":1800000000000}
+               ]}}"#,
+        )
+        .unwrap();
+        let never = v.packages.iter().find(|p| p.key == "rp-1").unwrap();
+        assert_eq!((never.expiry_ms, never.never_expires), (None, true));
+        let dated = v.packages.iter().find(|p| p.key == "rp-2").unwrap();
+        assert_eq!(
+            (dated.expiry_ms, dated.never_expires),
+            (Some(1_800_000_000_000), false)
+        );
+        assert_eq!(v.earliest_expiry_ms, Some(1_800_000_000_000));
+    }
 
     #[test]
     fn parses_personal_shape_into_two_slots() {
@@ -452,6 +574,7 @@ mod tests {
             )
         };
         let accounts = [crate::accounts::Account {
+            region: Region::Global,
             id: "a1".into(),
             name: "甲".into(),
             phone: None,
@@ -512,10 +635,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn smoke_real_usage_endpoint() {
-        let list = crate::auth_file::discover_local_accounts();
+        let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
         println!("token_len={}", a.token.len());
-        let v = fetch_usage(&a.token).await;
+        let v = fetch_usage(a.region, &a.token).await;
         println!(
             "credits={:?} earliest_expiry_ms={:?} packages={}",
             v.credits,

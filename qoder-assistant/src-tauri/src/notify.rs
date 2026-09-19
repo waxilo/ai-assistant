@@ -165,6 +165,7 @@ pub fn summary_message(views: &[AccountView]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::region::Region;
     use super::*;
     use crate::accounts::CheckinRecord;
 
@@ -173,6 +174,7 @@ mod tests {
     fn acct(name: &str, phone: Option<&str>, rec: Option<CheckinRecord>) -> AccountView {
         AccountView {
             account: Account {
+                region: Region::Global,
                 id: name.to_string(),
                 name: name.to_string(),
                 phone: phone.map(|p| p.to_string()),

@@ -39,6 +39,7 @@ import { LogsPage } from "./pages/LogsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import {
   IconCheck,
+  IconQ,
   IconSwap,
   IconActivity,
   IconList,
@@ -505,7 +506,11 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <span className="logo">
-            <IconCheck size={18} />
+            {/* 22 不是拍脑袋：`.logo` 是 34px 蓝方块，而 IconQ 的字形外接框 = 整个 svg 框。
+                应用图标里字形占蓝方块对边的 64.9%（270/416），要让应用内这块 34px 的方块
+                看起来是**同一个标记**，svg 就得给 0.649 × 17 ÷ (11.98/24) ≈ 22。
+                给 19 会让 Q 比应用图标小一圈，两个东西并排一眼能看出不是一套。 */}
+            <IconQ size={22} />
           </span>
           <div className="brand-text">
             <span className="brand-name">Qoder 助手</span>

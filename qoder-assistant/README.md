@@ -4,7 +4,7 @@
 
 - **多账号管理**：账号条目**只读展示**（名称 + 手机号 + 凭证有效期 + 剩余积分），不做手工录入与编辑 —— 凭证一律来自「登录新账号」或「导入本机账号」，避免粘贴错 token。删除账号时会一并清理它的签到日志。
 - **后台常驻（系统托盘）**：点窗口关闭按钮 = 隐藏到系统托盘，**进程不退出**（定时签到、token 续签、本地反代持续生效）；托盘菜单提供「显示主窗口 / 退出」，macOS 点 Dock 图标也会唤回主窗口。真正退出请走托盘菜单「退出」（退出时会自动关闭智能接管）。
-- **账号导入 / 导出（跨机器迁移）**：「导出」把全部账号（含 token / refresh_token / 有效期）写成 JSON 文件（落盘权限 0600）；「导入」选择该文件后按「手机号或 token」合并补全，**不会产生重复条目**。导出文件含登录凭证，请妥善保管。
+- **云端凭证池（跨机器共用账号）**：把本机这批账号整体上传成一个池，管家颁发一串 uuid；别的机器填同一串 uuid 即接上同一池（两边**取并集**，本机独有的不会被删）。刷新与续签始终在本机执行，refresh token **不进任何共享文件** —— 旧版「导出凭证文件」正是因此删除的（几台机器各持一份 refresh token，而官方续签是单链轮换，谁先签就把别人踢下线）。
 - **一键签到**：单个账号签到，或「全部签到」批量领取每日积分。
 - **定时自动签到**：每天在设定时刻（默认 `09:07`）自动跑一遍「全部签到」，**应用运行期间生效**；错过时刻后 30 分钟内打开应用会自动补签一次，跨启动不会重复签（`schedule_state.json` 记录已执行日期）。配套提供「开机自启动」开关，让定时签到真正能每天生效。
 - **签到通知（webhook）**：可配置一个 webhook 地址，签到结束后推送结果汇总（成功 / 已签 / 失败数量 + 失败明细）；可分别开关「定时签到后推送」与「手动全部签到后推送」，并内置「测试推送」按钮自查配置。调度触发与推送结果会记入 `scheduler.log`（保留最近 200 行），便于事后排查「为什么没自动签到」。
@@ -12,9 +12,15 @@
 - **token 自动续签**：导入 / 无感登录时会一并保存 `refreshToken` 与 `expiresAt`。应用启动及常驻期间**每 12 小时**扫描一次，**剩余有效期不足 48 小时即自动换新凭证**（签到前另有兜底判定）；续签失败不阻断签到（仍用旧 token 试一次）。
 - **智能接管（Qoder 专用反代）**：在 `127.0.0.1:8789`（可改端口；避开同机 workbuddy-assistant 占用的 8787）起一个 Qoder 专用反代，开启后自动把 Qoder 的对话请求接管到本地——只在**勾选的扣费备选账号**里选号（未勾选的不允许扣费，全不勾 = 全部可用；会话粘滞 + 积分最早过期优先轮换）。页面下方有**接管动态时间线**：开启 / 关闭接管、每个会话开始使用哪个账号、代理错误，一目了然。详见 [智能接管](#智能接管qoder-专用)。
 - **账号获取（两条通道，无手工录入）**：
-  - **导入本机账号**：直接读 Qoder 写在本机的凭据文件 `auth.v1.dat`（Windows 可解；macOS 的密钥在 Keychain 里、端外解不出，所以 macOS 上请走「登录新账号」），**不需要应用运行、也不需要调试端口**，Windows 上一次就能拿到 token + 昵称 + 手机号 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
-  - **登录新账号**：走 Qoder **设备授权流**（`/device/selectAccounts` → 浏览器扫码 → 轮询 `/api/v1/deviceToken/poll`），**不重启、不打断当前 Qoder、不改动本机登录文件**，能主动签发**任意新账号**的凭证与昵称（macOS 上这是唯一可行的通道）。
-- **上游只有一套域**：账号接口 `openapi.qoder.sh`、模型网关 `api2-v2.qoder.sh`、登录页 `qoder.com`，全部写死在代码里；**界面不提供修改入口**（改错会让请求打到不存在的域）。
+  - **导入本机账号**：直接读 Qoder 写在本机的凭据文件 `auth.v1.dat`（Chromium `safeStorage` / **OSCrypt** 加密，**两个平台都能解**：Windows 走 DPAPI、macOS 走系统钥匙串），**不需要应用运行、也不需要调试端口**，一次就能拿到 token + 昵称 + 手机号 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
+  - **登录新账号**：走 Qoder **设备授权流**（`/device/selectAccounts` → 浏览器扫码 → 轮询 `/api/v1/deviceToken/poll`），**不重启、不打断当前 Qoder、不改动本机登录文件**，能主动签发**任意新账号**的凭证与昵称（与「导入本机账号」互补：后者只能收编已经登录过的那个）。
+- **两套部署（国际版 / 国内版）都支持，且可切换**：Qoder 有**两套互不相通**的部署
+  —— 国际版登录 `qoder.com` / 接口 `openapi.qoder.sh` / CLI 目录 `~/.qoder` / 应用 `Qoder.app`，
+  国内版登录 `qoder.cn` / 接口 `openapi.qoder.com.cn` / `~/.qoder-cn` / `Qoder CN.app`。
+  账号、积分、签到活动两边各自独立，所以「哪个区域」是账号的一部分（合并键是「区域 + 手机号」）。
+  域名、本地目录、客户端路径与进程名**全部集中在 `src-tauri/src/region.rs` 一处**按区域取，
+  别处只消费、不自己拼 —— 少改一处不会报错，只会表现成「这个功能在另一个区域上悄悄用错域」。
+  界面上的区域清单由后端的 `regions` 命令给出（中文名与「OpenAPI 在哪个域」只该有一处定义）。
 - **GitHub Release 自动更新**：内置 `tauri-plugin-updater`，点击「检查更新」即可从 Release 拉取并安装新版本。
 - **积分日报（按天 + 逐小时）**：按**自然日**统计积分消耗与新增，每天一条，展开可见**每小时**明细（总览柱状图 + 逐账号列表）。
   口径是资源包**累计量**的差值（`CapacityUsed` / `CapacitySize`），不是「抓余额算涨跌」——
@@ -22,6 +28,10 @@
   采样时增量就落进「采样时刻所属的小时」，因此小时之和恒等于当天合计、相邻两天可直接相加。
   数据在应用数据目录的 `credit_ledger.json`（台账 + 60 天小时桶）与 `credit_reports.json`（日报，最近 400 条），均 0600。
 - **签到日志（按账号查看）**：每次签到结果（账号 / 时间 / 结果 / 积分 / 详情）落库到应用数据目录的 `checkin_logs.json`（权限 0600，保留最近 2000 条）。入口在**每个账号条目上的「日志」按钮**，面板按时间倒序简单列出该账号记录，可一键清空。
+- **资源包到期是「三态」**，界面上分别说：有到期日（`N 天后过期` / `已过期`）· 服务端明说不过期（`不过期`）· 响应里没给到期信息（未知，退回「查看资源包」）。
+  之所以要专门记一笔：免费账号的 usage 响应里 `qoderUsage.expiresAt` 是 **`9999-12-31` 哨兵**（同一账号在 `/api/v2/user/plan` 里的 `end_date` 是 `0`，
+  同一个意思、两处两套写法），把它当普通时间戳透传下去，界面就会出现「到期 9999-12-31」和「2922776 天后过期 100」。
+  归一在**解析边界**做一次（`ledger::normalize_expiry` → `never_expires: bool`），投影旧台账时再走一遍，别在别处重判一次哨兵。
 - 跨平台：macOS（`.app` / `.dmg`）与 Windows（`.msi`）。
 
 > 签到逻辑参考自 `qoder-checkin` 与 `WorkDaddy` 的 `checkin-result.js`：
@@ -103,6 +113,14 @@ npx tauri icon src-tauri/icons/icon-source.png   # 生成各平台图标套件
 npm run tauri build                 # 产出 src-tauri/target/release/bundle/
 npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不依赖 create-dmg）
 ```
+
+> **图标（字母 Q）有「两个出口、一套几何」，改一处必须同时改另一处**：
+> ① `scripts/make-icon.mjs` 画 1024 的源 PNG（`tauri icon` 吃它生成各平台套件）；
+> ② `src/components/Icons.tsx` 的 `IconQ` 是应用内侧栏那块蓝方块里的同一个字形。
+> 后者的每个数都从前者按 `12/270` 折算而来（换算表写在 `IconQ` 的注释里）。
+> 只改一边的后果是应用图标与应用内标记**长成两个东西**——不会报错，只有并排看才发现。
+> 调完记得**按 16/24/32/64 看一眼缩略图**（Dock 与列表里都是小尺寸），
+> 以及比一下「字形外接半径 ÷ 蓝方块半边长」这个比值（源 PNG 是 `0.6466`，`IconQ size=22` 在 34px 的 `.logo` 里是 `0.6462`）。
 
 > macOS 首次构建若提示「无法验证开发者」，在「系统设置 → 隐私与安全性」中点「仍要打开」。
 >
@@ -188,50 +206,71 @@ npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不�
 
 ### 1. 导入本机账号
 
-Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据目录里：
+Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据目录里。
+两套部署各有自己的目录，**两个都会被扫**（每条结果因此都带着「来自哪个区域」）：
 
-| 平台 | 路径 |
-| --- | --- |
-| macOS | `~/Library/Application Support/com.qoder.app.stable/auth.v1.dat` |
-| Windows | `%APPDATA%\com.qoder.app.stable\auth.v1.dat` |
+| 平台 | 国际版 | 国内版 |
+| --- | --- | --- |
+| macOS | `~/Library/Application Support/com.qoder.app.stable/auth.v1.dat` | `~/Library/Application Support/com.qodercn.app.stable/auth.v1.dat` |
+| Windows | `%APPDATA%\com.qoder.app.stable\auth.v1.dat` | `%APPDATA%\com.qodercn.app.stable\auth.v1.dat` |
 
-它不是明文 JSON，而是 Electron `safeStorage`（Chromium **OSCrypt**）加密的二进制：
-`"v10"` 魔数 + nonce(12B) + AES-256-GCM 密文 + tag(16B)。AES 密钥由系统包一层后存在
-同目录的 `Local State`（`os_crypt.encrypted_key`）里：
+它不是明文 JSON，而是 Chromium `safeStorage`（**OSCrypt**）加密的二进制，
+而**两个平台的封锁与密钥都不一样**（两条都是 Chromium 的既有实现，不是本项目发明的格式）：
 
-- **Windows**：`DPAPI` 前缀 + `CryptUnprotectData`（当前用户）即可解出密钥 → 工具能端外读出
-  `token` / `refreshToken` / 两个有效期 / `user.{id,name,phone}`，**一次拿全**；
-- **macOS**：密钥在 Keychain 里，**端外解不出** → 这条通道在 macOS 上不可用，
-  请直接走下面的「登录新账号」。
+| | Windows | macOS |
+| --- | --- | --- |
+| 二进制布局 | `"v10"` + nonce(12B) + **AES-256-GCM** 密文 + tag(16B) | `"v10"` + **AES-128-CBC**（IV = 16 个空格，PKCS#7 填充） |
+| 密钥放在哪 | 同目录 `Local State` 的 `os_crypt.encrypted_key` | 系统钥匙串 `Qoder App Safe Storage` / `Qoder CN App Safe Storage`（账号名 `<…> Key`） |
+| 密钥怎么来 | `DPAPI` 前缀 + `CryptUnprotectData`（当前用户）→ **32B 原始密钥** | 钥匙串密码 → `PBKDF2-HMAC-SHA1`(`saltysalt`, 1003 轮) → **16B** |
+
+两边解出来的是同一份 JSON：`token` / `refreshToken` / 两个有效期 / `user.{id,name,phone}`，
+**一次拿全**。
+
+> macOS 上读钥匙串走的是 `/usr/bin/security`，而不是应用自己调 Keychain API：钥匙串条目的
+> ACL 绑定「请求者」，而 `security` 是 Apple 签名、路径固定的可执行文件，用户点一次
+> 「始终允许」就永久生效；应用自己调的话，调试构建每次重建（ad-hoc 签名，cdhash 会变）
+> 都要重新点一次。首次读取若弹出系统授权，点「始终允许」即可。
+
+> **历史（2026-09-19 纠正）**：这里曾写着「macOS 的密钥在 Keychain 里、**端外解不出**」——
+> 那是把「不去解钥匙串」当成了「解不了」。于是 macOS 上这条通道恒为空，
+> 而界面还会补一句「请先在 Qoder 桌面端登录一次」，把已经登录的用户指去重登。
 
 因此：
 
 - **不需要 Qoder 正在运行**，也不用改启动方式（不涉及 `--remote-debugging-port`）；
-- Qoder 是**单账号模型**：`auth.v1.dat` 只存当前登录那一个，切号 / 重登会覆盖它，
-  所以这里最多只列出 **1 条**，不是多账号列表；
+- **每套部署**都是单账号模型：`auth.v1.dat` 只存当前登录那一个，切号 / 重登会覆盖它，
+  所以这里最多列出 **2 条**（两套部署各一条），不是多账号列表；
 - 列表会标出「当前登录」「有效期至 … / 剩 N 天 / 已过期」；
-- 已存在的账号按 token / 昵称识别后合并补全，不会重复添加。
+- 已存在的账号按「区域 + token」识别后合并补全，不会重复添加 ——
+  只看 token 是不够的：两套部署签发的 token 互不相通，区域是这条凭据的一半身份。
 
-> 只读，不写回、不外传。续签后的写回是另一条独立开关，见「token 续签」。
+> 读取本身**不改动任何文件**；续签成功后的写回是另一条路径，见「token 续签」。
 
 ### 2. 登录新账号
 
 点工具栏「**登录新账号**」（独立入口，不在导入弹窗里）。走 Qoder 的**设备授权流（device flow）**
 —— 官方桌面端自己用的就是这套 —— **不重启、不打断当前 Qoder，也不改动本机登录文件**，
-是加第二个 / 第三个账号最省事的路子（macOS 上也是**唯一**可行的一条）：
+是加第二个 / 第三个账号最省事的路子：
 
-1. 点「打开授权页并开始」→ 本工具本地生成 PKCE 材料（`verifier` / `challenge=S256` /
-   `nonce` / `machine_id`），再用**系统浏览器**打开：
-   `https://qoder.com/device/selectAccounts?challenge=…&challenge_method=S256&nonce=…&machine_id=…&client_id=…`
-   服务端会自己 302 到 `https://qoder.com/users/sign-in?biz_variant=qoder&oauth_callback=…`。
-2. 在浏览器里完成登录（扫码即可）。本工具每 2 秒轮询一次
-   `GET https://openapi.qoder.sh/api/v1/deviceToken/poll?nonce=…&verifier=…&challenge_method=S256`；
+1. **先选「登到哪个区域」**（国际版 / 国内版），再点「打开授权页并开始」。
+   这一步非有不可：授权链接本身**不含**区域信息，只有发起方知道用户点的是哪个入口；
+   选错了只会把账号收进另一个区域，不影响本机已登录的客户端。
+2. 点「打开授权页并开始」→ 本工具本地生成 PKCE 材料（`verifier` / `challenge=S256` /
+   `nonce` / `machine_id`），再用**系统浏览器**打开
+   （`{auth_base}` 按区域取：国际版 `https://qoder.com` / 国内版 `https://qoder.cn`）：
+   `{auth_base}/device/selectAccounts?challenge=…&challenge_method=S256&nonce=…&machine_id=…&client_id=…`
+   服务端会自己 302 到 `{auth_base}/users/sign-in?biz_variant=qoder&oauth_callback=…`。
+3. 在浏览器里完成登录（扫码即可）。本工具每 2 秒轮询一次
+   `GET {openapi_base}/api/v1/deviceToken/poll?nonce=…&verifier=…&challenge_method=S256`
+   （国际版 `openapi.qoder.sh` / 国内版 `openapi.qoder.com.cn`）；
    未授权时返回 `HTTP 404 {"errorCode":"NotFound"}` —— **这是正常等待态，不是报错**。
-3. 拿到 `token` + `refresh_token` 后自动拉 `GET /api/v1/userinfo`，把**昵称 / uid** 一并显示；
-   点「添加为账号」入库，或连点「再登一个」继续加号。
+4. 拿到 `token` + `refresh_token` 后自动拉 `GET /api/v1/userinfo`，把**昵称 / uid** 一并显示；
+   点「添加为账号」入库（入库时带上这一步选的区域），或连点「再登一个」继续加号。
 
-> **只有一套域**：登录 `qoder.com`、接口 `openapi.qoder.sh`，都写死在代码里，没有「选域」这回事
-> （旧版的域下拉框已删除）。
+> **区域不是「随便填的域」**：两套部署的域、目录、客户端都在 `region.rs` 里写死，界面只能
+> 在这两个之中选一个。（历史注：旧版那个下拉框列的是 CodeBuddy 时代的四个域，而那个参数在后端
+> 从来就被忽略 —— 一个不起作用的选项比没有更糟，所以当时删掉了它。现在它重新存在，是因为
+> 它真的会决定「请求打哪个域、账号收进哪个区域」。）
 >
 > 授权链接里**不填** `redirect_uri`。官方填的是 `qoder-app://`，那是官方桌面端自己注册占用的
 > scheme（`lsregister` 里 `qoder-app:` 归 `/Applications/Qoder.app`）；照抄它会让浏览器在授权
@@ -255,6 +294,13 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 - **签到前兜底**：每次签到（手动 / 批量 / 定时）前也会再判一次阈值，避免「扫描刚过、签到时刚好过期」。
 - 条目上**没有手动「续签」按钮**——续签完全自动（后台扫描 + 签到前兜底），条目只读。
 - 条目会显示凭证有效期（已过期标红，7 天内提示）。
+- **写回 Qoder 自己的凭据文件**：续签成功后，新 token / refreshToken 与有效期会**原子写回**
+  `auth.v1.dat`（临时文件 + rename，避免官方客户端读到半个文件），免得官方与本工具各持一条
+  已被轮换掉的 refresh token。写回用的是**与读取同一把钥匙、同一个平台封锁**重新加密，
+  并在替换前**解一遍自检** —— macOS 的 CBC 段没有完整性保护，
+  这道自检是「写进去就再也读不回来」之前的唯一拦截。
+  两个时间戳字段**按原文的写法**回写（官方是 ISO-8601 字符串 `"2026-10-19T03:38:47Z"`，
+  写成数字会让客户端读到另一种类型）。
 - 续签失败**不阻断**签到，仍用旧 token 试一次，由签到结果给出明确提示；
   若 refresh token 本身已失效，重新「导入本机账号」或「登录新账号」即可。
 
@@ -314,7 +360,8 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 ```bash
 # 接管后 Qoder 的对话实际请求链路（机制已逆向确认，见 basedata/20260918_Qoder接管机制逆向.md）：
 # Qoder 桌面端 → 拉起长驻 CLI host（claude 式 agent runtime，模型请求由它发出）
-#            → https://127.0.0.1:8789（本应用反代）→ https://api2-v2.qoder.sh/model/v1/chat/completions
+#            → https://127.0.0.1:8789（本应用反代）→ 接管区域的模型网关
+#              国际版 https://api2-v2.qoder.sh · 国内版 https://gateway.qoder.com.cn
 #
 # 杠杆是进程环境变量 QODER_MODEL_SERVER_HOST（CLI 里 gtn() 读它；**scheme 被写死成 https**，
 # 所以本地反代必须提供 TLS —— 与 CodeBuddy「写 settings.json 一个键」的做法完全不同）。
@@ -324,8 +371,34 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 > 切换点是 `stealth.rs` 的「端点存储后端」（租约 / 心跳 / 事件日志骨架可原样复用）。
 
 - **Qoder 专用**：只监听 `127.0.0.1`、无鉴权 Key（不对外提供通用代理能力）；
-  开启时把 `~/.qoder/settings.json` 的 `env.CODEBUDDY_BASE_URL` 指向本机，
-  关闭 / 换端口 / 应用退出时自动安全摘除（含原子端点切换与重启，不留死端口）。
+  开启时把**接管区域**那个 CLI 配置目录（`~/.qoder` 或 `~/.qoder-cn`）的
+  `settings.json` 里 `env.CODEBUDDY_BASE_URL` 指向本机，
+  关闭 / 换端口 / **换区域** / 应用退出时自动安全摘除（含原子端点切换与重启，不留死端口）。
+- **接管目标区域**：控制条上的「区域」选择器决定三件事 —— 端点写进哪套客户端的配置、
+  请求转发到哪个模型网关、以及扣费账号**从哪个池里选**（跨区域的 token 在对方网关上无效，
+  所以扣费池与模型清单都只列该区域）。开启期间换区域会走安全切换流程
+  （摘旧区域的端点 → 重启受影响的客户端 → 装进新区域），并把扣费池重置为「全部」；
+  关闭期间换区域只是把设置存下来，不会惊动任何进程。
+  两套部署可以同时装着，而「现在该接管哪一个」是用户的意图、不是能从磁盘猜出来的事实，
+  所以它是一次**显式选择**（`settings.takeover_region`）。选中区域**一个账号都没有**时，
+  控制条下方会出现一行提示 + 一键切到有账号的那个区域（只提示，**不替用户改设置**）。
+- **限流切换的模型清单**：三层来源 —— Qoder 模型目录（联网，缓存 1 小时）→ 落盘快照
+  （按区域分开存）→ 本机 Qoder 的痕迹（`~/.qoder[cn]/.models/default` + 会话日志，
+  只含这台机器用过的模型）。第 1 层**实测基本永远拉不到**，两个区域的失败形态还不一样：
+
+  | 区域 | 宿主 | 常规 HTTPS 客户端 |
+  |---|---|---|
+  | 国际版 | `api3.qoder.sh` | 空 `404`（任何路径、带不带认证都一样） |
+  | 国内版 | `gateway.qoder.com.cn` | `503`（阿里云 ALB 的 HTML 页） |
+
+  国内版那条是照着 CLI 日志逐项复现后仍然失败的：用日志里那两个 httpdns 落点 IP `--resolve`、
+  HTTP/1.1 与 2、GET 与 POST、带与不带 UA 一律 503。CLI 自己把整份目录缓存在
+  `.models/<uid>/catalog-v6`，但那是 `QMC\x01` 开头的密文（熵 7.997），没有 CLI 手里的密钥解不开。
+
+  **由此推出：凭证对这份清单几乎没有价值，「这个区域还没有账号」不是错误。**
+  三层里两层是纯本地的，没账号只是让第 1 层缺席 —— 界面照常显示清单，
+  并在胶囊上标出来源（`· 本机记录`）、在弹窗里写明「第 1 层为什么没结果」。
+  路由侧的免费集合与界面同源（`models::free_ids`），避免「界面显示免费、路由却不切换」。
 - **路由策略**：硬指定「优先扣费账号」> 会话粘滞（30 分钟滑动续期，对话中途不换号）>
   「积分最早过期优先」轮换（快照缓存 10 分钟）。指定账号不存在时自动降级为轮换。
 - **`/v2` 路径改写**：CLI 在端点覆盖模式下请求的是裸路径 `/chat/completions`，
@@ -357,24 +430,29 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 
 | 命令 | 说明 |
 | --- | --- |
-| `list_accounts` | 列出全部账号 |
-| `import_accounts` | 批量导入账号（「导入本机账号」/「登录新账号」共用）：已存在账号按手机号或 token 识别后**合并补全**凭证，不会重复添加 |
-| `export_accounts` / `import_accounts_file` | 账号跨机器迁移：导出全部账号为 JSON（0600 权限落盘）/ 从导出文件导入（同一套合并逻辑） |
+| `list_accounts` | 列出全部账号（每条都带它所属的区域） |
+| `import_accounts` | 批量导入账号（「导入本机账号」/「登录新账号」共用）：按「**区域 + 手机号 / token**」识别后**合并补全**凭证，不会重复添加 |
 | `remove_account` | 删除账号（同时清理该账号的签到日志） |
 | `checkin_one` | 对单个账号签到 |
 | `checkin_all` | 批量签到全部账号 |
-| `discover_local_accounts` | 读取本机 Qoder 登录文件（含昵称/手机号/有效期） |
-| `oauth_start` | 登录新账号第一步：申请 state + 授权链接（不重启应用） |
+| `refresh_all` | 一键刷新：重拉并持久化全部账号的积分快照 / 签到状态 / 积分余量 |
+| `discover_local_accounts` | 读取本机 Qoder 登录文件（两个 profile 目录都扫；含区域/昵称/手机号/有效期） |
+| `oauth_start` | 登录新账号第一步：**按区域**申请 state + 授权链接（不重启应用） |
 | `oauth_poll` | 登录新账号第二步：轮询授权结果；`done=false` 表示仍在等用户授权 |
 | `open_external` | 用系统默认浏览器打开链接（授权页） |
-| `get_settings` / `save_settings` | 读写全局设置（保存时校验定时时刻与 webhook） |
+| `broker_upload` / `broker_link` / `broker_unbind` / `broker_state` | 云端凭证池：上传成一个池并拿 uuid / 绑定别处的 uuid / 解绑 / 只读状态。四个都是**池级**命令，不带账号 id |
+| `get_settings` | 读全局设置（含**接管目标区域** `takeover_region`） |
+| `regions` | 区域清单（国际版 / 国内版的中文名与说明）：界面上「区域」的**唯一来源** |
+| `save_settings` | 保存设置（校验定时时刻与 webhook）；拓扑类字段（启停 / 端口 / 区域）在接管开启时会被拒，必须走 `apply_settings` |
+| `apply_settings` | 原子应用设置；接管启停 / 换端口 / **换区域**时会走安全切换流程（摘端点 + 重启受影响的客户端） |
 | `test_notify` | 向 webhook 发一条测试通知，返回推送服务原始响应 |
 | `get_autostart` / `set_autostart` | 读取 / 设置开机自启动（直接操作系统登录项，失败会返回原因） |
 | `get_checkin_logs` | 查询签到日志（倒序、可按账号 id 筛选、最多 300 条） |
 | `clear_checkin_logs` | 清空签到日志（传 `accountId` 则只清该账号） |
-| `refresh_all` | 一键刷新：重拉并持久化全部账号的积分快照 / 签到状态 / 积分余量 |
-| `stealth_status` / `stealth_stop` | 读取接管状态（端点是否装上 / 心跳）与立即停止接管（含安全重启） |
-| `proxy_routes` | 最近代理路由记录（账号 / 路径 / 是否流式） |
-| `net_diagnose` / `net_restore` | 网络急救：只读诊断 / 一键恢复（自动备份被改文件） |
-| `restart_qoder` | 安全重启 Qoder 与长驻 CLI host（收割孤儿进程） |
+| `credit_briefing` / `credit_briefing_clear` / `credit_briefing_enable` | 积分简报：读日条目（= 当天时条目之和，现算）/ 清空历史 / 开启（清历史 + 采一次样只对齐基线） |
+| `stealth_status` | 读取接管状态（端点是否装上 / 心跳 / 属于哪个区域 / 该做什么）。停止接管走 `apply_settings(proxy_enabled=false)` |
+| `takeover_events` / `takeover_events_clear` | 接管事件流（新的在前）/ 清空 |
+| `free_models` | 限流切换支持的模型清单（三层来源：Qoder 目录 / 落盘快照 / 本机痕迹）；**按区域**取，快照也分区域存。不要求该区域有账号（无账号只是跳过联网那层，`note` 里写明原因） |
+| `net_diagnose` / `net_restore` / `reveal_path` | 网络急救：只读诊断 / 一键恢复（自动备份被改文件，并清理两个区域的残留端点）/ 在文件管理器里定位 |
+| `update_accelerated` | 加速下载更新包（多镜像源 + 签名自验） |
 | `app_version` | 当前版本号 |

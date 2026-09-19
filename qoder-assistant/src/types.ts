@@ -23,7 +23,31 @@ export interface CheckinRecord {
   at: string;
 }
 
+/**
+ * 一个可选区域（国际版 / 国内版）。
+ *
+ * 清单来自后端的 `regions` 命令（`Region::ALL` 的投影），而不是前端自己写一份：
+ * 中文名、以及「OpenAPI 在哪个域」这类事实只该有一处定义 ——
+ * 两边各写一份的下场是「界面说的」与「请求实际打的」各走各的。
+ */
+export interface RegionOption {
+  /** 落盘 / IPC 的稳定标识（`global` / `cn`），原样回传给后端 */
+  key: string;
+  /** 中文名（「国际版」/「国内版」） */
+  label: string;
+  /** 一句话说明差异（域在哪） */
+  hint: string;
+}
+
 export interface Account {
+  /**
+   * 这个账号属于**哪一套部署**（`global` / `cn`）—— 是账号的**身份**，不是可覆盖的选项。
+   *
+   * 同一台机器上可以同时有国际版与国内版的账号，同一个手机号也完全可能在两边都出现，
+   * 所以「哪个区域里的哪个号」才是唯一标识（后端合并键就是 `(region, phone)`）。
+   * 它还决定每一次请求打哪个域：跨区域的 token 在对方的网关上无效。
+   */
+  region: string;
   id: string;
   name: string;
   phone: string | null;
@@ -34,9 +58,10 @@ export interface Account {
   expires_at: number | null;
   /** refresh token 过期时间（毫秒）；null 表示未知。它才是「还能不能换出新 token」的判据 */
   rt_expires_at: number | null;
-  // 这里曾经有 `base_url: string | null`：CodeBuddy 多域时代「这个账号打哪个域」的覆盖。
-  // 它只写不读（转发实际用 `Settings.default_base_url`），而且写进去的还是错的
-  // （登录流程塞的是授权域，不是模型网关），2026-09-18 前后端一并删除。
+  // 这里曾经有 `base_url: string | null`：多域时代「这个账号打哪个域」的**逐账号覆盖**。
+  // 它只写不读，写进去的还恒是错的（登录流程塞的是授权域，不是模型网关），
+  // 2026-09-18 前后端一并删除。它想表达的东西现在由上面那个 `region` 承担 ——
+  // 区别在于 `region` 是账号**被谁签发的**，不是可以随手改的覆盖项。
   created_at: string;
   last: CheckinRecord | null;
   /**
@@ -54,7 +79,18 @@ export interface Account {
 }
 
 export interface Settings {
-  default_base_url: string;
+  /**
+   * **接管目标区域**（`global` / `cn`）：智能接管作用于哪一套官方客户端。
+   *
+   * 它决定三件事：端点写进哪个 CLI 配置目录（`~/.qoder` / `~/.qoder-cn`）、
+   * 反代把对话请求转发到哪个模型网关、以及扣费账号只在**该区域**里选。
+   * 「两个官方客户端同时装着」是常态，而「现在该接管哪一个」是用户的意图，
+   * 不是能从文件系统推断出来的事实，所以是显式选择。
+   *
+   * 它取代了旧的 `default_base_url`：那个字段是模板残留的 CodeBuddy 域名，
+   * 而上游其实由区域唯一决定 —— 留一个可写字段只会多一处「改错了不报错」。
+   */
+  takeover_region: string;
   auto_checkin_on_start: boolean;
   /** 每天定时自动签到（应用需保持运行） */
   schedule_enabled: boolean;
@@ -113,10 +149,16 @@ export interface Settings {
 }
 
 /**
- * 直接读本机 Qoder 登录文件（auth/*.info）得到的账号。
+ * 直接读本机 Qoder **凭据文件**（`auth.v1.dat`，Chromium safeStorage 加密）得到的账号。
  * 一次就能拿到 token + 昵称 + 手机号，是首选通道。
  */
 export interface LocalAccount {
+  /**
+   * 这条凭据属于**哪一套部署** —— 由它来自哪个 profile 目录决定，不是猜出来的。
+   * 两套部署的登录文件分别在 `com.qoder.app.stable` 与 `com.qodercn.app.stable` 下，
+   * 同一台机器可以各有一个「当前账号」。导入时必须把它一起带上（见 [`ImportItem`]）。
+   */
+  region: string;
   token: string;
   /** 续签用的 refresh token */
   refresh_token: string | null;
@@ -134,8 +176,41 @@ export interface LocalAccount {
   file: string;
 }
 
-/** 一次导入请求：token 必填，其余为可直接预填的元信息（没有「域」字段，见 `Account`） */
+/**
+ * **单个区域**的读取结果（`LocalScan.probes` 里的一条）。
+ *
+ * 存在的理由：`LocalScan.accounts` 只能表达「有没有」，而「没有」至少有三种**互不相同**
+ * 的原因 —— 那个版本从未登录过 / 钥匙串里没条目（或用户拒绝授权）/ 解密失败。
+ * 上一版把它们都渲染成「请先在 Qoder 桌面端登录一次」，于是**已经登录**的用户
+ * 被告知去重新登录一次。
+ */
+export interface LocalProbe {
+  /** 区域标识（`global` / `cn`） */
+  region: string;
+  /** 该区域是否读到了账号 */
+  found: boolean;
+  /** 一句话说明：读到了什么，或者为什么没读到 */
+  detail: string;
+}
+
+/**
+ * 一次「导入本机账号」扫描的完整结果。
+ *
+ * `probes` 每个区域一条、顺序与后端 `Region::ALL` 一致：界面直接按它渲染，
+ * 不要再自己按区域分组（分组规则会在前端多出一份定义）。
+ */
+export interface LocalScan {
+  accounts: LocalAccount[];
+  probes: LocalProbe[];
+}
+
+/** 一次导入请求：token 必填，其余为可直接预填的元信息 */
 export interface ImportItem {
+  /**
+   * 该账号所属区域。**缺省 = 国际版**（后端 `#[serde(default)]`）：
+   * 老版本攒下的条目里没有这个字段，而它们全部来自国际版域。
+   */
+  region?: string;
   token: string;
   name?: string | null;
   phone?: string | null;
@@ -190,6 +265,11 @@ export interface OAuthStart {
   login_id: string;
   verification_uri: string;
   expires_in: number;
+  /**
+   * 这一轮登录打的是**哪套部署** —— 授权链接本身不含区域信息，只有发起方能告诉我们。
+   * 轮询结果（[`OAuthPoll`]）里**没有**这个字段，所以前端要自己记住它、并在导入时带上。
+   */
+  region: string;
 }
 
 /**
@@ -233,13 +313,25 @@ export interface CreditFact {
   packages: CreditPackage[];
 }
 
-/** 一个资源包的展示快照：名字 + 剩余积分 + 到期时间 */
+/**
+ * 一个资源包的展示快照：名字 + 剩余积分 + 到期。
+ *
+ * 「到期」是**三态**，靠两个字段联用表示（不是冗余字段）：
+ * - `expiry_ms != null` → 有明确到期日
+ * - `never_expires` → 服务端明说不会过期（响应里 `expiresAt` 给的是 `9999-12-31` 哨兵）
+ * - 两者皆无 → 响应里根本没给到期信息（未知）
+ *
+ * 后端在**解析响应时**就已经把哨兵归一掉了（`ledger::normalize_expiry`），
+ * 所以这里永远收不到 9999 年的假日期；界面只需要把三态分别说清楚。
+ */
 export interface CreditPackage {
   name: string;
   /** 本包剩余积分 */
   remaining: number;
-  /** 本包到期时间（毫秒）；null = 未知 */
+  /** 本包到期时间（毫秒）；null = 没有真实到期日（是「不过期」还是「未知」看下一项） */
   expiry_ms: number | null;
+  /** 服务端明说这个包不会过期 */
+  never_expires: boolean;
 }
 
 /**
@@ -324,6 +416,8 @@ export interface StealthStatus {
   installed: boolean;
   /** 租约是否新鲜（心跳还在跳） */
   alive: boolean;
+  /** 这份状态说的是**哪个区域**的接管（即接管目标区域） */
+  region: string;
   port: number;
   url: string;
   /** 人话说明当前状态与下一步该做什么 */
@@ -358,11 +452,22 @@ export interface ModelInfo {
  * `fetched` = 刚从 Qoder 模型目录拉取；`cache` = 落盘快照；
  * `local` = 本机 Qoder 痕迹；`empty` = 三层都没拿到（界面显示空态）。
  * 这里**没有**「内置兜底」这一档 —— 兜底写死模型名正是旧实现认错模型的根源。
+ *
+ * ⚠️ 这份清单**不要求所在区域有账号**：三层里两层是纯本地的，「没账号」只是让
+ * 第 1 层（联网）缺席 —— 理由见后端 `crate::models` 模块头。
  */
 export interface ModelReport {
   /** 免费排前、其余按 id 排序 */
   models: ModelInfo[];
   source: "fetched" | "cache" | "local" | "empty";
+  /**
+   * 第 1 层为什么没结果，直接显示给用户（`source === "fetched"` 时恒为 null）。
+   *
+   * 与 `source` 是两件事：那个说「清单来自哪一层」，这个说「为什么不是刚拉到的」。
+   * 后端给的是成句的中文，界面不要自己拼（「没有账号」与「接口不开放」两种原因
+   * 的下一步动作完全不同）。
+   */
+  note: string | null;
 }
 
 /**

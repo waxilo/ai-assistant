@@ -37,10 +37,19 @@ sha2 = "0.10"
 minisign-verify = "0.2"
 thiserror = "1"
 # —— Qoder 本机凭据（auth.v1.dat）OSCrypt 解密/回写 ——
-# Chromium OSCrypt 在 Windows 上的两层：DPAPI 解出 32B AES 数据密钥 + AES-256-GCM 解数据
+# `auth.v1.dat` 是 Chromium `safeStorage`（OSCrypt）的产物，**两个平台的封装不一样**：
+# Windows = DPAPI 解出 32B 原始密钥 + AES-256-GCM；macOS = 钥匙串密码经 PBKDF2-SHA1
+# 派生 16B 密钥 + AES-128-CBC。所以下面两组依赖都要：
+# - Windows 分支：aes-gcm / aead
+# - macOS 分支：aes + cbc + block-padding（AES-128-CBC/PKCS7），hmac + sha1（PBKDF2-SHA1）
 aes-gcm = { version = "0.10", features = ["aes"] }
 aead = "0.5"
 rand = "0.8"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+block-padding = "0.3"
+hmac = "0.12"
+sha1 = "0.10"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 

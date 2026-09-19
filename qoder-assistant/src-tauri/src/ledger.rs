@@ -84,6 +84,42 @@ pub fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+/// 服务端表示「永不过期」的时间戳哨兵：`9999-12-31T00:00:00Z`。
+///
+/// 2026-09-19 实测：免费账号（`plan_tier_name: "Free"`、`is_paid_plan: false`）的
+/// usage 响应里 `qoderUsage.expiresAt` 就是这个值，而同一个账号在
+/// `GET /api/v2/user/plan` 里的 `end_date` 是 `0` —— 同一个意思，两处两套写法。
+///
+/// ⚠️ 它**不是一个日期**。上一版把它当普通毫秒时间戳一路透传下去，界面上因此出现
+/// 「到期 9999-12-31」和「2922776 天后过期 100」（实测踩到）。凡是拿 `expiresAt`
+/// 的地方都必须先过 [`normalize_expiry`]。
+pub const NEVER_EXPIRES_MS: i64 = 253_402_214_400_000;
+
+/// 这个时间戳是不是「永不过期」而不是一个日期。
+///
+/// 用 `>=` 而不是 `==`：哨兵值的右边界就是 `9999-12-31T00:00:00Z` 加一个周期，
+/// 服务端把终点往上抬一天也仍然只可能是「不打算过期」。真正到 9999 年这个阈值才会
+/// 误判，那时这段代码早就不在了。
+pub fn is_never_expires(ms: i64) -> bool {
+    ms >= NEVER_EXPIRES_MS
+}
+
+/// 把服务端给的到期时间戳归一到 `(到期时刻, 是否永不过期)`。
+///
+/// **唯一的判定入口**：`usage` 解析响应时用它、台账投影旧数据时也用它，
+/// 免得「哨兵」这件事在两个地方各判一次（那种写法迟早只改一处）。
+///
+/// 归一后 `None` 与 `never_expires = true` 的分工：
+/// - `(Some(ms), false)` — 有明确到期时刻
+/// - `(None, true)` — 服务端明说不过期（**与「没读到」不是一回事**，界面文案不同）
+/// - `(None, false)` — 响应里根本没给到期信息（未知）
+pub fn normalize_expiry(ms: Option<i64>) -> (Option<i64>, bool) {
+    match ms {
+        Some(m) if is_never_expires(m) => (None, true),
+        other => (other, false),
+    }
+}
+
 /// 一个额度包的观测值 —— 台账的输入。
 ///
 /// 由 [`crate::usage::parse_view`] 从 Qoder usage 响应里解析出来（个人版把两个额度槽位
@@ -106,8 +142,16 @@ pub struct PkgView {
     /// 个人版的计划额度拿「周期终点」当标识（真实响应只给终点，续期后终点后移，
     /// 与用起点判等价）；没有周期信息的包留空 —— 宁可漏记一次翻周期，也不虚报归零。
     pub cycle_start: String,
-    /// 本包到期时间（毫秒）；未知为 `None` —— 供前端「资源包列表」展示
+    /// 本包到期时间（毫秒）；未知为 `None` —— 供前端「资源包列表」展示。
+    ///
+    /// ⚠️ 「永不过期」走 [`PkgView::never_expires`]，**不在这里**放哨兵值：
+    /// 这个字段只能是真实时刻（见 [`normalize_expiry`]）。
     pub expiry_ms: Option<i64>,
+    /// 服务端明说这个包不会过期（哨兵值归一后的结果，见 [`normalize_expiry`]）。
+    ///
+    /// 与 `expiry_ms == None` 联用构成三态，**不是冗余字段**：
+    /// `Some` = 有到期日、`never_expires = true` = 永不过期、两者皆无 = 未知。
+    pub never_expires: bool,
     /// 本包剩余积分 —— 展示用，与「最早到期只算余量>0 的包」口径一致
     pub remaining: f64,
 }
@@ -128,9 +172,29 @@ pub struct PkgEntry {
     /// 本包到期时间（毫秒）；`None` = 未知。展示口径，latest-wins 覆盖，不取 max
     #[serde(default)]
     pub expiry_ms: Option<i64>,
+    /// 服务端明说这个包不会过期。展示口径，latest-wins 覆盖。
+    ///
+    /// 老台账里没有这个键（默认 `false`），但那时可能已经把哨兵值写进 `expiry_ms` 了
+    /// —— 读取侧由 [`PkgEntry::expiry`] 兜住，不必等下一次采样，也不必升 schema。
+    #[serde(default)]
+    pub never_expires: bool,
     /// 本包剩余积分；展示口径，latest-wins 覆盖，不取 max
     #[serde(default)]
     pub remaining: f64,
+}
+
+impl PkgEntry {
+    /// 到期口径：`(到期时刻, 是否永不过期)`。
+    ///
+    /// 存在的理由是**旧台账**：哨兵值曾经被当普通时间戳存进来过（那正是界面上
+    /// 「9999-12-31」的来源）。归一放在读取侧，旧文件就不必等下一次采样才显示对，
+    /// 也不必为了一个显示字段升 schema 丢掉小时桶。
+    fn expiry(&self) -> (Option<i64>, bool) {
+        if self.never_expires {
+            return (None, true);
+        }
+        normalize_expiry(self.expiry_ms)
+    }
 }
 
 /// 单个账号的台账。
@@ -253,6 +317,7 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
                         cycle_start: v.cycle_start.clone(),
                         last_seen: at.to_string(),
                         expiry_ms: v.expiry_ms,
+                        never_expires: v.never_expires,
                         remaining: v.remaining,
                     },
                 );
@@ -287,6 +352,7 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
                 // 到期时间 / 剩余是**展示口径**，latest-wins 直接覆盖，不取 max：
                 // 包续期会推晚到期、消耗会使剩余下降，若被 max 卡住就永远停在旧值上了。
                 e.expiry_ms = v.expiry_ms;
+                e.never_expires = v.never_expires;
                 e.remaining = v.remaining;
             }
         }
@@ -505,7 +571,8 @@ pub struct CreditFact {
     pub at: String,
     /// 最早重置/过期时刻（毫秒）
     pub earliest_expiry_ms: Option<i64>,
-    /// 逐资源包明细（`{name, remaining, expiry_ms}`），供前端「资源包列表」展示
+    /// 逐资源包明细（`{name, remaining, expiry_ms, never_expires}`），
+    /// 供前端「资源包列表」展示
     #[serde(default)]
     pub packages: Vec<CreditPackage>,
 }
@@ -515,7 +582,11 @@ pub struct CreditFact {
 pub struct CreditPackage {
     pub name: String,
     pub remaining: f64,
+    /// 到期时刻（毫秒）；`None` = 没有真实到期日（可能是永不过期，也可能是未知，
+    /// 看 [`CreditPackage::never_expires`]）
     pub expiry_ms: Option<i64>,
+    /// 服务端明说不过期。界面据此显示「不过期」而不是一个日期或「未知」
+    pub never_expires: bool,
 }
 
 /// 从台账的逐包条目投影出展示用的资源包列表（过滤掉余量为 0 的包）。
@@ -524,14 +595,25 @@ fn project_packages(a: &AcctLedger) -> Vec<CreditPackage> {
         .pkgs
         .values()
         .filter(|p| p.remaining > 0.0)
-        .map(|p| CreditPackage {
-            name: p.name.clone(),
-            remaining: p.remaining,
-            expiry_ms: p.expiry_ms,
+        .map(|p| {
+            // 走 `PkgEntry::expiry` 而不是直接读字段：老台账里可能存着哨兵值
+            let (expiry_ms, never_expires) = p.expiry();
+            CreditPackage {
+                name: p.name.clone(),
+                remaining: p.remaining,
+                expiry_ms,
+                never_expires,
+            }
         })
         .collect();
-    // 排序稳定：最早到期的排前面，无到期的排最后；方便前端直接吃第 0 项当「快过期」
-    out.sort_by_key(|p| p.expiry_ms.unwrap_or(i64::MAX));
+    // 排序稳定：最早到期的排前面，方便前端直接吃第 0 项当「快过期」。
+    // 永不过期的排在**所有**有到期日的之后（它永远不着急），只有未知的比它更靠后
+    // —— 未知连「要不要着急」都不知道，不该抢在「确定不着急」前面。
+    out.sort_by_key(|p| match (p.expiry_ms, p.never_expires) {
+        (Some(ms), _) => (0, ms),
+        (None, true) => (1, 0),
+        (None, false) => (2, 0),
+    });
     out
 }
 
@@ -715,6 +797,7 @@ mod tests {
             used,
             cycle_start: cycle.into(),
             expiry_ms: None,
+            never_expires: false,
             remaining: size - used,
         }
     }
@@ -1082,6 +1165,97 @@ mod tests {
         assert_eq!(f.credits, Some(90.0));
         assert_eq!(f.at, "2026-09-16 11:00:00");
         assert_eq!(f.earliest_expiry_ms, Some(1789954208000));
+    }
+
+    // ── 「永不过期」不是日期 ────────────────────────────────────
+
+    /// 服务端的哨兵值必须被认出来。这是整条链唯一的判定点，
+    /// 另外两个调用方（`usage::parse_view` 的两种形态）都只是消费它。
+    #[test]
+    fn the_never_expires_sentinel_is_told_apart_from_a_real_deadline() {
+        // 9999-12-31T00:00:00Z：实测免费账号的 qoderUsage.expiresAt
+        assert_eq!(normalize_expiry(Some(NEVER_EXPIRES_MS)), (None, true));
+        assert!(is_never_expires(NEVER_EXPIRES_MS));
+        assert!(is_never_expires(NEVER_EXPIRES_MS + 86_400_000), "抬一天也还是不过期");
+
+        let real = 1_790_927_528_327; // 2026-10-02
+        assert_eq!(normalize_expiry(Some(real)), (Some(real), false));
+        assert!(!is_never_expires(real));
+        // `None` 是「响应里没给」，**不能**顺手说成「不过期」——两者界面文案不同
+        assert_eq!(normalize_expiry(None), (None, false));
+    }
+
+    /// 展示投影里「永不过期」与「未知」必须是两种结果，且顺序是
+    /// 「有到期日 → 永不过期 → 未知」。
+    #[test]
+    fn the_projection_keeps_never_and_unknown_apart() {
+        let mut a = AcctLedger::default();
+        let mut never = pkg("never", 100.0, 0.0, "");
+        never.never_expires = true;
+        let mut dated = pkg("dated", 300.0, 0.0, "");
+        dated.expiry_ms = Some(1_790_927_528_327);
+        let unknown = pkg("unknown", 50.0, 0.0, "");
+        observe(
+            &mut a,
+            &[never, dated, unknown],
+            Some(450.0),
+            None,
+            "2026-09-19 12:00:00",
+            Mode::Normal,
+        );
+
+        let list = project_packages(&a);
+        assert_eq!(
+            list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["包dated", "包never", "包unknown"]
+        );
+        assert_eq!(
+            (list[0].expiry_ms, list[0].never_expires),
+            (Some(1_790_927_528_327), false)
+        );
+        assert_eq!((list[1].expiry_ms, list[1].never_expires), (None, true));
+        assert_eq!((list[2].expiry_ms, list[2].never_expires), (None, false));
+    }
+
+    /// 旧台账回归：哨兵值曾经被当普通时间戳存进来过（界面因此显示 9999-12-31）。
+    /// 归一必须发生在**读取侧** —— 否则要么等下一次采样，要么为了一个展示字段升
+    /// schema 把小时桶一起丢掉，两条路都不该走。
+    #[test]
+    fn an_old_ledger_holding_the_sentinel_reads_back_as_never_expires() {
+        // 用 json! 拼而不是手写带 `format!` 的字符串：JSON 的花括号与格式占位符会打架
+        let old = serde_json::json!({
+            "v": SCHEMA,
+            "accts": {
+                "a1": {
+                    "credits": 100.0,
+                    "credits_at": "2026-09-19 12:00:00",
+                    "pkgs": {
+                        "qoder:addon": {
+                            "name": "附加额度",
+                            "size": 100.0,
+                            "remaining": 100.0,
+                            "expiry_ms": NEVER_EXPIRES_MS,
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let led = decode(&old);
+        assert_eq!(
+            led.accts["a1"].pkgs["qoder:addon"].expiry_ms,
+            Some(NEVER_EXPIRES_MS),
+            "文件里确实还是旧值（这条断言就是「读的是同一份数据」的凭据）"
+        );
+
+        let f = fact(&led, "a1").expect("有读数就该投影");
+        assert_eq!(f.packages.len(), 1);
+        assert_eq!(
+            (f.packages[0].expiry_ms, f.packages[0].never_expires),
+            (None, true),
+            "投影出来必须已经是「永不过期」，而不是一个 9999 年的日期"
+        );
     }
 
     // ── 唯一的写入口（Store）──────────────────────────────────

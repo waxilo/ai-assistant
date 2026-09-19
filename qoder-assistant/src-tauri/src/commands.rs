@@ -1,5 +1,5 @@
 use crate::accounts::{self, Account, Settings};
-use crate::auth_file::{self, LocalAccount};
+use crate::auth_file::{self, LocalScan};
 use crate::briefing;
 use crate::broker;
 use crate::checkin;
@@ -8,6 +8,7 @@ use crate::logs::{self, CheckinLog};
 use crate::notify;
 use crate::oauth;
 use crate::refresh;
+use crate::region::Region;
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -102,7 +103,7 @@ pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<()
         .refresh_token
         .clone()
         .ok_or_else(|| "没有 refresh token，无法续签".to_string())?;
-    let r = refresh::refresh(&account.token, &rt).await?;
+    let r = refresh::refresh(account.region, &account.token, &rt).await?;
     account.token = r.token.clone();
     let next_rt = r.refresh_token.clone();
     if let Some(nrt) = &next_rt {
@@ -112,6 +113,7 @@ pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<()
     account.rt_expires_at = r.rt_expires_at.or(account.rt_expires_at);
     // 续签成功 → 同窗口原子写回 auth.v1.dat（尽力而为，失败只读模式静默）
     let _ = crate::auth_file::apply_refresh(
+        account.region,
         &r.token,
         next_rt.as_deref(),
         r.expires_at,
@@ -211,10 +213,17 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
 
 /// 一条导入项：来自「导入本机账号」或「登录新账号」。
 ///
-/// **没有「域」字段**：旧版这里有个 `host`，会被写进 `Account.base_url`。Qoder 只有一套域，
-/// 那个字段既没人读、登录流程写进去的还是错的（授权域 ≠ 模型网关），已随该字段一并删除。
+/// `region` 是**必填语义、可省字段**：来源一定知道它属于哪套部署（登录时用户点的
+/// 那个入口；导入本机账号时来自凭据所在的 profile 目录），前端原样带回来即可。
+/// 缺省落成国际版 —— 没有这个字段的那些请求都是「两套部署出现之前」的旧前端，
+/// 而那时能导进来的只有国际版账号。
+///
+/// 旧版这里还有个 `host`，会被写进 `Account.base_url`。那条路已经删掉了：
+/// 授权域（`qoder.com`）≠ 模型网关（`api2-v2.qoder.sh`），一个恒错的字段没人该读。
 #[derive(serde::Deserialize)]
 pub struct ImportItem {
+    #[serde(default)]
+    pub region: Region,
     pub token: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -238,7 +247,12 @@ pub struct ImportReport {
 
 /// 批量导入账号：已存在的账号**合并补全**而不是跳过。
 ///
-/// 识别规则：手机号相同或 token 相同即视为同一账号（token 会轮换，手机号更稳定）。
+/// 识别规则：**同一区域**内，手机号相同或 token 相同即视为同一账号
+/// （token 会轮换，手机号更稳定）。
+///
+/// 区域必须先相等：同一个手机号在两套部署里是**两个不同的账号**（两套后端、两份
+/// token、各自的活动权益）。只按手机号匹配，会把国内版那条合并进国际版记录里 ——
+/// token 一换就再也签不到到，而界面上看不出哪里错了。
 /// 合并时以新来源为准：token、refresh token 以及**两个 token 各自的过期时间**都用新值覆盖
 /// （本机登录文件 / 授权响应是权威来源），没给的字段则保留本地那份；昵称仅在原名为空时补。
 /// 这样早期导入、缺续签字段的账号重新导入一次即可获得自动续签能力，也不会产生重复条目。
@@ -280,8 +294,11 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let region = it.region;
         let found = accounts.iter_mut().find(|a| {
-            a.token == token || phone.is_some() && a.phone.as_deref() == phone.as_deref()
+            a.region == region
+                && (a.token == token
+                    || phone.is_some() && a.phone.as_deref() == phone.as_deref())
         });
         match found {
             Some(a) => {
@@ -324,6 +341,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     phone,
+                    region,
                     token,
                     refresh_token: it.refresh_token.filter(|s| !s.trim().is_empty()),
                     expires_at: it.expires_at,
@@ -347,8 +365,9 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
 mod import_tests {
     use super::*;
 
-    fn acct(name: &str, phone: Option<&str>, token: &str) -> Account {
+    fn acct_in(region: Region, name: &str, phone: Option<&str>, token: &str) -> Account {
         Account {
+            region,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             phone: phone.map(str::to_string),
@@ -362,8 +381,14 @@ mod import_tests {
         }
     }
 
-    fn item(token: &str, phone: Option<&str>) -> ImportItem {
+    /// 国际版账号 —— 绝大多数用例只关心一套部署，用这个短名字
+    fn acct(name: &str, phone: Option<&str>, token: &str) -> Account {
+        acct_in(Region::Global, name, phone, token)
+    }
+
+    fn item_in(region: Region, token: &str, phone: Option<&str>) -> ImportItem {
         ImportItem {
+            region,
             token: token.into(),
             name: None,
             phone: phone.map(str::to_string),
@@ -371,6 +396,10 @@ mod import_tests {
             expires_at: Some(123456),
             rt_expires_at: Some(234567),
         }
+    }
+
+    fn item(token: &str, phone: Option<&str>) -> ImportItem {
+        item_in(Region::Global, token, phone)
     }
 
     #[test]
@@ -417,6 +446,40 @@ mod import_tests {
         let r = merge_import(&mut accs, vec![item("  ", Some("111"))]);
         assert_eq!((r.added, r.updated), (0, 0));
         assert_eq!(accs.len(), 1);
+    }
+
+    /// 同一个手机号在两套部署里是**两个不同的账号**。只按手机号合并，国内版那条会
+    /// 被合并进国际版记录里 —— token 一换就再也签不到到，而界面上看不出哪里错了。
+    #[test]
+    fn the_same_phone_in_two_regions_stays_two_accounts() {
+        let mut accs = vec![acct("g", Some("13800000000"), "t-global")];
+
+        let r = merge_import(
+            &mut accs,
+            vec![item_in(Region::Cn, "t-cn", Some("13800000000"))],
+        );
+        assert_eq!((r.added, r.updated), (1, 0), "跨区域的同手机号必须新建而不是合并");
+        assert_eq!(accs.len(), 2);
+        assert_eq!(accs[1].region, Region::Cn);
+        assert_eq!(accs[0].token, "t-global", "国际版那条不该被动到");
+        assert_eq!(accs[0].region, Region::Global);
+
+        // 同一区域内仍然按手机号合并（老行为不能变）
+        let r = merge_import(
+            &mut accs,
+            vec![item_in(Region::Cn, "t-cn2", Some("13800000000"))],
+        );
+        assert_eq!((r.added, r.updated), (0, 1));
+        assert_eq!(accs[1].token, "t-cn2");
+    }
+
+    /// 缺省区域 = 国际版：没有 `region` 字段的导入项来自「两套部署出现之前」的前端，
+    /// 而那时能导进来的只有国际版账号。
+    #[test]
+    fn an_import_item_without_a_region_lands_on_global() {
+        let raw = serde_json::json!({ "token": "t" });
+        let it: ImportItem = serde_json::from_value(raw).unwrap();
+        assert_eq!(it.region, Region::Global);
     }
 }
 
@@ -553,7 +616,7 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
         // 凭证临期的先续签，避免拿着过期 token 把「没积分」误判成「查不到」。
         let _ = ensure_fresh_token(&mut accounts[i]).await;
         // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账
-        let view = checkin::fetch_resource_view(&accounts[i].token).await;
+        let view = checkin::fetch_resource_view(accounts[i].region, &accounts[i].token).await;
         readings.push(ledger::Reading {
             id: accounts[i].id.clone(),
             packages: view.packages,
@@ -670,21 +733,27 @@ pub fn broker_state() -> broker::BrokerStatus {
     broker::status()
 }
 
-/// 首选通道：直接读本机 Qoder 写在磁盘上的登录信息文件（auth/*.info）。
+/// 首选通道：直接读本机 Qoder 写在磁盘上的凭据文件（`auth.v1.dat`，OSCrypt 加密）。
 ///
 /// 不需要应用处于运行状态、不需要调试端口，且一次就能拿到 token + 昵称 + 手机号。
+/// 两个区域各读一条（同机可以各登录一个），并**逐区域**回报读取结果 ——
+/// 「没读到」的原因（未登录 / 钥匙串没条目 / 解密失败）必须能显示出来。
 #[tauri::command]
-pub fn discover_local_accounts() -> Result<Vec<LocalAccount>, String> {
+pub fn discover_local_accounts() -> Result<LocalScan, String> {
     Ok(auth_file::discover_local_accounts())
 }
 
-/// 「无感登录」第一步：申请 state + 授权链接（不重启应用、不打断当前 Qoder）。
+/// 「无感登录」第一步：申请 state + 授权链接（不重启应用、不打断正在跑的客户端）。
 ///
-/// **不收任何域参数**：Qoder 只有一套 Global 域，地址由 `qoder_api::AUTH_BASE` 唯一决定。
-/// 旧版这里是 `oauth_start(host)`，那个参数从来就没被用过（见 `oauth` 模块头）。
+/// `region` = 用户在界面上点的那个登录入口（国际版 / 国内版）。它决定授权页打哪个域，
+/// 并随 [`oauth::OAuthStart::region`] 原样回给前端 —— 导入时再带回来，
+/// 账号才认得出自己属于哪一套部署。
+///
+/// 旧版这里是 `oauth_start(host)`，那个参数从来没被用过（那时只有一套域）。
+/// 现在它不是「可选覆盖」，而是**唯一的区域来源**：授权链接本身不含区域信息。
 #[tauri::command]
-pub async fn oauth_start() -> Result<oauth::OAuthStart, String> {
-    oauth::start().await
+pub async fn oauth_start(region: Region) -> Result<oauth::OAuthStart, String> {
+    oauth::start(region).await
 }
 
 /// 「无感登录」第二步：轮询一次授权结果。
@@ -702,25 +771,54 @@ pub fn open_external(url: String) -> Result<(), String> {
     oauth::open_in_browser(&url)
 }
 
+/// 一条区域的可展示信息（登录弹窗、账号标签、接管页下拉都用它）
+#[derive(serde::Serialize)]
+pub struct RegionOption {
+    /// 落盘 / IPC 的稳定标识（`global` / `cn`），前端原样回传
+    pub key: &'static str,
+    /// 中文名（「国际版」/「国内版」）
+    pub label: &'static str,
+    /// 一句话说明差异（域在哪）
+    pub hint: &'static str,
+}
+
+/// 区域清单：**界面上「国际版 / 国内版」的唯一来源**。
+///
+/// 由后端给而不是前端各写一份：中文名、以及「OpenAPI 在哪个域」这类事实只该有
+/// 一处定义（见 [`crate::region`]），否则界面说的和实际请求打的会各走各的。
+#[tauri::command]
+pub fn regions() -> Vec<RegionOption> {
+    Region::ALL
+        .iter()
+        .map(|r| RegionOption {
+            key: r.key(),
+            label: r.label(),
+            hint: r.hint(),
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn get_settings(app: AppHandle) -> Result<Settings, String> {
     Ok(accounts::load_settings(&data_dir(&app)))
 }
 
-const QODER_MAIN_PATTERN: &str = "^/Applications/Qoder.app/Contents/MacOS/Electron$";
-const QODER_CORE_PATTERN: &str = "^/Applications/Qoder.app/Contents/MacOS/Electron($| )";
+// 这里曾有 `QODER_MAIN_PATTERN` / `QODER_CORE_PATTERN` / `QODER_CLI_HOST_PATTERN`
+// 三个常量，值都指向 `/Applications/Qoder.app/.../MacOS/Electron` —— **一个进程都
+// 匹配不到**（Qoder 的 `CFBundleExecutable` 是 `Qoder`，国内版是 `Qoder CN`，
+// `Contents/MacOS/` 下根本没有叫 `Electron` 的文件）。于是「退出 / 重启 / 判断是否
+// 在跑」这三件事一直是假装做完了。现在它们全部由 [`Region`] 按区域给出：
+// [`Region::macos_process_pattern`] 与 [`Region::cli_host_process_pattern`]。
 
 /// 长驻 CLI host（对话真正跑在它里面）：argv 里带着 Qoder 内置 CLI 的路径。
 ///
 /// # 为什么必须单独杀它
 ///
-/// 它是 Electron 桌面端 spawn 的独立 node 进程，**桌面端退出后会被孤儿化并继续存活**，
+/// 它是官方客户端 spawn 的独立 node 进程，**桌面端退出后会被孤儿化并继续存活**，
 /// 而它进程环境里的 `CODEBUDDY_BASE_URL` 是 spawn 那一刻定死的：
 /// - 接管开启期间启动的 host，在关闭接管后仍把请求发向已死的本地端口 →「服务异常」；
 /// - 接管关闭期间启动的 host，在开启接管并重启桌面端后依然直连上游 →「感觉没走代理」。
 /// 两者都只有把 host 进程杀掉、让桌面端重新 spawn 才能纠正。
-const QODER_CLI_HOST_PATTERN: &str =
-    "/Applications/Qoder\\.app/Contents/Resources/app\\.asar\\.unpacked/cli/";
 
 fn process_pids(pattern: &str) -> Vec<u32> {
     std::process::Command::new("pgrep")
@@ -735,10 +833,6 @@ fn process_pids(pattern: &str) -> Vec<u32> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn process_matches(pattern: &str) -> bool {
-    !process_pids(pattern).is_empty()
 }
 
 /// 等到匹配进程全部消失；超时返回 false（剩余进程数用于报错信息）
@@ -772,53 +866,87 @@ fn kill_processes(pattern: &str) -> usize {
     n
 }
 
-fn quit_qoder_and_wait() -> Result<usize, String> {
+/// 退出**指定区域**的官方客户端，并等它连同常驻 CLI host 一起消失。
+///
+/// `region` 直接决定 AppleScript 里的应用名（`Qoder` / `Qoder CN`）、等待用的
+/// 进程正则、以及要收割的 CLI host 正则 —— 这三个过去各有各的错法，现在同源。
+fn quit_qoder_and_wait(region: Region) -> Result<usize, String> {
     let quit = std::process::Command::new("osascript")
-        .args(["-e", "tell application \"Qoder\" to quit"])
+        .args([
+            "-e",
+            &format!("tell application \"{}\" to quit", region.app_name()),
+        ])
         .output()
         .map_err(|e| format!("执行 AppleScript 失败：{e}"))?;
     if !quit.status.success() {
         return Err(format!(
-            "Qoder 未能正常退出：{}",
+            "{} 未能正常退出：{}",
+            region.label(),
             String::from_utf8_lossy(&quit.stderr).trim()
         ));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let left = wait_processes_gone(QODER_CORE_PATTERN, deadline);
+    let left = wait_processes_gone(&region.macos_process_pattern(), deadline);
     if left > 0 {
-        return Err("等待 Qoder 退出超时；接管状态未改变。".into());
+        return Err(format!("等待 {} 退出超时；接管状态未改变。", region.label()));
     }
     // 桌面端已退出，但长驻 CLI host 会被孤儿化继续存活——必须显式收割，
     // 否则它带着旧的环境变量继续服务对话，接管开关对它永远不生效。
-    let hosts_killed = kill_processes(QODER_CLI_HOST_PATTERN);
+    let hosts_killed = kill_processes(&region.cli_host_process_pattern());
     Ok(hosts_killed)
 }
 
-fn open_qoder() -> Result<(), String> {
+/// 拉起**指定区域**的官方客户端（`open -a` 认的就是 `CFBundleExecutable` 那个名字）。
+fn open_qoder(region: Region) -> Result<(), String> {
     let status = std::process::Command::new("open")
-        .args(["-a", "Qoder"])
+        .args(["-a", region.app_name()])
         .status()
-        .map_err(|e| format!("启动 Qoder 失败：{e}"))?;
+        .map_err(|e| format!("启动 {} 失败：{e}", region.label()))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("启动 Qoder 失败（状态 {status}）"))
+        Err(format!("启动 {} 失败（状态 {status}）", region.label()))
     }
 }
 
-pub(crate) fn restart_qoder_process(app: &AppHandle) -> Result<(), String> {
-    let hosts_killed = quit_qoder_and_wait()?;
-    open_qoder()?;
+pub(crate) fn restart_qoder_process(app: &AppHandle, region: Region) -> Result<(), String> {
+    let hosts_killed = quit_qoder_and_wait(region)?;
+    open_qoder(region)?;
     if let Ok(dir) = try_data_dir(app) {
         crate::stealth::journal_append(
             &dir,
             "restart_qoder",
             &format!(
-                "Qoder 已重启；长驻 CLI host 终止 {hosts_killed} 个（重生后按当前接管状态取端点）"
+                "{} 已重启；长驻 CLI host 终止 {hosts_killed} 个（重生后按当前接管状态取端点）",
+                region.label()
             ),
         );
     }
     Ok(())
+}
+
+/// 这些区域里，哪些官方客户端此刻正在跑（去重，顺序同入参）。
+///
+/// 进程列表用 `pgrep -f <区域正则>`：两个客户端的可执行路径不同，所以同一台机器上
+/// 「国际版在跑、国内版没开」这种状态能分得清 —— 而重启只该打扰正在跑的那个。
+fn running_apps(regions: impl IntoIterator<Item = Region>) -> Vec<Region> {
+    let mut out: Vec<Region> = Vec::new();
+    for region in regions {
+        if !out.contains(&region) && !process_pids(&region.macos_process_pattern()).is_empty() {
+            out.push(region);
+        }
+    }
+    out
+}
+
+/// 当前**实际装着**端点的是哪个区域。
+///
+/// 取租约而不是取设置：一次保存里用户可能既换了区域又关了开关，而写进磁盘的是
+/// 租约上那个区域 —— 要摘掉的正是它。租约丢了（数据目录被清理过）才退回旧设置里的值。
+fn installed_region(dir: &Path, fallback: Region) -> Region {
+    crate::stealth::load_lease(dir)
+        .map(|l| l.region)
+        .unwrap_or(fallback)
 }
 
 fn normalize_settings(mut settings: Settings) -> Result<Settings, String> {
@@ -847,10 +975,15 @@ fn normalize_settings(mut settings: Settings) -> Result<Settings, String> {
     Ok(settings)
 }
 
-fn wait_for_takeover(home: &std::path::Path, dir: &std::path::Path, port: u16) -> bool {
+fn wait_for_takeover(
+    home: &std::path::Path,
+    region: Region,
+    dir: &std::path::Path,
+    port: u16,
+) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
-        let status = crate::stealth::status(home, dir);
+        let status = crate::stealth::status(home, region, dir);
         if status.installed && status.alive && status.port == port {
             return true;
         }
@@ -861,77 +994,122 @@ fn wait_for_takeover(home: &std::path::Path, dir: &std::path::Path, port: u16) -
     }
 }
 
+/// 接管的「拓扑」= 决定**装不装、装在哪个区域、转发到哪个端口**的那三项。
+///
+/// 只有它变化时才需要动官方客户端的配置文件与进程。定时时刻、webhook、限流清单
+/// 那些改了就存 —— 不该为了改一个通知地址去重启用户正开着的客户端。
+///
+/// 区域属于拓扑：换区域 = 换一个客户端接管，配置文件与进程都要跟着换。
+#[derive(PartialEq, Eq)]
+struct TakeoverTopology {
+    enabled: bool,
+    port: u16,
+    region: Region,
+}
+
+fn topology(s: &Settings) -> TakeoverTopology {
+    TakeoverTopology {
+        enabled: s.proxy_enabled,
+        port: s.proxy_port,
+        region: s.takeover_region,
+    }
+}
+
 pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Result<Settings, String> {
     let dir = data_dir(app);
     let home = dirs::home_dir().ok_or_else(|| "无法定位家目录".to_string())?;
     let old = accounts::load_settings(&dir);
     let next = normalize_settings(settings)?;
-    let topology_changed = old.proxy_enabled != next.proxy_enabled
-        || (old.proxy_enabled && next.proxy_enabled && old.proxy_port != next.proxy_port);
-    if !topology_changed {
+    if topology(&old) == topology(&next) {
         accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
         return Ok(next);
     }
 
-    let was_running = process_matches(QODER_MAIN_PATTERN);
+    // 旧的那份端点装在哪个区域：租约说了算（设置里的区域可能在同一次保存里被改过）
+    let old_region = installed_region(&dir, old.takeover_region);
+
     match (old.proxy_enabled, next.proxy_enabled) {
         (false, true) => {
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
-            if !wait_for_takeover(&home, &dir, next.proxy_port) {
+            // 反代监督线程会按新设置自己装卸；这里等它把端点写上再决定要不要重启客户端
+            if !wait_for_takeover(&home, next.takeover_region, &dir, next.proxy_port) {
                 let _ = accounts::save_settings(&dir, &old);
-                let _ = crate::stealth::uninstall(&home, &dir);
+                let _ = crate::stealth::uninstall(&home, next.takeover_region, &dir);
                 return Err(format!(
                     "无法监听 127.0.0.1:{}，接管未开启。请检查端口是否被占用。",
                     next.proxy_port
                 ));
             }
-            if was_running {
-                restart_qoder_process(app)?;
+            // 只重启**正在跑**的那个客户端：没开着的不要顺手拉起来
+            for region in running_apps([next.takeover_region]) {
+                restart_qoder_process(app, region)?;
             }
         }
         (true, false) => {
-            let note = was_running.then_some("已重启 Qoder 清除长驻 CLI host 环境");
-            crate::stealth::uninstall_with_note(&home, &dir, note)?;
-            if was_running {
-                if let Err(e) = quit_qoder_and_wait() {
-                    let _ = crate::stealth::install(&home, &dir, old.proxy_port);
+            let running = running_apps([old_region]);
+            let note = running
+                .first()
+                .map(|_| "已重启客户端清除长驻 CLI host 环境");
+            crate::stealth::uninstall_with_note(&home, old_region, &dir, note)?;
+            if !running.is_empty() {
+                if let Err(e) = quit_qoder_and_wait(old_region) {
+                    let _ = crate::stealth::install(&home, old_region, &dir, old.proxy_port);
                     return Err(e);
                 }
             }
             if let Err(e) = accounts::save_settings(&dir, &next) {
-                let _ = crate::stealth::install(&home, &dir, old.proxy_port);
-                if was_running {
-                    let _ = open_qoder();
+                let _ = crate::stealth::install(&home, old_region, &dir, old.proxy_port);
+                if !running.is_empty() {
+                    let _ = open_qoder(old_region);
                 }
                 return Err(e.to_string());
             }
-            if was_running {
-                open_qoder()?;
+            if !running.is_empty() {
+                open_qoder(old_region)?;
             }
         }
         (true, true) => {
-            let note = was_running.then_some("已重启 Qoder 切换端口并清除长驻 CLI host 环境");
-            crate::stealth::uninstall_with_note(&home, &dir, note)?;
-            if was_running {
-                if let Err(e) = quit_qoder_and_wait() {
-                    let _ = crate::stealth::install(&home, &dir, old.proxy_port);
+            // 换端口 / 换区域：两个区域的客户端都可能正在跑，都算「受影响」
+            let running = running_apps([old_region, next.takeover_region]);
+            let note = running
+                .first()
+                .map(|_| "已重启客户端以清除长驻 CLI host 环境");
+            crate::stealth::uninstall_with_note(&home, old_region, &dir, note)?;
+            if !running.is_empty() {
+                if let Err(e) = quit_qoder_and_wait(old_region) {
+                    let _ = crate::stealth::install(&home, old_region, &dir, old.proxy_port);
                     return Err(e);
                 }
             }
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
-            if !wait_for_takeover(&home, &dir, next.proxy_port) {
+            if !wait_for_takeover(&home, next.takeover_region, &dir, next.proxy_port) {
                 let _ = accounts::save_settings(&dir, &old);
-                let _ = wait_for_takeover(&home, &dir, old.proxy_port);
-                if was_running {
-                    let _ = open_qoder();
+                let _ = wait_for_takeover(&home, old_region, &dir, old.proxy_port);
+                if running.contains(&old_region) {
+                    let _ = open_qoder(old_region);
                 }
-                return Err(format!("无法切换到端口 {}，已回滚原端口。", next.proxy_port));
+                return Err(format!(
+                    "无法把接管切换到{}（127.0.0.1:{}），已回滚。",
+                    next.takeover_region.label(),
+                    next.proxy_port
+                ));
             }
-            if was_running {
-                open_qoder()?;
+            // 之前跑着的客户端全部拉起（旧区域的刚被我们退掉；新区域的若本来开着，
+            // 它进程里那份 spawn 时刻定死的 env 还指着旧地址，也只有重启能纠正）
+            for region in &running {
+                open_qoder(*region)?;
             }
         }
-        (false, false) => unreachable!(),
+        // 两端都关着：那说明变的是**区域**（关着的时候端口本来就能随手改，
+        // 那条路走 `save_settings`）。此时没有任何端点装着、也没有客户端受影响 ——
+        // 只是一次普通的落盘。
+        //
+        // ⚠️ 这里此前是 `unreachable!()`：拓扑只有「启停 + 端口」时确实到不了，
+        // 但区域进了拓扑之后，「接管关着的时候换区域」是**合法操作**，
+        // 一旦命中就会把整个应用 panic 掉（release 构建里 panic = abort）。
+        (false, false) => {
+            accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
+        }
     }
     Ok(next)
 }
@@ -946,10 +1124,15 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, Str
     let dir = data_dir(&app);
     let current = accounts::load_settings(&dir);
     let settings = normalize_settings(settings)?;
+    // 拓扑（启停 / 端口 / 区域）里任何一项变了，都必须走 `apply_settings`：
+    // 区域同样属于拓扑 —— 换区域要「摘掉旧区域的端点 + 重启受影响的客户端 + 装进新区域」，
+    // 直接落盘会留下「A 区域的客户端还指着我们的代理，代理却按 B 区域的账号扣费」。
+    // 关着的时候端口与区域都只是普通配置（那时没有任何端点装着），照旧允许直接存。
     if current.proxy_enabled != settings.proxy_enabled
         || (current.proxy_enabled && current.proxy_port != settings.proxy_port)
+        || (current.proxy_enabled && current.takeover_region != settings.takeover_region)
     {
-        return Err("接管启停或换端口必须使用安全切换流程。".into());
+        return Err("接管启停、换端口或换区域必须使用安全切换流程。".into());
     }
     accounts::save_settings(&dir, &settings).map_err(|e| e.to_string())?;
     Ok(settings)
@@ -1033,7 +1216,7 @@ pub(crate) async fn fetch_samples(accounts: &[Account]) -> (String, Vec<ledger::
         if i > 0 {
             crate::http::account_gap().await;
         }
-        let view = checkin::fetch_resource_view(&a.token).await;
+        let view = checkin::fetch_resource_view(a.region, &a.token).await;
         readings.push(ledger::Reading {
             id: a.id.clone(),
             packages: view.packages,
@@ -1249,23 +1432,55 @@ fn stagger_seconds(enabled: bool, max: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// 常驻 CLI host 的正则必须命中**该区域客户端自己**解包资源里的进程，
+    /// 且不能误杀本项目自身、也不能命中另一个区域的客户端。
+    ///
+    /// 旧版这里写死的是 `.../MacOS/Electron`（一个进程都匹配不到），
+    /// 以及 `.../app.asar.unpacked/cli/`（0.3.3 起资源目录已经不在 `cli/` 下）。
     #[test]
-    fn cli_host_pattern_matches_host_and_not_ourselves() {
-        let re = regex::Regex::new(QODER_CLI_HOST_PATTERN).unwrap();
-        // 长驻 CLI host 的典型 argv：node + Qoder 内置 CLI 路径
-        assert!(re.is_match(
+    fn cli_host_pattern_is_per_region_and_never_matches_ourselves() {
+        let g = regex::Regex::new(&Region::Global.cli_host_process_pattern()).unwrap();
+        // 长驻 CLI host 的典型 argv：node + 该客户端内置 CLI 的路径
+        assert!(g.is_match(
             "/usr/local/bin/node /Applications/Qoder.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy host --session=x"
         ));
-        assert!(re.is_match(
-            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+        // 资源目录改了名也照样命中：正则钉的是「解包资源根」这条稳定不变量
+        assert!(g.is_match(
+            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/cli/bin/qoder host"
         ));
-        // 自家应用（QoderAssistant）绝不能被误杀
-        assert!(!re.is_match(
+        // 自家应用绝不能被误杀
+        assert!(!g.is_match(
             "/Users/waxilo/Desktop/Code/QoderAssistant/src-tauri/target/debug/qoder-assistant"
         ));
-        assert!(!re.is_match(
-            "/Applications/Qoder.app/Contents/MacOS/Electron --type=renderer"
+        // 另一个区域的客户端也不该被这个区域的正则命中 —— 否则「切换接管区域」时
+        // 会把用户正在用的另一个客户端的长驻 host 一起杀掉
+        assert!(!g.is_match(
+            "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/cli/bin/qoder host"
         ));
+
+        // 国内版：应用名带空格，转义必须仍然正确
+        let c = regex::Regex::new(&Region::Cn.cli_host_process_pattern()).unwrap();
+        assert!(c.is_match(
+            "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/cli/bin/qoder host"
+        ));
+        assert!(!c.is_match(
+            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/cli/bin/qoder host"
+        ));
+    }
+
+    /// 「是否在跑 / 退出 / 重启」全靠这条主正则。旧版指向并不存在的
+    /// `/Applications/Qoder.app/Contents/MacOS/Electron`，于是这三件事一直是假装做完了。
+    /// 这里把它钉在真实的 `CFBundleExecutable` 上，并保证两个区域互不误伤。
+    #[test]
+    fn main_process_pattern_points_at_the_real_executables() {
+        let g = regex::Regex::new(&Region::Global.macos_process_pattern()).unwrap();
+        assert!(g.is_match("/Applications/Qoder.app/Contents/MacOS/Qoder"));
+        assert!(g.is_match("/Applications/Qoder.app/Contents/MacOS/Qoder --type=renderer"));
+        assert!(!g.is_match("/Applications/Qoder CN.app/Contents/MacOS/Qoder CN"));
+
+        let c = regex::Regex::new(&Region::Cn.macos_process_pattern()).unwrap();
+        assert!(c.is_match("/Applications/Qoder CN.app/Contents/MacOS/Qoder CN --type=gpu"));
+        assert!(!c.is_match("/Applications/Qoder.app/Contents/MacOS/Qoder"));
     }
 
     #[test]
@@ -1348,6 +1563,7 @@ mod tests {
 
     fn acct_with_last(id: &str, at: &str, balance: Option<f64>) -> Account {
         Account {
+            region: Region::Global,
             id: id.into(),
             name: id.into(),
             phone: None,

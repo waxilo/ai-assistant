@@ -17,7 +17,7 @@
 //! 但没有任何一处报错。所以这里把「不认识就返回 `None`」和「认识但值非法也返回 `None`」
 //! 分开处理：前者是覆盖不全，后者是数据坏了，都不该编出一个假时间。
 
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
 
 /// 秒 / 毫秒的分界：早于 2001-09-09（`1e10` 毫秒）的一律当秒看待。
@@ -73,6 +73,15 @@ fn iso_to_ms(s: &str) -> Option<i64> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
         .ok()
         .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+/// 毫秒绝对值 → **官方文件里那个写法**：UTC 的 ISO-8601、秒精度（`2026-10-19T03:38:47Z`）。
+///
+/// 这是 [`norm_ts`] 的逆运算，存在的唯一理由是**写回**：`auth.v1.dat` 里两个有效期字段是
+/// 字符串，若续签后写成毫秒数字，官方客户端读到的类型就变了。精度按秒——原文就是秒，
+/// 多写三位小数会让同一份数据在两次写回之间"看起来变了"。
+pub(crate) fn iso_utc(ms: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp_millis(ms).map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// 从一段响应里取有效期：**绝对时间戳优先，只有相对秒数时按 `now_ms` 折算**。
@@ -159,6 +168,23 @@ mod tests {
         assert_eq!(token_expiry(&json!({}), &["expiresAt"], &["expires_in"], now), None);
         // 绝对字段是垃圾 → 不产生「0 = 已过期」这种假结论
         assert_eq!(token_expiry(&json!({ "expiresAt": "abc" }), &["expiresAt"], &[], now), None);
+    }
+
+    /// `iso_utc` 与 `norm_ts` 必须互为逆运算 —— 写回用它，读回用前者，
+    /// 一旦两者精度/时区口径不一致，就会出现「续签一次，有效期漂移几小时」。
+    #[test]
+    fn iso_utc_is_the_inverse_of_norm_ts() {
+        // 实测值：本机国内版 auth.v1.dat 的 expiresAt
+        assert_eq!(
+            iso_utc(1_792_381_127_000).as_deref(),
+            Some("2026-10-19T03:38:47Z")
+        );
+        for ms in [1_792_381_127_000i64, 1_820_893_127_000, 1_700_000_000_000] {
+            let text = iso_utc(ms).expect("合法毫秒应可格式化");
+            assert_eq!(norm_ts(Some(&json!(text.clone()))), Some(ms), "{text}");
+        }
+        // 超出 chrono 表示范围时宁可为 None，也不编一个时间
+        assert_eq!(iso_utc(i64::MAX), None);
     }
 
     /// 绝对字段缺失（`null`）时**不能**回退到相对字段：`null` 是明确的「没有」，

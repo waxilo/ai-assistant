@@ -31,6 +31,42 @@ export const IconCheck = (p: IconProps) => (
   </Svg>
 );
 
+/**
+ * 品牌标记：字母 Q —— 侧栏标题左边那块蓝色方块里的白色字形。
+ *
+ * 它**不是**线性图标，所以不走上面的 `Svg`（那套是 1.75 的细描边）。
+ * 这里的每个数都从 `scripts/make-icon.mjs` 的版面常量**折算**而来，换算比 = 12/270
+ * （应用图标里环外径 270 ↦ viewBox 半径 12，即字形外接框正好填满 24 画布）：
+ *
+ * | make-icon.mjs | 算式 | 此处 |
+ * |---|---|---|
+ * | 环中径 222（=270−96/2） | 222 × 12/270 | `r = 9.85`（留 0.02 防贴边） |
+ * | 环笔画 96 | 96 × 12/270 | `strokeWidth = 4.27` |
+ * | 尾宽 86 | 86 × 12/270 | `strokeWidth = 3.82` |
+ * | 尾起 70（半径） | 12 + 70×12/270×cos45° | `M14.2 14.2` |
+ * | 尾终 312（半径） | 12 + 312×12/270×cos45° | `21.81 21.81` |
+ *
+ * ⚠️ **端帽必须是 `round`**：make-icon 里尾巴是「线段距离再减半宽」，也就是**胶囊**；
+ * 用 `butt` 端帽尾巴会短掉 16%，读起来是「环上被啃了个缺口」而不是字母尾巴 ——
+ * 而两者都叫「Q」，肉眼不比对根本看不出来。
+ *
+ * 尾巴刻意**穿过环的空心**：只贴着外沿伸出去会变成放大镜（试过，见 make-icon.mjs 的注释）。
+ */
+export const IconQ = ({ size = 18, className }: IconProps) => (
+  <svg
+    className={className}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeLinecap="round"
+  >
+    <circle cx="12" cy="12" r="9.85" strokeWidth={4.27} />
+    <path d="M14.2 14.2 21.81 21.81" strokeWidth={3.82} />
+  </svg>
+);
+
 export const IconSwap = (p: IconProps) => (
   <Svg {...p}>
     <path d="M17 3l4 4-4 4" />

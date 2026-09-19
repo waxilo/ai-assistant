@@ -24,6 +24,7 @@
 
 use crate::accounts::{Account, CheckinRecord};
 use crate::qoder_api::{self, Campaign, CampaignView};
+use crate::region::Region;
 use crate::usage::ResourceView;
 
 /// 一次拉取「剩余积分 + 最早过期时间 + 逐包明细」—— **额度读数的唯一入口**。
@@ -31,12 +32,13 @@ use crate::usage::ResourceView;
 /// `commands`（刷新 / 采样 / 批量签到后的补读）与 `proxy`（路由前补拉）都调它，
 /// 再交给 `ledger` 落同一份盘。
 ///
-/// **为什么不再收 `host`**：那个参数是 CodeBuddy 时代「按 token 的 `iss` 猜域」的残留
-/// （旧版 `candidate_hosts`），在 Qoder 上三个调用方传进来的值**一个都没被用过**。
-/// 一个恒被忽略的参数比没有参数更糟：它让下一个人以为「这里可以选域」，
-/// 而实际上打到哪个域只由 [`crate::qoder_api::OPENAPI_BASE`] 决定。
-pub async fn fetch_resource_view(token: &str) -> ResourceView {
-    crate::usage::fetch_usage(token).await
+/// **为什么要收 `region`**：上一版这里收的是一个**恒被忽略**的 `host` 参数
+/// （CodeBuddy 时代「按 token 的 `iss` 猜域」的残留）。现在域真的有两个了，
+/// 但它**依然不该由调用方猜** —— 传进来的必须是 [`Account::region`]，
+/// 即账号自己登记的区域。理由是同一个：猜错的代价是静默 401，
+/// 而唯一知道答案的地方就是账号记录本身。
+pub async fn fetch_resource_view(region: Region, token: &str) -> ResourceView {
+    crate::usage::fetch_usage(region, token).await
 }
 
 /// 只读查询「今天领没领」。
@@ -49,7 +51,7 @@ pub async fn fetch_resource_view(token: &str) -> ResourceView {
 /// 「今天没有这条活动」「活动已过期」「查询失败」都不等于「没领」，
 /// 编一个布尔值出去只会让界面显示一个假状态。
 pub async fn query_checked_today(account: &Account) -> Option<bool> {
-    let view = qoder_api::fetch_campaigns(&account.token).await?;
+    let view = qoder_api::fetch_campaigns(account.region, &account.token).await?;
     checked_from_status(&view.daily_claim()?.claim_status)
 }
 
@@ -106,7 +108,7 @@ fn plan(view: &CampaignView) -> Plan<'_> {
 /// - 都不是：真失败（网络 / 鉴权 / 服务端拒绝），`message` 里带原因
 pub async fn do_checkin(account: &Account) -> CheckinRecord {
     let at = now();
-    let Some(view) = qoder_api::fetch_campaigns(&account.token).await else {
+    let Some(view) = qoder_api::fetch_campaigns(account.region, &account.token).await else {
         return CheckinRecord {
             message: "活动接口不可用（网络或登录态异常）".into(),
             ..blank(&at)
@@ -131,7 +133,7 @@ pub async fn do_checkin(account: &Account) -> CheckinRecord {
 /// 真正的那一下 `POST …/{campaignId}/claim`，外加一次余额补读。
 async fn claim(account: &Account, c: &Campaign, at: &str) -> CheckinRecord {
     let amount = c.benefit.as_ref().map(|b| b.amount);
-    let mut rec = match qoder_api::claim_campaign(&account.token, &c.id).await {
+    let mut rec = match qoder_api::claim_campaign(account.region, &account.token, &c.id).await {
         Ok(()) => CheckinRecord {
             success: true,
             message: match amount {
@@ -166,14 +168,14 @@ async fn claim(account: &Account, c: &Campaign, at: &str) -> CheckinRecord {
     // 领取成功 → 立刻补一次额度读数，让台账马上能看到这一笔。
     // best-effort：读不到就留空，界面显示「—」而不是谎报 0。
     if rec.success {
-        rec.balance = fetch_resource_view(&account.token).await.credits;
+        rec.balance = fetch_resource_view(account.region, &account.token).await.credits;
     }
     rec
 }
 
 /// 复查某条活动是否已经变成 `CLAIMED`（只读；查询失败即 `false`）。
 async fn claimed_afterwards(account: &Account, campaign_id: &str) -> bool {
-    qoder_api::fetch_campaigns(&account.token)
+    qoder_api::fetch_campaigns(account.region, &account.token)
         .await
         .and_then(|v| v.campaigns.into_iter().find(|c| c.id == campaign_id))
         .is_some_and(|c| c.claim_status == "CLAIMED")
@@ -344,11 +346,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "真实网络调用，需本机已登录 Qoder"]
     async fn smoke_real_campaigns_endpoint() {
-        let list = crate::auth_file::discover_local_accounts();
+        let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
         // 这里直接打接口（而不是 `query_campaigns`）：本机登录文件给的是 `LocalAccount`，
         // 与落盘的 `Account` 不是一个类型，冒烟测试没有理由为了一个 token 去造后者
-        let v = qoder_api::fetch_campaigns(&a.token)
+        let v = qoder_api::fetch_campaigns(a.region, &a.token)
             .await
             .expect("活动接口应可用");
         println!(
@@ -362,14 +364,15 @@ mod tests {
         }
     }
 
-    /// 真实接口冒烟：额度读数（重构后 `fetch_resource_view` 少了一个参数，确认仍可用）。
+    /// 真实接口冒烟：额度读数（重构后 `fetch_resource_view` 收的是**账号自己的区域**，
+    /// 用来确认本机账号的区域登记与真实域对得上）。
     /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_credits_endpoint`
     #[tokio::test]
     #[ignore = "真实网络调用，需本机已登录 Qoder"]
     async fn smoke_real_credits_endpoint() {
-        let list = crate::auth_file::discover_local_accounts();
+        let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
-        let v = fetch_resource_view(&a.token).await;
+        let v = fetch_resource_view(a.region, &a.token).await;
         println!(
             "剩余={:?} 最早到期={:?} 包数={}",
             v.credits,

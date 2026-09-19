@@ -134,19 +134,66 @@
   padding: 2px 8px;
   border-radius: var(--radius-pill);
 }
-/* 控制条里的端口：宽度是设计值，且不再需要 !important */
-.tk-port {
+/* 控制条里的行内小字段（区域 / 端口）：一个标签 + 一个窄控件。
+   两者外观必须同源，否则一排小控件会长短不齐。 */
+.tk-field {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   font-size: var(--fs-sm);
   color: var(--muted);
 }
-.tk-port input {
+.tk-field input {
   width: 78px;
   margin: 0;
   padding: 5px 8px;
   text-align: right;
+}
+/* 下拉框的宽度由内容撑（「国际版」三个字），右侧留出自定义箭头的位置 */
+.tk-field select {
+  width: auto;
+  margin: 0;
+  padding: 5px 32px 5px 9px;
+}
+
+/* 「这个区域一个账号都没有」的提示条：说清这一页为什么没得选，右侧带一键切换。
+   用 warn 系而不是 err 系 —— 它不是故障，是一个还没配好的状态。 */
+.tk-nudge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--text-2);
+  font-size: var(--fs-cap);
+  line-height: 1.55;
+}
+.tk-nudge > svg {
+  flex: 0 0 auto;
+  color: var(--warn-d);
+}
+.tk-nudge b {
+  color: var(--text);
+}
+
+/* 模型清单「第 1 层为什么没结果」的说明行（限流切换弹窗里，紧随「来源：…」）。
+   比 .modal-meta 大一档、颜色亮一档：它是用户下一步该做什么的依据，
+   而「来源：本机记录」只说出了结果。 */
+.tk-why {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: var(--fs-cap);
+  color: var(--muted);
+  line-height: 1.6;
+}
+.tk-why > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
 }
 
 /* 动态区：组合 .card 后填满剩余高度，事件列表内部滚动 */
@@ -474,7 +521,8 @@
   color: var(--muted);
   margin: 0;
 }
-.set-field input {
+.set-field input,
+.set-field select {
   width: 100%;
   margin-top: 6px;
 }
