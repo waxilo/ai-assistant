@@ -1,6 +1,6 @@
 [package]
 name = "qoder-assistant"
-version = "0.1.4"
+version = "0.1.6"
 description = "Qoder 多账号签到桌面助手"
 authors = ["waxilo"]
 edition = "2021"
@@ -50,6 +50,27 @@ cbc = { version = "0.1", features = ["alloc"] }
 block-padding = "0.3"
 hmac = "0.12"
 sha1 = "0.10"
+# —— COSY 凭据重签（这才是「真接管」的落点）——
+# Qoder 客户端**不拿 Bearer token 认证业务接口**，而是把账号凭据**封进请求头自己**：
+# `Authorization: Bearer COSY.<payload_b64>.<md5hex>` + `Cosy-User/Cosy-Key/Cosy-Date`。
+# 想换号就只能按同一算法重算（见 `src/cosy.rs`）：
+#   - AES-128-CBC（已有 aes + cbc + block-padding）
+#   - 内嵌 RSA 公钥做 PKCS#1 v1.5 加密 → 需要 `rsa`
+#   - 载荷摘要是 **MD5**（不是 sha256）→ 需要 `md-5`
+md-5 = "0.10"
+# 用默认 features（含 `pem`/`std`）：`RsaPublicKey::from_public_key_pem` 是
+# `pkcs8::DecodePublicKey` trait 提供的，把 features 砍到最小反而会把它关掉。
+rsa = "0.9"
+# —— 智能接管的本地 TLS ——
+# Qoder 客户端把端点 scheme **写死成 https**（覆盖值只校验 `new URL(v).origin`），
+# 所以反代必须真的能终止 TLS，否则写进端点的地址会被客户端直接拒绝或握手失败。
+# 证书在本机生成（自签 CA + 叶证书，SAN = IP:127.0.0.1），私钥只落本应用数据目录。
+# - rustls：同步 `StreamOwned`，与 proxy.rs 现有的 `Read + Write` 手写 HTTP 解析天然契合
+# - ring：与 reqwest 已带入的 backend 一致，避免同一 crate 被编两遍
+# - rcgen：纯 Rust 生成证书；显式选 ring，避开默认的 aws-lc-rs（需要 cmake）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 

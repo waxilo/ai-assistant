@@ -699,6 +699,7 @@ export default function App() {
               accounts={accounts}
               askConfirm={askConfirm}
               onSettings={setSettings}
+              onReloadSettings={reloadSettings}
               onToast={showToast}
             />
           )}

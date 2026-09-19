@@ -14,6 +14,21 @@
 //! 里面还有 `sandbox` / `claw` / `enabledPlugins` 等我们不认识的键。用 `serde_json::Value`
 //! 原样保留未知字段，避免「恢复」变成「清空别人的配置」。
 //!
+//! # 2026-09-19 修正：这里的「病因」已经作废，但「清残留」仍然有用
+//!
+//! `CODEBUDDY_BASE_URL` 是 WorkBuddy/CodeBuddy 时代的键，而 Qoder 的两个客户端
+//! **都不读它**（无字面量、无消费者）。智能接管现在也不再写任何配置文件 ——
+//! 它改的是客户端 `app.asar.unpacked` 里那份 worker 产物（见 [`crate::patch`]）。
+//! 所以：扫描命中这些键 ≠ 网络会不通，清掉它属于**历史残留清理**，不是修复。
+//!
+//! **真正会断网的是产物里的僵尸注入**：产物里留着指向本机端口、而反代已经不在，
+//! 那个客户端的每一次对话都会去敲一个没人监听的端口。这一项由 `takeover_issues`
+//! 直接读产物判定，报成 `block`；活着的接管则是 `ok`，不污染 `healthy`。
+//!
+//! 同时删除了一项判定：过去它会因为「长驻 CLI host 仍缓存已摘除的端点」而报 `block`
+//! 并让用户重启 Qoder —— 那个前提不成立（Qoder 每次会话 spawn 一次性 `--print`
+//! 进程，没有长驻 host），它只会制造假警报、并诱导用户去重启客户端。
+//!
 //! 家目录是**参数**而不是到处调 `dirs::home_dir()`：这样整条恢复流程能在临时目录里跑完
 //! 单测，不会碰到用户真实配置（见文末 tests）。
 
@@ -271,12 +286,9 @@ pub fn diagnose(home: &Path, data_dir: &Path) -> NetReport {
                 if val.trim().is_empty() {
                     continue;
                 }
-                // 先问一句「这是本应用正在工作的接管吗」——是就不能当污染报，
-                // 否则用户点一次「一键恢复」就把自己刚开的功能关了。
-                if let Some(issue) = self_issue(data_dir, &label, key, val) {
-                    issues.push(issue);
-                    continue;
-                }
+                // 这里**不再**问「是不是本应用正在工作的接管」：接管已经改成直接往
+                // 客户端的 worker 产物里注入端点，配置文件里一个键都不写。所以配置文件
+                // 里出现这些键，就一定是历史残留或用户自己配的，照常按污染报。
                 let (level, note) = judge_value(val);
                 issues.push(NetIssue {
                     id: format!("file:{label}:env.{key}"),
@@ -349,9 +361,12 @@ pub fn diagnose(home: &Path, data_dir: &Path) -> NetReport {
     }
     scanned.push("shell 启动脚本（.zshrc / .zprofile / .bash_profile 等）".into());
 
-    // 4) 本应用反代：开着不是故障，但「一键恢复」会顺带关掉，先说清楚。
-    //    如果上面已识别为「智能接管 / 正常」（活的接管），这里不再单列一条，
-    //    否则用户会以为有两个东西在跑。只在没有识别到活的接管时（异常状态）才报出来。
+    // 4) 智能接管：它的踪迹**只在客户端 worker 产物里**，上面那圈配置文件扫描看不到它。
+    issues.extend(takeover_issues(data_dir));
+    scanned.push("Qoder 客户端 worker 产物（智能接管注入）".into());
+
+    // 5) 本应用反代：开着不是故障，但「一键恢复」会顺带关掉，先说清楚。
+    //    已经识别到「活的接管」时不再单列一条，否则用户会以为有两个东西在跑。
     let settings = crate::accounts::load_settings(data_dir);
     if settings.proxy_enabled {
         let alive_takeover = issues
@@ -372,14 +387,6 @@ pub fn diagnose(home: &Path, data_dir: &Path) -> NetReport {
         }
     }
 
-    // 5) 长驻 CLI host 是否使用过随后被摘除的接管端点。
-    //    settings 键删除后，旧值仍可能留在 process.env；只能用代理请求事件、卸载事件
-    //    与当前主进程启动时间交叉定位。
-    match desktop_stale_takeover(home, data_dir) {
-        Some(issue) => issues.push(issue),
-        None => scanned.push("接管事件日志 × Qoder 进程启动时间（未见异常）".into()),
-    }
-
     NetReport {
         healthy: !issues.iter().any(|i| i.level == "block"),
         issues,
@@ -387,132 +394,53 @@ pub fn diagnose(home: &Path, data_dir: &Path) -> NetReport {
     }
 }
 
-/// 判定核心：某次接管确实收到过模型请求，随后端点被摘除，而当前 Qoder
-/// 主进程又早于摘除时刻启动，说明长驻 CLI host 尚未通过重启清掉旧 process.env。
-fn stale_cli_cache(events: &[crate::stealth::JournalEvent], desktop_start_ms: i64) -> Option<i64> {
-    let mut open = false;
-    let mut used = false;
-    for e in events {
-        match e.event.as_str() {
-            "install" => {
-                open = true;
-                used = false;
-            }
-            "proxy_request" if open => used = true,
-            "uninstall" if open => {
-                if used && desktop_start_ms <= e.at_ms {
-                    return Some(e.at_ms);
-                }
-                open = false;
-                used = false;
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// **任意一个**官方客户端的进程启动时刻，取最早的那个。
+/// 智能接管现在**只剩一处踪迹**：客户端 worker 产物里的注入段。
 ///
-/// 它用来回答「桌面端是不是比那批残留事件更晚起来」。两个客户端可能同时在跑，
-/// 取最早 = 最保守的判断（更不容易把残留误判成已经清干净）。
+/// 端点已不再写进任何配置文件（`settings.json` 的 `env` 块根本没有消费者），
+/// 所以「扫配置文件」这件事对判断接管状态彻底失效 —— 必须直接问产物。
 ///
-/// 旧版这里的正则是 `^/Applications/Qoder.app/Contents/MacOS/Electron$` —— 一个进程
-/// 都匹配不到（见 `region` 模块），所以这条判断实际上从来没有生效过。
-fn qoder_start_ms() -> Option<i64> {
-    let mut earliest: Option<i64> = None;
+/// 心跳还在且租约指的就是这个区域 → `ok`（正常工作中），不污染 `healthy`，
+/// 免得用户点一次「一键恢复」把自己刚开的功能关掉；心跳停了 → 那是崩溃留下的
+/// 僵尸注入，它会让这个客户端的所有对话都打到一个没人监听的端口上，判为断网。
+fn takeover_issues(data_dir: &Path) -> Vec<NetIssue> {
+    let lease = crate::stealth::load_lease(data_dir);
+    let mut out = Vec::new();
     for region in Region::ALL {
-        let Some(ms) = process_start_ms(&region.macos_process_pattern()) else {
+        if !crate::patch::is_installed(region) {
             continue;
-        };
-        earliest = Some(earliest.map_or(ms, |cur: i64| cur.min(ms)));
+        }
+        let url = crate::patch::current_url(region).unwrap_or_default();
+        // 租约必须「新鲜 **且** 说的就是这个区域」才算工作正常：
+        // 两个区域各可能留一份注入，其中一份是上一轮接手时的残留。
+        let mine = lease.as_ref().filter(|l| l.region == region);
+        let working = mine.is_some_and(crate::stealth::is_alive);
+        out.push(NetIssue {
+            id: format!("takeover:{}", region.key()),
+            scope: if working {
+                "智能接管".into()
+            } else {
+                "客户端产物".into()
+            },
+            target: format!("{} · worker 产物", region.label()),
+            value: truncate(&url, 120),
+            // ok 不参与 healthy 判定，界面上显示成「正常」
+            level: if working { "ok".into() } else { "block".into() },
+            note: if working {
+                format!(
+                    "本应用「智能接管」正在工作：端点已注入该客户端的 worker 产物，对话请求经 \
+                     127.0.0.1:{} 转发，按你勾选的扣费账号轮换。这是你自己开的功能，不需要处理；\
+                     想停用请到「智能接管」页关闭。",
+                    mine.map(|l| l.port).unwrap_or_default()
+                )
+            } else {
+                "这里留着本应用「智能接管」写下的端点，但心跳已停（应用可能崩溃退出）——\
+                 它会让这个客户端的所有对话都打到没人监听的端口上，清掉即可恢复。"
+                    .into()
+            },
+            fixable: true,
+        });
     }
-    earliest
-}
-
-/// `pgrep -f <正则>` 取第一个 pid，再由 `ps -o lstart=` 换算成毫秒时间戳
-fn process_start_ms(pattern: &str) -> Option<i64> {
-    let out = Command::new("pgrep").args(["-f", pattern]).output().ok()?;
-    let pid = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
-    if pid.is_empty() {
-        return None;
-    }
-    let out = Command::new("ps").args(["-p", &pid, "-o", "lstart="]).output().ok()?;
-    let line = String::from_utf8_lossy(&out.stdout).to_string();
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 5 {
-        return None;
-    }
-    let naive = chrono::NaiveDateTime::parse_from_str(
-        &format!("{} {} {}", parts[1], parts[2], parts[4]),
-        "%b %e %H:%M:%S %Y",
-    )
-    .ok()?;
-    use chrono::TimeZone;
-    chrono::Local.from_local_datetime(&naive).single().map(|t| t.timestamp_millis())
-}
-
-fn desktop_stale_takeover(home: &Path, data_dir: &Path) -> Option<NetIssue> {
-    let events = crate::stealth::journal_read(data_dir);
-    let removed_at = stale_cli_cache(&events, qoder_start_ms()?)?;
-    // 两个区域任一还挂着端点，就说明「已经摘干净」这个前提不成立
-    if Region::ALL
-        .iter()
-        .any(|r| crate::stealth::current_endpoint(home, *r).is_some())
-    {
-        return None;
-    }
-    let at = chrono::DateTime::from_timestamp_millis(removed_at)
-        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
-        .unwrap_or_default();
-    Some(NetIssue {
-        id: "desktop:stale-takeover".into(),
-        scope: "桌面端进程".into(),
-        target: "Qoder 长驻 CLI host（运行中）".into(),
-        value: "仍可能缓存已摘除的接管端点".into(),
-        level: "block".into(),
-        note: format!(
-            "接管期间代理确实收到过模型请求，端点已在 {at} 摘除；\
-             Qoder 的长驻 CLI host 会把该值留在 process.env，删除配置键不会清掉缓存。\
-             请重启 Qoder 与 CLI host 后恢复直连。"
-        ),
-        fixable: false,
-    })
-}
-
-/// 这个端点是「本应用智能接管」自己装的吗？
-///
-/// 是且心跳还在 → 报成 `ok`（正常工作中），不污染 `healthy`，免得用户点「一键恢复」
-/// 把自己刚开的功能关掉；心跳停了 → 那是崩溃留下的僵尸，按常规判定，会被判成会断网。
-fn self_issue(data_dir: &Path, label: &str, key: &str, val: &str) -> Option<NetIssue> {
-    let lease = crate::stealth::load_lease(data_dir)?;
-    if lease.url != val.trim() {
-        return None; // 值不是我们写进去的，不是自己人
-    }
-    let alive = crate::stealth::is_alive(&lease);
-    Some(NetIssue {
-        id: format!("file:{label}:env.{key}"),
-        scope: if alive {
-            "智能接管".into()
-        } else {
-            "配置文件".into()
-        },
-        target: format!("{label} · env.{key}"),
-        value: truncate(val, 120),
-        // ok 不参与 healthy 判定，界面上显示成「正常」
-        level: if alive { "ok".into() } else { "block".into() },
-        note: if alive {
-            format!(
-                "本应用「智能接管」正在工作：对话请求经 127.0.0.1:{} 转发，按最旧积分自动选账号。\
-                 这是你自己开的功能，不需要处理；想停用请在上方关闭「智能接管」。",
-                lease.port
-            )
-        } else {
-            "这是本应用「智能接管」写下的端点，但心跳已停（应用可能崩溃退出）——\
-             它就是现在断网的原因，清掉即可恢复。".into()
-        },
-        fixable: true,
-    })
+    out
 }
 
 fn launchctl_getenv(key: &str) -> Option<String> {
@@ -702,14 +630,14 @@ fn restore_impl(home: &Path, data_dir: &Path, touch_launchd: bool) -> NetRestore
     let (proxy_steps, proxy_disabled) = disable_proxy(data_dir);
     steps.extend(proxy_steps);
 
-    // 2) 摘掉接管端点（会还原成装载前的值，并删掉租约文件）
-    match crate::stealth::uninstall_all(home, data_dir) {
+    // 2) 摘掉接管注入（逐字节还原客户端产物，并删掉租约文件）
+    match crate::stealth::uninstall_all(data_dir) {
         Ok(()) => {
             if crate::stealth::load_lease(data_dir).is_none() {
                 steps.push(NetStep {
                     action: "摘除接管端点".into(),
                     ok: true,
-                    detail: "已还原为装载前的值（原本没有则已删除），租约已清除。".into(),
+                    detail: "客户端 worker 产物已还原成官方原样，租约已清除。".into(),
                 });
             }
         }
@@ -839,6 +767,37 @@ mod tests {
         }
         fs::create_dir_all(&data).unwrap();
         (home, data)
+    }
+
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    /// 一份「官方原版」worker 产物（只求形状像，不执行）。
+    const OFFICIAL_WORKER: &str =
+        "// qoder worker runtime (official)\nexport const boot = () => {};\n";
+
+    /// 在**临时 SDK 根**下铺好两个区域的官方产物，并覆盖 `patch` 的根。
+    ///
+    /// 必须隔离：`diagnose` 现在直接去问客户端 worker 产物「有没有我们的注入」，
+    /// 不隔离就会读到**这台机器上真装着的那个客户端** —— 本机装过又接管过时，
+    /// 这些用例会莫名其妙地变红。
+    fn with_client<T>(f: impl FnOnce() -> T) -> T {
+        let sdk = std::env::temp_dir().join(format!(
+            "wb-netfix-sdk-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for region in Region::ALL {
+            crate::patch::plant_worker(&sdk, region, OFFICIAL_WORKER);
+        }
+        let out = crate::patch::with_sdk_root(&sdk, f);
+        let _ = fs::remove_dir_all(&sdk);
+        out
+    }
+
+    /// 反代那张自签 CA 的 PEM。注入必须带上它 —— 端点被客户端强制成 https，
+    /// 少了证书客户端就连不上本地反代。
+    fn ca(data: &Path) -> String {
+        crate::certs::ensure(data).unwrap().ca_pem().unwrap()
     }
 
     #[test]
@@ -1009,16 +968,18 @@ mod tests {
     #[test]
     fn live_stealth_takeover_is_reported_as_healthy_not_pollution() {
         let (home, data) = sandbox();
-        crate::stealth::install(&home, Region::Global, &data, 8787).unwrap();
+        with_client(|| {
+            crate::stealth::install(Region::Cn, &data, 8787, &ca(&data)).unwrap();
 
-        let rep = diagnose(&home, &data);
-        let hit = rep
-            .issues
-            .iter()
-            .find(|i| i.scope == "智能接管")
-            .expect("应把本应用的接管认出来");
-        assert_eq!(hit.level, "ok", "活的接管不该报成 block/warn");
-        assert!(rep.healthy, "接管生效时不能显示成「网络有问题」");
+            let rep = diagnose(&home, &data);
+            let hit = rep
+                .issues
+                .iter()
+                .find(|i| i.id.starts_with("takeover:"))
+                .expect("应把本应用的接管认出来");
+            assert_eq!(hit.level, "ok", "活的接管不该报成 block/warn");
+            assert!(rep.healthy, "接管生效时不能显示成「网络有问题」");
+        });
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }
@@ -1027,58 +988,64 @@ mod tests {
     #[test]
     fn stale_stealth_takeover_is_reported_as_blocker() {
         let (home, data) = sandbox();
-        crate::stealth::install(&home, Region::Global, &data, 8787).unwrap();
+        with_client(|| {
+            crate::stealth::install(Region::Cn, &data, 8787, &ca(&data)).unwrap();
 
-        // 把心跳拨到很早以前，模拟应用被 kill -9 后再没起来
-        let lease = crate::stealth::lease_path(&data);
-        let mut v: Value =
-            serde_json::from_str(&fs::read_to_string(&lease).unwrap()).unwrap();
-        v["heartbeat_ms"] = Value::from(0);
-        fs::write(&lease, v.to_string()).unwrap();
+            // 把心跳拨到很早以前，模拟应用被 kill -9 后再没起来
+            let lease = crate::stealth::lease_path(&data);
+            let mut v: Value =
+                serde_json::from_str(&fs::read_to_string(&lease).unwrap()).unwrap();
+            v["heartbeat_ms"] = Value::from(0);
+            fs::write(&lease, v.to_string()).unwrap();
 
-        let rep = diagnose(&home, &data);
-        let hit = rep
-            .issues
-            .iter()
-            .find(|i| i.target.contains("CODEBUDDY_BASE_URL"))
-            .expect("僵尸端点必须被报出来");
-        assert_eq!(hit.level, "block", "心跳已停 = 断网现场");
-        assert!(!rep.healthy);
-        assert!(hit.note.contains("心跳已停"), "要说清为什么：{}", hit.note);
+            let rep = diagnose(&home, &data);
+            let hit = rep
+                .issues
+                .iter()
+                .find(|i| i.id.starts_with("takeover:"))
+                .expect("僵尸注入必须被报出来");
+            assert_eq!(hit.level, "block", "心跳已停 = 断网现场");
+            assert_eq!(hit.scope, "客户端产物", "残留不该再冒充「正常接管」");
+            assert!(!rep.healthy);
+            assert!(hit.note.contains("心跳已停"), "要说清为什么：{}", hit.note);
+        });
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }
 
-    /// 一键恢复必须「先关开关再摘端点」，且两者都落在磁盘上。
-    /// 反过来的话，反代监督线程会在 2 秒内把端点重新装回去，用户会以为恢复没生效。
+    /// 一键恢复必须「先关开关再摘注入」，且两者都落在磁盘上。
+    /// 反过来的话，反代监督线程会在 2 秒内把注入重新打回去，用户会以为恢复没生效。
     #[test]
     fn restore_disables_takeover_and_removes_the_endpoint() {
         let (home, data) = sandbox();
-        let mut s = crate::accounts::load_settings(&data);
-        s.proxy_enabled = true;
-        crate::accounts::save_settings(&data, &s).unwrap();
-        crate::stealth::install(&home, Region::Global, &data, 8787).unwrap();
-        assert_eq!(
-            crate::stealth::current_endpoint(&home, Region::Global).as_deref(),
-            Some("http://127.0.0.1:8787")
-        );
+        with_client(|| {
+            let mut s = crate::accounts::load_settings(&data);
+            s.proxy_enabled = true;
+            crate::accounts::save_settings(&data, &s).unwrap();
+            crate::stealth::install(Region::Cn, &data, 8787, &ca(&data)).unwrap();
+            assert_eq!(
+                crate::stealth::current_endpoint(Region::Cn).as_deref(),
+                Some("https://127.0.0.1:8787"),
+                "端点必须被注入（且是 https —— 客户端只认 https origin）"
+            );
 
-        // 不走 launchctl，免得测试动到整机环境
-        let rep = restore_impl(&home, &data, false);
-        assert!(rep.proxy_disabled, "恢复应报告反代被关掉");
+            // 不走 launchctl，免得测试动到整机环境
+            let rep = restore_impl(&home, &data, false);
+            assert!(rep.proxy_disabled, "恢复应报告反代被关掉");
 
-        let after = crate::accounts::load_settings(&data);
-        assert!(!after.proxy_enabled, "接管开关必须被关掉");
-        assert_eq!(
-            crate::stealth::current_endpoint(&home, Region::Global),
-            None,
-            "端点要摘干净"
-        );
-        assert!(
-            crate::stealth::load_lease(&data).is_none(),
-            "租约要删掉，否则 supervisor 会以为还装着"
-        );
-        assert!(rep.report.healthy, "恢复后应复检为健康");
+            let after = crate::accounts::load_settings(&data);
+            assert!(!after.proxy_enabled, "接管开关必须被关掉");
+            assert_eq!(
+                crate::stealth::current_endpoint(Region::Cn),
+                None,
+                "注入要摘干净"
+            );
+            assert!(
+                crate::stealth::load_lease(&data).is_none(),
+                "租约要删掉，否则 supervisor 会以为还装着"
+            );
+            assert!(rep.report.healthy, "恢复后应复检为健康");
+        });
 
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }
@@ -1103,32 +1070,12 @@ mod tests {
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }
 
-    fn ev(at_ms: i64, event: &str) -> crate::stealth::JournalEvent {
-        crate::stealth::JournalEvent {
-            at_ms,
-            at: String::new(),
-            event: event.into(),
-            detail: String::new(),
-        }
-    }
-
-    #[test]
-    fn stale_cli_cache_requires_a_real_proxy_request_before_uninstall() {
-        let used = vec![
-            ev(0, "install"),
-            ev(20, "proxy_request"),
-            ev(100, "uninstall"),
-        ];
-        assert_eq!(stale_cli_cache(&used, 10), Some(100));
-        assert_eq!(stale_cli_cache(&used, 101), None, "卸载后启动的新进程没有缓存");
-
-        let unused = vec![ev(0, "install"), ev(100, "uninstall")];
-        assert_eq!(stale_cli_cache(&unused, 10), None, "从未走过代理就没有缓存");
-        let open = vec![ev(0, "install"), ev(20, "proxy_request")];
-        assert_eq!(stale_cli_cache(&open, 10), None, "端点仍在线时不是故障");
-        assert_eq!(stale_cli_cache(&[], 10), None);
-    }
-
+    /// 事件日志里那条 `proxy_request`（「反代确实收到过模型请求」的内部证据）必须原样
+    /// 落在盘上：它不展示，但它是**唯一**能证明端点被真正用过的东西。
+    ///
+    /// 这里曾有第二个断言，问的是「长驻 CLI host 有没有把摘掉的端点留在 process.env」。
+    /// 该前提已被推翻（Qoder 的推理进程是每次会话一次性 spawn 的 `--print` 进程，
+    /// 没有长驻 host），判定逻辑随之删除，只留下「证据不丢」这一半。
     #[test]
     fn journal_preserves_proxy_request_evidence() {
         let (home, data) = sandbox();
@@ -1143,8 +1090,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let hit = stale_cli_cache(&crate::stealth::journal_read(&data), now - 50_000);
-        assert_eq!(hit, Some(now - 30_000));
+        let events = crate::stealth::journal_read(&data);
+        assert_eq!(
+            events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
+            vec!["install", "proxy_request", "uninstall"]
+        );
+        assert_eq!(events[1].at_ms, now - 45_000, "时间戳要原样保留");
         let _ = diagnose(&home, &data);
         let _ = fs::remove_dir_all(home.parent().unwrap());
     }

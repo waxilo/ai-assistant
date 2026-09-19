@@ -438,7 +438,10 @@ export interface StealthStatus {
 export interface JournalEvent {
   at_ms: number;
   at: string;
-  /** install / uninstall / route_start / restart_qoder / proxy_upstream_error / … */
+  /**
+   * install / uninstall / route_start / proxy_upstream_error / …
+   * （历史日志里还可能见到 `restart_qoder`：产它的代码已删除，展示层仍认得它）
+   */
   event: string;
   detail: string;
 }

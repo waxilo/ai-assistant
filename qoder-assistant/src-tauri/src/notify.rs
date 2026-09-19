@@ -209,6 +209,7 @@ mod tests {
                 rt_expires_at: None,
                 created_at: String::new(),
                 checked_today: None,
+                cosy_uid: None,
                 last: rec,
             },
             credits: None,

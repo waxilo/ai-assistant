@@ -44,10 +44,11 @@
 //! # 不猜的部分
 //!
 //! 国内版的 `authRedirectUris` 是 `null`、`cliEnvironmentPrefix` 是 `QODERCN`，
-//! 但**接管用的那个环境变量键名在 CN 侧没有实测依据**（CLI 是独立二进制，
-//! 键名由 `${prefix}_...` 拼出来）。所以 [`Region::takeover_env_key`] 两个区域都返回
-//! 同一个已实测可用的键，并在该处写明了这条不确定性 —— 与其猜一个新键把现网可用的
-//! 接管弄坏，不如让两边共用同一个已验证的键。
+//! 键名由 `${prefix}${name}` 拼出来。`QODERCN_SERVER_ENDPOINT` 已**实测生效**
+//! （客户端运行日志的 `[config-service] baseUrl` 变成了我们给的值），所以
+//! [`Region::endpoint_env_key`] 对国内版返回它；国际版走的是只覆盖 center 的另一个键，
+//! 推理端点还得靠代答 `/api/v3/service/region/endpoints`，因此**返回 `None` 显式表示
+//! 不支持** —— 而不是猜一个键名，把接管做成「看着开着、其实空转」。
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -218,14 +219,62 @@ impl Region {
         }
     }
 
-    // ---------------------------------------------------------------- 官方客户端
+    // ---------------------------------------------------------------- 官方客户端（无进程指纹）
 
-    /// 官方客户端的可执行名 / `open -a` 用的名字（`CFBundleExecutable`，也是
-    /// `open -a` 认的那个名字）。
-    pub fn app_name(self) -> &'static str {
+    // 这里曾有 `app_name` / `macos_app_dir` / `macos_exec_path` / `macos_process_pattern`
+    // 一串「进程指纹」，服务的是「退出客户端 → 重启客户端 → 判断它在不在跑」那套操作。
+    // 那套操作整体删除之后（Qoder 的推理是**每次会话一次性 spawn 的 `--print` 进程**，
+    // 没有可重启的长驻 host），这四个方法就没有调用方了，一并删掉 —— 留着只会让人
+    // 以为本应用还会去动客户端进程。
+    //
+    // 顺带记一笔当年的坑：老正则写死成 `.../Contents/MacOS/Electron`，而两个客户端的
+    // `CFBundleExecutable` 其实是 `Qoder` / `Qoder CN` —— 那条正则**一个进程都匹配不到**，
+    // 于是「重启成功」这件事长期是假装做完了。这也是为什么「假装接管成功」能骗过界面。
+
+    // ------------------------------------------------------------------ 智能接管
+
+    /// 智能接管要写进客户端的**端点环境变量键**；该区域不支持时返回 None。
+    ///
+    /// # 键名在产物里没有字面量，只能顺着 `Rr=` 回溯
+    ///
+    /// 客户端读端点的唯一入口是：
+    ///
+    /// ```text
+    /// function v7a(){ if(!Ja) return; let A = process.env[aue]; let e = M7a(A); … }
+    /// function yg(A){ return v7a() ?? A }      // 有覆盖就用覆盖，没有才退回默认
+    /// ```
+    ///
+    /// 其中 `aue = Rr("SERVER_ENDPOINT")`、`Rr(name) = ${前缀}${name}`，前缀由区域
+    /// 常量决定（国内版构建里 `Mo = "cn" == (eTs="cn")` 恒真，`"QODERCN_"` 被折叠进
+    /// 产物）。**所以直接 grep `QODERCN_SERVER_ENDPOINT` 是 0 命中**（踩过这个坑），
+    /// 要顺着 `Rr(` 与 `Uer=` 回溯才拿得到真实键名。
+    ///
+    /// # 两个区域的开关是相反的，所以这里必须分叉
+    ///
+    /// `v7a()` 开头那句 `if(!Ja) return` 说明**它只在一个区域的构建里生效**：
+    /// `Ja` 在国内版里恒真、国际版里恒假 —— 国际版读的是 `U7a()`
+    /// （`QODER_CENTER_ENDPOINT`），而它**只覆盖 center**：推理端点还得靠代答
+    /// `/api/v3/service/region/endpoints` 的选举结果。
+    ///
+    /// 于是国际版这里返回 `None`，让上层明确报「尚未支持」——
+    /// 而不是写一段**看起来生效、实际没人读**的注入。那正是这块历史踩过的坑：
+    /// 配置写成功、界面显示已开启、端口在听，而对话一直直连官方。
+    ///
+    /// # 覆盖值的形态（实测确认）
+    ///
+    /// `M7a()` 只做 `new URL(v).origin` 校验，所以：
+    ///
+    /// - **必须 https**（没有 `http:` 分支）；
+    /// - 路径必须为空或 `/`，不能带查询串 / 散列 / 用户名；
+    /// - **端口可以带** —— origin 含端口，`https://127.0.0.1:8789` 合法，
+    ///   不必占 443、不需要管理员。反代因此必须自己终止 TLS，见 [`crate::certs`]。
+    ///
+    /// 实测（`QODERCN_SERVER_ENDPOINT=https://127.0.0.1:9999` 手工起 worker）：
+    /// 客户端日志 `[config-service] baseUrl` 立刻由 `'(SDK default, …)'` 变成该值。
+    pub fn endpoint_env_key(self) -> Option<&'static str> {
         match self {
-            Region::Global => "Qoder",
-            Region::Cn => "Qoder CN",
+            Region::Cn => Some("QODERCN_SERVER_ENDPOINT"),
+            Region::Global => None,
         }
     }
 
@@ -237,48 +286,27 @@ impl Region {
         }
     }
 
-    /// macOS 主可执行文件的绝对路径。
+    /// 智能接管的落点：官方 agent SDK 在 `app.asar.unpacked` 里的根目录。
     ///
-    /// ⚠️ 上一版这里的正则写的是 `.../MacOS/Electron`，**一个进程都匹配不到**：
-    /// Qoder 的 `CFBundleExecutable` 是 `Qoder`（国内版是 `Qoder CN`），
-    /// `Contents/MacOS/` 下也没有叫 `Electron` 的文件（只有
-    /// `Frameworks/Electron Framework.framework`）。所以退出/重启/判断是否在跑
-    /// 这三件事一直是「假装做完了」。这里按 `Info.plist` 的真值拼。
-    pub fn macos_exec_path(self) -> String {
-        format!("{}/Contents/MacOS/{}", self.macos_app_dir(), self.app_name())
-    }
-
-    /// 匹配「官方客户端本体 + 它的全部子进程」的正则（macOS `pkill -f` / `kinfo_proc`）。
+    /// # 为什么是 asar 外这份
     ///
-    /// `($| )` 让 `.../MacOS/Qoder --type=renderer` 这类带参数的子进程一起命中。
-    pub fn macos_process_pattern(self) -> String {
-        format!("^{}($| )", regex_escape(&self.macos_exec_path()))
-    }
-
-    /// 官方客户端里**长驻 CLI host** 的进程正则。
+    /// 客户端起推理进程前会把路径里的 `app.asar` 换成 `app.asar.unpacked`
+    /// （产物里的 `xt()`），命中就直接用，并留下诊断
+    /// `[WorkerTransport] Using asar-unpacked worker runtime: …`。
+    /// 也就是说**被执行的正是 asar 之外那一份** —— 它不在归档完整性校验范围内，
+    /// 可以直接改；而 asar 内那份永远轮不到。
     ///
-    /// 它由客户端从自己的解包资源里拉起（旧版本是 `app.asar.unpacked/cli/`，
-    /// 0.3.3 已经改成 `app.asar.unpacked/node_modules/@qoder-ai/*`）。
-    /// 因此这里只钉「必须属于这个 app 的解包资源根」这一条**稳定不变量**，
-    /// 不再跟随官方内部结构调整的具体子目录 —— 上一版写死 `cli/` 的下场就是
-    /// 那条正则指向一个并不存在的目录。
-    pub fn cli_host_process_pattern(self) -> String {
-        format!(
-            "{}/Contents/Resources/app\\.asar\\.unpacked/",
-            regex_escape(self.macos_app_dir())
+    /// 具体文件由 [`crate::patch`] 按与客户端一致的顺序探测。
+    pub fn worker_sdk_root(self) -> Option<std::path::PathBuf> {
+        let sdk = match self {
+            Region::Global => "@qoder-ai/qoder-agent-sdk",
+            Region::Cn => "@qoder-ai/qoder-cn-agent-sdk",
+        };
+        Some(
+            std::path::Path::new(self.macos_app_dir())
+                .join("Contents/Resources/app.asar.unpacked/node_modules")
+                .join(sdk),
         )
-    }
-
-    /// 接管写进 CLI 配置的**环境变量键**。
-    ///
-    /// 两个区域目前共用同一个键：`CODEBUDDY_BASE_URL` 是 `~/.qoder/settings.json` 里
-    /// 那个已被现网验证过的键（`netfix` 的 `ENV_KEYS` 与它一致），而国内版的
-    /// `cliEnvironmentPrefix` 虽然叫 `QODERCN`，**CLI 侧真正的键名没有实测依据**
-    /// （CLI 是独立二进制，`${prefix}_...` 只是拼法猜测）。猜一个新键的代价是把
-    /// 现在能用的接管弄坏，收益是零 —— 所以先共用，等真机验证后再分叉。
-    pub fn takeover_env_key(self) -> &'static str {
-        let _ = self;
-        "CODEBUDDY_BASE_URL"
     }
 }
 
@@ -286,19 +314,6 @@ impl fmt::Display for Region {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.key())
     }
-}
-
-/// `regex` 语法里的元字符转义（我们只用它来处理路径，而路径里有 `Qoder CN.app` 的
-/// 空格与 `.`；空格不需要转义，`.` 需要）。
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        if "\\.+*?()|[]{}^$".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -332,31 +347,6 @@ mod tests {
         assert_ne!(Region::Global.cli_dir_name(), Region::Cn.cli_dir_name());
     }
 
-    /// 两个官方客户端是**两个 app**：路径、可执行名、进程正则都不能相同。
-    /// 特别是正则必须匹配 `CFBundleExecutable` 的真值（`Qoder` / `Qoder CN`），
-    /// 而不是历史上写错的 `Electron`。
-    #[test]
-    fn process_patterns_point_at_the_real_executables() {
-        assert_eq!(
-            Region::Global.macos_exec_path(),
-            "/Applications/Qoder.app/Contents/MacOS/Qoder"
-        );
-        assert_eq!(
-            Region::Cn.macos_exec_path(),
-            "/Applications/Qoder CN.app/Contents/MacOS/Qoder CN"
-        );
-        assert!(!Region::Global.macos_process_pattern().contains("Electron"));
-        // 路径里的 `.` 要转义，空格不用
-        assert_eq!(
-            Region::Global.macos_process_pattern(),
-            "^/Applications/Qoder\\.app/Contents/MacOS/Qoder($| )"
-        );
-        assert_eq!(
-            Region::Cn.macos_process_pattern(),
-            "^/Applications/Qoder CN\\.app/Contents/MacOS/Qoder CN($| )"
-        );
-    }
-
     /// 钥匙串条目名必须与实测逐字一致：
     /// `security find-generic-password -s "Qoder CN App Safe Storage" -a "Qoder CN App Key" -w`
     /// 能直接取到密码。拼错的唯一表现是「读不到本机凭据」——不报错、不崩溃，
@@ -372,15 +362,14 @@ mod tests {
             Region::Global.keychain_service(),
             Region::Cn.keychain_service()
         );
-        // 回归护栏：这里**曾经**按 `<app_name> Safe Storage` 拼（少一个 `App`），
-        // 实测 `Qoder Safe Storage` 根本不存在。这条断言让那种"顺手统一"改法当场失败。
-        for region in Region::ALL {
-            assert_ne!(
-                region.keychain_service(),
-                format!("{} Safe Storage", region.app_name()),
-                "钥匙串名不是由 app_name 拼出来的（{}）",
-                region.label()
-            );
+        // 回归护栏：这里**曾经**按 `<客户端名> Safe Storage` 拼（少一个 `App`），
+        // 实测 `Qoder Safe Storage` 根本不存在。这条断言让那种"顺手统一"改法当场失败
+        // ——拼错的唯一表现是「读不到本机凭据」，不报错不崩溃，只能靠断言钉住。
+        for (svc, naive) in [
+            (Region::Global.keychain_service(), "Qoder Safe Storage"),
+            (Region::Cn.keychain_service(), "Qoder CN Safe Storage"),
+        ] {
+            assert_ne!(svc, naive, "钥匙串名不是由客户端名直接拼出来的");
         }
     }
 
@@ -402,5 +391,44 @@ mod tests {
     #[test]
     fn default_region_is_global() {
         assert_eq!(Region::default(), Region::Global);
+    }
+
+    /// 接管的端点键**只有国内版有**：`v7a()` 的 `if(!Ja) return` 让它在国际版构建里
+    /// 恒不生效，国际版覆盖的是别的键、且只覆盖 center。所以国际版必须返回 None
+    /// —— 上层据此明确报「尚未支持」，而不是写一段没人读的注入。
+    #[test]
+    fn endpoint_env_key_exists_only_where_it_is_actually_read() {
+        assert_eq!(Region::Cn.endpoint_env_key(), Some("QODERCN_SERVER_ENDPOINT"));
+        assert_eq!(Region::Global.endpoint_env_key(), None);
+        // 键名前缀与区域一一对应，别把两边的键搞混（读错区域 = 覆盖静默失效）
+        for (r, key) in [
+            (Region::Cn, Region::Cn.endpoint_env_key().unwrap()),
+            (Region::Global, "QODER_CENTER_ENDPOINT"),
+        ] {
+            let want = if r == Region::Cn { "QODERCN_" } else { "QODER_" };
+            assert!(key.starts_with(want), "{key} 的前缀应与 {} 对应", r.label());
+        }
+    }
+
+    /// 接管落点必须指向 asar **之外**那份被执行的产物，并且两个客户端各指各的 SDK。
+    #[test]
+    fn takeover_target_points_at_the_unpacked_sdk_of_each_client() {
+        let cn = Region::Cn.worker_sdk_root().unwrap();
+        assert_eq!(
+            cn.to_string_lossy(),
+            "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk"
+        );
+        let g = Region::Global.worker_sdk_root().unwrap();
+        assert_eq!(
+            g.to_string_lossy(),
+            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk"
+        );
+        // 关键不变量：路径里必须是 `app.asar.unpacked`，不能落在 `app.asar` 内
+        // （asar 内那份不受我们控制，也不会被执行）
+        for p in [cn, g] {
+            let s = p.to_string_lossy().to_string();
+            assert!(s.contains("app.asar.unpacked"), "{s}");
+            assert!(!s.contains("app.asar/node_modules"), "{s}");
+        }
     }
 }

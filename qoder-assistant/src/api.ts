@@ -66,6 +66,15 @@ export const oauthPoll = (loginId: string) =>
 export const openExternal = (url: string) =>
   invoke<void>("open_external", { url });
 
+/**
+ * 打开 macOS 系统设置里的「App 管理」授权面板。
+ *
+ * 不带参数是有意的：深链写死在后端（系统私有 scheme 不放行给前端传值）。
+ * 为什么需要这一条：写官方客户端的产物受「App 管理」管辖，而本应用是固定自签
+ * 签名的，**系统不会弹授权框** → 用户只能手动去开。见 `src-tauri/src/patch.rs`。
+ */
+export const openAppManagement = () => invoke<void>("open_app_management");
+
 // ── 凭证池：四个命令都是**池级**的，都不带账号 id ──────────────────────────
 //
 // 一池一个 uuid、池内一把闸，所以这里的动作作用范围是「整台机器」。
@@ -88,7 +97,7 @@ export const getSettings = () => invoke<Settings>("get_settings");
 export const saveSettings = (settings: Settings) =>
   invoke<Settings>("save_settings", { settings });
 
-/** 原子应用设置；接管启停或换端口时会安全重启 Qoder 与长驻 CLI host */
+/** 原子应用设置；接管启停 / 换端口 / 换区域全程只改配置，不动 Qoder 进程 */
 export const applySettings = (settings: Settings) =>
   invoke<Settings>("apply_settings", { settings });
 
@@ -137,7 +146,7 @@ export const stealthStatus = () => invoke<StealthStatus>("stealth_status");
 /** 可选区域清单（国际版 / 国内版）：界面上「区域」的唯一来源 */
 export const regions = () => invoke<RegionOption[]>("regions");
 
-/** 接管事件流（新的在前）：开启 / 关闭 / 开始使用账号 / 重启 / 错误 */
+/** 接管事件流（新的在前）：开启 / 关闭 / 开始使用账号 / 错误 */
 export const takeoverEvents = () => invoke<JournalEvent[]>("takeover_events");
 /** 清空接管动态（不可恢复） */
 export const clearTakeoverEvents = () => invoke<void>("takeover_events_clear");

@@ -380,6 +380,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     last: None,
                     checked_today: None,
+                    cosy_uid: None,
                 });
                 added += 1;
             }
@@ -408,6 +409,7 @@ mod import_tests {
             rt_expires_at: None,
             created_at: String::new(),
             checked_today: None,
+            cosy_uid: None,
             last: None,
         }
     }
@@ -836,6 +838,33 @@ pub fn open_external(url: String) -> Result<(), String> {
     oauth::open_in_browser(&url)
 }
 
+/// macOS 系统设置里「App 管理」授权面板的深链（`kTCCServiceSystemPolicyAppBundles`）。
+///
+/// **不能走 [`open_external`]**：那条路只放行 http(s)（有意收窄，免成跳板），
+/// 而这里要用系统私有的 `x-apple.systempreferences:` scheme。
+/// URL 写死在函数里、前端不传参 —— 单开一个入口比放宽那条白名单安全。
+///
+/// 存在的理由见 [`crate::patch::write_hint`]：本应用用**固定自签证书**签名，写官方
+/// 客户端的产物受「App 管理」管辖，而**未带授权签名的应用永远不会弹授权框**
+/// （系统只往 tccd 记一条拒绝，`authValue=0 authReason=2`）→ 用户唯一的出路就是
+/// 手动去这个面板打开开关。这一步既然是绕不过的，就别再让他们去搜「在哪」。
+#[tauri::command]
+pub fn open_app_management() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        const PANE: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AppBundles";
+        std::process::Command::new("open")
+            .arg(PANE)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开系统设置失败：{e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("「App 管理」是 macOS 专有的授权项，当前系统不需要这一步。".to_string())
+    }
+}
+
 /// 一条区域的可展示信息（登录弹窗、账号标签、接管页下拉都用它）
 #[derive(serde::Serialize)]
 pub struct RegionOption {
@@ -868,141 +897,31 @@ pub fn get_settings(app: AppHandle) -> Result<Settings, String> {
     Ok(accounts::load_settings(&data_dir(&app)))
 }
 
-// 这里曾有 `QODER_MAIN_PATTERN` / `QODER_CORE_PATTERN` / `QODER_CLI_HOST_PATTERN`
-// 三个常量，值都指向 `/Applications/Qoder.app/.../MacOS/Electron` —— **一个进程都
-// 匹配不到**（Qoder 的 `CFBundleExecutable` 是 `Qoder`，国内版是 `Qoder CN`，
-// `Contents/MacOS/` 下根本没有叫 `Electron` 的文件）。于是「退出 / 重启 / 判断是否
-// 在跑」这三件事一直是假装做完了。现在它们全部由 [`Region`] 按区域给出：
-// [`Region::macos_process_pattern`] 与 [`Region::cli_host_process_pattern`]。
-
-/// 长驻 CLI host（对话真正跑在它里面）：argv 里带着 Qoder 内置 CLI 的路径。
-///
-/// # 为什么必须单独杀它
-///
-/// 它是官方客户端 spawn 的独立 node 进程，**桌面端退出后会被孤儿化并继续存活**，
-/// 而它进程环境里的 `CODEBUDDY_BASE_URL` 是 spawn 那一刻定死的：
-/// - 接管开启期间启动的 host，在关闭接管后仍把请求发向已死的本地端口 →「服务异常」；
-/// - 接管关闭期间启动的 host，在开启接管并重启桌面端后依然直连上游 →「感觉没走代理」。
-/// 两者都只有把 host 进程杀掉、让桌面端重新 spawn 才能纠正。
-
-fn process_pids(pattern: &str) -> Vec<u32> {
-    std::process::Command::new("pgrep")
-        .args(["-f", pattern])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 等到匹配进程全部消失；超时返回 false（剩余进程数用于报错信息）
-fn wait_processes_gone(pattern: &str, deadline: std::time::Instant) -> usize {
-    loop {
-        let left = process_pids(pattern).len();
-        if left == 0 || std::time::Instant::now() >= deadline {
-            return left;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-fn kill_processes(pattern: &str) -> usize {
-    let pids = process_pids(pattern);
-    let n = pids.len();
-    if n == 0 {
-        return 0;
-    }
-    let args: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-    // TERM 先礼后兵：TERM 等 3 秒，还在就 KILL
-    let _ = std::process::Command::new("kill").args(&args).output();
-    if wait_processes_gone(pattern, std::time::Instant::now() + std::time::Duration::from_secs(3)) == 0 {
-        return n;
-    }
-    let _ = std::process::Command::new("kill")
-        .args(["-9"])
-        .args(&args)
-        .output();
-    let _ = wait_processes_gone(pattern, std::time::Instant::now() + std::time::Duration::from_secs(3));
-    n
-}
-
-/// 退出**指定区域**的官方客户端，并等它连同常驻 CLI host 一起消失。
-///
-/// `region` 直接决定 AppleScript 里的应用名（`Qoder` / `Qoder CN`）、等待用的
-/// 进程正则、以及要收割的 CLI host 正则 —— 这三个过去各有各的错法，现在同源。
-fn quit_qoder_and_wait(region: Region) -> Result<usize, String> {
-    let quit = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            &format!("tell application \"{}\" to quit", region.app_name()),
-        ])
-        .output()
-        .map_err(|e| format!("执行 AppleScript 失败：{e}"))?;
-    if !quit.status.success() {
-        return Err(format!(
-            "{} 未能正常退出：{}",
-            region.label(),
-            String::from_utf8_lossy(&quit.stderr).trim()
-        ));
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let left = wait_processes_gone(&region.macos_process_pattern(), deadline);
-    if left > 0 {
-        return Err(format!("等待 {} 退出超时；接管状态未改变。", region.label()));
-    }
-    // 桌面端已退出，但长驻 CLI host 会被孤儿化继续存活——必须显式收割，
-    // 否则它带着旧的环境变量继续服务对话，接管开关对它永远不生效。
-    let hosts_killed = kill_processes(&region.cli_host_process_pattern());
-    Ok(hosts_killed)
-}
-
-/// 拉起**指定区域**的官方客户端（`open -a` 认的就是 `CFBundleExecutable` 那个名字）。
-fn open_qoder(region: Region) -> Result<(), String> {
-    let status = std::process::Command::new("open")
-        .args(["-a", region.app_name()])
-        .status()
-        .map_err(|e| format!("启动 {} 失败：{e}", region.label()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("启动 {} 失败（状态 {status}）", region.label()))
-    }
-}
-
-pub(crate) fn restart_qoder_process(app: &AppHandle, region: Region) -> Result<(), String> {
-    let hosts_killed = quit_qoder_and_wait(region)?;
-    open_qoder(region)?;
-    if let Ok(dir) = try_data_dir(app) {
-        crate::stealth::journal_append(
-            &dir,
-            "restart_qoder",
-            &format!(
-                "{} 已重启；长驻 CLI host 终止 {hosts_killed} 个（重生后按当前接管状态取端点）",
-                region.label()
-            ),
-        );
-    }
-    Ok(())
-}
-
-/// 这些区域里，哪些官方客户端此刻正在跑（去重，顺序同入参）。
-///
-/// 进程列表用 `pgrep -f <区域正则>`：两个客户端的可执行路径不同，所以同一台机器上
-/// 「国际版在跑、国内版没开」这种状态能分得清 —— 而重启只该打扰正在跑的那个。
-fn running_apps(regions: impl IntoIterator<Item = Region>) -> Vec<Region> {
-    let mut out: Vec<Region> = Vec::new();
-    for region in regions {
-        if !out.contains(&region) && !process_pids(&region.macos_process_pattern()).is_empty() {
-            out.push(region);
-        }
-    }
-    out
-}
+// ⛔ 这里曾有一整套「退出客户端 → 收割长驻 CLI host → 重新拉起」的进程操作
+// （`process_pids` / `wait_processes_gone` / `kill_processes` / `quit_qoder_and_wait`
+// / `open_qoder` / `restart_qoder_process` / `running_apps`），用来在切换接管拓扑时
+// 把官方客户端整个重启一遍。它建立在两个**在 Qoder 上并不成立**的前提上：
+//
+// 1. 「CLI 是长驻 host，它进程环境里的端点值是 spawn 那一刻定死的，所以只有重启客户端
+//    才能纠正」——那是 CodeBuddy 时代的形态。Qoder 0.3.3（CLI 1.1.53）的推理进程是
+//    **每次会话按需 spawn 的一次性 `--print` 进程**：证据在
+//    `~/.qoder[-cn]/logs/runs/<时间戳>-p<桌面端pid>/manifest.json`（`argv` 就是
+//    `.../app.asar.unpacked/node_modules/@qoder-ai/qoder-*-agent-sdk/.../qoder-worker-runtime.obf.mjs
+//    --print ...`），跑完即退，`ps` 里几乎抓不到。没有长驻 host ⇒ 没有「要重启的东西」。
+//
+//    ⚠️ 但**别**由此推出「改配置就等于生效」：那个一次性进程的 env 是**桌面端 spawn 时
+//    构造**的（`new Worker(runtime,{argv,env})`，`env` 来自 SDK 调用方、**不继承桌面端自己的
+//    process.env**），而 `~/.qoder[-cn]/settings.json` 的 `env` 块**没有任何消费者**。
+//    所以「写配置 → 下次会话读到」这条链根本不存在。现在改的是**产物本身**
+//    （见 [`crate::patch`]）：端点跟着产物一起被那次会话读到，所以「不重启客户端」这条
+//    结论仍然成立 —— 它是靠「根本不需要重启」而不是靠「改了配置就会生效」站住的。
+// 2. 顺带，`open -a` 紧跟在 AppleScript `quit` 之后会撞上 LaunchServices 的注册竞态，
+//    返回 `exit status: 1`；而 `.status()` 把 stderr 一并丢掉，只剩一个状态码。
+//    旧实现在这一步失败后**不回滚**，于是磁盘说「已开启」、界面还停在「已关闭」——
+//    用户报的「接管报错、随后又显示接管成功」正是这条链路。
+//
+// 所以接管现在只做**写配置**这一件事，对正在登录、正在对话的客户端零打扰：
+// 唯一的事实源是 `settings.json`（见 [`crate::stealth`]）与落盘设置。
 
 /// 当前**实际装着**端点的是哪个区域。
 ///
@@ -1040,15 +959,14 @@ fn normalize_settings(mut settings: Settings) -> Result<Settings, String> {
     Ok(settings)
 }
 
-fn wait_for_takeover(
-    home: &std::path::Path,
-    region: Region,
-    dir: &std::path::Path,
-    port: u16,
-) -> bool {
+/// 等端点真正就位（监督线程装完 + 租约心跳起来）。
+///
+/// 不需要 `home`：端点现在是注入到客户端的 worker 产物里，不再依赖家目录下的配置文件，
+/// 「装没装上」由产物里的注入标记回答。
+fn wait_for_takeover(region: Region, dir: &std::path::Path, port: u16) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
-        let status = crate::stealth::status(home, region, dir);
+        let status = crate::stealth::status(region, dir);
         if status.installed && status.alive && status.port == port {
             return true;
         }
@@ -1061,10 +979,10 @@ fn wait_for_takeover(
 
 /// 接管的「拓扑」= 决定**装不装、装在哪个区域、转发到哪个端口**的那三项。
 ///
-/// 只有它变化时才需要动官方客户端的配置文件与进程。定时时刻、webhook、限流清单
-/// 那些改了就存 —— 不该为了改一个通知地址去重启用户正开着的客户端。
+/// 只有它变化时才需要动官方客户端的产物与进程。定时时刻、webhook、限流清单
+/// 那些改了就存 —— 不该为了改一个通知地址去动用户正开着的客户端。
 ///
-/// 区域属于拓扑：换区域 = 换一个客户端接管，配置文件与进程都要跟着换。
+/// 区域属于拓扑：换区域 = 换一个客户端接管，产物要跟着换。
 #[derive(PartialEq, Eq)]
 struct TakeoverTopology {
     enabled: bool,
@@ -1080,9 +998,23 @@ fn topology(s: &Settings) -> TakeoverTopology {
     }
 }
 
+/// 把旧端点**原样装回去**（回滚用）。
+///
+/// CA 必须一起给：端点被客户端强制成 https，缺了证书的注入等于把对话打断 ——
+/// 回滚反而比不回滚更糟。CA 取不到时宁可什么都不做，让调用方如实报错。
+fn reinstate(region: Region, dir: &std::path::Path, port: u16) {
+    match crate::certs::ensure(dir).and_then(|c| c.ca_pem()) {
+        Ok(ca) => {
+            if let Err(e) = crate::stealth::install(region, dir, port, &ca) {
+                eprintln!("[commands] 回滚接管端点失败：{e}");
+            }
+        }
+        Err(e) => eprintln!("[commands] 回滚时取不到本地 CA，端点未恢复：{e}"),
+    }
+}
+
 pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Result<Settings, String> {
     let dir = data_dir(app);
-    let home = dirs::home_dir().ok_or_else(|| "无法定位家目录".to_string())?;
     let old = accounts::load_settings(&dir);
     let next = normalize_settings(settings)?;
     if topology(&old) == topology(&next) {
@@ -1095,74 +1027,55 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
 
     match (old.proxy_enabled, next.proxy_enabled) {
         (false, true) => {
+            // 先落盘：反代监督线程据此监听端口并注入端点（**必须先监听成功才注入**）。
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
-            // 反代监督线程会按新设置自己装卸；这里等它把端点写上再决定要不要重启客户端
-            if !wait_for_takeover(&home, next.takeover_region, &dir, next.proxy_port) {
+            if !wait_for_takeover(next.takeover_region, &dir, next.proxy_port) {
+                // 失败原因**必须在 uninstall 之前取走**：注入的真实原因活在租约的
+                // `last_error` 里，而紧接的 uninstall 会把租约删掉 —— 读晚了就只剩
+                // 一句与事实无关的「端口被占用」，把用户送去查一个没坏的东西。
+                //
+                // 这条路径最常撞上的原因恰恰是唯一需要用户动手的那一项：macOS
+                // 「App 管理」未授权，而自签应用**永远不会弹授权框**（系统只往 tccd
+                // 记一条拒绝）。原样端出去，用户才知道该开哪个开关。
+                let cause = crate::stealth::last_error(&dir);
+                // 端点没装上（端口被占 / 客户端没装 / 未授权）→ 连设置一起退回去。
+                // 绝不留下「设置说已开启、磁盘上却没有端点」的半成品：那种状态会让开关与
+                // 事实长期相反，而且此后这一页的每次保存都会被拓扑守卫拒掉 ——
+                // 用户报的「切换账号失败」正是它的下游症状。
+                let _ = crate::stealth::uninstall(next.takeover_region, &dir);
                 let _ = accounts::save_settings(&dir, &old);
-                let _ = crate::stealth::uninstall(&home, next.takeover_region, &dir);
-                return Err(format!(
-                    "无法监听 127.0.0.1:{}，接管未开启。请检查端口是否被占用。",
-                    next.proxy_port
-                ));
+                return Err(match cause {
+                    Some(c) => format!("接管没能开启（设置已回滚）。\n{c}"),
+                    None => format!(
+                        "无法在 127.0.0.1:{} 上就位接管（设置已回滚）。\
+                         请检查端口是否被占用、以及官方客户端是否已安装在 /Applications。",
+                        next.proxy_port
+                    ),
+                });
             }
-            // 只重启**正在跑**的那个客户端：没开着的不要顺手拉起来
-            for region in running_apps([next.takeover_region]) {
-                restart_qoder_process(app, region)?;
-            }
+            // 客户端一个进程都不动（也不需要动）：Qoder 每次会话自己起一次性进程，
+            // 没有长驻 host 可重启。
         }
         (true, false) => {
-            let running = running_apps([old_region]);
-            let note = running
-                .first()
-                .map(|_| "已重启客户端清除长驻 CLI host 环境");
-            crate::stealth::uninstall_with_note(&home, old_region, &dir, note)?;
-            if !running.is_empty() {
-                if let Err(e) = quit_qoder_and_wait(old_region) {
-                    let _ = crate::stealth::install(&home, old_region, &dir, old.proxy_port);
-                    return Err(e);
-                }
-            }
+            // 摘掉注入即可 —— 不碰任何客户端进程，正在进行的对话不受影响
+            crate::stealth::uninstall(old_region, &dir)?;
             if let Err(e) = accounts::save_settings(&dir, &next) {
-                let _ = crate::stealth::install(&home, old_region, &dir, old.proxy_port);
-                if !running.is_empty() {
-                    let _ = open_qoder(old_region);
-                }
+                reinstate(old_region, &dir, old.proxy_port);
                 return Err(e.to_string());
-            }
-            if !running.is_empty() {
-                open_qoder(old_region)?;
             }
         }
         (true, true) => {
-            // 换端口 / 换区域：两个区域的客户端都可能正在跑，都算「受影响」
-            let running = running_apps([old_region, next.takeover_region]);
-            let note = running
-                .first()
-                .map(|_| "已重启客户端以清除长驻 CLI host 环境");
-            crate::stealth::uninstall_with_note(&home, old_region, &dir, note)?;
-            if !running.is_empty() {
-                if let Err(e) = quit_qoder_and_wait(old_region) {
-                    let _ = crate::stealth::install(&home, old_region, &dir, old.proxy_port);
-                    return Err(e);
-                }
-            }
+            // 换端口 / 换区域：摘掉旧区域的注入 → 落盘 → 等新端点就位；任一环节失败整体回滚
+            crate::stealth::uninstall(old_region, &dir)?;
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
-            if !wait_for_takeover(&home, next.takeover_region, &dir, next.proxy_port) {
+            if !wait_for_takeover(next.takeover_region, &dir, next.proxy_port) {
                 let _ = accounts::save_settings(&dir, &old);
-                let _ = wait_for_takeover(&home, old_region, &dir, old.proxy_port);
-                if running.contains(&old_region) {
-                    let _ = open_qoder(old_region);
-                }
+                let _ = wait_for_takeover(old_region, &dir, old.proxy_port);
                 return Err(format!(
                     "无法把接管切换到{}（127.0.0.1:{}），已回滚。",
                     next.takeover_region.label(),
                     next.proxy_port
                 ));
-            }
-            // 之前跑着的客户端全部拉起（旧区域的刚被我们退掉；新区域的若本来开着，
-            // 它进程里那份 spawn 时刻定死的 env 还指着旧地址，也只有重启能纠正）
-            for region in &running {
-                open_qoder(*region)?;
             }
         }
         // 两端都关着：那说明变的是**区域**（关着的时候端口本来就能随手改，
@@ -1184,20 +1097,38 @@ pub fn apply_settings(app: AppHandle, settings: Settings) -> Result<Settings, St
     apply_settings_inner(&app, settings)
 }
 
+/// 拓扑守卫：接管**开着**的时候，启停 / 端口 / 区域这三项只能经安全切换流程
+/// （`apply_settings`）改；关着的时候端口与区域都只是普通配置（那时没有任何端点装着）。
+///
+/// 抽成纯函数是为了能被测 —— 它是「前端拿着过期值来保存」这类事故的第一道闸，
+/// 但它必须**只**拦拓扑项：拦宽一点（比如拿整份设置做比对）就会把正常的扣费池 /
+/// 限流清单保存一起拒掉，而那正是用户能直接摸到的故障。
+///
+/// 返回 `Some(文案)` 表示这次保存必须被拒。
+fn topology_conflict(current: &Settings, next: &Settings) -> Option<&'static str> {
+    const MSG: &str = "接管启停、换端口或换区域必须使用安全切换流程。";
+    if current.proxy_enabled != next.proxy_enabled {
+        return Some(MSG);
+    }
+    if current.proxy_enabled
+        && (current.proxy_port != next.proxy_port
+            || current.takeover_region != next.takeover_region)
+    {
+        return Some(MSG);
+    }
+    None
+}
+
 #[tauri::command]
 pub fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
     let dir = data_dir(&app);
     let current = accounts::load_settings(&dir);
     let settings = normalize_settings(settings)?;
     // 拓扑（启停 / 端口 / 区域）里任何一项变了，都必须走 `apply_settings`：
-    // 区域同样属于拓扑 —— 换区域要「摘掉旧区域的端点 + 重启受影响的客户端 + 装进新区域」，
+    // 区域同样属于拓扑 —— 换区域要「摘掉旧区域的端点 + 把端点装进新区域」，
     // 直接落盘会留下「A 区域的客户端还指着我们的代理，代理却按 B 区域的账号扣费」。
-    // 关着的时候端口与区域都只是普通配置（那时没有任何端点装着），照旧允许直接存。
-    if current.proxy_enabled != settings.proxy_enabled
-        || (current.proxy_enabled && current.proxy_port != settings.proxy_port)
-        || (current.proxy_enabled && current.takeover_region != settings.takeover_region)
-    {
-        return Err("接管启停、换端口或换区域必须使用安全切换流程。".into());
+    if let Some(msg) = topology_conflict(&current, &settings) {
+        return Err(msg.into());
     }
     accounts::save_settings(&dir, &settings).map_err(|e| e.to_string())?;
     Ok(settings)
@@ -1498,55 +1429,58 @@ fn stagger_seconds(enabled: bool, max: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// 常驻 CLI host 的正则必须命中**该区域客户端自己**解包资源里的进程，
-    /// 且不能误杀本项目自身、也不能命中另一个区域的客户端。
+    /// 拓扑守卫只该拦「启停 / 端口 / 区域」这三项 —— 拦宽了就会把正常的扣费池、
+    /// 限流清单保存一起拒掉。
     ///
-    /// 旧版这里写死的是 `.../MacOS/Electron`（一个进程都匹配不到），
-    /// 以及 `.../app.asar.unpacked/cli/`（0.3.3 起资源目录已经不在 `cli/` 下）。
+    /// 用户 2026-09-19 报的「切换扣费账号失败」正是这个形状：前端带着一份**过期的**
+    /// `proxy_enabled` 来保存扣费池，守卫于是按「你在改拓扑」拒收，而此后这一页的
+    /// 每一次保存都会一直被拒。前端那一侧已改成以 props 为唯一事实源（见 TakeoverPage），
+    /// 这条测试则把后端闸门的边界钉死：**只拦拓扑项**。
     #[test]
-    fn cli_host_pattern_is_per_region_and_never_matches_ourselves() {
-        let g = regex::Regex::new(&Region::Global.cli_host_process_pattern()).unwrap();
-        // 长驻 CLI host 的典型 argv：node + 该客户端内置 CLI 的路径
-        assert!(g.is_match(
-            "/usr/local/bin/node /Applications/Qoder.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy host --session=x"
-        ));
-        // 资源目录改了名也照样命中：正则钉的是「解包资源根」这条稳定不变量
-        assert!(g.is_match(
-            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/cli/bin/qoder host"
-        ));
-        // 自家应用绝不能被误杀
-        assert!(!g.is_match(
-            "/Users/waxilo/Desktop/Code/QoderAssistant/src-tauri/target/debug/qoder-assistant"
-        ));
-        // 另一个区域的客户端也不该被这个区域的正则命中 —— 否则「切换接管区域」时
-        // 会把用户正在用的另一个客户端的长驻 host 一起杀掉
-        assert!(!g.is_match(
-            "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/cli/bin/qoder host"
-        ));
+    fn topology_guard_blocks_only_topology_changes() {
+        let base: Settings = serde_json::from_str("{}").expect("Settings 应能由空对象反序列化");
+        let on = || Settings {
+            proxy_enabled: true,
+            proxy_port: 8789,
+            takeover_region: Region::Cn,
+            ..base.clone()
+        };
 
-        // 国内版：应用名带空格，转义必须仍然正确
-        let c = regex::Regex::new(&Region::Cn.cli_host_process_pattern()).unwrap();
-        assert!(c.is_match(
-            "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/cli/bin/qoder host"
-        ));
-        assert!(!c.is_match(
-            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/cli/bin/qoder host"
-        ));
-    }
+        // ── 纯粹的非拓扑字段：一律放行 ──
+        let cur = on();
+        let mut next = cur.clone();
+        next.billing_account_ids = vec!["a".into()];
+        assert!(topology_conflict(&cur, &next).is_none());
+        let mut next = cur.clone();
+        next.rate_limit_models = vec!["m".into()];
+        assert!(topology_conflict(&cur, &next).is_none());
+        let mut next = cur.clone();
+        next.failover_on_rate_limit = !cur.failover_on_rate_limit;
+        assert!(topology_conflict(&cur, &next).is_none());
 
-    /// 「是否在跑 / 退出 / 重启」全靠这条主正则。旧版指向并不存在的
-    /// `/Applications/Qoder.app/Contents/MacOS/Electron`，于是这三件事一直是假装做完了。
-    /// 这里把它钉在真实的 `CFBundleExecutable` 上，并保证两个区域互不误伤。
-    #[test]
-    fn main_process_pattern_points_at_the_real_executables() {
-        let g = regex::Regex::new(&Region::Global.macos_process_pattern()).unwrap();
-        assert!(g.is_match("/Applications/Qoder.app/Contents/MacOS/Qoder"));
-        assert!(g.is_match("/Applications/Qoder.app/Contents/MacOS/Qoder --type=renderer"));
-        assert!(!g.is_match("/Applications/Qoder CN.app/Contents/MacOS/Qoder CN"));
+        // ── 拓扑三项：接管开着时必须拦 ──
+        let mut next = cur.clone();
+        next.proxy_enabled = false;
+        assert!(topology_conflict(&cur, &next).is_some());
+        let mut next = cur.clone();
+        next.proxy_port = 8899;
+        assert!(topology_conflict(&cur, &next).is_some());
+        let mut next = cur.clone();
+        next.takeover_region = Region::Global;
+        assert!(topology_conflict(&cur, &next).is_some());
 
-        let c = regex::Regex::new(&Region::Cn.macos_process_pattern()).unwrap();
-        assert!(c.is_match("/Applications/Qoder CN.app/Contents/MacOS/Qoder CN --type=gpu"));
-        assert!(!c.is_match("/Applications/Qoder.app/Contents/MacOS/Qoder"));
+        // ── 接管关着时，端口与区域只是普通配置：放行（启停本身仍然要拦）──
+        let off = Settings {
+            proxy_enabled: false,
+            ..cur.clone()
+        };
+        let mut next = off.clone();
+        next.proxy_port = 8899;
+        next.takeover_region = Region::Global;
+        assert!(topology_conflict(&off, &next).is_none());
+        let mut next = off.clone();
+        next.proxy_enabled = true;
+        assert!(topology_conflict(&off, &next).is_some());
     }
 
     #[test]
@@ -1638,6 +1572,7 @@ mod tests {
             expires_at: None,
             rt_expires_at: None,
             created_at: String::new(),
+            cosy_uid: None,
             last: Some(accounts::CheckinRecord {
                 success: true,
                 already: false,

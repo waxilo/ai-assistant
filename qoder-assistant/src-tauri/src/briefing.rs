@@ -481,6 +481,7 @@ mod tests {
             created_at: String::new(),
             last: None,
             checked_today: None,
+            cosy_uid: None,
         }
     }
 

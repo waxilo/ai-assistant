@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "QoderAssistant",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "identifier": "com.waxilo.qoder-assistant",
   "build": {
     "frontendDist": "../dist",
@@ -31,6 +31,10 @@
     "category": "Utility",
     "shortDescription": "Qoder 多账号签到桌面助手",
     "longDescription": "Qoder 助手：多账号一键/定时签到、登录新账号与导入本机账号、token 自动续签、webhook 通知、GitHub Release 自动更新。",
+    "macOS": {
+      "signingIdentity": "QoderAssistant Self-Signed",
+      "hardenedRuntime": false
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

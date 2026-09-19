@@ -106,6 +106,17 @@ pub struct Account {
     /// 绝不再把昨天的本地缓存或一次本地报错当成确定状态）。
     #[serde(default)]
     pub checked_today: Option<bool>,
+    /// **COSY 凭据里的 uid**（Qoder 侧账号 id，形如 `019eb647-a8b6-7664-…`）。
+    ///
+    /// 与 [`Account::id`] 是**两码事**：后者是本应用内部的 UUID（`8aa97773-…`，v4），
+    /// 前者是 Qoder 侧的账号标识（v7 形态）。混用时服务端回 `105 Login expired` ——
+    /// 看起来像 token 过期，其实与 token 毫无关系（2026-09-19 实测两条账号各验一遍）。
+    ///
+    /// 它只在「反代要重签 COSY 凭据」时被消费（见 [`crate::cosy`]）。首次需要时
+    /// 用 token 调 `/api/v3/user/status` 取回并落盘（[`set_cosy_uid`]），
+    /// 所以老账号第一次接管会多一次查询、之后走缓存。
+    #[serde(default)]
+    pub cosy_uid: Option<String>,
 }
 
 /// 发给前端的账号视图 = **账号本身** + 从唯一台账投影出来的积分事实。
@@ -375,7 +386,99 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
         return Vec::new();
     }
     let s = fs::read_to_string(&f).unwrap_or_default();
-    serde_json::from_str(&s).unwrap_or_default()
+    let accounts: Vec<Account> = serde_json::from_str(&s).unwrap_or_default();
+    // 读出口就收敛重复条目：**这里是所有「给界面/路由看」的账号的唯一来源**，
+    // 在别处兜底都只能治一条路（见 `dedupe_by_credential` 的说明）。
+    dedupe_by_credential(accounts)
+}
+
+/// 同一份凭证只该有一条记录 —— 把重复条目收敛掉。
+///
+/// 为什么要在**读**的路径上做：重复记录是跨机凭证池认错身份锚点时留下的
+/// （池里同一份凭证因「手机号后补」挂了两个 key，见 `broker::claims`），
+/// 锚点修好之后盘上那条幽灵记录**不会自己消失** —— 它看起来完全正常
+/// （有昵称、有 token），用户只能在界面上看着一个重复账号发愣。
+///
+/// 判据只有一条不变量：**access / refresh token 相等 = 同一个账号**。
+/// 两套部署的 token 由各自后端签发，不会撞；token 为空的条目不参与合并
+/// （否则所有「还没导入凭证」的东西会被合成一条）。
+///
+/// 保留哪条：信息最全的那条。权重最高的是「有签到结果」——
+/// **一次成功的签到就是「这个区域标签是对的」的实证**，而幽灵记录恰恰靠区域标签错
+/// （被服务端兜成国际版）才活下来的。被并掉那条的独有字段（手机号、昵称、续签信息）
+/// 会补进保留的那条，一个字段都不丢。**幂等**：对已收敛的列表再跑一次结果不变。
+pub fn dedupe_by_credential(accounts: Vec<Account>) -> Vec<Account> {
+    let mut kept: Vec<Account> = Vec::with_capacity(accounts.len());
+    for a in accounts {
+        let Some(i) = kept.iter().position(|k| same_credential(k, &a)) else {
+            kept.push(a);
+            continue;
+        };
+        if completeness(&a) > completeness(&kept[i]) {
+            let mut winner = a;
+            merge_gaps(&mut winner, &kept[i]);
+            kept[i] = winner;
+        } else {
+            merge_gaps(&mut kept[i], &a);
+        }
+    }
+    kept
+}
+
+/// 两份凭证是不是同一份？（判据与 `broker::same_credential` 同源，那一侧是「池条目 vs 账号」）
+fn same_credential(a: &Account, b: &Account) -> bool {
+    let (at, bt) = (a.token.trim(), b.token.trim());
+    if !at.is_empty() && at == bt {
+        return true;
+    }
+    match (
+        a.refresh_token.as_deref().map(str::trim),
+        b.refresh_token.as_deref().map(str::trim),
+    ) {
+        (Some(x), Some(y)) => !x.is_empty() && x == y,
+        _ => false,
+    }
+}
+
+/// 信息完整度（越高越该保留这条）。三项的含义：
+/// 有签到结果 = 这份凭证真的在**这个区域**的后端上签成功过；
+/// 有手机号 = 跨机认人的第一顺位可用；问过服务端状态 = 至少确认过一次真实状态。
+fn completeness(a: &Account) -> u8 {
+    u8::from(a.last.is_some()) * 4
+        + u8::from(a.phone.as_deref().is_some_and(|p| !p.trim().is_empty())) * 2
+        + u8::from(a.checked_today.is_some())
+}
+
+/// 把 `from` 有、`into` 没有的字段补进去（**只补空，绝不覆盖**）。
+/// 区域、id、昵称都不是「空字段」问题，所以一律不动 —— 保留方是谁，身份就是谁。
+fn merge_gaps(into: &mut Account, from: &Account) {
+    if into.token.trim().is_empty() {
+        into.token = from.token.clone();
+    }
+    if into.refresh_token.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        into.refresh_token = from.refresh_token.clone().filter(|s| !s.trim().is_empty());
+    }
+    if into.phone.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        into.phone = from.phone.clone().filter(|s| !s.trim().is_empty());
+    }
+    if into.name.trim().is_empty() {
+        into.name = from.name.clone();
+    }
+    if into.expires_at.is_none() {
+        into.expires_at = from.expires_at;
+    }
+    if into.rt_expires_at.is_none() {
+        into.rt_expires_at = from.rt_expires_at;
+    }
+    if into.last.is_none() {
+        into.last = from.last.clone();
+    }
+    if into.checked_today.is_none() {
+        into.checked_today = from.checked_today;
+    }
+    if into.created_at.trim().is_empty() {
+        into.created_at = from.created_at.clone();
+    }
 }
 
 pub fn save_accounts(dir: &Path, accounts: &[Account]) -> std::io::Result<()> {
@@ -386,6 +489,31 @@ pub fn save_accounts(dir: &Path, accounts: &[Account]) -> std::io::Result<()> {
     fs::rename(&tmp, &target)?;
     set_private_permissions(&target);
     Ok(())
+}
+
+/// 把某个账号的 [`Account::cosy_uid`] 落盘（幂等：值没变就不写）。
+///
+/// 为什么是「运行期补齐」而不是「导入时填好」：uid 要联网问一次
+/// `/api/v3/user/status` 才拿得到，而反代是**收到第一个 COSY 请求时**才第一次需要它。
+/// 在那里顺手取一次、落盘，之后所有转发都命中缓存 —— 不给导入流程加网络依赖。
+///
+/// 返回是否真的改了盘（只用于日志；写失败不影响本次转发，uid 内存里还能用一次）。
+/// 反代是多线程的，所以写前加锁：两个请求同时补齐同一账号时，只写一次、不互相覆盖。
+pub fn set_cosy_uid(dir: &Path, account_id: &str, uid: &str) -> bool {
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = match WRITE_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut accounts = load_accounts(dir);
+    let mut changed = false;
+    for a in accounts.iter_mut() {
+        if a.id == account_id && a.cosy_uid.as_deref() != Some(uid) {
+            a.cosy_uid = Some(uid.to_string());
+            changed = true;
+        }
+    }
+    changed && save_accounts(dir, &accounts).is_ok()
 }
 
 pub fn load_settings(dir: &Path) -> Settings {
@@ -467,6 +595,7 @@ mod tests {
                 created_at: "2026-09-16 09:00:00".into(),
                 last: None,
                 checked_today: Some(true),
+                cosy_uid: None,
             },
             credits: Some(ledger::CreditFact {
                 credits: Some(2957.83),
@@ -621,5 +750,136 @@ mod tests {
         // 旧版单选字段不再使用：读到也不影响新逻辑（多选列表仍为空 = 全部可用）
         let s: Settings = serde_json::from_str(r#"{"preferred_account_id":"abc"}"#).unwrap();
         assert!(s.billing_account_ids.is_empty());
+    }
+
+    // ── 重复条目自愈（2026-09-19 的「凭空多一个国际版账号」）────────────────
+
+    fn mk(
+        id: &str,
+        region: Region,
+        name: &str,
+        phone: Option<&str>,
+        token: &str,
+    ) -> Account {
+        Account {
+            id: id.into(),
+            region,
+            name: name.into(),
+            phone: phone.map(str::to_string),
+            token: token.into(),
+            refresh_token: Some(format!("rt-{token}")),
+            expires_at: None,
+            rt_expires_at: None,
+            created_at: "2026-09-19 13:16:24".into(),
+            last: None,
+            checked_today: None,
+            cosy_uid: None,
+        }
+    }
+
+    /// 幽灵条目的原型：池里的旧 key 认不出本机账号时 `account_from_item` 收养出来的那条
+    /// —— 同一份 token、区域被服务端兜成国际版、没有手机号、从没签过到。
+    #[test]
+    fn a_ghost_row_with_the_same_token_is_absorbed() {
+        let mut real = mk("real", Region::Cn, "nick0494015252", Some("19174256652"), "dt-abc");
+        real.last = Some(CheckinRecord {
+            success: true,
+            already: false,
+            inactive: false,
+            message: "已领取 100 Credits".into(),
+            credit: Some(100.0),
+            balance: Some(400.0),
+            campaign_key: Some("act-20260918-628".into()),
+            expires_at: None,
+            at: "2026-09-19 13:16:32".into(),
+        });
+        real.checked_today = Some(true);
+        let ghost = mk("ghost", Region::Global, "nick0494015252", None, "dt-abc");
+
+        let out = dedupe_by_credential(vec![real.clone(), ghost.clone()]);
+        assert_eq!(out.len(), 1, "同一份凭证只能留一条记录");
+        assert_eq!(out[0].region, Region::Cn, "保留区域标签被签到证实过的那条");
+        assert_eq!(out[0].id, "real", "id 必须留在原账号上（积分台账按 id 挂账）");
+        assert_eq!(out[0].phone.as_deref(), Some("19174256652"));
+
+        // 顺序反过来（幽灵排在前）结论必须一样 —— 判据是「谁更全」，不是「谁在前面」
+        let out = dedupe_by_credential(vec![ghost, real]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "real");
+    }
+
+    /// 被并掉那条的独有字段要补进保留的那条，不能因为「它不是主角」就丢。
+    /// 注意方向：**只补空，绝不覆盖** —— 保留方已有的值一律不动。
+    #[test]
+    fn absorption_keeps_the_loser_s_unique_fields() {
+        let mut keeper = mk("keep", Region::Global, "", Some("13800000000"), "dt-t");
+        // 造出「空」：保留方没有续签信息，被并方那两份正是缺口
+        keeper.refresh_token = None;
+        keeper.last = Some(CheckinRecord {
+            success: true,
+            already: false,
+            inactive: false,
+            message: "ok".into(),
+            credit: None,
+            balance: None,
+            campaign_key: None,
+            expires_at: None,
+            at: "2026-09-19 13:16:32".into(),
+        });
+        let mut loser = mk("lose", Region::Global, "昵称", None, "dt-t");
+        loser.refresh_token = Some("rt-new".into());
+        loser.rt_expires_at = Some(1_790_898_980_000);
+
+        // 昵称为空的那条反而更完整（有签到结果）→ 它留下，昵称/续签信息补进来
+        let out = dedupe_by_credential(vec![loser, keeper]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "昵称", "空昵称应从被并方补上");
+        assert_eq!(out[0].refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(out[0].rt_expires_at, Some(1_790_898_980_000));
+
+        // 反过来：保留方有值，被并方也有值 → 保留方的值不许被覆盖
+        let mut a = mk("a", Region::Global, "n", Some("138"), "dt-t");
+        a.last = Some(CheckinRecord {
+            success: true,
+            already: false,
+            inactive: false,
+            message: "ok".into(),
+            credit: None,
+            balance: None,
+            campaign_key: None,
+            expires_at: None,
+            at: "2026-09-19 13:16:32".into(),
+        });
+        let mut b = mk("b", Region::Global, "n", Some("139"), "dt-t");
+        b.refresh_token = Some("rt-别的".into());
+        let out = dedupe_by_credential(vec![a, b]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].phone.as_deref(), Some("138"), "已填的字段不被覆盖");
+        assert_eq!(out[0].refresh_token.as_deref(), Some("rt-dt-t"));
+    }
+
+    /// 不同凭证（两套部署各一份 token）**绝不能**被合成一条；没 token 的也不参与。
+    #[test]
+    fn distinct_credentials_and_tokenless_rows_are_left_alone() {
+        let a = mk("a", Region::Global, "n1", Some("138"), "dt-global");
+        let b = mk("b", Region::Cn, "n2", Some("138"), "dt-cn");
+        assert_eq!(dedupe_by_credential(vec![a, b]).len(), 2, "同手机号的两套部署是两个账号");
+
+        let mut empty1 = mk("e1", Region::Global, "空1", None, "");
+        empty1.refresh_token = None;
+        let mut empty2 = mk("e2", Region::Global, "空2", None, " ");
+        empty2.refresh_token = None;
+        assert_eq!(dedupe_by_credential(vec![empty1, empty2]).len(), 2, "没有凭证的不参与合并");
+    }
+
+    /// 幂等：收敛过的列表再收敛一次，结果与第一次完全相同。
+    #[test]
+    fn dedupe_is_idempotent() {
+        let real = mk("real", Region::Cn, "n", Some("191"), "dt-t");
+        let ghost = mk("ghost", Region::Global, "n", None, "dt-t");
+        let once = dedupe_by_credential(vec![real, ghost]);
+        let twice = dedupe_by_credential(once.clone());
+        assert_eq!(once.len(), twice.len());
+        assert_eq!(once[0].id, twice[0].id);
     }
 }

@@ -3,8 +3,12 @@ mod accounts;
 mod auth_file;
 mod briefing;
 mod broker;
+// 智能接管的本地 TLS 材料（自签 CA + 叶证书）：端点被客户端强制成 https origin，
+// 反代必须真的能终止 TLS —— 见 certs 模块说明。
+mod certs;
 mod checkin;
 mod commands;
+mod cosy;
 mod http;
 mod ledger;
 mod logs;
@@ -12,6 +16,10 @@ mod models;
 mod netfix;
 mod notify;
 mod oauth;
+// 智能接管的注入补丁器：直接改客户端 `app.asar.unpacked` 里那个**真正被执行**的
+// worker 产物（在 asar 之外，每次会话新起进程 → 改完下一次对话即生效，无需重启）。
+// 端点键与本地 CA 都从这里写进去 —— 见 patch 模块说明。
+mod patch;
 mod proxy;
 mod qoder_api;
 mod refresh;
@@ -89,6 +97,7 @@ pub fn run() {
             commands::oauth_start,
             commands::oauth_poll,
             commands::open_external,
+            commands::open_app_management,
             // 凭证管家：四个都是池级命令，不带账号 id（一池一 uuid、池内一把闸）
             commands::broker_upload,
             commands::broker_link,
@@ -126,8 +135,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
 
-    // 退出时安全关闭接管。仅摘配置不够：Qoder 的长驻 CLI host 会把旧值留在
-    // process.env，必须在代理仍存活时让它退出，之后才能停止监听。
+    // 退出时安全关闭接管：摘掉端点、停掉监听，不给用户留下「配置指向一个已经不在
+    // 的本地端口」这种残留。不用碰 Qoder 的进程 —— 它的每一次推理都是新起的
+    // 一次性 `--print` 进程，下一次会话读到的就是还原后的配置。
     app.run(|handle, event| {
         static CLEANED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         match &event {

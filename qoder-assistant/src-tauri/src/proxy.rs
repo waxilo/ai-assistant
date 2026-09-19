@@ -33,8 +33,10 @@
 //! 关闭开关或改端口即自动解绑/重绑，无需重启应用。
 
 use crate::accounts;
+use crate::certs;
 use crate::checkin::fetch_resource_view;
 use crate::commands;
+use crate::cosy;
 use crate::ledger;
 use crate::region::Region;
 use crate::stealth;
@@ -44,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Qoder 对话请求带的会话标识，用作粘滞键
@@ -72,6 +74,14 @@ const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 请求头 / 请求体上限
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// 端点**安装失败**后的重试间隔。
+///
+/// 失败几乎只有一种原因：还没拿到 macOS 的「App 管理」授权（见 [`crate::patch`]）。
+/// 它在用户手动打开开关之前**不会自己好**，而每次失败的尝试都会让 sandboxd 往系统日志里
+/// 丢一条 `System Policy: … deny file-write-create`，重试太快只会刷屏（实测 2s 一次能刷满一屏）
+/// 且毫无收益。30s 足够让用户在系统设置里开完开关之后自愈，也不会把日志淹掉。
+const INSTALL_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -391,13 +401,13 @@ fn pick_index(ids: &[String], infos: &[ledger::CreditFact]) -> Option<usize> {
 /// 必须先成功监听，再安装端点。否则端口被占时会把 Qoder 指向无人监听的地址。
 pub fn spawn(app: tauri::AppHandle) {
     std::thread::spawn(move || {
-        if let (Ok(dir), Some(home)) = (commands::try_data_dir(&app), dirs::home_dir()) {
-            stealth::sweep(&home, &dir);
+        if let Ok(dir) = commands::try_data_dir(&app) {
+            stealth::sweep(&dir);
         }
 
         // 当前装着端点的是**哪个区域 + 哪个端口**。区域必须一起记：
         // 只记端口的话，用户换区域时这个循环会以为「已经装好了」，
-        // 新区域的配置文件永远不会被写上，而界面显示「接管生效中」。
+        // 新区域的 worker 永远不会被改，而界面显示「接管生效中」。
         let mut installed: Option<(Region, u16)> = None;
         let mut disabled_cleaned = false;
         loop {
@@ -408,15 +418,13 @@ pub fn spawn(app: tauri::AppHandle) {
             let settings = accounts::load_settings(&dir);
             if !settings.proxy_enabled {
                 if !disabled_cleaned || installed.take().is_some() {
-                    if let Some(home) = dirs::home_dir() {
-                        // 摘**租约上那个区域**的：设置里的区域可能刚被改过，
-                        // 而真正写在磁盘上的是租约记的那一个。
-                        let region = stealth::load_lease(&dir)
-                            .map(|l| l.region)
-                            .unwrap_or(settings.takeover_region);
-                        if let Err(e) = stealth::uninstall(&home, region, &dir) {
-                            eprintln!("[proxy] 摘除接管端点失败：{e}");
-                        }
+                    // 摘**租约上那个区域**的：设置里的区域可能刚被改过，
+                    // 而真正注入到磁盘上的是租约记的那一个。
+                    let region = stealth::load_lease(&dir)
+                        .map(|l| l.region)
+                        .unwrap_or(settings.takeover_region);
+                    if let Err(e) = stealth::uninstall(region, &dir) {
+                        eprintln!("[proxy] 摘除接管端点失败：{e}");
                     }
                     disabled_cleaned = true;
                 }
@@ -427,15 +435,27 @@ pub fn spawn(app: tauri::AppHandle) {
             disabled_cleaned = false;
             let port = settings.proxy_port;
             let region = settings.takeover_region;
+
+            // TLS 材料必须在**监听之前**就绪：端点键只接受 https，客户端一连上来
+            // 就是 TLS 握手。证书没准备好就把端点装上去，只会把对话打断 —— 比空转更糟。
+            let (ca_pem, tls_cfg) = match certs::ensure(&dir).and_then(|c| {
+                let ca = c.ca_pem()?;
+                let cfg = certs::server_config(&c)?;
+                Ok((ca, cfg))
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[proxy] 准备 TLS 材料失败，暂不接管：{e}");
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
             match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(listener) => {
-                    let Some(home) = dirs::home_dir() else {
-                        std::thread::sleep(Duration::from_secs(2));
-                        continue;
-                    };
-                    if let Err(e) = stealth::install(&home, region, &dir, port) {
+                    if let Err(e) = stealth::install(region, &dir, port, &ca_pem) {
                         eprintln!("[proxy] 安装接管端点失败：{e}");
-                        std::thread::sleep(Duration::from_secs(2));
+                        std::thread::sleep(INSTALL_RETRY_BACKOFF);
                         continue;
                     }
                     installed = Some((region, port));
@@ -463,7 +483,8 @@ pub fn spawn(app: tauri::AppHandle) {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 let app2 = app.clone();
-                                std::thread::spawn(move || handle_conn(stream, app2));
+                                let cfg = tls_cfg.clone();
+                                std::thread::spawn(move || serve(stream, cfg, app2));
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(ACCEPT_POLL);
@@ -474,9 +495,7 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
                 Err(e) => {
                     if installed.take().is_some() {
-                        if let Some(home) = dirs::home_dir() {
-                            let _ = stealth::uninstall(&home, region, &dir);
-                        }
+                        let _ = stealth::uninstall(region, &dir);
                     }
                     eprintln!("[proxy] 无法监听 127.0.0.1:{port}：{e}");
                     std::thread::sleep(Duration::from_secs(2));
@@ -484,6 +503,38 @@ pub fn spawn(app: tauri::AppHandle) {
             }
         }
     });
+}
+
+/// 一条连接的分流：TLS 还是明文。
+///
+/// 端点覆盖只把 `https://…` 交给客户端，所以正常流量一定以 TLS 握手开头
+/// （首个记录字节 `0x16` = handshake）。保留明文分支是因为：本地 curl 调试、
+/// 以及用户手里还没刷新的旧端点值仍然走 http。
+///
+/// `configure_conn` 必须在**包装成 TLS 之前**调用 —— `StreamOwned` 上没有
+/// `set_read_timeout` / `set_nonblocking`（见其文档）。
+fn serve(stream: TcpStream, tls: Arc<rustls::ServerConfig>, app: tauri::AppHandle) {
+    if let Err(e) = configure_conn(&stream) {
+        eprintln!("[proxy] 连接参数设置失败：{e}");
+        return;
+    }
+    if !looks_like_tls(&stream) {
+        handle_conn(stream, app);
+        return;
+    }
+    match rustls::ServerConnection::new(tls) {
+        Ok(conn) => handle_conn(rustls::StreamOwned::new(conn, stream), app),
+        Err(e) => eprintln!("[proxy] TLS 会话建立失败：{e}"),
+    }
+}
+
+/// 探测首字节是不是 TLS 握手（`0x16` = handshake record）。
+///
+/// 用 `peek` 而不是 `read`：探测不能吃掉字节 —— 一旦读走，rustls 拿到的
+/// ClientHello 就残缺了，握手会以一个与「证书」毫不相干的错误失败。
+fn looks_like_tls(stream: &TcpStream) -> bool {
+    let mut b = [0u8; 1];
+    matches!(stream.peek(&mut b), Ok(1) if b[0] == 0x16)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,8 +549,14 @@ struct Request {
     target: String,
     /// 全部请求头（名字保留原样，值 trim 过）
     headers: Vec<(String, String)>,
-    /// 正文字节数（按 Content-Length）
+    /// 正文字节数（按 `Content-Length`；分块传输时这里恒为 0，
+    /// 真实长度要等 [`dechunk`] 把正文解出来才知道）
     body_len: usize,
+    /// 正文是不是用 `Transfer-Encoding: chunked` 传的。
+    ///
+    /// ⚠️ 判据只此一处，且**绝不能**省略：没有 `Content-Length` 不等于「没有正文」。
+    /// 忽略它就是把正文整段丢掉（见 [`dechunk`] 的事故说明）。
+    chunked: bool,
     /// 请求头（含 `\r\n\r\n`）之后的起始偏移
     head_end: usize,
 }
@@ -522,6 +579,7 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
 
     let mut headers = Vec::new();
     let mut body_len = 0usize;
+    let mut chunked = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -530,6 +588,13 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
         if name.eq_ignore_ascii_case("content-length") {
             body_len = value.parse().unwrap_or(0);
         }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            // 这个头可以是列表（`gzip, chunked`），只关心「有没有 chunked」；
+            // 其余编码原样透传，交给上游自己解。
+            chunked = value
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("chunked"));
+        }
         headers.push((name.trim().to_string(), value));
     }
     Some(Request {
@@ -537,8 +602,47 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
         target,
         headers,
         body_len,
+        chunked,
         head_end: end + 4,
     })
+}
+
+/// 把 HTTP/1.1 分块正文解开：返回 `(消耗字节数, 正文)`；还没收全返回 `None`。
+///
+/// # 为什么必须有这条（2026-09-19 实测事故）
+///
+/// 正文长度原来**只**从 `Content-Length` 读。分块传输没有这个头 ⇒ `body_len = 0`
+/// ⇒ 反代把一个**空体**转发给上游。失败形态是最难查的那种「静默」：
+/// 上游回 400，接管动态里只有一行「上游返回 400」—— 从任何角度看都像上游的毛病，
+/// 看不出是本地把正文吃掉了。Qoder 的 OTLP 遥测（`/otel/v1/*`，80 KB 级）正是分块上传，
+/// 于是每次心跳都在时间线上刷一行 400，用户因此以为「接管又失败了」。
+///
+/// 对照实测（同一份 89 KB 正文打到反代）：带 `Content-Length` → 上游 200；
+/// 改成 `Transfer-Encoding: chunked` → 上游 400。判据就此锁定。
+fn dechunk(buf: &[u8], start: usize) -> Option<(usize, Vec<u8>)> {
+    let mut pos = start;
+    let mut out = Vec::new();
+    loop {
+        let nl = pos + find_subslice(buf.get(pos..)?, b"\r\n")?;
+        // 分块头允许带扩展（`1a;name=value`），取分号前那一段当长度。
+        let size_text = std::str::from_utf8(&buf[pos..nl]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        let data_start = nl + 2;
+        if size == 0 {
+            // 结束块。`0\r\n` 之后可能有 trailer，再接一个空行 —— 从**块尾那个 CRLF**
+            // 起找 `\r\n\r\n`，一次覆盖两种情况：无 trailer 时它们紧挨着，
+            // 有 trailer 时则是「最后一行 trailer 的 CRLF + 空行」。
+            // （若从 `data_start` 起找，有 trailer 时就只会吃掉 trailer 自己那一行。）
+            let end = find_subslice(buf.get(nl..)?, b"\r\n\r\n")?;
+            return Some((nl + end + 4 - start, out));
+        }
+        let data_end = data_start + size;
+        if buf.len() < data_end + 2 {
+            return None; // 这一块还没收全，等着继续读
+        }
+        out.extend_from_slice(&buf[data_start..data_end]);
+        pos = data_end + 2;
+    }
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -567,6 +671,77 @@ fn hop_by_hop(name: &str) -> bool {
     ]
     .iter()
     .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// 客户端的 `Authorization` 是不是**账号凭证**（`Bearer <token>`）？
+///
+/// 不是 ⇒ 当作**不可改写的凭证**原样透传。判据写死在这里、只此一处：
+///
+/// | 形态 | 谁在用 | 反代该做什么 |
+/// |---|---|---|
+/// | `Bearer COSY.…` | **Qoder 客户端的全部业务接口**（对话、模型清单、data policy…） | 由 [`crate::cosy::rebuild`] **重签**；本判据管不到、也不该管 |
+/// | `Bearer dt-…` | 推理 `/model/v1/chat/completions`（OpenAI 风格）、`/api/v1/userinfo` | **换成选中扣费账号的 token** —— 这就是接管 |
+/// | `Signature <hmac>` | 客户端的上传 / feedback 模块（解出来密钥是 `cosy`） | **原样透传**，一个字都不能改 |
+///
+/// ## 这里走过的弯路（写下来免得再走）
+///
+/// 曾经判成「`/algo/*` 带的是 `Signature <hmac>` 请求签名」，于是定了「只要不是 Bearer
+/// 就透传」—— 而它带的**恰好是 `Bearer COSY.…`**，判据整个落空。更早一版还无条件
+/// `.bearer_auth()`，把 COSY 覆盖成账号 token，上游回
+/// `{"code":"101","message":"Signature invalid"}` → 客户端 catalog 拉不到模型清单 →
+/// `no_models_available` 起不来（2026-09-19 实测事故）。
+///
+/// 现在这个形态有了正规出口：[`crate::cosy`] 就是为「按同一算法重签 COSY」写的，
+/// 换号在那里完成；本函数只负责它管得到的那一小撮。
+///
+/// （`/otel/v1/*` 在这条判据里**不作数**：实测带 Bearer / 不带 / 带假 Signature 它都回 200，
+/// 压根不看身份。它那批 400 是另一条 bug —— 分块正文被吃掉，见 [`dechunk`]。）
+///
+/// 取不到前 7 个字节（太短 / 切在多字节中间）就当**不是**凭证：这种值不可能是合法 scheme，
+/// 一律按不可改写处理。失败方向是刻意选的 ——
+/// 覆盖错的表现是「客户端整个起不来」，透传错的表现只是「这个请求没换号」，后者轻得多。
+fn is_bearer_credential(value: &str) -> bool {
+    value
+        .trim_start()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+}
+
+/// 接管对客户端 `Authorization` 的处置方式。
+#[derive(Debug, PartialEq)]
+enum AuthPlan {
+    /// 换成选中扣费账号的凭证 —— 这就是「接管」本身
+    Swap,
+    /// 原样带走客户端的凭证（一个字都不能动）
+    Keep,
+}
+
+/// 这条请求的 `Authorization` 该不该换成扣费账号的凭证？
+///
+/// # 规则（两类凭证、两种路径，别混）
+///
+/// ⚠️ **走到这里的一切都已经不是 COSY**：`Bearer COSY.…` 由调用方在本函数**之前**
+/// 用 [`crate::cosy::rebuild`] 重签，签成了根本不会进来。进来只说明重签没成
+/// （取不到 uid、body 非 UTF-8…），此时 `Keep` 正是想要的答案 ——
+/// 宁可原样透传，也不能发一个半改的请求出去。
+///
+/// 剩下的两类：
+/// - **推理路径**（`/model/v1/chat/completions`，OpenAI 风格）：客户端带该账号的
+///   `Bearer <token>` ⇒ 换号，扣费才落到选中的账号上。
+/// - 任何路径上的 `Signature …` 等非 Bearer 凭证：一律原样透传（它们覆盖
+///   method/path/body，我们只搬运不改写，所以照样成立）。
+/// - 客户端没带凭证：补扣费账号的 —— 上游不认匿名请求（`/api/v1/userinfo` 这类也靠它）。
+///
+/// 判据是**两个条件的合取**：`is_inference` 与「是不是 Bearer」。
+fn auth_plan(is_inference: bool, authorization: Option<&str>) -> AuthPlan {
+    match authorization {
+        // 非推理路径：无论 Bearer 还是 Signature，都不碰
+        Some(_) if !is_inference => AuthPlan::Keep,
+        // 推理路径但凭证不是 Bearer ⇒ 签名类，同样不碰
+        Some(v) if !is_bearer_credential(v) => AuthPlan::Keep,
+        // 推理路径 + Bearer（或没带）⇒ 换号
+        _ => AuthPlan::Swap,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +784,10 @@ enum HeadRead {
 }
 
 /// 读请求头 + 正文，返回已收到的字节供调用方落盘诊断。
-fn read_head(stream: &mut TcpStream) -> HeadRead {
+///
+/// 只依赖 `Read`：调用方可能是明文 `TcpStream`，也可能是 rustls 包装后的流
+/// （端点覆盖强制 https，见 [`crate::certs`]），两者对这个函数没有区别。
+fn read_head(stream: &mut impl Read) -> HeadRead {
     let mut buf = Vec::with_capacity(8 * 1024);
     let mut tmp = [0u8; 8192];
     loop {
@@ -618,7 +796,13 @@ fn read_head(stream: &mut TcpStream) -> HeadRead {
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
                 if let Some(req) = parse_request(&buf) {
-                    if buf.len() >= req.head_end() + req.body_len {
+                    // 分块传输没有 Content-Length，只能等结束块到了才算读完（见 `dechunk`）。
+                    let complete = if req.chunked {
+                        dechunk(&buf, req.head_end()).is_some()
+                    } else {
+                        buf.len() >= req.head_end() + req.body_len
+                    };
+                    if complete {
                         return HeadRead::Ready(req, buf);
                     }
                 }
@@ -646,18 +830,20 @@ fn head_prefix(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..buf.len().min(512)]).to_string()
 }
 
-fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
+/// 处理一条已建立的连接。
+///
+/// 泛型化（而不是写死 `TcpStream`）是为了同时容纳两种承载：端点覆盖强制 https，
+/// 客户端连过来的是 TLS 流；而明文分支要留着 —— 旧配置、本地 curl 调试、
+/// 以及「TLS 材料还没准备好」时的降级都靠它。
+///
+/// 套接字层面的设置（阻塞模式 / 读写超时）必须在**包装成 TLS 之前**做完：
+/// `StreamOwned` 上没有 `set_read_timeout`，见 `configure_conn` 的文档。
+fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
     // 数据目录：选账号 / 写接管日志都要用；取不到直接 500，不再读请求
     let Ok(dir) = commands::try_data_dir(&app) else {
         respond(&mut stream, 500, "text/plain", b"internal error", &[]);
         return;
     };
-
-    // 0. 先复位成阻塞再读。漏掉这一步的代价见 `configure_conn` 的文档。
-    if let Err(e) = configure_conn(&stream) {
-        let _ = stealth::journal_append(&dir, "proxy_conn_setup_failed", &format!("{e}"));
-        return;
-    }
 
     // 1. 读完请求头（+ body）
     let (req, buf) = match read_head(&mut stream) {
@@ -698,7 +884,17 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
     //
     // 无鉴权：监听 127.0.0.1，来源只可能是本机进程（Qoder 或调试用的 curl）。
     let body_start = req.head_end;
-    let body = buf.get(body_start..body_start + req.body_len).unwrap_or(&[]);
+    // ⚠️ 分块分支不能省 —— 省掉就是「长度取不到 ⇒ 当 0 字节 ⇒ 把正文丢掉」，
+    // 而那正是 2026-09-19 那次「遥测一路 400」的真正原因（见 `dechunk` 的对照实测）。
+    let dechunked = if req.chunked {
+        dechunk(&buf, body_start).map(|(_, b)| b)
+    } else {
+        None
+    };
+    let body: &[u8] = match &dechunked {
+        Some(b) => b.as_slice(),
+        None => buf.get(body_start..body_start + req.body_len).unwrap_or(&[]),
+    };
     let conv = header_value(&req, CONV_HEADER)
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -709,10 +905,10 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
     // 既没人能改、内容还是模板残留的字段，已随区域模型一起删掉。
     let host = settings.takeover_region.infer_base().to_string();
     let bare = normalize_target(&req.target);
-    let path = upstream_path(bare).to_string();
-    let is_chat = bare == "/chat/completions";
+    let path = bare;
+    let is_chat = is_inference_path(bare);
     let model = if is_chat { body_model(body) } else { None };
-    let url = upstream_url(&host, &path);
+    let url = upstream_url(&host, path);
 
     // 3. 选账号并透传；0 积分免费模型限流（429）发生在流式输出开始前，响应头还没写给
     //    下游，正好有重试窗口：把「该账号 × 该模型」冷却到上游给出的重置时刻，换下一个
@@ -731,13 +927,13 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
             respond(&mut stream, 503, "text/plain", b"no account available", &[]);
             return;
         };
-        if ban.is_empty() && is_chat {
-            // 内部证据事件：仅供网络救急判定「端点被用过」，时间线展示层会过滤。
+        if ban.is_empty() && (is_chat || is_chat_generation(&bare)) {
+            // 内部证据事件：证明「反代确实收到了模型请求」，时间线展示层会过滤。
             stealth::journal_append(
                 &dir,
                 "proxy_request",
                 &format!(
-                    "长驻 CLI host 已使用接管端点（扣费账号：{}，模型：{}）",
+                    "反代收到模型请求（扣费账号：{}，模型：{}）",
                     account.name,
                     model.as_deref().unwrap_or("未知")
                 ),
@@ -746,15 +942,132 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
 
         // 透传
         let upstream = tauri::async_runtime::block_on(async {
-            let mut r = CLIENT
-                .request(
-                    reqwest::Method::from_bytes(req.method.as_bytes())
-                        .unwrap_or(reqwest::Method::GET),
-                    &url,
-                )
-                .bearer_auth(&account.token);
+            let mut r = CLIENT.request(
+                reqwest::Method::from_bytes(req.method.as_bytes())
+                    .unwrap_or(reqwest::Method::GET),
+                &url,
+            );
+            // ⚠️ 这段是接管的**全部落点**，判据一个字都不能含糊。
+            //
+            // 客户端在同一台机上并行用**两套凭证**，且它们分属不同路径：
+            //
+            // | 路径 | 客户端发什么 | 我们该做什么 |
+            // |---|---|---|
+            // | 推理 `/model/v1/chat/completions` | `Bearer <该账号的 access token>` | **换成选中扣费账号的 token**（这就是接管） |
+            // | 目录/策略 `/algo/*`（模型清单、data policy） | WASM 按「机器 + 账号」现场生成的凭证 | **原样带走，一个字都不能动** |
+            //
+            // 曾经这里是「只要不是 Bearer 就透传」—— 于是 `/algo/*` 的 Bearer 也被换成
+            // 扣费账号的 token。后果不是「换号没生效」，是客户端**整个起不来**：网关回
+            // `{"code":"101","message":"Signature invalid"}` → 模型清单拉不到 →
+            // `no_models_available` → 会话初始化失败、进程退出（2026-09-19 实测）。
+            //
+            // 所以判据必须**同时**看两件事：是不是 Bearer、是不是推理路径。
+            // 规则本体在 [`auth_plan`]（纯函数，有回归测试）；下面只负责执行与留痕。
+            let auth_in = header_value(&req, "authorization")
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+
+            // ⓪ Qoder 的**真实**认证形态：`Bearer COSY.…`。
+            //
+            // 它和「Bearer 账号 token」形似而神不同：凭据被加密封在 payload 里，
+            // 由内嵌 RSA 公钥保护的对称密钥解开（见 [`crate::cosy`]）。**原样透传**
+            // ⇒ 上游永远看到客户端登录的那个账号 —— 这正是「接管开着、额度却扣第一个
+            // 账号」的成因（2026-09-19 定位）。想换号只能按同一算法**重签**。
+            //
+            // 重签失败（不是 COSY / 取不到 uid / body 非 UTF-8）一律回落到下面的
+            // `auth_plan`：宁可原样透传，也绝不发一个半改的请求。
+            let cosy_rebuilt = match auth_in
+                .as_deref()
+                .filter(|v| cosy::is_cosy_authorization(v))
+            {
+                None => None,
+                Some(v) => {
+                    let uid = match account.cosy_uid.clone().filter(|u| !u.is_empty()) {
+                        Some(u) => Some(u),
+                        // 该账号第一次被路由到：联网问一次 `/api/v3/user/status` 并落盘。
+                        None => match cosy::fetch_uid(&CLIENT, &host, &account.token).await {
+                            Some(u) => {
+                                accounts::set_cosy_uid(&dir, &account.id, &u);
+                                Some(u)
+                            }
+                            None => None,
+                        },
+                    };
+                    uid.and_then(|uid| {
+                        let id = cosy::Identity {
+                            uid,
+                            name: account.name.clone(),
+                            email: String::new(),
+                            token: account.token.clone(),
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        cosy::rebuild(v, &id, &bare, body, now)
+                    })
+                }
+            };
+
+            let auth_action = match cosy_rebuilt {
+                Some(reb) => {
+                    // 四个头必须**同时**替换：只换 Authorization，上游仍会拿旧的
+                    // Cosy-Key/Cosy-Date 去校验，等于没换。
+                    r = r
+                        .header("authorization", reb.authorization.as_str())
+                        .header("cosy-user", reb.user.as_str())
+                        .header("cosy-key", reb.key.as_str())
+                        .header("cosy-date", reb.date.as_str());
+                    "已重签 COSY（换成扣费账号）"
+                }
+                None => match auth_plan(is_chat, auth_in.as_deref()) {
+                    AuthPlan::Swap => {
+                        r = r.bearer_auth(&account.token);
+                        "已换成扣费账号"
+                    }
+                    AuthPlan::Keep => {
+                        r = r.header("authorization", auth_in.as_deref().unwrap_or_default());
+                        if is_chat {
+                            "原样透传（签名类凭证）"
+                        } else {
+                            "原样透传（非推理路径）"
+                        }
+                    }
+                },
+            };
+            // 诊断留痕：只在「目录/策略」与「推理」这两类**接管真正关心**的请求上写一行。
+            // 它把「客户端发了什么」与「我们怎么处理」钉在同一个时间点上 —— 上一轮在
+            // 「客户端到底带没带签名」上只能靠反推，代价是一整轮排障。
+            if is_chat || bare.starts_with("/algo/") {
+                let shape = match auth_in.as_deref() {
+                    None => "无".to_string(),
+                    Some(v) => {
+                        let (scheme, rest) = v.split_once(' ').unwrap_or((v, ""));
+                        let head: String = rest.chars().take(8).collect();
+                        format!("{scheme} {head}…")
+                    }
+                };
+                let ts = if header_value(&req, "x-client-timestamp").is_some() {
+                    "有"
+                } else {
+                    "无"
+                };
+                stealth::journal_append(
+                    &dir,
+                    "proxy_auth",
+                    &format!(
+                        "反代收到 {} {}（鉴权：{shape}；X-Client-Timestamp：{ts}）→ {auth_action}",
+                        req.method,
+                        bare.split('?').next().unwrap_or(bare)
+                    ),
+                );
+            }
             for (k, v) in &req.headers {
-                if !hop_by_hop(k) {
+                // `hop_by_hop` 已经滤掉 `authorization`；`Cosy-*` 也必须滤掉 ——
+                // 重签时已显式写过新值，再复制一遍就成了**两个同名头**，
+                // 上游取哪个由实现决定（多半取先到的那个 = 旧的），等于没换。
+                if !hop_by_hop(k) && !cosy::is_cosy_header(k) {
                     r = r.header(k.as_str(), v.as_str());
                 }
             }
@@ -859,6 +1172,39 @@ fn upstream_url(host: &str, path: &str) -> String {
 }
 
 /// 请求目标可能是相对路径 `/chat/completions`，也可能是代理风格的绝对 URL。
+/// 这个请求是不是**模型推理请求**？
+///
+/// 判据是**路径末段的动作**（`completions` / `messages`），而不是某一层前缀：
+/// 客户端发的是 `/model/v1/chat/completions`（`QODER_MODEL_SERVER_HOST` 里把路径写死成
+/// 这一条，端点覆盖模式下 baseUrl 被整个换掉、路径仍然留在 `/model/v1/` 下），
+/// 而 CodeBuddy 时代是裸的 `/chat/completions`。两者末段都是 `completions`。
+///
+/// ⚠️ 不能用 `starts_with("/model/v1/")` 代替：同一前缀下还有 `/model/v1/models`
+/// 这类**列举**接口，把它当成推理请求会去解析它的 body 取 `model`。
+///
+/// 认错的后果**不是路由错**（选号与转发对所有路径一视同仁），而是「反代收到模型请求」
+/// 这条**时间线事件在真实路径上缺席** —— 那是用户唯一能当场核验「接管到底有没有生效」
+/// 的证据，不能在 Qoder 的路径上偏偏没有。
+fn is_inference_path(bare: &str) -> bool {
+    let p = bare.split('?').next().unwrap_or(bare);
+    matches!(p.rsplit('/').next().unwrap_or(""), "completions" | "messages")
+}
+
+/// 是不是「对话生成」端点 —— Qoder 自家的流式推理入口。
+///
+/// 与 [`is_inference_path`] **不是**一回事，别合并：
+/// - `is_inference_path` 认的是 OpenAI 风格的 `/…/completions`，服务的是**限流换号**那套
+///   （要读响应体、要按模型冷却）；国际版走这条。
+/// - 国内版的对话走 `/algo/api/v2/service/pro/sse/agent_chat_generation`（**SSE 包裹**），
+///   路径形态完全不同，2026-09-19 实测。它需要的是「扣费账号」证据埋点，不是那套重试。
+///
+/// 把两者混在一起，会让「读响应体」的重试逻辑落到流式响应上 —— 那是另一个量级的风险，
+/// 所以这里刻意分开。
+fn is_chat_generation(bare: &str) -> bool {
+    let p = bare.split('?').next().unwrap_or(bare);
+    p.ends_with("/agent_chat_generation")
+}
+
 /// 上游只认相对路径，这里统一剥掉协议与主机部分。
 fn normalize_target(target: &str) -> &str {
     match target.find("://") {
@@ -873,25 +1219,19 @@ fn normalize_target(target: &str) -> &str {
     }
 }
 
-/// 补上 CLI 在端点覆盖模式下丢掉的 `/v2` 前缀。
-///
-/// # 为什么必须由代理来补
-///
-/// CLI 直连官方网关时，请求的是 `https://copilot.tencent.com/v2/chat/completions`
-/// （`/v2` 由 CLI 自己拼上）；而一旦设置 `CODEBUDDY_BASE_URL`，它请求的路径就变成
-/// 裸的 `/chat/completions`。网关上这个裸路径**不存在**——APISIX 会 302 跳到官网，
-/// CLI 收到一页 HTML、解析出 0 个 SSE 数据事件，报
-/// `Empty stream: upstream gateway sent only placeholder chunks (chunks=0, bytes=0)`。
-/// 所以转发前必须改写成网关真实路由 `/v2/chat/completions`。
-fn upstream_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = path.strip_prefix("/chat/completions") {
-        // 精确匹配裸路径（可带查询串），避免误伤 /chat/completions-foo 之类的路径
-        if rest.is_empty() || rest.starts_with('?') {
-            return format!("/v2/chat/completions{rest}").into();
-        }
-    }
-    path.into()
-}
+// 这里曾有 `upstream_path()`，作用是给裸 `/chat/completions` 补上 `/v2` 前缀
+// （CodeBuddy 时代的 APISIX 网关不吃裸路径，会 302 到官网、CLI 报 `Empty stream`）。
+//
+// 在 Qoder 上这条改写**已被证伪，必须去掉**（2026-09-19 未鉴权探测国际版网关
+// `api2-v2.qoder.sh`，401 = 路由存在、404 = 不存在）：
+//
+//   POST /model/v1/chat/completions  → 401   ← 客户端真正在用的路径
+//   POST /v2/chat/completions        → 404   ← 旧改写指向的地方，**根本不存在**
+//   POST /chat/completions           → 404
+//
+// 所以「补 /v2」在 Qoder 上是把请求改到一个确实不存在的路由上。而且它本来也不会触发：
+// 客户端发的是 `/model/v1/chat/completions`，前缀对不上。**透传代理不该替网关发明路径** ——
+// 没有正面证据要求改写时，原样转发才是与「客户端自己直连」等价的那条路。
 
 /// 从对话请求体里取 `model` 字段（解析失败返回 None，不阻断转发）。
 fn body_model(body: &[u8]) -> Option<String> {
@@ -1019,7 +1359,7 @@ fn reason_phrase(status: u16) -> &'static str {
 /// 写响应头。**一律用 chunked** —— 下游（CLI / 桌面端）按 SSE 解析，
 /// 缓冲成一次性 body 会让它报 `Empty stream` 并丢掉全部输出。
 fn write_head(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     ctype: &str,
     headers: &[(String, String)],
@@ -1041,7 +1381,7 @@ fn write_head(
 }
 
 /// 写一个 chunk 并**立刻 flush**：SSE 的实时性全靠这个
-fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+fn write_chunk(stream: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -1052,7 +1392,7 @@ fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// 终止 chunked 流
-fn write_chunk_end(stream: &mut TcpStream) -> std::io::Result<()> {
+fn write_chunk_end(stream: &mut impl Write) -> std::io::Result<()> {
     stream.write_all(b"0\r\n\r\n")?;
     stream.flush()
 }
@@ -1062,7 +1402,7 @@ fn write_chunk_end(stream: &mut TcpStream) -> std::io::Result<()> {
 /// 中途出错只能断开 —— chunked 没有「出错补报」机制，但对端看到流被截断
 /// 至少比拿到一个空响应要好。
 fn stream_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     mut resp: reqwest::Response,
     dir: &std::path::Path,
     account: &accounts::Account,
@@ -1172,7 +1512,7 @@ async fn read_rate_limited(resp: reqwest::Response) -> RateLimited {
 /// 用 `Content-Length` 而不是 chunked，与网关自己发 429 的形态一致——
 /// 一段错误 JSON 不必套成 SSE 帧，客户端也少一层解析。
 fn forward_rate_limited(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     rl: &RateLimited,
     account: &accounts::Account,
     host: &str,
@@ -1392,7 +1732,7 @@ async fn choose_account(
 
 /// 写一个最简 HTTP 响应并关闭连接。
 fn respond(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     ctype: &str,
     body: &[u8],
@@ -1429,6 +1769,58 @@ mod tests {
     }
 
     #[test]
+    fn detects_chunked_request_bodies() {
+        let raw = b"POST /otel/v1/logs HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let req = parse_request(raw).unwrap();
+        assert!(req.chunked);
+        assert_eq!(req.body_len, 0, "分块传输本来就没有 Content-Length");
+        // 取值的编码列表里含 chunked 也要认出来
+        let raw = b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        assert!(parse_request(raw).unwrap().chunked);
+        // 不带就是不带：Content-Length 那条路径不能被这条判据动摇
+        assert!(!parse_request(b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap()
+            .chunked);
+    }
+
+    /// 分块正文必须**解出来**再转发。曾经的 bug：正文长度只认 `Content-Length`
+    /// ⇒ 分块请求被当成「没有正文」转发空体 ⇒ 上游 400
+    /// （2026-09-19 实测：Qoder 的 OTLP 遥测走分块上传，每次心跳在时间线上刷一行 400，
+    /// 用户因此以为「接管又失败了」）。
+    #[test]
+    fn dechunks_a_request_body_instead_of_dropping_it() {
+        // 两段正文 + 块扩展 + trailer：三样都要正确处理
+        let body = b"4\r\nWiki\r\n5;n=v\r\npedia\r\n0\r\nX-Trailer: 1\r\n\r\n";
+        let (consumed, out) = dechunk(body, 0).unwrap();
+        assert_eq!(out, b"Wikipedia");
+        assert_eq!(consumed, body.len(), "trailer 与最后那个空行都要吃掉");
+        // 最简形态（无 trailer）
+        let (consumed, out) = dechunk(b"2\r\nhi\r\n0\r\n\r\n", 0).unwrap();
+        assert_eq!(out, b"hi");
+        assert_eq!(consumed, 12);
+        // 空正文
+        let (_, out) = dechunk(b"0\r\n\r\n", 0).unwrap();
+        assert!(out.is_empty());
+        // start 之前的字节（真实 buf 里是请求头）不能算进正文
+        let (_, out) = dechunk(b"HEAD\r\n3\r\nabc\r\n0\r\n\r\n", 6).unwrap();
+        assert_eq!(out, b"abc");
+        // 大写十六进制长度
+        let (_, out) = dechunk(b"A\r\n0123456789\r\n0\r\n\r\n", 0).unwrap();
+        assert_eq!(out, b"0123456789");
+    }
+
+    /// 没读完必须回 `None`（读循环要继续等），**不能**退化成「当空体转发」。
+    #[test]
+    fn dechunk_reports_incomplete_input_instead_of_guessing() {
+        assert_eq!(dechunk(b"4\r\nWi", 0), None, "正文没到齐");
+        assert_eq!(dechunk(b"4\r\nWiki", 0), None, "少了块尾 CRLF");
+        assert_eq!(dechunk(b"4\r\nWiki\r\n", 0), None, "还没到结束块");
+        assert_eq!(dechunk(b"zz\r\nabc\r\n", 0), None, "长度不是十六进制");
+        assert_eq!(dechunk(b"", 0), None);
+        assert_eq!(dechunk(b"4\r\nWiki\r\n0\r\n", 0), None, "结束块的空行没到");
+    }
+
+    #[test]
     fn rejects_incomplete_or_garbage_input() {
         assert_eq!(parse_request(b"GET /x HTTP/1.1\r\n"), None, "头未读完");
         assert_eq!(parse_request(b"garbage"), None);
@@ -1442,6 +1834,44 @@ mod tests {
         assert!(hop_by_hop("content-length"));
         assert!(!hop_by_hop("Content-Type"));
         assert!(!hop_by_hop("Accept"));
+    }
+
+    /// 只有**账号凭证**才换号。`Signature …` 是请求签名（密钥绑机器），
+    /// 覆盖掉 = 客户端 `no_models_available` 起不来 —— 2026-09-19 真实事故的回归测试。
+    #[test]
+    fn only_bearer_authorization_is_swapped_for_the_billing_account() {
+        // 账号凭证：换号（接管的落点）
+        assert!(is_bearer_credential("Bearer dt-abc"));
+        assert!(is_bearer_credential("bearer dt-abc")); // scheme 大小写不敏感
+        assert!(is_bearer_credential("  Bearer dt-abc")); // 容忍前导空白（比对前会 trim）
+        // 请求签名：必须原样透传
+        assert!(!is_bearer_credential("Signature 1a2b3c"));
+        assert!(!is_bearer_credential("signature 1a2b3c"));
+        // 空 / 短得不像 scheme：当「不是凭证」，宁可透传也不覆盖
+        assert!(!is_bearer_credential(""));
+        assert!(!is_bearer_credential("Basic"));
+        // 多字节不能 panic：`.get(..7)` 切在字符中间 → None → false
+        assert!(!is_bearer_credential("签名签名签名"));
+    }
+
+    /// 换号判据必须**同时**看「路径」与「凭证类型」。
+    ///
+    /// 最贵的两次跑偏都在这里：① 无条件换号 → `/algo/*` 的签名被覆盖；
+    /// ② 只看「是不是 Bearer」→ `/algo/*` 的 Bearer 照样被换掉，上游回
+    /// `403 Signature invalid`，客户端模型清单拿不到、会话起不来（2026-09-19 实测）。
+    #[test]
+    fn auth_plan_keeps_non_inference_credentials_untouched() {
+        // 推理路径 + Bearer：换号（接管的落点）
+        assert_eq!(auth_plan(true, Some("Bearer dt-abc")), AuthPlan::Swap);
+        assert_eq!(auth_plan(true, Some("bearer dt-abc")), AuthPlan::Swap);
+        // 推理路径 + 签名类凭证：原样透传
+        assert_eq!(auth_plan(true, Some("Signature 1a2b3c")), AuthPlan::Keep);
+        // 非推理路径：**无论什么凭证**都不碰 —— 这两条就是那次事故的回归测试
+        assert_eq!(auth_plan(false, Some("Bearer dt-abc")), AuthPlan::Keep);
+        assert_eq!(auth_plan(false, Some("Signature 1a2b3c")), AuthPlan::Keep);
+        // 客户端没带凭证：补扣费账号的（上游不认匿名请求）
+        assert_eq!(auth_plan(true, None), AuthPlan::Swap);
+        assert_eq!(auth_plan(false, None), AuthPlan::Swap);
     }
 
     #[test]
@@ -1464,14 +1894,21 @@ mod tests {
         assert_eq!(normalize_target("https://host"), "/");
     }
 
+    /// 推理路径的判定必须同时认两种形状。
+    ///
+    /// 认错的后果不是路由错，而是**时间线里那条「反代收到模型请求」在真实路径上缺席** ——
+    /// 参见 2026-09-19 的网关探测：客户端发的是 `/model/v1/chat/completions`（401 = 路由存在），
+    /// 而 CodeBuddy 时代的裸 `/chat/completions` 与 `/v2/chat/completions` 在 Qoder 网关上
+    /// 都是 404。
     #[test]
-    fn rewrites_bare_chat_path_to_v2() {
-        // CLI 在端点覆盖模式下发的裸路径：必须补 /v2，否则网关 302 → CLI 报 Empty stream
-        assert_eq!(upstream_path("/chat/completions"), "/v2/chat/completions");
-        assert_eq!(
-            upstream_path("/chat/completions?a=b"),
-            "/v2/chat/completions?a=b"
-        );
+    fn inference_path_covers_both_the_old_bare_and_the_qoder_model_path() {
+        assert!(is_inference_path("/model/v1/chat/completions"));
+        assert!(is_inference_path("/model/v1/chat/completions?a=b"));
+        assert!(is_inference_path("/chat/completions"));
+        // 非推理路径不能误判成推理（否则会去解析它们的 body 取 model）
+        assert!(!is_inference_path("/model/v1/models"));
+        assert!(!is_inference_path("/sash/api/v1/me/campaigns"));
+        assert!(!is_inference_path("/chat/completions-foo"));
     }
 
     #[test]
@@ -1487,6 +1924,7 @@ mod tests {
             rt_expires_at: None,
             created_at: String::new(),
             checked_today: None,
+            cosy_uid: None,
             last: None,
         };
         let all = vec![mk("a"), mk("b"), mk("c")];
@@ -1513,6 +1951,7 @@ mod tests {
             rt_expires_at: None,
             created_at: String::new(),
             checked_today: None,
+            cosy_uid: None,
             last: None,
         };
         let all = vec![mk("a"), mk("b"), mk("c")];
@@ -1553,15 +1992,18 @@ mod tests {
         assert!(!is_rate_limited_model(None, &set, &enabled));
     }
 
+    /// 路径**原样透传**，代理不替网关发明路由。
+    ///
+    /// 这条替代了原来的 `rewrites_bare_chat_path_to_v2`：`/v2/chat/completions` 在 Qoder
+    /// 网关上实测 404（见 `upstream_path` 原地那段注释），补 `/v2` 只会把请求改到不存在的路由。
     #[test]
-    fn leaves_non_chat_paths_untouched() {
-        // 已带 /v2 的、以及其它任何路径都不动
-        assert_eq!(upstream_path("/v2/chat/completions"), "/v2/chat/completions");
-        assert_eq!(upstream_path("/v1/models"), "/v1/models");
-        assert_eq!(upstream_path("/"), "/");
-        // 前缀相同但不是同一个路径，不能误伤
+    fn forwards_the_path_verbatim() {
+        assert_eq!(normalize_target("/model/v1/chat/completions"), "/model/v1/chat/completions");
+        assert_eq!(normalize_target("/v2/chat/completions"), "/v2/chat/completions");
+        assert_eq!(normalize_target("/v1/models"), "/v1/models");
+        assert_eq!(normalize_target("/"), "/");
         assert_eq!(
-            upstream_path("/chat/completions-extra"),
+            normalize_target("/chat/completions-extra"),
             "/chat/completions-extra"
         );
     }
@@ -1912,6 +2354,7 @@ mod tests {
             rt_expires_at: None,
             created_at: String::new(),
             checked_today: None,
+            cosy_uid: None,
             last: None,
         };
         stream_response(
@@ -2019,6 +2462,7 @@ mod tests {
             rt_expires_at: None,
             created_at: String::new(),
             checked_today: None,
+            cosy_uid: None,
             last: None,
         };
         forward_rate_limited(&mut server, &limited, &acct, "mock.host");

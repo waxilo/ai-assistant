@@ -309,16 +309,33 @@ fn item_identity_of(account: &Account) -> String {
     account.id.clone()
 }
 
+/// key 里带的区域前缀（`global:` / `cn:`），没有就 None。
+fn region_from_key(key: &str) -> Option<Region> {
+    let k = key.trim();
+    Region::ALL
+        .iter()
+        .copied()
+        .find(|r| k.starts_with(&region_prefix(*r)))
+}
+
+/// **这一条池条目属于哪套部署** —— 客户端认区域时的唯一入口。
+///
+/// 顺序是「key 的 `xx:` 前缀 → `region` 字段」，与直觉相反但必须如此：
+/// 2026-09-19 之前服务端的 `normalizeItem` 根本不返回 `region`，池里所有条目的区域
+/// 都是空的（被 `#[serde(default)]` 兜成国际版）。前缀是上传方写进身份串里的，
+/// **老数据里唯一还活着的区域信息就是它**；服务端修好之后两者一致，也不冲突。
+/// 详见 `broker::merge_into` 上面那段「身份锚点」的说明。
+pub fn item_region(item: &PoolItem) -> Region {
+    region_from_key(&item.key).unwrap_or(item.region)
+}
+
 /// 把来自云端的 key 归一化成**当前格式**（带区域前缀）后再比对。
 ///
 /// 老版本写进云端的 key 是裸身份（那时只有国际版），统一补上 `global:` ——
 /// 不补的话，同一条账号会被当成新账号再存一份，界面上直接变成两个。
 pub fn normalize_pool_key(key: &str) -> String {
     let k = key.trim();
-    if Region::ALL
-        .iter()
-        .any(|r| k.starts_with(&region_prefix(*r)))
-    {
+    if region_from_key(k).is_some() {
         return k.to_string();
     }
     format!("{}{}", region_prefix(Region::Global), k)
@@ -360,7 +377,9 @@ pub fn account_from_item(item: &PoolItem) -> Account {
     Account {
         id: uuid::Uuid::new_v4().to_string(),
         name,
-        region: item.region,
+        // 区域只认 [`item_region`]：它是「前缀 → 字段」的统一出口，
+        // 直接用 `item.region` 会把老池里的国内版条目全标成国际版。
+        region: item_region(item),
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
@@ -369,6 +388,7 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         last: None,
         checked_today: None,
+        cosy_uid: None,
     }
 }
 
@@ -433,18 +453,43 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
 
 /// 把池里那份并进本机账号：**并集** —— 本地独有的账号一个都不删。
 /// 返回改动的条目数。
+/// 这一条池条目与这个本机账号**是不是同一份凭证**？
+///
+/// 这是跨机认人的**兜底锚点**，也是唯一不会漂移的那个：key 由「区域 + 人」拼成，
+/// 而「人」的第一顺位是手机号 —— 手机号是**后来才补上**的（`fill_phone_if_missing`），
+/// 昵称也可能被用户改掉，于是同一个账号的 key 会变；变的那一刻，池里按旧 key
+/// 存着的那条就再也认不出本机账号了。token 不会：它就是这份凭证本身。
+///
+/// 判据是 access token 或 refresh token **任一相等**：续签只会轮换其中一对，
+/// 而池里那条必然是「某台机器当时手里的那一对」，两对里总有一半对得上。
+fn same_credential(item: &PoolItem, account: &Account) -> bool {
+    let it_at = item.access_token.trim();
+    let it_rt = item.refresh_token.trim();
+    (!it_at.is_empty() && it_at == account.token.trim())
+        || (!it_rt.is_empty() && account.refresh_token.as_deref().map(str::trim) == Some(it_rt))
+}
+
+/// 本机这个账号「认领」这一条池条目吗？—— 合并与并集**共用同一条判据**。
+///
+/// 两级：① 同区域同人（key 相等，续签后 token 变了也认得出）；② 同一份凭证
+/// （token 相等，手机号后补导致 key 漂移时靠它兜住）。缺任一级都会漏，
+/// 而漏掉的后果就是**凭空多出一个账号**（2026-09-19 的重复账号事故）。
+fn claims(account: &Account, item: &PoolItem) -> bool {
+    item_key_of(account) == normalize_pool_key(&item.key) || same_credential(item, account)
+}
+
 pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
     let mut changed = 0;
     for item in items {
         if item.key.trim().is_empty() {
             continue;
         }
-        match accounts
-            .iter_mut()
-            .find(|a| item_key_of(a) == normalize_pool_key(&item.key))
-        {
-            Some(a) => {
-                if adopt(a, item) {
+        let hit = accounts
+            .iter()
+            .position(|a| claims(a, item));
+        match hit {
+            Some(i) => {
+                if adopt(&mut accounts[i], item) {
                     changed += 1;
                 }
             }
@@ -457,23 +502,41 @@ pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
     changed
 }
 
-/// 提交给管家的整池内容 = **云端那份 ∪ 本机账号**。
+/// 提交给管家的整池内容 = **云端那份 ∪ 本机独有的账号**，外加一条清洗：
+/// **「同一份凭证、却挂着另一个 key」的副本要被丢掉**。
 ///
-/// 不能只拿云端那份起步：`PUT` 是**整池替换**，漏掉「本机有、池里没有」的账号，就等于
-/// 把并集悄悄缩回云端那一份 —— 两台机器各绑同一池时，池里会永远只有第一个上传者的账号，
-/// 另一台的账号只进本地、不出本地。
+/// 上一版只有前半句，于是池里那些副本一条也掉不了：身份锚点漂移（手机号后补、昵称被改）
+/// 会让同一个凭证在池里占上好几格，而每一格都会在别的机器上被当成**新账号收养**一次
+/// —— 每同步一次就多一个重复账号（2026-09-19 的事故）。
+///
+/// 只丢「key 也对不上」的那种：同 key 的那条按既有契约**保留闸带回来的那份** ——
+/// 闸里是云端的最新轮换，本机那份可能早在别处被换掉了，真正要覆盖时由续签循环写回。
+/// 判据见 [`same_credential`]，与 [`merge_into`] 认人用的是同一套。
 pub fn union_pool(cloud: &[PoolItem], local: &[Account]) -> Vec<PoolItem> {
-    let mut pool: Vec<PoolItem> = cloud.to_vec();
+    let mut pool: Vec<PoolItem> = cloud
+        .iter()
+        .filter(|i| !i.key.trim().is_empty() && !is_drifted_duplicate(i, local))
+        .cloned()
+        .collect();
     for acct in local {
         let key = item_key_of(acct);
-        if key.trim().is_empty() {
+        // 本机两个账号算出同一个 key（同区域同人）时只提交一条，免得池里出现重复
+        if key.trim().is_empty() || pool.iter().any(|i| normalize_pool_key(&i.key) == key) {
             continue;
         }
-        if !pool.iter().any(|i| normalize_pool_key(&i.key) == key) {
-            pool.push(to_item(acct));
-        }
+        pool.push(to_item(acct));
     }
     pool
+}
+
+/// 这条池条目是不是「同一份凭证、却挂着另一个 key」的副本？
+///
+/// 只有这种才从池里丢掉。它**永远不会**再被本机认出来（本机的 key 已经漂走了），
+/// 留着就等着下一台机器把它收养成新账号。
+fn is_drifted_duplicate(item: &PoolItem, local: &[Account]) -> bool {
+    local
+        .iter()
+        .any(|a| item_key_of(a) != normalize_pool_key(&item.key) && same_credential(item, a))
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
@@ -970,6 +1033,7 @@ mod tests {
             created_at: String::new(),
             last: None,
             checked_today: None,
+            cosy_uid: None,
         }
     }
 
@@ -1008,6 +1072,88 @@ mod tests {
     #[test]
     fn blank_phone_falls_through_to_name() {
         assert_eq!(item_key_of(&acct("n", Some("   "), "t")), "global:n");
+    }
+
+    // ── 身份锚点漂移：池里同一份凭证挂了多个 key（2026-09-19 重复账号事故）─────
+
+    /// 造一条「服务端还不存 region」年代的池条目。`region: Global` 不是笔误：
+    /// 老数据被 `#[serde(default)]` 兜底成国际版，正是事故的另一半。
+    fn pi(key: &str, name: &str, phone: &str, at: &str) -> PoolItem {
+        PoolItem {
+            region: Region::Global,
+            key: key.into(),
+            name: name.into(),
+            phone: phone.into(),
+            access_token: at.into(),
+            refresh_token: format!("rt-{at}"),
+            expires_at: Some(1_000),
+            rt_expires_at: Some(1_001),
+            updated_at: Some(1),
+        }
+    }
+
+    #[test]
+    fn item_region_trusts_the_key_prefix_over_the_field() {
+        // 前缀是上传方写进身份串里的真值；字段可能来自「服务端不存区域」的年代
+        assert_eq!(item_region(&pi("cn:191", "n", "191", "t")), Region::Cn);
+        assert_eq!(item_region(&pi("global:191", "n", "191", "t")), Region::Global);
+        // 赤裸 key（两套部署之前）只能是国际版
+        assert_eq!(item_region(&pi("191", "n", "191", "t")), Region::Global);
+        // 没有前缀时才轮到字段
+        let mut it = pi("k", "n", "191", "t");
+        it.region = Region::Cn;
+        assert_eq!(item_region(&it), Region::Cn);
+        // 收养新账号时走的必须是同一个出口
+        assert_eq!(
+            account_from_item(&pi("cn:191", "n", "191", "t")).region,
+            Region::Cn
+        );
+    }
+
+    /// 回归：账号在「还没补上手机号」时被推上云，之后手机号补齐 → 本机 key 从
+    /// `cn:nick…` 变成 `cn:19174256652`，池里那条旧 key 的副本**不能**被收养成新账号。
+    #[test]
+    fn a_drifted_pool_key_does_not_become_a_second_account() {
+        let stale = pi("cn:nick0494015252", "nick0494015252", "", "dt-same");
+        let by_phone = pi("cn:19174256652", "nick0494015252", "19174256652", "dt-same");
+        let mut local = vec![acct_in(
+            Region::Cn,
+            "nick0494015252",
+            Some("19174256652"),
+            "dt-same",
+        )];
+        local[0].refresh_token = Some("rt-dt-same".into());
+
+        merge_into(&mut local, &[stale, by_phone]);
+        assert_eq!(local.len(), 1, "同一份凭证只该是一条账号");
+        assert_eq!(local[0].region, Region::Cn, "区域不能被池里的兜底值改掉");
+    }
+
+    /// 上一条的另一面：池里同凭证的副本要被**收敛掉**，而别的机器独有的条目原样保留。
+    #[test]
+    fn union_collapses_duplicates_and_keeps_other_machines_items() {
+        let cloud = vec![
+            pi("cn:19098779775", "nick4300340010", "19098779775", "dt-a"),
+            pi("cn:nick0494015252", "nick0494015252", "", "dt-b"),
+            pi("cn:19174256652", "nick0494015252", "19174256652", "dt-b"),
+            pi("global:nick0494015252", "nick0494015252", "", "dt-b"),
+            pi("cn:13900000000", "别的机器", "13900000000", "dt-other"),
+        ];
+        let mut a = acct_in(Region::Cn, "nick4300340010", Some("19098779775"), "dt-a");
+        a.refresh_token = Some("rt-dt-a".into());
+        let mut b = acct_in(Region::Cn, "nick0494015252", Some("19174256652"), "dt-b");
+        b.refresh_token = Some("rt-dt-b".into());
+
+        let pool = union_pool(&cloud, &[a, b]);
+        let keys: Vec<&str> = pool.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["cn:19098779775", "cn:19174256652", "cn:13900000000"],
+            "同凭证的漂移副本要收敛掉，别的机器的条目一条不丢"
+        );
+        // 反复同步必须稳定（清洗是幂等的）
+        let again = union_pool(&pool, &[acct_in(Region::Cn, "x", Some("19098779775"), "dt-a")]);
+        assert_eq!(again.len(), pool.len(), "{again:?}");
     }
 
     // ── 采纳规则 ────────────────────────────────────────────────────────

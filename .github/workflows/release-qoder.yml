@@ -8,6 +8,12 @@
 # 需要的仓库 Secrets：
 #   TAURI_SIGNING_PRIVATE_KEY            —— updater 签名私钥（`npm run tauri signer generate` 生成）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   —— 私钥密码，无密码可不配
+#   MACOS_CERT_P12_QODER                 —— macOS 代码签名证书（base64 的 p12，内含叶证书+私钥+根 CA）
+#   MACOS_CERT_PASSWORD_QODER            —— 该 p12 的密码
+#
+# ⚠️ macOS 证书是**必需项**，不是可选优化：`tauri.conf.json` 里写死了
+#    `bundle.macOS.signingIdentity`，缺证书时 `tauri build` 会直接失败。
+#    为什么必须有固定身份，见下方「导入 macOS 签名证书」步骤的注释。
 name: Release QoderAssistant
 
 on:
@@ -80,6 +86,53 @@ jobs:
             echo "并把私钥（及密码）配到本仓库 Actions secrets。"
             exit 1
           fi
+
+      # ⚠️ 签名身份**必须**有：未签名（或 ad-hoc 签名）的包，macOS 会把「App 管理」的授权
+      # 记在易变的 cdhash 上 —— 每次重新构建 / 自动更新后授权即失效。而 Qoder 助手的
+      # 「智能接管」**正是**要修改别的应用包（Qoder CN.app 的 worker 产物），没有这个授权
+      # 时系统会**静默拒绝写入**（没有弹窗，表现为「接管没生效」）。
+      # 身份名由 tauri.conf.json 的 `bundle.macOS.signingIdentity` 指定，两处必须一致。
+      - name: 导入 macOS 签名证书
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          CERT_P12_B64: ${{ secrets.MACOS_CERT_P12_QODER }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD_QODER }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CERT_P12_B64:-}" ]; then
+            echo "::error::缺少 secret MACOS_CERT_P12_QODER —— 未签名的构建会让 macOS「App 管理」授权在每次更新后失效，拒绝继续。"
+            echo "生成方式：cd qoder-assistant && CA_DIR=~/.traework-signing bash scripts/make-signing-cert.sh"
+            exit 1
+          fi
+
+          P12="$RUNNER_TEMP/qa.p12"
+          CA="$RUNNER_TEMP/qa-ca.crt"
+          KEYCHAIN="$RUNNER_TEMP/qa-signing.keychain-db"
+
+          echo "$CERT_P12_B64" | openssl base64 -d -A > "$P12"
+
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN"
+
+          # 构建用的 codesign 要在这个钥匙串里找到身份（保留原有的搜索条目）
+          EXISTING=$(security list-keychains -d user | tr -d ' "' | tr '\n' ' ')
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+
+          # 自签根 CA 必须被信任，否则 codesign 看不到任何可用身份。
+          # 直接从 p12 里抽出 CA 证书，**不按 CN 查** —— 免得把「根证书叫什么名字」这种
+          # 细节写死在流程里（那份 CA 是整个仓库共用的）。
+          openssl pkcs12 -in "$P12" -cacerts -nokeys -passin "pass:$CERT_PASSWORD" -out "$CA"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$CA"
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          rm -f "$P12"
 
       - name: Tauri build（带更新产物）
         working-directory: ${{ env.APP_DIR }}

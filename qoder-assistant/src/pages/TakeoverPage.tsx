@@ -7,6 +7,7 @@ import {
   saveSettings,
   stealthStatus,
   freeModels,
+  openAppManagement,
 } from "../api";
 import { AccountCell } from "../common";
 import { regionHint, regionLabel, useRegions } from "../regions";
@@ -89,6 +90,7 @@ export function TakeoverPage({
   accounts,
   askConfirm,
   onSettings,
+  onReloadSettings,
   onToast,
 }: {
   settings: Settings;
@@ -96,16 +98,27 @@ export function TakeoverPage({
   askConfirm: (opts: Omit<ConfirmReq, "resolve">) => Promise<boolean>;
   /** 保存后把最新 settings 同步回外层（后端可能已代为改写字段） */
   onSettings: (s: Settings) => void;
+  /** 从磁盘重读设置：任何一次操作失败后都要用它把界面拉回与后端一致 */
+  onReloadSettings: () => Promise<void>;
   onToast: (t: Toast) => void;
 }) {
-  const [proxyOn, setProxyOn] = useState(settings.proxy_enabled);
-  const [proxyPort, setProxyPort] = useState(String(settings.proxy_port || 8789));
-  // 接管目标区域：这一页的「作用对象」—— 端点写进哪套客户端的配置、模型清单从哪个域拉、
-  // 扣费账号在哪个池里选，全由它决定。改它属于拓扑变更，不是普通保存（见 onChangeRegion）。
-  const [region, setRegion] = useState(settings.takeover_region);
+  // ⚠️ 这一页曾经有 6 个镜像 state（`proxyOn` / `proxyPort` / `region` / `billing` /
+  // `rlModels` / `rlFailover`，逐个 `useState(settings.x)`）。它们是这页最贵的 bug：
+  // 镜像只在挂载时初始化、**永不跟 props 同步**，而组装请求时又无条件把它们盖回去 ——
+  // 只要后端在任何一次操作里改写了设置（或某次失败后回滚），界面就会拿着**过期的**
+  // `proxy_enabled` 去 `save_settings`，被后端的拓扑守卫拒成「必须使用安全切换流程」，
+  // 而且此后这一页的任何保存都会一直失败，直到切页重挂载或重启应用。
+  //
+  // 现在事实源只有一个：`settings`（props）。本地只留两类**草稿** ——
+  // 弹窗里尚未提交的勾选、端口输入框的中间态。
+  const [portDraft, setPortDraft] = useState<string | null>(null);
+  const region = settings.takeover_region;
   const regionOpts = useRegions();
-  // 扣费备选池：空 = 默认全部勾选（智能轮换）；非空 = 只有勾选的账号允许扣费
-  const [billing, setBilling] = useState<string[]>(settings.billing_account_ids);
+  const billing = settings.billing_account_ids;
+  const rlModels = settings.rate_limit_models;
+  const rlFailover = settings.failover_on_rate_limit;
+  const proxyOn = settings.proxy_enabled;
+  const proxyPort = portDraft ?? String(settings.proxy_port || 8789);
   const [pickerOpen, setPickerOpen] = useState(false);
   // 弹框草稿：打开时复制当前生效值，点「保存」才落库生效
   const [draft, setDraft] = useState<string[] | null>(null);
@@ -122,10 +135,6 @@ export function TakeoverPage({
   // 模型清单：三层来源（Qoder 目录 / 落盘快照 / 本机痕迹），弹窗列表与控制条摘要共用
   const [fm, setFm] = useState<ModelReport | null>(null);
   const [fmBusy, setFmBusy] = useState(false);
-  // 限流切换模型勾选：用户额外启用的付费模型（免费模型恒生效，不进这里）
-  const [rlModels, setRlModels] = useState<string[]>(settings.rate_limit_models);
-  // 「限流时在同一会话内换号」：与模型清单同一个弹窗、同样草稿制（点「保存」才落库）
-  const [rlFailover, setRlFailover] = useState(settings.failover_on_rate_limit);
   const [mdlFailover, setMdlFailover] = useState<boolean | null>(null);
 
   /**
@@ -251,35 +260,64 @@ export function TakeoverPage({
     setMdlOpen(false);
   };
 
-  /** 组装一份以当前界面状态为准的设置 */
-  const snapshot = (over?: Partial<Settings>): Settings => ({    ...settings,
-    proxy_enabled: proxyOn,
-    proxy_port: Number(proxyPort) || 8789,
-    billing_account_ids: billing,
-    ...over,
-  });
+  /**
+   * 组装一份**只改动指定字段**的设置：其余字段一律以 props 为准。
+   *
+   * 刻意不再把界面上的 `proxy_enabled` / `proxy_port` 之类「盖」回去 ——
+   * 后端才是拓扑字段的事实源，前端盖回去等于拿旧值把新事实顶掉。
+   */
+  const patched = (over: Partial<Settings>): Settings => ({ ...settings, ...over });
 
-  /** 开关即拨即用：确认后立即应用（开启/关闭都会安全重启 Qoder） */
+  /**
+   * 出错后把界面拉回与磁盘一致。
+   *
+   * 一次失败的 `apply_settings` 可能已经落盘、也可能整段回滚了 —— 结果的判断权在后端，
+   * 前端唯一正确的动作是**重读**，而不是自己猜。猜错就是那个「开关与事实相反、
+   * 此后这一页每次保存都被拒」的死结。
+   */
+  const resync = async (e: unknown) => {
+    setErr(String(e));
+    try {
+      await onReloadSettings();
+    } catch {
+      /* 重读本身失败就算了：下一次轮询或重挂载还会再拉一次 */
+    }
+  };
+
+  /**
+   * 开关即拨即用。
+   *
+   * **不碰官方客户端进程**：Qoder 的推理进程是每次会话按需起的一次性 `--print` 进程，
+   * 端点由它在启动时读客户端配置决定 —— 所以写配置就够了，正在登录的账号、
+   * 正在进行的对话都不受影响（详见 `commands.rs` 顶部那段说明）。
+   */
   const doToggle = async (next: boolean) => {
     const action = next ? "开启接管" : "关闭接管";
     const ok = await askConfirm({
-      title: `${action}并重启 Qoder`,
-      body:
-        `${action}需要重启 Qoder 与长驻 CLI host，才能安全清除旧端点。` +
-        "代理会在整个切换过程中保持可用，不会留下死端口。现在继续吗？（请先保存未提交的输入）",
+      title: action,
+      body: next
+        ? "接管开启后，Qoder 的下一次对话将按备选账号扣费。" +
+          "端点写进客户端配置即生效，**不需要重启或退出 Qoder**，" +
+          "正在登录的账号与正在进行的对话都不受影响。现在开启吗？"
+        : "接管关闭后，Qoder 的下一次对话恢复直连官方。" +
+          "端点会从客户端配置里摘掉，同样**不需要重启 Qoder**。现在关闭吗？",
       okText: action,
     });
     if (!ok) return; // 取消：开关状态不动
     setBusy(true);
     setErr("");
     try {
-      const saved = await applySettings(snapshot({ proxy_enabled: next }));
+      const saved = await applySettings(patched({ proxy_enabled: next }));
       onSettings(saved);
-      setProxyOn(next);
-      onToast({ kind: "ok", text: `已${action}，Qoder 已安全重启` });
+      onToast({
+        kind: "ok",
+        text: next
+          ? "接管已开启，下一次对话生效"
+          : "接管已关闭，下一次对话恢复直连",
+      });
       await refreshStealth();
     } catch (e) {
-      setErr(String(e));
+      await resync(e);
     } finally {
       setBusy(false);
     }
@@ -289,9 +327,9 @@ export function TakeoverPage({
    * 换区域：**属于拓扑变更**，不是普通保存。
    *
    * 换区域 = 换一套官方客户端来接管 —— 端点写进的配置文件（`~/.qoder` ↔ `~/.qoder-cn`）、
-   * 反代的上游网关、以及扣费账号所在的那一池，全都跟着换。所以接管开着的时候必须走
-   * 安全切换流程（摘掉旧区域的端点 → 重启受影响的客户端 → 把端点装进新区域）；
-   * 关着的时候只是把设置存下来，不必惊动任何进程。
+   * 反代的上游网关、以及扣费账号所在的那一池，全都跟着换。接管开着的时候必须走
+   * 安全切换流程（摘掉旧区域的端点 → 把端点装进新区域）；关着的时候只是把设置存下来。
+   * 两种情况下都**不动任何客户端进程**。
    *
    * 同时把扣费池清回「全选」：原来选的是另一个区域的账号 id，那些 id 在新区域里
    * 一个都不存在，留着会让代理选不出任何账号。
@@ -302,9 +340,9 @@ export function TakeoverPage({
       const ok = await askConfirm({
         title: `把接管切换到${labelOf(next)}`,
         body:
-          `接管正开着，换区域需要先摘掉旧区域的端点并重启受影响的客户端，再把端点装进新区域的配置。` +
-          `代理在整个过程中保持可用，不会留下死端口。` +
-          `另外扣费账号会重置为「全部」—— 两个区域的账号互不通用。现在继续吗？（请先保存未提交的输入）`,
+          `接管正开着，换区域需要先摘掉旧区域的端点，再把端点装进新区域的配置。` +
+          `不需要重启任何客户端 —— 各自的下一次对话自然读到新配置。` +
+          `另外扣费账号会重置为「全部」—— 两个区域的账号互不通用。现在继续吗？`,
         okText: "切换区域",
       });
       if (!ok) return;
@@ -312,42 +350,42 @@ export function TakeoverPage({
     setBusy(true);
     setErr("");
     try {
-      // 关着的时候走 saveSettings：此时没有任何端点装着，applySettings 会去动进程，
-      // 而它无事可做（也没有要重启的理由）
-      const patch = {
-        takeover_region: next,
-        billing_account_ids: [] as string[],
-      };
+      // 关着的时候走 saveSettings：此时没有任何端点装着，也没有拓扑要动
+      const body = { takeover_region: next, billing_account_ids: [] as string[] };
       const saved = proxyOn
-        ? await applySettings(snapshot(patch))
-        : await saveSettings(snapshot(patch));
+        ? await applySettings(patched(body))
+        : await saveSettings(patched(body));
       onSettings(saved);
-      setRegion(next);
-      setBilling([]);
       if (proxyOn) await refreshStealth();
       onToast({
         kind: "ok",
         text: proxyOn
-          ? `接管已切换到${labelOf(next)}，客户端已安全重启`
+          ? `接管已切换到${labelOf(next)}，下一次对话生效`
           : `接管区域已设为${labelOf(next)}，开启接管时生效`,
       });
     } catch (e) {
-      setErr(String(e));
+      await resync(e);
     } finally {
       setBusy(false);
     }
   };
 
-  /** 端口只在接管关闭时可改；失焦时若变了就立即落盘（纯配置，无需重启） */
+  /** 端口只在接管关闭时可改；失焦时若变了就立即落盘（纯配置，不动任何进程） */
   const onPortBlur = async () => {
     const port = Number(proxyPort) || 8789;
-    if (proxyOn || port === settings.proxy_port) return;
+    if (proxyOn || port === settings.proxy_port) {
+      setPortDraft(null);
+      return;
+    }
     try {
-      const saved = await saveSettings(snapshot({ proxy_port: port }));
+      const saved = await saveSettings(patched({ proxy_port: port }));
       onSettings(saved);
+      setPortDraft(null);
       onToast({ kind: "ok", text: "端口已保存" });
     } catch (e) {
       onToast({ kind: "err", text: "端口保存失败：" + String(e) });
+      setPortDraft(null);
+      await onReloadSettings().catch(() => undefined);
     }
   };
 
@@ -358,22 +396,20 @@ export function TakeoverPage({
     setBusy(true);
     setErr("");
     try {
-      const saved = await saveSettings(
-        snapshot({ billing_account_ids: next })
-      );
+      const saved = await saveSettings(patched({ billing_account_ids: next }));
       onSettings(saved);
-      setBilling(next);
       setDraft(null);
       setPickerOpen(false);
       onToast({ kind: "ok", text: "扣费账号已生效" });
     } catch (e) {
       onToast({ kind: "err", text: "保存失败：" + String(e) });
+      await onReloadSettings().catch(() => undefined);
     } finally {
       setBusy(false);
     }
   };
 
-  /** 限流切换弹框「保存」：草稿落库立即生效（纯模型白名单 + 换号开关，不需要重启） */
+  /** 限流切换弹框「保存」：草稿落库立即生效（纯模型白名单 + 换号开关，不需要动进程） */
   const doSaveModels = async () => {
     if (mdlDraft == null) return;
     const failover = mdlFailover ?? rlFailover;
@@ -381,17 +417,16 @@ export function TakeoverPage({
     setErr("");
     try {
       const saved = await saveSettings(
-        snapshot({ rate_limit_models: mdlDraft, failover_on_rate_limit: failover })
+        patched({ rate_limit_models: mdlDraft, failover_on_rate_limit: failover })
       );
       onSettings(saved);
-      setRlModels(mdlDraft);
-      setRlFailover(failover);
       setMdlDraft(null);
       setMdlFailover(null);
       setMdlOpen(false);
       onToast({ kind: "ok", text: "限流切换设置已生效" });
     } catch (e) {
       onToast({ kind: "err", text: "保存限流设置失败：" + String(e) });
+      await onReloadSettings().catch(() => undefined);
     } finally {
       setBusy(false);
     }
@@ -468,14 +503,14 @@ export function TakeoverPage({
     );
   }, [regionAccounts.length, regionOpts, accounts, region]);
 
-  /** 状态副文案 */
+  /** 状态副文案。只说盘上为真的事：端点写没写进去、反代在不在听。 */
   const stateText = live
-    ? "接管生效中，对话正按备选账号扣费"
+    ? "配置已就绪：端点已写入，本地反代正在监听"
     : stealth?.installed
-    ? "状态异常：关闭开关即可恢复直连"
+    ? "状态异常：关闭开关即可把配置还原成直连"
     : proxyOn
-    ? "应用中：会安全重启 Qoder"
-    : "开启后对话自动按备选账号分流扣费";
+    ? "应用中：正在写入端点配置（不重启 Qoder）"
+    : "开启后会把端点写进客户端配置，按备选账号分流扣费";
 
   /**
    * 连续相同（类型 + 内容都一样）的事件聚合为一条，附重复次数。
@@ -515,8 +550,39 @@ export function TakeoverPage({
         <span>
           开启后 Qoder 的对话请求由本地代理转发，按「积分最早过期优先」在账号间分配扣费；
           下方记录每一次开关、路由与异常。
-          <b>接管只作用于上面选的区域</b>：端点写进那一套客户端的配置，
+          <b>接管只作用于上面选的区域</b>：端点写进那一套客户端的 worker 产物，
           扣费也只在该区域的账号里选（跨区域的 token 在对方网关上无效）。
+          <b>全程不重启 Qoder</b>：Qoder 每次会话自己起一次性推理进程，会重新读一遍产物，
+          所以改完下一次对话就生效，正在登录的账号与正在进行的对话都不受影响。
+          <b>本机 TLS</b>：端点被客户端强制成 https，所以反代会用一张只签给 127.0.0.1 的
+          自签证书终止 TLS；这张 CA 随注入一起写进产物，<b>不改系统信任库、不需要管理员</b>。
+          <b>官方客户端更新会覆盖注入</b>，本应用每次心跳都会复查文件指纹并自动重打；
+          想恢复原样就在上面关掉开关（注入会被逐字节剥离）。
+          {/*
+            「App 管理」是 macOS 专有授权：写官方客户端的产物要它放行，而本应用是
+            **固定自签证书**签的 —— 系统只拦截、**永远不弹授权框**（只往 tccd 记一条
+            拒绝）。这一步绕不过去，那就别让用户再去搜「在哪」。
+            非 macOS 不显示：那张面板只存在于 macOS。
+          */}
+          {/Mac/.test(navigator.userAgent) && (
+            <>
+              {" "}
+              <b>macOS 首次开启要手动授权一次</b>
+              ：「App 管理」只拦截、<b>不会弹授权框</b>（本应用用固定自签证书签名），
+              去「系统设置 → 隐私与安全性 → App 管理」把本应用打开，再重启本应用即可。
+              <button
+                type="button"
+                className="link-btn"
+                onClick={() => {
+                  openAppManagement().catch((e) => {
+                    onToast({ kind: "err", text: String(e) });
+                  });
+                }}
+              >
+                打开「App 管理」设置
+              </button>
+            </>
+          )}
         </span>
       </p>
 
@@ -567,7 +633,7 @@ export function TakeoverPage({
           className="tk-field"
           title={
             regionHint(regionOpts, region) ??
-            "接管哪一套部署的客户端（换区域会重启受影响的客户端）"
+            "接管哪一套部署的客户端（换区域只改配置，不重启客户端）"
           }
         >
           区域
@@ -597,7 +663,7 @@ export function TakeoverPage({
             min={1024}
             max={65535}
             disabled={proxyOn || busy}
-            onChange={(e) => setProxyPort(e.target.value)}
+            onChange={(e) => setPortDraft(e.target.value)}
             onBlur={() => void onPortBlur()}
           />
         </label>

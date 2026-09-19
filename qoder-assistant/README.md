@@ -8,7 +8,7 @@
     就是这么取的）。2026-09-19 更正：此前认为「userinfo 不含手机号」，于是登录来的账号手机号恒空 ——
     而手机号是跨机账号合并（`broker`）的第一顺位锚点，缺了它就只能退化成按昵称认人。
 - **后台常驻（系统托盘）**：点窗口关闭按钮 = 隐藏到系统托盘，**进程不退出**（定时签到、token 续签、本地反代持续生效）；托盘菜单提供「显示主窗口 / 退出」，macOS 点 Dock 图标也会唤回主窗口。真正退出请走托盘菜单「退出」（退出时会自动关闭智能接管）。
-- **云端凭证池（跨机器共用账号）**：把本机这批账号整体上传成一个池，管家颁发一串 uuid；别的机器填同一串 uuid 即接上同一池（两边**取并集**，本机独有的不会被删）。刷新与续签始终在本机执行，refresh token **不进任何共享文件** —— 旧版「导出凭证文件」正是因此删除的（几台机器各持一份 refresh token，而官方续签是单链轮换，谁先签就把别人踢下线）。
+- **云端凭证池（跨机器共用账号）**：把本机这批账号整体上传成一个池，管家颁发一串 uuid；别的机器填同一串 uuid 即接上同一池（两边**取并集**，本机独有的不会被删）。刷新与续签始终在本机执行，refresh token **不进任何共享文件** —— 旧版「导出凭证文件」正是因此删除的（几台机器各持一份 refresh token，而官方续签是单链轮换，谁先签就把别人踢下线）。跨机认人有**两级锚点**：「同区域同人」（key 相等）与「**同一份凭证**」（access / refresh token 相等，兜住手机号后补、昵称被改导致的 key 漂移）；同一凭证的漂移副本会被从池里清掉，本机重复条目在读账号时自动收敛 —— 详见 [跨机认人](#跨机认人为什么不能只看-key)。
 - **一键签到**：单个账号签到，或「全部签到」批量领取每日积分。
 - **定时自动签到**：每天在设定时刻（默认 `09:07`）自动跑一遍「全部签到」，**应用运行期间生效**；错过时刻后 30 分钟内打开应用会自动补签一次，跨启动不会重复签（`schedule_state.json` 记录已执行日期）。配套提供「开机自启动」开关，让定时签到真正能每天生效。
 - **签到通知（webhook）**：可配置一个 webhook 地址，签到结束后推送结果汇总（成功 / 已签 / 失败数量 + 失败明细）；可分别开关「定时签到后推送」与「手动全部签到后推送」，并内置「测试推送」按钮自查配置。调度触发与推送结果会记入 `scheduler.log`（保留最近 200 行），便于事后排查「为什么没自动签到」。
@@ -21,7 +21,8 @@
 - **两套部署（国际版 / 国内版）都支持，且可切换**：Qoder 有**两套互不相通**的部署
   —— 国际版登录 `qoder.com` / 接口 `openapi.qoder.sh` / CLI 目录 `~/.qoder` / 应用 `Qoder.app`，
   国内版登录 `qoder.cn` / 接口 `openapi.qoder.com.cn` / `~/.qoder-cn` / `Qoder CN.app`。
-  账号、积分、签到活动两边各自独立，所以「哪个区域」是账号的一部分（合并键是「区域 + 手机号」）。
+  账号、积分、签到活动两边各自独立，所以「哪个区域」是账号的一部分（合并键 = **区域 +**
+  （手机号 → 昵称 → id），另有「同一份 token」作兜底锚点，见 [跨机认人](#跨机认人为什么不能只看-key)）。
   域名、本地目录、客户端路径与进程名**全部集中在 `src-tauri/src/region.rs` 一处**按区域取，
   别处只消费、不自己拼 —— 少改一处不会报错，只会表现成「这个功能在另一个区域上悄悄用错域」。
   界面上的区域清单由后端的 `regions` 命令给出（中文名与「OpenAPI 在哪个域」只该有一处定义）。
@@ -74,9 +75,11 @@ QoderAssistant/
 │       ├── refresh.rs      # token 续签（refresh token → 新 access token）
 │       ├── notify.rs       # 签到结果推送 webhook（GET ?message=，浏览器 UA + 3 次重试）
 │       ├── scheduler.rs    # 定时自动签到 + 自动续签扫描（后台线程，到点即触发 + 30 分钟补跑 + scheduler.log）
-│       ├── proxy.rs        # 智能接管反代（127.0.0.1 专用透传 + 优先扣费账号/粘滞/最旧积分路由 + /v2 改写）
+│       ├── proxy.rs        # 智能接管反代（127.0.0.1 专用透传 + 优先扣费账号/粘滞/最旧积分路由；首字节探测 TLS，用 rustls 终止握手）
+│       ├── certs.rs        # 接管用的本地 TLS 材料：自签 CA + 只签给 127.0.0.1/localhost 的叶证书（私钥 0600）
+│       ├── patch.rs        # 接管注入补丁器：改客户端 app.asar.unpacked 里那份 worker 产物（端点 + 本地 CA + 指纹自愈 + 精确剥离）
 │       ├── stealth.rs      # 接管 Fuse：端点装卸、租约、接管事件日志（takeover-journal.jsonl）
-│       ├── netfix.rs       # 网络急救：诊断（含接管事件交叉判定）+ 一键恢复 + 自动备份
+│       ├── netfix.rs       # 网络急救：诊断（配置文件 / launchd / shell 启动脚本 / worker 产物注入）+ 一键恢复 + 自动备份
 │       ├── logs.rs         # 签到日志存储（JSON，权限 0600，保留最近 2000 条）
 │       └── commands.rs     # Tauri 命令
 ├── scripts/make-icon.mjs   # 纯 Node 生成图标源 PNG
@@ -198,6 +201,13 @@ npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不�
 |---|---|
 | `TAURI_SIGNING_PRIVATE_KEY` | updater 签名私钥（`npx tauri signer generate` 生成，公钥已内嵌在 `tauri.conf.json`） |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 私钥密码，无密码可不配 |
+| `MACOS_CERT_P12_QODER` | macOS 代码签名证书（base64 的 p12，内含叶证书 + 私钥 + 根 CA）。来源：`~/.qoder-signing/ci-cert-p12.b64` |
+| `MACOS_CERT_PASSWORD_QODER` | 该 p12 的密码。来源：`~/.qoder-signing/ci-cert-password.txt` |
+
+> ⚠️ macOS 证书是**必需项**：`tauri.conf.json` 里写死了 `bundle.macOS.signingIdentity`，
+> 缺证书时 `tauri build` **直接失败**（故意如此 —— 静默产出未签名的包会让上面那个
+> 「App 管理静默拒绝」的问题在用户机器上复发）。为什么必须有固定身份见
+> 「智能接管 → 前置条件」。
 
 > 注意：更新只在**已签名的 Release** 之间生效。本地 `npm run tauri build` 未设置
 > `TAURI_SIGNING_PRIVATE_KEY` 时不会生成 `.sig`，此类构建包无法用于自动更新。
@@ -326,6 +336,38 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 
 ---
 
+## 跨机认人：为什么不能只看 key
+
+云端凭证池（`cred-broker`）用一个 `key` 做跨机身份锚点：`区域:` + （手机号 → 昵称 → 本地 id）。
+这一版之前**只看它**，于是踩出一个真实事故（2026-09-19）：账号列表里凭空多出一条
+「国际版、同 token、无手机号、从没签过到」的重复账号。
+
+事故由三个可独立复现的缺陷叠成：
+
+1. **服务端不存区域**：`cred-broker` 的 `normalizeItem` 返回值里根本没有 `region` 字段，
+   池里所有条目的区域都是空的 → 客户端被 `#[serde(default)]` 兜成**国际版**。
+   于是一条国内版凭证只要在池里被当成新账号收养一次，就变成「国际版」的重复账号。
+2. **key 会漂移**：上传时账号还没补上手机号（手机号是导入后 `fill_phone_if_missing` 补的），
+   key 落在昵称上（`cn:nick0494015252`）；补上手机号后本机 key 变成 `cn:19174256652`
+   → **池里那条旧 key 再也认不出本机账号** → 收养成新账号。
+3. **合并只比 key 字符串**，从不看 token：同一份凭证在池里以多个 key 存在时，
+   本机会变成多条记录；而它们区域不同（cn / global），之后再怎么导入都不会合并。
+
+现在的规则（`src-tauri/src/broker.rs` 的 `claims` / `is_drifted_duplicate`）：
+
+| 判据 | 用途 | 为什么 |
+|---|---|---|
+| `item_key_of(a) == normalize_pool_key(item.key)` | 同区域同人 | 续签轮换 token 后仍认得出，是最精确的一级 |
+| `same_credential(item, a)`（access / refresh token 任一相等） | **同一份凭证** | key 会漂移、token 不会；它兜住「手机号后补 / 昵称被改」的窗口 |
+| `item_region(item)`：key 的 `xx:` 前缀 → `region` 字段 | 判定条目属于哪套部署 | 老数据的区域只剩前缀这一条线索 |
+| `union_pool` 丢掉「同凭证、另一个 key」的副本 | 池内自净 | 留着它，别的机器每同步一次就多收养一个账号 |
+| `accounts::load_accounts` 的 `dedupe_by_credential` | 本机自净 | 盘上的幽灵条目不会自己消失；保留信息最全的那条（**有签到结果 = 该区域标签被证实过**） |
+
+服务端侧同步修复：`normalizeItem` 必须原样往返 `region`（缺省时按 key 前缀回填），
+并且**读出口也走一遍规范化** —— D1 的 `payload` 是不透明 JSON，老条目在读的那一刻就自愈。
+
+---
+
 ## 定时自动签到
 
 在「设置」里开启「每天定时自动签到全部账号」并选好时刻（默认 `09:07`，与参考脚本
@@ -367,30 +409,240 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 独立弹窗（工具栏「智能接管」），把 Qoder 的对话请求接管到本机反代：
 
 ```bash
-# 接管后 Qoder 的对话实际请求链路（机制已逆向确认，见 basedata/20260918_Qoder接管机制逆向.md）：
-# Qoder 桌面端 → 拉起长驻 CLI host（claude 式 agent runtime，模型请求由它发出）
-#            → https://127.0.0.1:8789（本应用反代）→ 接管区域的模型网关
+# 请求链路（已落地）：
+# Qoder 桌面端 → 每次会话 spawn 一次性 `--print` 推理进程（跑完即退，没有长驻 host）
+#            → https://127.0.0.1:8789（本应用反代，**终止 TLS**）→ 接管区域的模型网关
 #              国际版 https://api2-v2.qoder.sh · 国内版 https://gateway.qoder.com.cn
 #
-# 杠杆是进程环境变量 QODER_MODEL_SERVER_HOST（CLI 里 gtn() 读它；**scheme 被写死成 https**，
-# 所以本地反代必须提供 TLS —— 与 CodeBuddy「写 settings.json 一个键」的做法完全不同）。
+# 杠杆是那个推理进程读到的**环境变量** QODERCN_SERVER_ENDPOINT（国内版，覆盖全部 purpose）；
+# 客户端把 scheme 写死成 https，所以反代必须真的能完成 TLS 握手。
 ```
 
-> ⚠️ **改造中**：以下描述仍是对齐 workbuddy 旧机制的实现现状，Rust 侧尚未切到上面的环境变量机制。
-> 切换点是 `stealth.rs` 的「端点存储后端」（租约 / 心跳 / 事件日志骨架可原样复用）。
+### 它怎么真正生效的
+
+1. **注入点 = 真正被执行的那个文件。** Qoder 每次会话起的一次性进程，argv 指向
+   `…/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs`
+   —— 它在 **asar 之外**（不受完整性校验），也正是 worker 实际执行的入口。
+   我们在**文件头**插入一段注入（`/*qoder-assistant-takeover:begin … end*/`）：先
+   `process.env.QODERCN_SERVER_ENDPOINT = "https://127.0.0.1:8789"`，再把官方原文原样接在后面。
+2. **TLS 用「只对回环地址」的本地 CA 解决，不动系统信任库。** 注入段 monkeypatch
+   `node:tls` 的 `connect` / `createSecureContext`：**只有当目标 host 是 `127.0.0.1` /
+   `localhost` / `::1`** 时才塞入随注入一起携带的自签 CA 并关掉 `rejectUnauthorized`。
+   证书由本应用自签（CA + 只签给 `127.0.0.1`、`localhost` 的叶证书，私钥 `0600`），
+   落在应用数据目录的 `certs/` 下 —— **不需要管理员、不改系统信任、不装证书到钥匙串**。
+   两个参数都是 `{ca, rejectUnauthorized}` 的既有形状，改的是值而不是协议，所以不碰其它流量。
+3. **官方更新会覆盖它 → 指纹自愈。** 每次心跳（5s）比对文件头：不是我们的注入段就重打一遍。
+   备份只在「当前文件确实是官方原版」时刷新，所以备份永远是**最新那版官方文件**，
+   不会出现「还原把用户刚更新的客户端降级」。
+4. **摘除是精确剥离，不是回滚备份。** 关闭开关 = 把注入段逐字节剥掉、还原成官方原文
+   （有单测逐字节比对），而不是拿备份覆盖 —— 备份可能已经不是当前那版了。
+   关掉后客户端**下一次会话**就恢复直连，**全程不重启 Qoder、不影响正在进行的对话**。
+5. **换区域 = 换一个客户端接管。** 装新区域前先按旧租约把旧区域的注入卸干净，
+   否则旧客户端会一直指向一个已经没人监听的端口。
+
+### 真正要动的是 `COSY` 凭据（**不是** Bearer token）
+
+接管唯一要做的事，是让上游**认为这个请求来自选中的扣费账号**。但 Qoder 客户端的业务接口
+（对话、模型清单、data policy…）**根本不发 `Bearer <token>`**，而是发一个自包含凭据：
+
+```
+Authorization: Bearer COSY.<payload_b64>.<md5hex>
+Cosy-User: <uid>      Cosy-Key: <rsa密文>      Cosy-Date: <unix秒>
+```
+
+凭据本体（账号 token）封在 payload 里、是**密文**；`Cosy-Key` 是解开它的对称密钥，
+由客户端内嵌的 RSA 公钥加密。这决定了两种错法都不可行：
+
+| 做法 | 后果 |
+|---|---|
+| **原样透传**（早期版本） | 上游永远看到客户端登录的那个账号 —— 就是「接管开着，额度却扣第一个账号」 |
+| **换成扣费账号的 `Bearer dt-…`**（上一版） | 上游解不开 → `{"code":"101","message":"Signature invalid"}` → 模型清单拉不到 → `no_models_available`，客户端**起不来** |
+
+唯一出路是**按同一算法重签**（[`src/cosy.rs`](src-tauri/src/cosy.rs)）：
+
+```
+A    = 16 个 ASCII 字符（8 随机字节的 hex；同时当 AES 密钥与 IV）—— 必须是文本
+info = base64( AES-128-CBC(A, A)( JSON{uid, aid, name, email, security_oauth_token} ) )
+key  = base64( RSA_PKCS1v15(内嵌公钥, A) )
+n    = base64( JSON{version:"v1", requestId, info, cosyVersion, ideVersion} )
+sig  = md5( n \n key \n ts \n body \n path )     // path 剥 query、剥 `/algo` 前缀
+```
+
+四个必踩的坑（都实测过；**前三个的症状是一模一样的 `101 Signature invalid`**）：
+
+- **`uid` 是 Qoder 侧的账号 id**（`019eb647-…` 这种），**不是**本应用内部那个 UUID。
+  填错的表现是 `{"code":"105","message":"Login expired"}` —— 看着像 token 过期，
+  其实与 token 毫无关系。首次用到时用 token 调 `/api/v3/user/status` 取回并落盘。
+- **签名覆盖 `body` 与 `path`**，所以只能在「已拿到完整请求体」的位置重算，
+  且 path 要剥掉 `/algo` 前缀（客户端签名时就是这么剥的）。
+- **明文的 JSON 字段顺序要照抄客户端**。`serde_json::json!` 落 `BTreeMap`、按字母序输出，
+  明文一变密文全变 → `101`。**长度校验查不出来**：错版与对版都是 143B 明文 / 144B 密文 /
+  192 字符 base64，肉眼与断言都过。
+- **对称密钥 `A` 必须是 16 个可打印 ASCII 字符**。服务端把它当**字符串**用，16 个裸随机
+  字节会被弄坏 → 同样 `101`。实测：任意二进制 16B 必挂；任意可打印 ASCII 16 字符
+  （连 `7f7f7f7f…` 这种都行）全过。
+
+定位这一类问题只有一招：**用固定密钥跑整套头**，把 AES / RSA / 签名三段分别与 JS 版对撞 ——
+
+```bash
+cargo test --lib -- --ignored --nocapture cosy_probe   # 打印固定密钥下的整包头
+```
+
+随机密钥下只能看到「整包头不行」，分不清是 AES、RSA 还是签名错（本轮就在「Rust AES 有差异」
+这个假象上绕了很久 —— 真相是明文顺序不同，密文自然不同，而 AES 实现本来就是对的）。
+
+`Cosy-User` / `Cosy-Key` / `Cosy-Date` 与 `Authorization` 必须**同时**替换：只换 Authorization，
+上游仍拿旧的 Key/Date 去校验，等于没换。重签失败的每一处都**回落成原样透传** ——
+宁可这个请求没换号，也绝不发一个半改的请求出去。
+
+排障一眼看：每个推理 / `/algo` 请求都会在接管动态里留一行诊断 ——
+
+```
+反代收到 GET /algo/api/v2/model/list（鉴权：Bearer COSY.…）→ 已重签 COSY（换成扣费账号）
+```
+
+它把「客户端到底发了什么」与「我们怎么处理」钉在同一时间点上。上一轮在这里只能靠反推，
+代价是一整轮排障。
+
+### 前置条件：应用必须是**签名**的（macOS「App 管理」）
+
+写别人的应用包受 macOS 的 TCC「App 管理」管辖，而**授权记在代码身份上**：
+
+| 签名状态 | designated requirement | 重新构建 / 自动更新后 |
+|---|---|---|
+| 未签名 / ad-hoc（Tauri 默认 `adhoc,linker-signed`）| 只剩 `cdhash H"…"`，连标识符都是随机构造的 `qoder_assistant-<hash>` | **失配** → 系统把它当成新应用 |
+| 固定证书签名（本应用现状）| `identifier "com.waxilo.qoder-assistant" and certificate leaf = H"…"` | **仍然匹配** |
+
+失配的**表现很有欺骗性**：系统不是弹权限框，而是**静默拒绝写入**（`EPERM`），
+于是端口在听、租约在跳，客户端的产物却**一个字节都没改** —— 用户看到的正是「接管没生效」。
+（加 `sudo`、把应用装到别处都没用，这不是权限位问题。）
+
+因此 `tauri.conf.json` 里写死了身份：
+
+```json
+"bundle": { "macOS": { "signingIdentity": "QoderAssistant Self-Signed", "hardenedRuntime": false } }
+```
+
+身份由 `scripts/make-signing-cert.sh` 生成并导入登录钥匙串（自签证书，不需要 Apple 开发者账号）：
+
+```bash
+# 本机现状：复用已有的本机自签 CA 签发一张 Qoder 专用叶证书。
+# 共用 CA ⇒ 叶证书导入即可用，**不用再授权一次「信任设置」**；而 identifier 不同，
+# 两个应用在 TCC 里各记各的条目，互不干扰。
+CA_DIR=~/.traework-signing bash scripts/make-signing-cert.sh
+```
+
+自检（DR 里必须是 `certificate leaf` 而不是 `cdhash`）：
+
+```bash
+codesign -dvv /Applications/QoderAssistant.app | grep Authority
+codesign -d -r- /Applications/QoderAssistant.app
+```
+
+> **换机器**：把凭据目录连同 CA 一起拷过去、重跑脚本的「导入 + 信任」两步，
+> **不要重新生成** —— 新 CA 就是新身份，已授的权限全部作废。
+
+### 授权：**系统不会弹窗**，必须手动开
+
+这一点反直觉，但实测如此（2026-09-19，tccd 日志原文）：
+
+```text
+Failed to match existing code requirement for subject com.waxilo.qoder-assistant
+  and service kTCCServiceSystemPolicyAppBundles
+Service kTCCServiceSystemPolicyAppBundles does not allow prompting for unentitled
+  binaries; returning denied.
+AUTHREQ_RESULT: authValue=0, authReason=2          # 直接判拒，没有任何框
+```
+
+「unentitled」= 不是 Apple 签发的证书（自签就属于这类）。所以**别去等弹窗**，
+它永远不会出现，只有一条 deny 被记进 tccd。手动开是唯一的路：
+
+1. 打开 **系统设置 → 隐私与安全性 → App 管理**
+   （接管页的说明文字里有一个一键直达入口「打开「App 管理」设置」）；
+2. 把 **QoderAssistant** 的开关打开（首次请求后系统已替它建好条目，默认是关的；
+   若列表里没有，点左下角 **+** 从 `/Applications` 添加）；
+3. **重启 QoderAssistant**（授权对已运行的进程不追溯）。
+
+授权是记在代码身份上的，而这个身份现在**是稳定的** ⇒ 以后重新构建、应用内自动更新
+都不会让它失效。**一次授权，长期有效。**
+
+### 没授权时长什么样：开关自己弹回去，并告诉你原因
+
+授权没开时点「开启接管」，**开关会在几秒后自己关回去** —— 这不是 bug，是刻意的：
+设置与磁盘上的事实绝不能相反（「设置说已开启、产物里却没有端点」会让此后这一页的
+每次保存都被拓扑守卫拒掉，用户报的「切换账号失败」正是它的下游症状）。所以失败即整体
+回滚，并把**注入失败的真实原因原样端到弹窗上**，例如：
+
+```text
+接管没能开启（设置已回滚）。
+写入 worker 产物失败（…/qoder-worker-runtime.obf.mjs）：Operation not permitted (os error 1)。
+去「系统设置 → 隐私与安全性 → App 管理」把「QoderAssistant」的开关打开（/Applications/QoderAssistant.app）。
+这个服务不会弹授权框（系统只会在 tccd 里记一条拒绝），必须手动开、别等弹窗；
+列表里若没有本应用，点左下角「+」从 /Applications 添加。
+打开后重启本应用才生效；本应用用固定证书签名，重新构建不会让授权失效。
+```
+
+> 这条路径上有个**顺序陷阱**（已修）：真实原因活在租约的 `last_error` 里，而回滚的第一
+> 步 `uninstall` 会删掉租约 —— 取晚了就只剩一句与事实无关的「端口是否被占用」，
+> 把用户送去查一个没坏的东西。所以 `apply_settings` 在摘除**之前**先把原因取走
+> （`stealth::last_error`）。
+
+排查手法（比猜快）：
+
+```bash
+# ① 我们到底有没有被拦、被谁拦
+/usr/bin/log show --last 5m --predicate 'eventMessage CONTAINS "qoder-assistant"' \
+  | grep 'System Policy'                 # 有 deny 行 = App 管理没开
+# ② 拦住之后系统是怎么判的
+/usr/bin/log show --last 5m --predicate 'process == "tccd"' \
+  | grep -E 'SystemPolicyAppBundles|AUTHREQ_RESULT'
+# ③ 界面上直接看：接管页会显示「接管没能生效：注入 … 失败：Operation not permitted」
+#    —— 这句就是本条症状的原文，照着第 1~3 步做即可
+# ④ 退避是否生效：未授权时重试间隔是 30s（不是 2s），所以 deny 不该刷屏
+/usr/bin/log show --last 2m --predicate 'eventMessage CONTAINS "System Policy"' | grep -c deny
+```
+
+### 区域支持现状
+
+| 区域 | 生效的键 | 协议 | 覆盖范围 | 本应用 |
+|---|---|---|---|---|
+| 国内版 | `QODERCN_SERVER_ENDPOINT` | **必须 https**，只能是 origin（可含端口）| 全部 purpose（inference / center / openapi / base）| ✅ 支持 |
+| 国际版 | `QODER_CENTER_ENDPOINT` | http / https 均可 | **仅 center**，推理端点还要靠代答 `/api/v3/service/region/endpoints` | ⛔ 暂不支持 |
+
+另有 `QODER_MODEL_SERVER_HOST`（两区域通用，只给 host，路径写死
+`/model/v1/chat/completions` 且 scheme 写死 https）。**国际版被显式拒绝**而不是静默空转：
+`region::endpoint_env_key()` 对它返回 `None`，`stealth::install` 直接报「尚未支持」。
+
+- ✅ **端口可用，不用占 443**：`QODERCN_SERVER_ENDPOINT` 只做 `new URL(v).origin` 校验，
+  而 origin **含端口** ⇒ `https://127.0.0.1:8789` 合法。
+- **键名在源码里没有字面量，别用 grep 判死刑**：键是 `Rr(name) = ${prefix}${name}` 拼出来的，
+  国内版构建里 `prefix = "QODERCN"`（`Ja = ("cn" == "cn")` 硬编码）→ 搜不到原字符串。
+  扫二进制要按 **bytes** 计数（`strings` / `grep` 会因编码漏掉）。
+- ***为什么不能走 `settings.json`***：`~/.qoder[-cn]/settings.json` 的 `env` 块
+  **没有任何消费者**（asar 与 worker bundle 里都找不到「把 settings.env 灌进 `process.env`」的
+  代码）；进程 env 由桌面端 spawn 时构造，**不继承桌面端自己的 `process.env`**。
+  旧版本写的 `env.CODEBUDDY_BASE_URL` 是 WorkBuddy/CodeBuddy 时代的残留键，Qoder 两个客户端
+  都不读 —— 那正是「配置写成功、界面显示已开启、端口在听，但对话依旧直连官方」的原因。
+- **怎么自己验证「覆盖有没有被读到」**：读客户端自己的运行日志
+  `~/.qoder[-cn]/logs/runs/<时间戳>-p<桌面端pid>/qodercli.log`，看
+  `[config-service] Initialising { baseUrl: … }` 与 `[endpoints] Elected inference endpoint:`。
+  只要还是 `(SDK default, …)` + 官方域 ⇒ 没读到；应变成 `https://127.0.0.1:8789`。
+  反代侧同时会收到 `/model/v1/chat/completions`。
 
 - **Qoder 专用**：只监听 `127.0.0.1`、无鉴权 Key（不对外提供通用代理能力）；
-  开启时把**接管区域**那个 CLI 配置目录（`~/.qoder` 或 `~/.qoder-cn`）的
-  `settings.json` 里 `env.CODEBUDDY_BASE_URL` 指向本机，
-  关闭 / 换端口 / **换区域** / 应用退出时自动安全摘除（含原子端点切换与重启，不留死端口）。
-- **接管目标区域**：控制条上的「区域」选择器决定三件事 —— 端点写进哪套客户端的配置、
+  开启时把端点注入**接管区域**那个客户端的 worker 产物，
+  关闭 / 换端口 / **换区域** / 应用退出时自动安全摘除（含原子端点切换，不留死端口；
+  **全程不动任何客户端进程**，见本节末尾那两条）。
+- **接管目标区域**：控制条上的「区域」选择器决定三件事 —— 端点注入哪套客户端的产物、
   请求转发到哪个模型网关、以及扣费账号**从哪个池里选**（跨区域的 token 在对方网关上无效，
   所以扣费池与模型清单都只列该区域）。开启期间换区域会走安全切换流程
-  （摘旧区域的端点 → 重启受影响的客户端 → 装进新区域），并把扣费池重置为「全部」；
-  关闭期间换区域只是把设置存下来，不会惊动任何进程。
+  （摘旧区域的注入 → 装进新区域），并把扣费池重置为「全部」；
+  关闭期间换区域只是把设置存下来。**两种情况都不动进程。**
   两套部署可以同时装着，而「现在该接管哪一个」是用户的意图、不是能从磁盘猜出来的事实，
   所以它是一次**显式选择**（`settings.takeover_region`）。选中区域**一个账号都没有**时，
   控制条下方会出现一行提示 + 一键切到有账号的那个区域（只提示，**不替用户改设置**）。
+  换区域还要**先确认那个客户端真的装了**：worker 产物找不到时直接报错并回滚，
+  而不是留下一个「设置说开着、磁盘上什么都没有」的半成品。
 - **限流切换的模型清单**：三层来源 —— Qoder 模型目录（联网，缓存 1 小时）→ 落盘快照
   （按区域分开存）→ 本机 Qoder 的痕迹（`~/.qoder[cn]/.models/default` + 会话日志，
   只含这台机器用过的模型）。第 1 层**实测基本永远拉不到**，两个区域的失败形态还不一样：
@@ -410,17 +662,67 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
   路由侧的免费集合与界面同源（`models::free_ids`），避免「界面显示免费、路由却不切换」。
 - **路由策略**：硬指定「优先扣费账号」> 会话粘滞（30 分钟滑动续期，对话中途不换号）>
   「积分最早过期优先」轮换（快照缓存 10 分钟）。指定账号不存在时自动降级为轮换。
-- **`/v2` 路径改写**：CLI 在端点覆盖模式下请求的是裸路径 `/chat/completions`，
-  而真实网关路由是 `/v2/chat/completions`——代理转发前自动补 `/v2`，否则网关 302 → CLI 报 Empty stream。
-- **接管事件日志**：install / uninstall / 重启 / 每条代理请求（含扣费账号名）记入
+- **`Authorization` 有两种形态，必须分开对待**（2026-09-19 实测；这一条曾让接管「看起来开了、
+  却完全不能用」）：推理与用户信息走 `Bearer <token>` —— **换成选中扣费账号的凭证**，这就是接管的
+  落点；而 `/algo/*`（模型清单、data policy）走 **`Signature <hmac>` 请求签名**，
+  密钥是 `sha256(secret:productVersion:machineToken)`、签名串含
+  `method / path / requestId / machineToken / 时间戳 / sha256(body)` —— 它绑的是**机器**、
+  与选哪个账号无关，反代**原样透传，一个字都不改**。覆盖它的后果不是「换号失败」，
+  而是客户端**整个起不来**：网关回 `{"code":"101","message":"Signature invalid"}`
+  → 拉不到模型清单 → `HeadlessSession initialize failed: no_models_available`
+  → 会话初始化失败、进程退出。判据只在 `proxy::is_bearer_credential` 一处。
+- **请求体支持分块传输**：正文长度一度只从 `Content-Length` 读，于是
+  `Transfer-Encoding: chunked` 的请求被当成「没有正文」**转发空体** → 上游 400。
+  失败形态是静默的（时间线上只有一行「上游返回 400」，看上去像是上游的毛病）：
+  Qoder 的 OTLP 遥测（`/otel/v1/*`，80 KB 级）正是分块上传，每次心跳刷一行 400。
+  对照实测：同一份 89 KB 正文带 `Content-Length` 过反代 → 上游 200，改成分块 → 400。
+  现在分块正文先解开再转发（`proxy::dechunk`），**没解开就不转发**（继续读，不当空体）。
+- **模型目录第 1 层的真实失败原因**（原来只记到「503 是阿里云 ALB 的 HTML 页」）：
+  本工具的请求打的是 `gateway.qoder.com.cn/api/v2/model/list` → **503（ALB 空路由）**；
+  而反代实测收到客户端那一侧的目录请求是 **`/algo/api/v2/model/list?Encode=1`**，
+  **多了一段 `/algo` 前缀**（客户端 SDK 日志把它显示成 `path=/api/v2/model/list`，
+  与它签名时 `path.slice(5)` 剥掉前缀的行为一致）。带 `/algo` 的这条路由**是存在的**，
+  但要求机器签名：不带认证 / 带 Bearer / 带假签名一律
+  `403 {"code":"101","message":"Signature invalid"}`。所以这一层不是「域不通」，
+  而是**路径少了一段 + 缺签名**；真要补上，得先复现那份签名
+  （`machineToken` + `productVersion` + 密钥）—— 在能验证之前不猜着写。
+- **不再改写路径**（此条为订正）：这里原来写「CLI 请求裸 `/chat/completions`，
+  代理转发前自动补 `/v2`」——**代码里这条改写已经删掉**，因为实测在 Qoder 上讲不通：
+  客户端真正发的是 `/model/v1/chat/completions`（前缀对不上，改写本来也不会触发），
+  而旧改写指向的 `/v2/chat/completions` 在国际版网关上是 **404（路由不存在）**、
+  `/model/v1/chat/completions` 是 **401（路由存在、只是没认证）**。
+  **透传代理不替网关发明路径** —— 没有正面证据要求改写时，原样转发才与「客户端自己直连」等价。
+- **接管事件日志**：install / uninstall / 每条代理请求（含扣费账号名）记入
   应用数据目录 `takeover-journal.jsonl`。**不设条数上限**：日志与「一次接管会话」绑定
   ——开启接管时整份重置，会话之内一条不丢（页面上另有「清空」按钮可手动清）。
 - **网络急救**：设置 →「一键诊断 / 一键恢复」。会扫描配置文件、launchd 全局变量、
-  shell 启动脚本、接管事件，能识别「桌面端仍持有已摘除端点」这类隐性故障，一键恢复并自动备份被改文件。
+  shell 启动脚本，外加**两个客户端 worker 产物里的接管注入**，一键恢复并自动备份被改文件。
+  （原先还有一条「桌面端仍持有已摘除端点」的判定，因前提不成立（没有长驻 host）
+  且会误报成 `block` 并诱导用户去重启客户端，已删除。配置文件里的 `CODEBUDDY_*` 端点键
+  现在**只剩历史残留价值** —— Qoder 不读它们，所以清它属于清理，不是修复连通性。
+  真正会「断网」的是**产物里留着指向本机端口、而反代已经不在**的僵尸注入，
+  诊断会把它单独报成 `block` 并告诉你清掉即可 —— 详见 `netfix.rs` 模块文档。）
 
-> 关键机制：Qoder 桌面端与其长驻 CLI host 只在**启动时**读一次端点配置。
-> 因此开启 / 关闭接管时本应用会自动安全重启 Qoder 与长驻 CLI host（收割孤儿进程），
-> 老对话才会拿到新链路。
+> **关键机制（2026-09-19 三轮更正）**：
+>
+> 1. 原来这里写的是「桌面端与其长驻 CLI host 只在启动时读一次端点配置，所以开关接管要
+>    自动重启客户端」——**两半都不成立**。Qoder 没有「长驻 CLI host」：它的推理进程是
+>    **每次会话按需 spawn 的一次性 `--print` 进程**（证据：
+>    `~/.qoder[-cn]/logs/runs/<时间戳>-p<桌面端pid>/manifest.json` 的 `argv`，以及
+>    `runs/` 目录每个会话新增一份），跑完即退，没有可重启的东西。
+> 2. 但「改配置就等于生效」也**不成立**：那个一次性进程的 env 由**桌面端在 spawn 时构造**，
+>    而 `~/.qoder[-cn]/settings.json` 的 `env` 块**没有任何消费者** —— 所以旧实现写的
+>    端点键从来没被读过，接管是**空转**（配置写成功、界面说已开启、端口在听，对话依旧直连官方）。
+> 3. 现在改的**不是配置，而是那个一次性进程要执行的那份产物本身**：在 `app.asar.unpacked`
+>    里的 worker 产物头部注入端点与本地 CA（见本节开头）。产物每次会话重新读，所以
+>    「改完下一次对话即生效」，既不需要重启客户端，也不再依赖任何配置文件。
+>    代价是官方更新会覆盖 → 靠心跳比对文件头指纹自愈；摘除是**精确剥离**，不是拿备份回滚。
+>
+> 删掉那套进程操作还顺手消掉了一个真实故障：`open -a` 紧跟在 AppleScript `quit` 之后
+> 会撞上 LaunchServices 的注册竞态返回 `exit status: 1`，而旧实现在这一步失败后
+> **不回滚**，于是磁盘说「已开启」、界面说「已关闭」—— 用户报的「接管报错、随后又显示
+> 接管成功、切扣费账号却保存失败」整条链路都源于此。现在 `apply_settings` 的每一步
+> 要么全成、要么整体回滚（落盘 → 等端点就位 → 失败则连设置一起退回）。
 
 ---
 
@@ -449,11 +751,12 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 | `oauth_start` | 登录新账号第一步：**按区域**申请 state + 授权链接（不重启应用） |
 | `oauth_poll` | 登录新账号第二步：轮询授权结果；`done=false` 表示仍在等用户授权 |
 | `open_external` | 用系统默认浏览器打开链接（授权页） |
+| `open_app_management` | 打开 macOS「App 管理」授权面板（深链写死在后端、不收前端参数：系统私有 scheme 不放行给 `open_external`）。接管页说明里那个「打开「App 管理」设置」就是它 |
 | `broker_upload` / `broker_link` / `broker_unbind` / `broker_state` | 云端凭证池：上传成一个池并拿 uuid / 绑定别处的 uuid / 解绑 / 只读状态。四个都是**池级**命令，不带账号 id |
 | `get_settings` | 读全局设置（含**接管目标区域** `takeover_region`） |
 | `regions` | 区域清单（国际版 / 国内版的中文名与说明）：界面上「区域」的**唯一来源** |
 | `save_settings` | 保存设置（校验定时时刻与 webhook）；拓扑类字段（启停 / 端口 / 区域）在接管开启时会被拒，必须走 `apply_settings` |
-| `apply_settings` | 原子应用设置；接管启停 / 换端口 / **换区域**时会走安全切换流程（摘端点 + 重启受影响的客户端） |
+| `apply_settings` | 原子应用设置；接管启停 / 换端口 / **换区域**时走安全切换流程（摘端点 + 装到新区域），**全程不动客户端进程**；任一步失败整体回滚 |
 | `test_notify` | 向 webhook 发一条测试通知，返回推送服务原始响应 |
 | `get_autostart` / `set_autostart` | 读取 / 设置开机自启动（直接操作系统登录项，失败会返回原因） |
 | `get_checkin_logs` | 查询签到日志（倒序、可按账号 id 筛选、最多 300 条） |
