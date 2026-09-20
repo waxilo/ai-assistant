@@ -646,6 +646,11 @@ fn enable_endpoint(dir: PathBuf) -> Result<TakeoverStatus, String> {
     //    ⚠️ 位置在 `resolve_targets` **之后**：连目标都解析不出来时这一轮压根没开始，
     //       不该把上一轮的历史毁掉。
     crate::journal::clear(&dir);
+    // 路由归属的内存表（会话粘滞 / 各域上次选中的账号）跟着一起清。
+    // `route_start` 的去重判据就是这两张表：只清日志不清表，「重开接管后回到同一对话」
+    // 会静默复用账号 —— 积分在扣，接管动态里却一条账号记录都没有（用户报「日志不显示
+    // 现在用的什么账号」的成因）。理由与边界见 `proxy::reset_routing_state`。
+    crate::proxy::reset_routing_state();
 
     // 0a) 把规则文件落地（已存在则不动）：让「现在到底用哪张表」随时可见可改。
     //     ⚠️ 这个动作原先挂在已移除的「经系统代理」开启流程里，不能跟着一起丢掉：

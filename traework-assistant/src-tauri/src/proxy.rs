@@ -556,6 +556,25 @@ fn last_picked_changed(scope_key: &str, account_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 清空**路由归属的内存表**（会话粘滞 + 各域上次选中的账号）。
+///
+/// 为什么挂在「开启接管清 journal」的同一时机（`commands::enable_endpoint`）：
+/// `route_start` 只在「首次归属 / 换人」时写，判据就是这两张表；而接管动态每次开启都会清空。
+/// 表不清的话，「关接管 → 再开 → 回到同一个对话继续用」会命中粘滞而**静默复用账号** ——
+/// 积分在扣，接管动态里却一条账号记录都没有，对账入口断在开接管那一刻。
+/// 清了表 ⇒ 重开后的第一个请求必然重新写一条 `route_start`，日志与账本重新对齐。
+///
+/// 代价（刻意接受）：粘滞被清 ⇒ 同一会话在重开接管后可能换到另一个账号。
+/// 这与「开启接管 = 新的一本账」是同一套记账：上一轮的日志本来就已清空。
+pub fn reset_routing_state() {
+    if let Ok(mut m) = sticky_conv().lock() {
+        m.clear();
+    }
+    if let Ok(mut m) = last_picked().lock() {
+        m.clear();
+    }
+}
+
 /// 记一条「接管见过这条路」。`host` 与 **HTTP 方法**一并记进去。
 ///
 /// 理由有两层，第二层是 2026-09-15 才补上的：

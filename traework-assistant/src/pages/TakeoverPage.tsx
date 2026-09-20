@@ -15,19 +15,20 @@ import { IconTrash } from "../components/Icons";
 /**
  * 智能接管页。
  *
- * 设计取向：**一个开关 + 两张勾选表**，其余控件都只在「它此刻真的挡着路」时出现。
+ * 设计取向：**一个开关 + 一张应用单选 + 一张账号勾选表**，其余控件都只在「它此刻真的挡着路」时出现。
  *
  * - 改道方式**只有一种：端点改写**（把应用安装目录里 `product.json` 的 `bootConfig`
  *   指向 `http://127.0.0.1:PORT`），端点恒为**明文回环、不需要任何证书**。
  * - **接管哪些应用**：本机可能同时装了多个 Trae shell（如 `TRAE SOLO CN` + `Trae CN`），
- *   所以「接管对象」是一个**多选**。语义与「参与扣费」完全一致：
- *   **一个都不勾 = 全部接管**，取消勾选 = 只有勾上的被改道、被重启。
- *   ⚠️ 多选**只在真的多于一个应用时**才有交互（只有一个时那枚 chip 是只读的）。
- *   ⚠️ **接管开着时这两枚 chip 是灰的**（改名单要重启那些应用，跟改端口是同一类事：
+ *   「接管对象」是**单选**：点击即选中该应用，同一时刻只有被选中的那个被改道、被重启。
+ *   没配置过时后端名单为空（语义 = 全部），界面上把空名单渲染成「全部选中」；
+ *   点任意一个即收窄为单选。单选没有「取消」——点已选中的那个不做任何事。
+ *   ⚠️ 单选**只在真的多于一个应用时**才有交互（只有一个时那枚 chip 是只读的）。
+ *   ⚠️ **接管开着时 chip 是灰的**（改名单要重启那些应用，跟改端口是同一类事：
  *   先关接管再改）。界面只是**显示**这条规则，规则本身在后端 `set_apps` 里 ——
  *   界面过期也不会让「动别人应用」这件事悄悄发生。
  *   注意这与「参与扣费」**不同**：那个不碰任何应用，所以开着也能改、下一请求即生效。
- * - **补丁的生命周期完全跟着选择走**：勾上时后端自动打、取消时后端自动还原。
+ * - **补丁的生命周期完全跟着选择走**：选中时后端自动打、被换下时后端自动还原。
  *   留一个「还原补丁」按钮只会多出一个「忘了点」的状态。唯一仍要在这里说的是
  *   **打不成的时候** —— 那正是开关灰着的理由。
  * - 开关是唯一的「开着吗」，接管动态是唯一的「刚才发生了什么」，所以「已生效 / 未生效 /
@@ -218,14 +219,14 @@ function appTitle(a: AppStatus, enabled: boolean, multi: boolean): string {
   } else if (!a.selected) {
     parts.push("未接管");
   } else if (!enabled) {
-    parts.push("接管未开启，勾选只决定下次开启时改谁");
+    parts.push("接管未开启，选择只决定下次开启时改谁");
   } else {
     parts.push(a.installed && a.ours ? "端点已改道本机" : "尚未改道");
   }
   if (a.upstream_http) parts.push(`上游 ${a.upstream_http}`);
   if (a.running) parts.push("正在运行");
   // 悬停提示要说清「为什么点不动」——灰掉的控件不解释原因，就等于一个坏掉的控件。
-  if (multi) parts.push(enabled ? "开启接管时不可改（先关闭接管）" : "点击切换是否接管");
+  if (multi) parts.push(enabled ? "开启接管时不可改（先关闭接管）" : "点击接管该应用");
   return parts.join(" · ");
 }
 
@@ -295,12 +296,11 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
   const multi = apps.length > 1;
 
   /**
-   * 接管名单。
+   * 接管名单（界面上是**单选**，存储仍是后端那份列表）。
    *
    * **空列表 = 全部**（与后端 `target::select` 一致，也是「没配置过」的默认状态），
-   * 所以界面上把空列表渲染成「全部勾选」；用户一动就把显式列表写进设置。
-   * 「全不选」被禁止：那会写回空列表，后端又会退回「全部」，与「没勾的不接管」正好相反。
-   * 本机已不存在的 id 在后端会被丢掉，这里也过滤一遍，免得设置里留一条永远勾不亮的名字。
+   * 所以界面上把空列表渲染成「全部选中」；用户一点就收窄成只含那一个应用的显式列表。
+   * 本机已不存在的 id 在后端会被丢掉，这里也过滤一遍，免得设置里留一条永远选不中的名字。
    */
   const picked = useMemo(
     () => (settings?.takeover_apps ?? []).filter((id) => appIds.has(id)),
@@ -354,7 +354,8 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
       text = error;
     } else if (!enabled && blocked.length > 0) {
       // 开关此刻灰着 ⇒ 要说「怎么才能开」。原因已在明细里逐条写清了，这里只给下一步。
-      text = "取消勾选上面打不了补丁的应用，就可以接管其余应用。";
+      // 单选下出路只有一条：改选一个打得成补丁的应用（接管对象只能有一个）。
+      text = "在上方改选一个可以打补丁的应用，就可以开启接管。";
     } else if (enabled && !st.proxy_active) {
       text = st.proxy_error ? `本地反代没有在监听：${st.proxy_error}` : "本地反代没有在监听。";
     } else if (enabled && st.rules?.observe_only) {
@@ -388,7 +389,9 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
   };
 
   /**
-   * 改「接管哪些应用」。
+   * 改「接管哪个应用」（单选）。
+   *
+   * 点击即选中该应用、取消其他；单选没有「取消」——已经是唯一选中项时点击不做任何事。
    *
    * 必须走后端命令（而不是像账号那样直接写设置）：设置要对本机做一次解析
    * （丢掉本机不存在的 id、排序让文件稳定），而且这条规则**只在后端生效** ——
@@ -398,15 +401,10 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
    *
    * 关着接管时它只是记一笔设置，所以也不该弹框打扰。
    */
-  const toggleApp = async (id: string) => {
-    const current = picked.length === 0 ? apps.map((a) => a.id) : picked;
-    const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id];
-    if (next.length === 0) {
-      notify({ kind: "info", text: "至少保留一个应用" });
-      return;
-    }
-    // 全部勾上 = 写空名单（后端语义就是「全部」），避免设置里留一份与默认等价的显式名单
-    const ids = next.length === apps.length ? [] : next;
+  const selectApp = async (id: string) => {
+    // 已经是唯一选中项 ⇒ 无事发生（单选不可取消）
+    if (picked.length === 1 && picked[0] === id) return;
+    const ids = [id];
     setBusy(true);
     setError(null);
     update({ takeover_apps: ids });
@@ -415,7 +413,7 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
       setStCached(r);
       notify({ kind: "ok", text: "已记录，开启接管时生效" });
     } catch (e) {
-      // 勾不上必须留在页面上：否则「勾了却没接管」会变成一个看不见的状态
+      // 选不上必须留在页面上：否则「点了却没接管」会变成一个看不见的状态
       setError(String(e));
     } finally {
       setBusy(false);
@@ -544,13 +542,13 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
               busy ||
               apps.length === 0 ||
               // 名单里有应用打不成补丁 ⇒ 开接管必然失败（它第一步就是逐个打补丁），
-              // 先在「能开」之前灰掉（原因与下一步见下面那张勾选表和 issue）。
+              // 先在「能开」之前灰掉（原因与下一步见下面那枚应用单选和 issue）。
               (!enabled && !patchReady)
             }
             title={
               enabled
                 ? "关闭接管：恢复官方直连，并还原给这些应用打的免证书补丁（正在运行的会被重启；没开着的下次启动自然生效）"
-                : "开启接管：给勾选的应用打免证书补丁、把端点改到本机反代（正在运行的会被重启；没开着的下次启动自然生效）"
+                : "开启接管：给选中的应用打免证书补丁、把端点改到本机反代（正在运行的会被重启；没开着的下次启动自然生效）"
             }
             onChange={(v) => void onToggle(v)}
           />
@@ -565,7 +563,7 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
                   ? "本机只发现这一个 Trae 应用，没有选择余地"
                   : enabled
                     ? "开启接管时不可改（改名单要重启这些应用）；先关闭接管再改"
-                    : "只接管控勾选的应用；一个都不勾 = 全部接管"
+                    : "单选：只接管点击选中的应用"
               }
             >
               接管应用
@@ -577,12 +575,12 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
                   <button
                     key={a.id}
                     className={"chip" + (on ? " on" : "") + (multi ? "" : " static")}
-                    // 只有一个应用时不给点：全不选会被后端解释成「全部」，点了也表达不出别的意思。
+                    // 只有一个应用时不给点：选了也表达不出别的意思。
                     // ⚠️ 接管开着时也不给点：改名单意味着**重启这些应用**，跟改端口是同一类事 ——
                     // 先关接管再改。这条规则后端也拦（见 `commands::set_apps`），界面只是显示它。
                     disabled={busy || !multi || enabled}
                     title={appTitle(a, enabled, multi)}
-                    onClick={() => void toggleApp(a.id)}
+                    onClick={() => void selectApp(a.id)}
                   >
                     {on && <span className="tick">✓</span>}
                     {a.label}
