@@ -401,6 +401,39 @@ mod tests {
         }
     }
 
+    /// 真实接口对照冒烟（**只读**，国际版 vs 国内版）：确认两套部署当天是否都在
+    /// `campaigns[]` 里给出每日 `CLAIM_BENEFIT`，以及各自 `claimStatus`。
+    /// 这才是「为什么国际版报活动未开」的第一现场：国内版正常、国际版此刻没当天活动。
+    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_campaigns_both_regions`
+    #[tokio::test]
+    #[ignore = "真实网络调用，需本机已登录 Qoder"]
+    async fn smoke_real_campaigns_both_regions() {
+        for a in crate::auth_file::discover_local_accounts().accounts {
+            let Some(v) = qoder_api::fetch_campaigns(a.region, &a.token).await else {
+                println!("{}：活动接口不可用", a.region.label());
+                continue;
+            };
+            let daily = v.daily_claim().map(|c| {
+                format!(
+                    "{} status={} {}..{}",
+                    c.key,
+                    c.claim_status,
+                    c.start_at,
+                    c.end_at
+                )
+            });
+            println!(
+                "{} uid={:?} show={} claimable={} 每日活动={:?} 总数={}",
+                a.region.label(),
+                a.uid,
+                v.show_campaign,
+                v.claimable,
+                daily,
+                v.campaigns.len()
+            );
+        }
+    }
+
     /// 真实接口冒烟：额度读数（重构后 `fetch_resource_view` 收的是**账号自己的区域**，
     /// 用来确认本机账号的区域登记与真实域对得上）。
     /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_credits_endpoint`

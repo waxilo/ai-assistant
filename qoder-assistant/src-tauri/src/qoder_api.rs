@@ -23,7 +23,8 @@
 use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 // 这里曾经有四个 `pub const &str` 基址（`OPENAPI_BASE` / `AUTH_BASE` / `AUTH_CLIENT_ID`
 // / `INFER_BASE`）。它们在「Qoder 只有一个域」的前提下还算收敛，但**Qoder 其实有两套
@@ -70,6 +71,142 @@ pub fn client() -> reqwest::Client {
         .timeout(TIMEOUT)
         .build()
         .expect("构建 Qoder HTTP 客户端失败")
+}
+
+// ---------------------------------------------------------------- 国际版原生设备身份
+
+/// Qoder 国际版活动接口会校验一套由官方 `runtime-info.exe` 原生导出的设备身份
+/// `{machineToken, machineType, machineCode}`：不带时国际版返回的 `campaigns[]` 里
+/// **没有**当天那条每日 `CLAIM_BENEFIT`（界面就报「活动未开」）；带上后才会下发。
+/// 国内版无此校验，一直正常。
+///
+/// 这套身份来源于官方 `runtime-info.exe`（win32 调用 `runtime-info.exe <env> --account-stdin`，
+/// `<env>` 对 global 部署为 `3`，account 从 stdin 传 `{"account": uid}`）。三个值**每次
+/// 运行都会重新生成**，但同一次运行里必然配套 —— 服务端认可的正是「整体、自洽」的身份，
+/// 所以每次取值必须来自**同一次**输出，不可混用历史值。
+///
+/// 官方拿到身份后会缓存约 1 小时再刷新（`WJt = 3600_000`ms），因此这里也缓存复用，
+/// 避免每次请求都拉起一个子进程。缓存见 [`machine_identity`]。
+#[derive(Clone)]
+struct MachineIdentity {
+    token: String,
+    machine_type: String,
+    machine_code: String,
+}
+
+/// 设备身份缓存：`(身份, 取到时刻)`。只在缓存过期时才重新拉起 `runtime-info.exe`。
+static MACHINE_CACHE: OnceLock<Mutex<Option<(MachineIdentity, Instant)>>> = OnceLock::new();
+
+/// 缓存时长。官方约 1 小时，签到节奏一天一次，10 分钟足够且更宽松。
+const MACHINE_TTL: Duration = Duration::from_secs(600);
+
+fn machine_cache() -> &'static Mutex<Option<(MachineIdentity, Instant)>> {
+    MACHINE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 定位官方 `runtime-info.exe`：`~/.qoder/.bin/<umid-…>/runtime-info.exe`。
+/// 未安装官方 Qoder（或路径变了）就 `None` —— 此时国际版只能退回「不带头」的旧行为。
+fn runtime_info_exe() -> Option<std::path::PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let bin = std::path::Path::new(&home).join(".qoder").join(".bin");
+    std::fs::read_dir(bin).ok()?.flatten().find_map(|e| {
+        let p = e.path().join("runtime-info.exe");
+        p.is_file().then_some(p)
+    })
+}
+
+/// 官方 `Cosy-MachineId` 的来源：`~/.qoder/installation_id`（实测它和国际版
+/// `machine_id` 都能被服务端接受，取 `installation_id` 即可）。
+fn installation_id() -> Option<String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let s = std::fs::read_to_string(std::path::Path::new(&home).join(".qoder").join("installation_id"))
+        .ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// 真正拉起 `runtime-info.exe` 一次，返回新鲜整套身份。
+fn spawn_machine_identity(region: Region) -> Option<MachineIdentity> {
+    let exe = runtime_info_exe()?;
+    // 官方 `dZe`：global 部署 `environment = 3`，其它（含国内）为 `0`。
+    let env = if region == Region::Global { "3" } else { "0" };
+    let mut child = std::process::Command::new(exe)
+        .args([env, "--account-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    {
+        use std::io::Write;
+        if let Some(stdin) = child.stdin.as_mut() {
+            // account 走 stdin；身份本身是自洽的随机整体，account 不参与其有效性。
+            let _ = stdin.write_all(b"{\"account\":\"qoder-assistant\"}\n");
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    let first = String::from_utf8_lossy(&out.stdout).lines().next()?.to_string();
+    let v: Value = serde_json::from_str(&first).ok()?;
+    let token = v["machineToken"].as_str()?.to_string();
+    let machine_type = v["machineType"].as_str()?.to_string();
+    let machine_code = v["machineCode"].as_str()?.to_string();
+    if token.is_empty() || machine_type.is_empty() || machine_code.is_empty() {
+        return None;
+    }
+    Some(MachineIdentity {
+        token,
+        machine_type,
+        machine_code,
+    })
+}
+
+/// 取（并缓存）原生设备身份。**仅国际版**参与：国内版不需要、也不应被这个随机身份打扰。
+/// 官方环境（`runtime-info.exe`）缺失时回 `None`，调用方保持「不带机器头」的旧行为。
+fn machine_identity(region: Region) -> Option<MachineIdentity> {
+    if region != Region::Global {
+        return None;
+    }
+    {
+        let cache = machine_cache().lock().ok()?;
+        if let Some((m, at)) = cache.as_ref() {
+            if at.elapsed() < MACHINE_TTL {
+                return Some(m.clone());
+            }
+        }
+    }
+    let m = spawn_machine_identity(region)?;
+    if let Ok(mut cache) = machine_cache().lock() {
+        *cache = Some((m.clone(), Instant::now()));
+    }
+    Some(m)
+}
+
+/// 给请求补上官方那组 `Cosy-*` 设备头 —— 国际版活动接口的「门票」。
+///
+/// 只有国际版、且本机有能力取到原生身份时才加；其余情况（国内版 / 没装官方环境 /
+/// `runtime-info` 失败）原样放行，为的是**不破坏**国内版与「无头也能过的场景」。
+fn apply_machine_headers(req: reqwest::RequestBuilder, region: Region) -> reqwest::RequestBuilder {
+    if region != Region::Global {
+        return req;
+    }
+    let (m, machine_id) = match (machine_identity(region), installation_id()) {
+        (Some(m), Some(id)) => (m, id),
+        _ => return req,
+    };
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".into());
+    req.header("Cosy-Version", "0.3.4")
+        .header("Cosy-MachineOS", std::env::consts::OS)
+        .header("Cosy-MachineHostname", host)
+        .header("Cosy-MachineId", machine_id)
+        .header("Cosy-MachineToken", m.token)
+        .header("Cosy-MachineCode", m.machine_code)
+        .header("Cosy-MachineType", m.machine_type)
 }
 
 /// 发一个带鉴权的 GET（打 **OpenAPI**，基址取 [`Region::openapi_base`]），拿 JSON。
@@ -395,8 +532,24 @@ pub fn parse_campaigns(root: &Value) -> Option<CampaignView> {
 }
 
 /// 拉活动状态（打账号所属区域的 OpenAPI）。失败回 `None`。
+///
+/// 国际版这条接口会校验原生设备身份（见模块头），这里通过 [`apply_machine_headers`]
+/// 补上那组 `Cosy-*` 头 —— 否则国际版永远拿不到当天那条每日 `CLAIM_BENEFIT`，
+/// 表现为「活动未开」。国内版不受影响。
 pub async fn fetch_campaigns(region: Region, token: &str) -> Option<CampaignView> {
-    parse_campaigns(&get_json(region, token, CAMPAIGN_PATH, &[]).await?)
+    let resp = apply_machine_headers(
+        client()
+            .get(format!("{}{CAMPAIGN_PATH}", region.openapi_base()))
+            .bearer_auth(token),
+        region,
+    )
+    .send()
+    .await
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    parse_campaigns(&resp.json::<Value>().await.ok()?)
 }
 
 /// 一次领取的**发放凭据** —— `claim` 响应里与「这一笔积分」有关的那部分事实。
@@ -488,15 +641,18 @@ pub async fn claim_campaign(
     {
         return Err(format!("campaignId 形态异常，拒绝拼路径：{campaign_id:?}"));
     }
-    let resp = client()
-        .post(format!(
-            "{}{CAMPAIGN_PATH}/{campaign_id}/claim",
-            region.openapi_base()
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("领取请求失败：{e}"))?;
+    let resp = apply_machine_headers(
+        client()
+            .post(format!(
+                "{}{CAMPAIGN_PATH}/{campaign_id}/claim",
+                region.openapi_base()
+            ))
+            .bearer_auth(token),
+        region,
+    )
+    .send()
+    .await
+    .map_err(|e| format!("领取请求失败：{e}"))?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -791,5 +947,123 @@ mod tests {
         }
         // 只断言「能解析」——今天有没有可领的活动取决于时刻，不是稳定条件
         assert!(parse_campaigns(&serde_json::json!({})).is_none());
+    }
+
+    /// 只读实验 2：**用官方 `runtime-info.exe` 现取一整套原生设备身份
+    /// （`machineToken` / `machineType` / `machineCode`），再把 `Cosy-*` 机器头逐个补齐，
+    /// 验证国际版活动接口此时是否下发当天可领的每日活动**。
+    ///
+    /// 逆向结论（app.asar 0.3.4 `dZe`/`AXe`）：win32 下官方以
+    /// `runtime-info.exe <environment> --account-stdin` 调用，account 从 stdin 传
+    /// `{"account": uid}`；全局部署 `environment = 3`。输出为一段 JSON，
+    /// 官方只取 `{machineToken, machineType, machineCode}`。关键点：这三个值**每次调用
+    /// 都重新生成**（并非持久化），所以「同一次运行里三值必然配套」才是可用的资格，
+    /// 用任意历史值都可能被拒绝。
+    ///
+    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_campaigns_with_runtime_identity`
+    #[tokio::test]
+    #[ignore = "真实网络调用 + 本机原生工具，需已登录国际版；只读，绝不发 claim"]
+    async fn smoke_real_campaigns_with_runtime_identity() {
+        let list = crate::auth_file::discover_local_accounts().accounts;
+        let Some(acc) = list.iter().find(|a| a.region == Region::Global) else {
+            println!("本机没有国际版账号，跳过");
+            return;
+        };
+        // 定位 runtime-info.exe：~/.qoder/.bin/<umid-xxx>/runtime-info.exe
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+        let bin_dir = std::path::Path::new(&home).join(".qoder").join(".bin");
+        let exe = std::fs::read_dir(&bin_dir).ok().and_then(|rd| {
+            rd.flatten().find_map(|e| {
+                let p = e.path().join("runtime-info.exe");
+                p.is_file().then_some(p)
+            })
+        });
+        let Some(exe) = exe else {
+            println!("未找到 runtime-info.exe，跳过");
+            return;
+        };
+        // 调用官方同款：environment=3(global) --account-stdin，account 走 stdin
+        let mut child = std::process::Command::new(&exe)
+            .args(["3", "--account-stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("无法启动 runtime-info.exe");
+        {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                let uid = acc.uid.as_deref().unwrap_or("");
+                let _ = stdin.write_all(format!("{{\"account\":\"{uid}\"}}\n").as_bytes());
+            }
+        }
+        let output = child.wait_with_output().expect("等待 runtime-info 失败");
+        let out_txt = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let first_line = out_txt.lines().next().unwrap_or("");
+        let Ok(idv) = serde_json::from_str::<Value>(first_line) else {
+            println!("runtime-info 输出无法解析：{out_txt}");
+            return;
+        };
+        let (m_token, m_type, m_code) = (
+            idv["machineToken"].as_str().unwrap_or(""),
+            idv["machineType"].as_str().unwrap_or(""),
+            idv["machineCode"].as_str().unwrap_or(""),
+        );
+        println!("runtime-info => token={} type={} code={}", m_token.len(), m_type, m_code);
+        if m_token.is_empty() || m_type.is_empty() || m_code.is_empty() {
+            println!("runtime-info 缺 machineToken/machineType/machineCode");
+            return;
+        }
+        // Cosy-MachineId 用本机真实的 installation_id / machine_id 轮流试
+        let id_candidates = [
+            std::fs::read_to_string(home.clone() + "\\.qoder\\installation_id").ok(),
+            std::fs::read_to_string(home.clone() + "\\.qoder\\.auth\\machine_id").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+        let host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "unknown".into());
+
+        for mid in id_candidates {
+            println!("----- Cosy-MachineId = {mid} -----");
+            let req = super::client()
+                .get(format!("{}/sash/api/v1/me/campaigns", acc.region.openapi_base()))
+                .bearer_auth(&acc.token)
+                .header("Cosy-Version", "0.3.4")
+                .header("Cosy-MachineOS", std::env::consts::OS)
+                .header("Cosy-MachineHostname", host.as_str())
+                .header("Cosy-MachineId", mid.as_str())
+                .header("Cosy-MachineToken", m_token)
+                .header("Cosy-MachineCode", m_code)
+                .header("Cosy-MachineType", m_type);
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("请求失败：{e}");
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                println!("HTTP {status} 非 JSON：{}", text.chars().take(120).collect::<String>());
+                continue;
+            };
+            let view = parse_campaigns(&v);
+            println!("HTTP {status} show={:?} claimable={:?}",
+                v.get("showCampaign"), v.get("claimable"));
+            if let Some(v) = view {
+                println!("每日活动={:?}", v.daily_claim().map(|c| (c.key.as_str(), c.claim_status.as_str())));
+                for c in &v.campaigns {
+                    println!("  - {} {} {} status={}", c.id, c.key, c.action_type, c.claim_status);
+                }
+            } else {
+                println!("  响应体：{}", text.chars().take(300).collect::<String>());
+            }
+        }
     }
 }
