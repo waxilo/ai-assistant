@@ -235,7 +235,7 @@ impl GlobalSettings {
 /// 「视图」时的自我描述（前端与消费方读它），顶层的才是「当前选中哪个区域」这个
 /// 全局意图本身。写入路径保证两者一致（[`save_settings`] 按顶层键落对应切片，
 /// 且切片的 `takeover_region` 已被视图设为同一个区域）。
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SettingsStore {
     #[serde(default)]
     global: GlobalSettings,
@@ -246,6 +246,22 @@ pub struct SettingsStore {
     /// 所以老数据迁移与新增区域都不需要补写占位条目。
     #[serde(default)]
     regions: std::collections::HashMap<Region, Settings>,
+}
+
+/// **全新安装**（本机还没有 `settings.json`）时的落盘表：当前区域缺省 = 国内版
+/// （产品决定默认选中它，见 [`default_takeover_region`]）。
+///
+/// 注意与「老扁平文件」的解析区隔开：[`SettingsStore::from_legacy`] 走的是
+/// `Settings` 字段的 serde 缺省（那是历史 = 国际版），刻意不跟着这里改成 Cn
+/// —— 否则老用户升级后会被默认丢进国内版、看到空账号库。这里只管「无文件」。
+impl Default for SettingsStore {
+    fn default() -> Self {
+        Self {
+            global: GlobalSettings::default(),
+            takeover_region: default_takeover_region(),
+            regions: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl SettingsStore {
@@ -314,6 +330,11 @@ pub struct Settings {
     /// ⚠️ 这一项**取代了旧的 `default_base_url`**：那个字段先是模板残留的 CodeBuddy
     /// 域名（靠迁移改成 Qoder 的），随后又被当成「上游可覆盖」留着，而前端从来没有
     /// 它的入口。上游其实由区域唯一决定，留一个可写字段只会多一处「改错了不报错」。
+    ///
+    /// 字段 serde 缺省 = [`Region::default`]（国际版）是针对**老文件**的历史语义：
+    /// 老扁平 / 老新格式文件里没有它时，那份数据默认是国际版的账号库。
+    /// 「**全新安装**默认选国内版」走的是 [`SettingsStore::default`]，这里不跟着改，
+    /// 否则老用户升级后会被默认丢进国内版、看到空账号库。
     #[serde(default)]
     pub takeover_region: Region,
     #[serde(default)]
@@ -421,7 +442,11 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            takeover_region: Region::default(),
+            // 「当前区域」缺省 = 国内版（见 `default_takeover_region`，字段级 serde
+            // 与这里共用同一处真相）。**不要**用 `Region::default()`：那是账户 region
+            // 字段的身份缺省（老账号 = 国际版），一条线管两个含义会在默认改版时
+            // 把老账号都解析成国内版。
+            takeover_region: default_takeover_region(),
             auto_checkin_on_start: false,
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
@@ -445,6 +470,15 @@ impl Default for Settings {
             notify_on_briefing: true,
         }
     }
+}
+
+/// 「当前区域」= 国内版的缺省（做"**全新安装**默认选中国内版"的唯一一处真相）。
+///
+/// 供 [`SettingsStore::default`]（本机还没有 settings.json 时）与
+/// [`Settings::default`]（区域切片缺失时的视图回退）使用。**不要**换成
+/// [`Region::default`]：那是账户 region 字段与老文件解析的历史缺省（国际版）。
+fn default_takeover_region() -> Region {
+    Region::Cn
 }
 
 /// 风控随机间隔默认上限：45 秒足够打散节奏，又不至于让「全部签到」等太久
@@ -874,7 +908,8 @@ mod tests {
     }
 
     /// 升级路径：老 `settings.json` 里那个 `default_base_url` 键**必须还能读出来**
-    /// —— 字段已经删了，读到时直接忽略；新字段 `takeover_region` 落成国际版。
+    /// —— 字段已经删了，读到时直接忽略；新字段 `takeover_region` 落成历史缺省国际版
+    /// （老文件默认是国际版账号库，见字段上的注释）。
     ///
     /// 这条断言钉的是「删字段不会让整份配置报废」：serde 默认容忍未知键，
     /// 但哪天给 `Settings` 加上 `deny_unknown_fields`，老用户的配置就会**整份回退成默认值**
@@ -1005,7 +1040,7 @@ mod tests {
         )
         .unwrap();
 
-        // 当前（国际版 = 老配置的唯一区域）：所有值原样
+        // 当前（老文件的历史缺省 = 国际版）：所有值原样
         let s = load_settings(&dir);
         assert_eq!(s.takeover_region, Region::Global);
         assert_eq!(s.schedule_time, "08:30");

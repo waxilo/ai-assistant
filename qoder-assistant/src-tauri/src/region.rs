@@ -65,8 +65,10 @@ pub enum Region {
 }
 
 impl Region {
-    /// 全部区域（界面上的顺序就是它）
-    pub const ALL: [Region; 2] = [Region::Global, Region::Cn];
+    /// 全部区域（界面上的顺序就是它）—— 国内版在前、作为界面默认选中的那一项。
+    /// 注意这里的顺序只影响**展示/兜底**，不是 [`Region::default`]：后者是账户
+    /// region 字段的 serde 缺省（老账号无该字段 = 国际版），不能跟着调。
+    pub const ALL: [Region; 2] = [Region::Cn, Region::Global];
 
     /// 稳定标识：落盘（`accounts.json` / `settings.json`）与 IPC 都用它。
     ///

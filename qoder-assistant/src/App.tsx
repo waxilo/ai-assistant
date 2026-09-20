@@ -856,6 +856,7 @@ export default function App() {
       {modal?.type === "local" && (
         <LocalAccountsModal
           accounts={accounts}
+          region={settings?.takeover_region ?? null}
           onImport={importItems}
           onClose={() => setModal(null)}
           onToast={showToast}
@@ -863,6 +864,7 @@ export default function App() {
       )}
       {modal?.type === "oauth" && (
         <OAuthModal
+          region={settings?.takeover_region ?? null}
           onImport={importItems}
           onClose={() => setModal(null)}
           onToast={showToast}

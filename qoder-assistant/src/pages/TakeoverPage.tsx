@@ -11,7 +11,7 @@ import {
   openAppManagement,
 } from "../api";
 import { AccountCell } from "../common";
-import { regionHint, regionLabel, useRegions } from "../regions";
+import { regionLabel, useRegions } from "../regions";
 import type { ConfirmReq, Toast } from "../common";
 import { IconBolt, IconInfo, IconUser } from "../components/Icons";
 import { Row, Toggle } from "../components/SettingsControls";
@@ -529,7 +529,7 @@ export function TakeoverPage({
         <span>
           开启后 Qoder 的对话请求由本地代理转发，按「积分最早过期优先」在账号间分配扣费；
           下方记录每一次开关、路由与异常。
-          <b>接管只作用于上面选的区域</b>：端点写进那一套客户端的 worker 产物，
+          <b>接管作用于当前区域</b>（跟随后台左下角的全局区域选择器）：端点写进那一套客户端的 worker 产物，
           扣费也只在该区域的账号里选（跨区域的 token 在对方网关上无效）。
           <b>全程不重启 Qoder</b>：Qoder 每次会话自己起一次性推理进程，会重新读一遍产物，
           所以改完下一次对话就生效，正在登录的账号与正在进行的对话都不受影响。
@@ -608,19 +608,6 @@ export function TakeoverPage({
           <span className="ta-value">{modelSummary}</span>
           <span className="ta-edit">选择</span>
         </button>
-        <label
-          className="tk-field"
-          title={
-            regionHint(regionOpts, region) ??
-            "当前接管区域；切换请用左下角的区域选择器"
-          }
-        >
-          区域
-          {/* 只读展示：切区域的唯一入口在左下角选择器（`set_region`）。这页曾经
-              自己放了个下拉，但设置按区域各存一份后，「带着本页取值存进另一区域」
-              会把对方的设置整个盖掉，后端已把这条路拒掉。 */}
-          <span className="tk-region-static">{labelOf(region)}</span>
-        </label>
         <label
           className="tk-field"
           title={proxyOn ? "接管开启期间不允许修改端口；请先关闭接管" : "代理监听端口"}
@@ -778,7 +765,7 @@ export function TakeoverPage({
           {regionAccounts.length === 0 ? (
             <p className="empty">
               还没有{labelOf(region)}的账号。先到「账号签到」页登录或导入，
-              或把上面的「区域」换成另一个版本。
+              或在左下角把区域切成另一个版本。
             </p>
           ) : filteredAccounts.length === 0 ? (
             <p className="empty">没有匹配「{query}」的账号。</p>
@@ -855,7 +842,7 @@ export function TakeoverPage({
               清单的来源依次是：Qoder 模型目录（联网，缓存 1 小时）→ 落盘快照 →
               本机 Qoder 的记录。该接口实测「对常规客户端不开放」（国际版 404、国内版 503），
               所以多数时候给的是后两层 —— 那不是这台机器的网络问题，点「刷新」也一样。
-              清单<b>跟着上面选的「{labelOf(region)}」区域走</b> ——
+              清单<b>跟着左下角选的「{labelOf(region)}」区域走</b> ——
               两个区域的模型目录不在同一个域上，缓存也是分开存的。
             </span>
           </p>
@@ -885,7 +872,7 @@ export function TakeoverPage({
             <p className="empty">
               {regionAccounts.length === 0
                 ? `「${labelOf(region)}」下还没有账号，清单只能靠本机痕迹，而这台机器也没留下记录。` +
-                  "先在「账号签到」页登录一个该区域的账号，或把上面的「区域」换成另一个版本。"
+                  "先在「账号签到」页登录一个该区域的账号，或在左下角把区域切成另一个版本。"
                 : "暂未发现模型：Qoder 模型目录、落盘快照、本机记录三层都没拿到。" +
                   "确认 Qoder 已登录、且本机跑过一次对话，再点右上角「刷新」。"}
             </p>
