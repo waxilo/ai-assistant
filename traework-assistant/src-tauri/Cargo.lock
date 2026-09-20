@@ -5033,7 +5033,7 @@ dependencies = [
 
 [[package]]
 name = "traework-assistant"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "aes",
  "base64 0.22.1",
