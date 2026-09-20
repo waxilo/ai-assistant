@@ -9,6 +9,7 @@ use crate::notify;
 use crate::oauth;
 use crate::refresh;
 use crate::region::Region;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -124,11 +125,13 @@ pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<()
 
 /// 阈值内自动续签。返回值 `Ok(true)` = **账号字段有更新，调用方需要落盘**。
 ///
-/// 绑了凭证池时**恒为「没动」**：整池的续签统一由 [`sync_pool_if_bound`] 拿着闸做。
-/// 这里若退回本地续签，几台机器会同时打官方接口、各自换一条新链 ——
+/// 账号所属区域绑了凭证池时**恒为「没动」**：那池的续签统一由 [`sync_pool_if_bound`]
+/// 拿着闸做。这里若退回本地续签，几台机器会同时打官方接口、各自换一条新链 ——
 /// 「谁先签谁把别人踢下线」正是这么来的，所以这条分岔不能省。
+/// 判据按**账号自己的区域**算：两套部署各绑各的池，国际版绑了不代表国内版账号
+/// 也要停掉本地续签。
 pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, String> {
-    if crate::broker::bound() {
+    if crate::broker::bound_in(account.region) {
         return Ok(false);
     }
     if account.refresh_token.is_none() {
@@ -173,7 +176,7 @@ pub(crate) async fn fill_phone_if_missing(account: &mut Account) -> Result<bool,
     }
 }
 
-/// 绑定凭证池时先整池同步一轮再让调用方去读账号。
+/// 绑定凭证池时先整池同步一轮再让调用方去读账号（区域 = 当前选中的区域）。
 ///
 /// ⚠️ **必须在 `load_accounts` 之前调用**：它会把云端那一份并进 `accounts.json`，
 /// 而闸带回来的才是最新凭证（本地那份可能早被别的机器换掉了）。
@@ -183,10 +186,16 @@ pub(crate) async fn fill_phone_if_missing(account: &mut Account) -> Result<bool,
 /// 真出错也只写进 `broker::status().error`。它挂在签到 / 刷新 / 接管路由这些主流程上，
 /// 不该因为管家不可达就把主流程拦住 —— 本地凭证本来就还能用。
 pub(crate) async fn sync_pool_if_bound(dir: &Path) {
-    if !crate::broker::bound() {
+    sync_pool_if_bound_in(dir, accounts::load_settings(dir).takeover_region).await;
+}
+
+/// 同上，但区域由调用方指定：反代路由与批量动作都各只碰一个区域，
+/// 而自动续签是跨区域的 —— 绑了池的区域每一处都要先同步一轮。
+pub(crate) async fn sync_pool_if_bound_in(dir: &Path, region: Region) {
+    if !crate::broker::bound_in(region) {
         return;
     }
-    let _ = crate::broker::sync(dir, false).await;
+    let _ = crate::broker::sync(dir, false, region).await;
 }
 
 /// 这个账号接下来会真的发出**官方续签请求**吗？
@@ -206,8 +215,11 @@ fn will_refresh(account: &Account) -> bool {
 /// （续签失败是常态化的旁路事件，不该被当成「签到异常」）。
 pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, String> {
     let dir = data_dir(app);
-    // 先整池同步（绑了池才有动作）—— 必须在 load_accounts 之前，见它的注释
-    sync_pool_if_bound(&dir).await;
+    // 先整池同步（绑了池才有动作）—— 必须在 load_accounts 之前，见它的注释。
+    // 续签本身是跨区域的，所以**每个绑了池的区域**都要先同步一轮。
+    for r in Region::ALL {
+        sync_pool_if_bound_in(&dir, r).await;
+    }
 
     let mut accounts = accounts::load_accounts(&dir);
     let mut refreshed = Vec::new();
@@ -295,6 +307,8 @@ pub async fn import_accounts(
     items: Vec<ImportItem>,
 ) -> Result<ImportReport, String> {
     let dir = data_dir(&app);
+    // 导入项落在哪些区域（要在 `merge_import` 消费 items 之前取，见下面推云那段）
+    let regions: HashSet<Region> = items.iter().map(|i| i.region).collect();
     let mut accounts = accounts::load_accounts(&dir);
     let report = merge_import(&mut accounts, items);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
@@ -302,10 +316,13 @@ pub async fn import_accounts(
     // 绑了池：新增 / 改动的账号**立刻**推上云，不等下一次签到或接管路由。
     // 这里必须 `force` —— 常规路径有两分钟节流，而导入是用户看得见的动作，
     // 卡在节流窗口里会让「刚加的账号没上去」看起来像丢了。
+    // 每个区域各绑一池：导入项落在哪个区域，就推哪个区域的池。
     // 推不动（闸在别的机器手里 / 管家不可达）**不算导入失败**：整池同步每次提交的
     // 都是「云端 ∪ 本机」，下一次同步照样会把它带上，所以这里只吞掉错误、不改结果。
-    if broker::bound() {
-        let _ = broker::sync(&dir, true).await;
+    for r in regions {
+        if broker::bound_in(r) {
+            let _ = broker::sync(&dir, true, r).await;
+        }
     }
     Ok(report)
 }
@@ -616,6 +633,12 @@ pub async fn checkin_one(app: AppHandle, id: String) -> Result<accounts::Account
         .iter()
         .position(|a| a.id == id)
         .ok_or("账号不存在")?;
+    // 只签当前区域的账号（与「全部签到」同一条界线）。前端本来就只展示这一区域的行，
+    // 这道闸拦的是「拿着过期列表来点」：区域切走了，按钮还悬在旧账号上。
+    let region = accounts::load_settings(&dir).takeover_region;
+    if accounts[idx].region != region {
+        return Err("该账号不属于当前区域".into());
+    }
     // 临期先续签。
     // 失败不阻断：仍用旧 token 试一次，由签到结果给出明确提示
     let _ = ensure_fresh_token(&mut accounts[idx]).await;
@@ -658,22 +681,33 @@ pub async fn checkin_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
 ///
 /// 不打领取接口——已领的活动再打只会拿到 409，看最新状态没必要绕这一圈。
 /// 逐账号查询、单个失败不改原值（界面保留旧数），最后整体保存一次。
+///
+/// **只刷当前区域**（与「全部签到」同一条界线）：刷新是「把界面上看得见的数对齐」，
+/// 另一区域的行根本不在这一屏上，替它打一轮接口既多一倍请求，也把风控面摊宽。
+/// 凭证续签（`auto_refresh_all`）不受这条限制 —— 那是保命操作，跨区域照跑。
 #[tauri::command]
 pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, String> {
     let dir = data_dir(&app);
     sync_pool_if_bound(&dir).await;
     let mut accounts = accounts::load_accounts(&dir);
-    if accounts.is_empty() {
+    let region = accounts::load_settings(&dir).takeover_region;
+    let idx: Vec<usize> = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.region == region)
+        .map(|(i, _)| i)
+        .collect();
+    if idx.is_empty() {
         return Ok(Vec::new());
     }
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     // 采集与记账分开：先把读数攒齐（网络在锁外），最后一次性并入内存台账。
     // 这样既不会跨 `await` 持锁，也不会出现「改到一半被别的路径那份旧副本覆盖」。
-    let mut readings = Vec::with_capacity(accounts.len());
-    for i in 0..accounts.len() {
+    let mut readings = Vec::with_capacity(idx.len());
+    for (step, &i) in idx.iter().enumerate() {
         // 账号之间留抖动：每账号三四个请求，N 个账号零间隔打出去就是脚本形态。
         // 首个账号不等（它前面本就没有请求，也让首条结果尽快回到界面）
-        if i > 0 {
+        if step > 0 {
             crate::http::account_gap().await;
         }
         // 凭证临期的先续签，避免拿着过期 token 把「没积分」误判成「查不到」。
@@ -698,8 +732,10 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
         crate::scheduler::log_event(&dir, &format!("积分台账落盘失败：{e}"));
     }
     // 积分读数从刚写好的台账配上账号一起返回（界面口径与台账同源）；
-    // 落盘只写账号本身 —— 积分是台账的投影，不进 accounts.json
-    let views = accounts::view_accounts(accounts.clone(), &dir);
+    // 落盘只写账号本身 —— 积分是台账的投影，不进 accounts.json。
+    // 返回只含本区域（前端按 id 合并）；落盘是全量（另一区域的条目原样写回）。
+    let refreshed = idx.into_iter().map(|i| accounts[i].clone()).collect();
+    let views = accounts::view_accounts(refreshed, &dir);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     Ok(views)
 }
@@ -728,6 +764,11 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
 /// 抽成独立函数是因为定时调度（`scheduler`）与手动命令共用同一套逻辑——
 /// 后台线程走不了 Tauri 的 invoke，只能直接调它。
 ///
+/// **只签当前区域**（`settings.takeover_region`，即左下角选择器选中的那一套部署）：
+/// 另一区域的账号有自己的活动权益与刷新点，跟着这批签既没意义、又替用户做了他没选的写操作。
+/// 落盘仍是**全量账号**（只改了本区域那几条的 `last`），返回视图只含本区域 ——
+/// 前端按 id 合并回列表，另一区域的行保持原样。
+///
 /// `scheduled` 决定用哪一档「风控节奏」（见 [`gap_seconds`]）：
 /// - `true`：定时/自动触发，两次请求之间随机歇 `stagger_max_seconds` 以内（默认 45s 档）；
 /// - `false`：用户主动点（含启动即签到），走 `manual_stagger_max_seconds`（默认 8s 档）——
@@ -742,15 +783,23 @@ pub(crate) async fn checkin_all_inner(
     let dir = data_dir(app);
     sync_pool_if_bound(&dir).await;
     let mut accounts = accounts::load_accounts(&dir);
-    if accounts.is_empty() {
+    let settings = accounts::load_settings(&dir);
+    // 本区域账号在原列表里的下标：签到只碰这一批，其余条目连 `last` 都不动
+    let idx: Vec<usize> = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.region == settings.takeover_region)
+        .map(|(i, _)| i)
+        .collect();
+    if idx.is_empty() {
         return Ok(Vec::new());
     }
-    let settings = accounts::load_settings(&dir);
-    let order = visit_order(accounts.len(), settings.shuffle_checkin_order);
-    for (step, &i) in order.iter().enumerate() {
+    let order = visit_order(idx.len(), settings.shuffle_checkin_order);
+    for (step, &o) in order.iter().enumerate() {
         if let Some(secs) = gap_seconds(&settings, scheduled, step) {
             tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
         }
+        let i = idx[o];
         // 临期先续签：失败了也不阻断，仍用旧 token 试一次，由签到结果给出明确提示
         let _ = ensure_fresh_token(&mut accounts[i]).await;
         let rec = checkin::do_checkin(&accounts[i]).await;
@@ -759,45 +808,55 @@ pub(crate) async fn checkin_all_inner(
     }
     // 签到顺手把刚读到的余额写进台账 —— 那是「积分事实」的唯一来源，
     // 账户管理与积分简报都读它，所以这里不用、也不许另存一份。
-    // 本次每个账号都真的签到过（`visit_order` 是 `0..n` 的一个排列），所以整批都算新读数。
-    let checked: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+    // 本区域的每个账号都真的签到过（`visit_order` 是本批下标的一个排列），所以这批都算新读数。
+    let checked: Vec<String> = idx.iter().map(|&i| accounts[i].id.clone()).collect();
     record_checkin_credits(&dir, &accounts, &checked);
-    // 视图在台账写完**之后**取，才能带上刚读到的余额；落盘仍只写账号本身
-    let views = accounts::view_accounts(accounts.clone(), &dir);
+    // 视图在台账写完**之后**取，才能带上刚读到的余额；落盘仍只写账号本身（全量，含没动的另一区域）
+    let signed = idx.into_iter().map(|i| accounts[i].clone()).collect();
+    let views = accounts::view_accounts(signed, &dir);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     Ok(views)
 }
 
 // ── 凭证管家：四个命令都是**池级**的，都不带账号 id ────────────────────────
 //
-// 一池一个 uuid，闸也按池给 —— 所以这里的动作作用范围是「整台机器」，
-// 而不是「某个账号」。界面上也因此没有逐个账号的开关。
+// 一池一个 uuid，闸也按池给 —— 所以这里的动作作用范围是「一池」，而不是「某个账号」。
+// **每个区域各绑一池**：四个命令都取「当前选中的区域」为作用域，界面上也因此
+// 没有逐个账号的开关。前端切了区域（set_region）后再来问，拿到的就是另一池的状态。
 
-/// 把本机这一批账号整体上传：管家颁发一串 uuid 并当场绑定。
+/// 把本机**当前区域**的账号整体上传：管家颁发一串 uuid 并当场绑定该区域。
 ///
 /// 返回的 uuid 是**唯一要展示给用户复制**的东西（另一台机器靠它接上同一池）。
 #[tauri::command]
 pub async fn broker_upload(app: AppHandle) -> Result<broker::PoolOp, String> {
-    broker::upload(&data_dir(&app)).await
+    let dir = data_dir(&app);
+    let region = accounts::load_settings(&dir).takeover_region;
+    broker::upload(&dir, region).await
 }
 
-/// 绑定别处复制过来的 uuid。绑定后立刻整池同步一轮，把本地独有的账号也推上去。
+/// 绑定别处复制过来的 uuid（绑定到当前区域）。绑定后立刻整池同步一轮，
+/// 把本地独有的账号也推上去。
 #[tauri::command]
 pub async fn broker_link(app: AppHandle, uuid: String) -> Result<broker::PoolOp, String> {
-    broker::link(&data_dir(&app), &uuid).await
+    let dir = data_dir(&app);
+    let region = accounts::load_settings(&dir).takeover_region;
+    broker::link(&dir, region, &uuid).await
 }
 
-/// 解绑：摘掉本地 uuid，**云端那一池保留**；本机移除与云端重复的凭证，只留本机独有的。
-/// 拿不到云端那一池时返回 Err 且保留本地绑定 —— 见 `broker::unbind` 的注释。
+/// 解绑当前区域：摘掉本地 uuid，**云端那一池保留**；本机移除与云端重复的凭证，
+/// 只留本机独有的。拿不到云端那一池时返回 Err 且保留本地绑定 —— 见 `broker::unbind` 的注释。
 #[tauri::command]
-pub async fn broker_unbind() -> Result<broker::BrokerStatus, String> {
-    broker::unbind().await
+pub async fn broker_unbind(app: AppHandle) -> Result<broker::BrokerStatus, String> {
+    let dir = data_dir(&app);
+    let region = accounts::load_settings(&dir).takeover_region;
+    broker::unbind(region).await
 }
 
-/// 只读状态：绑没绑、uuid、云端版本、上次同步时刻、上次错误。无副作用。
+/// 只读状态：当前区域那池的绑没绑、uuid、云端版本、上次同步时刻、上次错误。无副作用。
 #[tauri::command]
-pub fn broker_state() -> broker::BrokerStatus {
-    broker::status()
+pub fn broker_state(app: AppHandle) -> broker::BrokerStatus {
+    let dir = data_dir(&app);
+    broker::status(accounts::load_settings(&dir).takeover_region)
 }
 
 /// 首选通道：直接读本机 Qoder 写在磁盘上的凭据文件（`auth.v1.dat`，OSCrypt 加密）。
@@ -890,6 +949,25 @@ pub fn regions() -> Vec<RegionOption> {
             hint: r.hint(),
         })
         .collect()
+}
+
+/// 切换「当前区域」（左下角区域选择器的落点）。返回切换后的设置视图。
+///
+/// 为什么不走 [`save_settings`]：那份视图带着**离开区域**的全部取值，保存进
+/// 「进入区域」会把对方刚配好的定时/简报/风控设置整个盖掉 —— 切区域不是存设置
+/// （细节见 [`accounts::set_region`]，那里只动「当前指向哪个区域」这一个指针）。
+///
+/// **接管开着时拒绝切换**（产品决定）：接管是一端装着真实注入的活拓扑，
+/// 「先关再切」把「A 的客户端还指着我们的代理、代理却按 B 的账号扣费」这种
+/// 中间态彻底排除在外；安全切换流程（`apply_settings`）只服务接管页自己的启停。
+#[tauri::command]
+pub fn set_region(app: AppHandle, region: Region) -> Result<Settings, String> {
+    let dir = data_dir(&app);
+    if accounts::load_settings(&dir).proxy_enabled {
+        return Err("接管开启中不能切换区域：请先在「智能接管」页关闭接管。".into());
+    }
+    accounts::set_region(&dir, region).map_err(|e| e.to_string())?;
+    Ok(accounts::load_settings(&dir))
 }
 
 #[tauri::command]
@@ -1029,6 +1107,13 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
     let dir = data_dir(app);
     let old = accounts::load_settings(&dir);
     let next = normalize_settings(settings)?;
+    // 区域不在这条路里改（理由见 [`save_settings`] 命令里的同一条守卫）。
+    // 这里必须**另外**拦一遍：安全切换流程自己就能「换区域 + 重装注入」（`(true, true)`
+    // 那一支），而产品决定是接管开着不给切、关着走 [`set_region`] —— 两个入口都开着，
+    // 「按区域存」的切片就会被带着上一区域取值的视图盖掉。
+    if old.takeover_region != next.takeover_region {
+        return Err("切换区域请使用左下角的区域选择器。".into());
+    }
     if topology(&old) == topology(&next) {
         accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
         return Ok(next);
@@ -1138,6 +1223,12 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, Str
     let dir = data_dir(&app);
     let current = accounts::load_settings(&dir);
     let settings = normalize_settings(settings)?;
+    // 「区域」只能由 [`set_region`] 改：视图带着**当前区域**的全部取值，
+    // 允许保存请求顺手改它，等于每次切换都把「进入区域」的切片用「离开区域」的设置盖掉。
+    // 这是按区域存储之后最难发现的写坏路径 —— 症状要等切回去才看得见，报错却是零。
+    if current.takeover_region != settings.takeover_region {
+        return Err("切换区域请使用左下角的区域选择器。".into());
+    }
     // 拓扑（启停 / 端口 / 区域）里任何一项变了，都必须走 `apply_settings`：
     // 区域同样属于拓扑 —— 换区域要「摘掉旧区域的端点 + 把端点装进新区域」，
     // 直接落盘会留下「A 区域的客户端还指着我们的代理，代理却按 B 区域的账号扣费」。

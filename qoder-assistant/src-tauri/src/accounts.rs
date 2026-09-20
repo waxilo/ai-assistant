@@ -164,20 +164,151 @@ pub fn load_account_views(dir: &Path) -> Vec<AccountView> {
     view_accounts(load_accounts(dir), dir)
 }
 
-/// 全局设置
+/// 设置里**不随区域变**的那几项：通知是整机行为（一个 webhook 频道），
+/// 两个区域的签到结果都往它推，没有「这一半是国内版的、那一半是国际版的」可分。
+///
+/// 它从 [`Settings`] 视图里抽出/塞回（[`GlobalSettings::of`] / [`GlobalSettings::apply_to`]），
+/// 是「global + regions」落盘格式里 global 那一半的全部成员。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GlobalSettings {
+    /// 通知总开关（关掉后定时与手动都不推送）
+    #[serde(default)]
+    pub notify_enabled: bool,
+    /// 通知 webhook 地址，形如 `https://…/hook/<key>`
+    #[serde(default)]
+    pub notify_webhook: String,
+    /// 定时签到结束后推送
+    #[serde(default = "default_true")]
+    pub notify_on_schedule: bool,
+    /// 手动「全部签到」结束后推送（默认关，避免连点造成刷屏）
+    #[serde(default)]
+    pub notify_on_manual: bool,
+    /// 简报是否推送到 webhook（复用通知总开关与地址）。
+    ///
+    /// 推的粒度是**天**：时条目每小时就在结算，但「今天花了多少」要等当天结束才有定论。
+    /// 同样带 `alias` 兼容旧键名。
+    #[serde(default = "default_true", alias = "notify_on_report")]
+    pub notify_on_briefing: bool,
+}
+
+impl Default for GlobalSettings {
+    fn default() -> Self {
+        Self {
+            notify_enabled: false,
+            notify_webhook: String::new(),
+            notify_on_schedule: true,
+            notify_on_manual: false,
+            notify_on_briefing: true,
+        }
+    }
+}
+
+impl GlobalSettings {
+    fn of(s: &Settings) -> Self {
+        GlobalSettings {
+            notify_enabled: s.notify_enabled,
+            notify_webhook: s.notify_webhook.clone(),
+            notify_on_schedule: s.notify_on_schedule,
+            notify_on_manual: s.notify_on_manual,
+            notify_on_briefing: s.notify_on_briefing,
+        }
+    }
+
+    /// 把全局项盖回视图上：`regions` 切片里那几份 `notify_*` 是序列化时顺带写下的
+    /// 冗余副本，**唯一可信来源是 store 的 `global`**，拼视图时必须无条件覆盖，
+    /// 否则两个区域各存一份通知配置，改一边另一边不同步，正好毁掉「通知是整机行为」这条。
+    fn apply_to(&self, s: &mut Settings) {
+        s.notify_enabled = self.notify_enabled;
+        s.notify_webhook = self.notify_webhook.clone();
+        s.notify_on_schedule = self.notify_on_schedule;
+        s.notify_on_manual = self.notify_on_manual;
+        s.notify_on_briefing = self.notify_on_briefing;
+    }
+}
+
+/// `settings.json` 的**落盘格式**：全局项 + 当前区域 + 每个区域各一份设置。
+///
+/// 界面与所有消费方拿到的仍是扁平的 [`Settings`]（[`load_settings`] 拼出来的视图），
+/// 这张嵌套表只存在于磁盘上 —— 除 [`load_settings`] / [`save_settings`] 外无人直接读写它。
+///
+/// 为什么 `takeover_region` 要**同时**存在于顶层和各切片里：切片里的值是它作为
+/// 「视图」时的自我描述（前端与消费方读它），顶层的才是「当前选中哪个区域」这个
+/// 全局意图本身。写入路径保证两者一致（[`save_settings`] 按顶层键落对应切片，
+/// 且切片的 `takeover_region` 已被视图设为同一个区域）。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SettingsStore {
+    #[serde(default)]
+    global: GlobalSettings,
+    /// 当前区域（全局意图，左下角区域选择器改的就是它）
+    #[serde(default)]
+    takeover_region: Region,
+    /// 每个区域一份设置。**缺某个区域的键是合法的**（拼视图时回退到默认值），
+    /// 所以老数据迁移与新增区域都不需要补写占位条目。
+    #[serde(default)]
+    regions: std::collections::HashMap<Region, Settings>,
+}
+
+impl SettingsStore {
+    /// 拼出「当前区域」的扁平视图：区域切片 + 全局通知项覆盖 + 当前区域标记。
+    fn view(&self) -> Settings {
+        let mut s = self
+            .regions
+            .get(&self.takeover_region)
+            .cloned()
+            .unwrap_or_else(Settings::default);
+        s.takeover_region = self.takeover_region;
+        self.global.apply_to(&mut s);
+        s
+    }
+
+    /// 老格式（扁平一份、无区域概念）→ 新格式：**复制进两个区域切片**。
+    ///
+    /// 复制而不是只给当前区域，是因为绝大多数可分区字段（定时时刻、风控打散、
+    /// 简报开关）在老版本里是「整机偏好」，用户在哪个区域都想要同一套策略；
+    /// 只有一类字段例外：**接管拓扑**（开关 / 端口 / 扣费与限流账号名单）——
+    /// 它描述的是一次真实安装，而老版本只可能装在一侧。把 `proxy_enabled: true`
+    /// 复制给另一侧，切过去就会「界面显示开着、反代却没跑」，且两个区域各自
+    /// 默认同一个 8789 端口必然撞车。所以非当前区域的这三项回退到默认值。
+    fn from_legacy(flat: Settings) -> Self {
+        let global = GlobalSettings::of(&flat);
+        let mut regions = std::collections::HashMap::new();
+        for r in Region::ALL {
+            let mut s = flat.clone();
+            s.takeover_region = r;
+            if r != flat.takeover_region {
+                s.proxy_enabled = false;
+                s.billing_account_ids = Vec::new();
+                s.rate_limit_models = Vec::new();
+            }
+            regions.insert(r, s);
+        }
+        SettingsStore {
+            global,
+            takeover_region: flat.takeover_region,
+            regions,
+        }
+    }
+}
+
+/// 应用设置 —— **当前区域的那一份投影视图**。
+///
+/// 落盘格式是「全局 + 按区域」（见 [`SettingsStore`]）：左下角的区域选择器切到哪一区域,
+/// [`load_settings`] 就返回哪一区域的设置，而所有消费方（反代、调度、命令、界面 IPC）
+/// 拿到的始终是这一张扁平的表 —— 字段名不变，读取路径就不变，两处口径不会分叉。
 ///
 /// 新增字段一律带 `#[serde(default)]`，这样老版本写下的 settings.json
 /// 仍能反序列化（不会整个文件被判为非法而回退成默认值）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
-    /// **接管目标区域**：智能接管作用于哪一套官方客户端。
+    /// **当前区域**（旧名「接管目标区域」，语义已升级为全局）：左下角区域选择器改的就是它。
     ///
-    /// 它同时决定三件事，所以必须是**显式选择**、不能靠磁盘猜：
-    /// ① 端点写进哪个 CLI 配置目录（`~/.qoder/settings.json` / `~/.qoder-cn/settings.json`）；
-    /// ② 反代把对话请求转发到哪个模型网关（各区域的 `infer_base`）；
-    /// ③ 反代的扣费账号只在该区域里选 —— 跨区域的 token 在对方网关上无效。
+    /// 它决定三件事，所以必须是**显式选择**、不能靠磁盘猜：
+    /// ① 界面各功能页展示哪一套部署的账号；② 智能接管作用于哪一套官方客户端
+    /// —— 端点写进哪个 CLI 配置目录（`~/.qoder/settings.json` / `~/.qoder-cn/settings.json`）、
+    /// 反代把对话请求转发到哪个模型网关；③ 反代的扣费账号只在该区域里选
+    /// —— 跨区域的 token 在对方网关上无效。
     ///
-    /// 「两个官方客户端可以同时装着」是常态，而「现在该接管哪一个」是用户的意图，
+    /// 「两个官方客户端可以同时装着」是常态，而「现在该看哪一个」是用户的意图，
     /// 不是能从文件系统推断出来的事实。
     ///
     /// ⚠️ 这一项**取代了旧的 `default_base_url`**：那个字段先是模板残留的 CodeBuddy
@@ -199,6 +330,11 @@ pub struct Settings {
     /// 当天挑定的时刻会写进 `schedule_state.json` 复用，重启不会重新摇。0 = 关闭随机。
     #[serde(default = "default_schedule_window")]
     pub schedule_window_minutes: u32,
+    // ── 以下几项 `notify_*` 是**全局字段**（不随区域变，见 [`GlobalSettings`]）。
+    //    它们留在视图里只为一个理由：所有既有消费方（通知、设置页、normalize）
+    //    读的都是这一张扁平的表；[`load_settings`] 从 store 拼视图时用 `global`
+    //    覆盖它们，[`save_settings`] 落盘时再把它们抽回 `global`。
+    //    区域切片里序列化出来的这几份是**冗余副本**，读侧一律忽略。
     /// 通知总开关（关掉后定时与手动都不推送）
     #[serde(default)]
     pub notify_enabled: bool,
@@ -276,6 +412,8 @@ pub struct Settings {
     ///
     /// 推的粒度是**天**：时条目每小时就在结算，但「今天花了多少」要等当天结束才有定论，
     /// 每小时推一条只会把通知刷成流水账。同样带 `alias` 兼容旧键名。
+    ///
+    /// 与上面几项 `notify_*` 一样是**全局字段**（见 [`GlobalSettings`]）。
     #[serde(default = "default_true", alias = "notify_on_report")]
     pub notify_on_briefing: bool,
 }
@@ -550,15 +688,36 @@ pub async fn cosy_identity(
     })
 }
 
+/// 读设置 —— 永远返回**当前区域**的扁平视图（落盘格式见 [`SettingsStore`]）。
+///
+/// 消费方（调度、反代、命令、界面）因此完全不需要知道「按区域存」这件事：
+/// 它们要的本来就是「现在这套配置」，区域是它们自己的 `takeover_region` 字段决定的上下文。
 pub fn load_settings(dir: &Path) -> Settings {
+    load_store(dir).view()
+}
+
+/// 读落盘表本体（不分区域）。迁移按**切片逐个**跑：老版本遗留值可能两份都在。
+fn load_store(dir: &Path) -> SettingsStore {
     let f = settings_file(dir);
     if !f.exists() {
-        return Settings::default();
+        return SettingsStore::default();
     }
     let s = fs::read_to_string(&f).unwrap_or_default();
-    let mut settings: Settings = serde_json::from_str(&s).unwrap_or_default();
-    migrate_settings(&mut settings);
-    settings
+    // 先读成 Value 再分格式：老 `settings.json` 是扁平的（没有 `regions` 键），
+    // 新版本写的是「global + regions」嵌套表。判据只看结构，不看内容 ——
+    // 内容判据（比如「有没有 notify 键」）会随字段增删悄悄失效。
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return SettingsStore::default();
+    };
+    let mut store = if value.get("regions").is_some() {
+        serde_json::from_value::<SettingsStore>(value).unwrap_or_default()
+    } else {
+        SettingsStore::from_legacy(serde_json::from_value::<Settings>(value).unwrap_or_default())
+    };
+    for slice in store.regions.values_mut() {
+        migrate_settings(slice);
+    }
+    store
 }
 
 /// 把历史遗留的配置值挪到当前正确的取值。
@@ -581,14 +740,43 @@ fn migrate_settings(s: &mut Settings) {
     }
 }
 
+/// 写设置 —— **读-改-写**：只替换当前区域的切片与全局项，另一个区域的原样保留。
+///
+/// 视图来自 [`load_settings`]，它带的就是「当前区域 + 全局」这一套，
+/// 所以「保存一次界面改动」不会把另一区域的定时时刻 / 接管端口盖掉 ——
+/// 这是按区域存储之后最容易犯、也最难被发现的错误（写路径只有一条，读路径有五条）。
 pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
+    let mut store = load_store(dir);
+    store.global = GlobalSettings::of(settings);
+    store.takeover_region = settings.takeover_region;
+    store
+        .regions
+        .insert(settings.takeover_region, settings.clone());
+    write_store(dir, &store)
+}
+
+fn write_store(dir: &Path, store: &SettingsStore) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let target = settings_file(dir);
     let tmp = dir.join("settings.json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(settings)?)?;
+    fs::write(&tmp, serde_json::to_string_pretty(store)?)?;
     fs::rename(&tmp, &target)?;
     set_private_permissions(&target);
     Ok(())
+}
+
+/// 切换「当前区域」—— 左下角区域选择器改的就是这一个指针。
+///
+/// 为什么必须单独成一条路而不能用 [`save_settings`] 代劳：视图带着**离开区域**的
+/// 全部取值，把它整个存进「进入区域」的切片，等于每次切换都把对方刚才的设置盖掉 ——
+/// 症状是「在 A 关了简报切到 B，B 的简报也关了」。切区域不动任何切片才成立。
+pub fn set_region(dir: &Path, region: Region) -> std::io::Result<()> {
+    let mut store = load_store(dir);
+    if store.takeover_region == region {
+        return Ok(());
+    }
+    store.takeover_region = region;
+    write_store(dir, &store)
 }
 
 /// 把账号/设置文件权限设为 0600（仅当前用户可读写）。
@@ -784,6 +972,155 @@ mod tests {
         // 旧版单选字段不再使用：读到也不影响新逻辑（多选列表仍为空 = 全部可用）
         let s: Settings = serde_json::from_str(r#"{"preferred_account_id":"abc"}"#).unwrap();
         assert!(s.billing_account_ids.is_empty());
+    }
+
+    // ── 按区域存储（global + regions 落盘格式）────────────────────────────
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "qoder-settings-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_raw(dir: &Path) -> serde_json::Value {
+        let s = fs::read_to_string(settings_file(dir)).unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+
+    /// 升级路径：老版扁平 `settings.json`（没有 `regions` 键）必须被拆成
+    /// 「global + 两个区域切片」，而**当前区域读出来的值一个都不许变**。
+    ///
+    /// 接管拓扑（`proxy_enabled`）只跟被证实装了接管的那一侧 —— 复制给另一侧
+    /// 会得到「切过去界面显示开着、反代却没跑」的幽灵状态（理由见
+    /// [`SettingsStore::from_legacy`]）。
+    #[test]
+    fn legacy_flat_file_expands_into_per_region_slices() {
+        let dir = temp_dir("legacy");
+        fs::write(
+            settings_file(&dir),
+            r#"{"schedule_time":"08:30","proxy_enabled":true,"notify_webhook":"https://hook"}"#,
+        )
+        .unwrap();
+
+        // 当前（国际版 = 老配置的唯一区域）：所有值原样
+        let s = load_settings(&dir);
+        assert_eq!(s.takeover_region, Region::Global);
+        assert_eq!(s.schedule_time, "08:30");
+        assert!(s.proxy_enabled);
+        assert_eq!(s.notify_webhook, "https://hook");
+
+        // 切到国内版（走切换这条正路，而不是「带着国际版的视图去保存」）：
+        // 普通偏好跟过来，接管拓扑不跟
+        set_region(&dir, Region::Cn).unwrap();
+        let s = load_settings(&dir);
+        assert_eq!(s.takeover_region, Region::Cn);
+        assert_eq!(s.schedule_time, "08:30", "整机偏好应复制到每个区域");
+        assert!(!s.proxy_enabled, "另一区域不该继承「接管已安装」的假象");
+        assert_eq!(s.notify_webhook, "https://hook", "通知是全局项，跟区域无关");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 保存是**读-改-写**：一次保存只许动当前区域的切片与全局项。
+    /// 这条钉死最隐蔽的回归 ——「在 A 区域改了设置，B 区域被整体覆盖」，
+    /// 而它只在切回去之后才看得见，写路径出问题时没有任何报错。
+    #[test]
+    fn saving_one_region_never_touches_the_other() {
+        let dir = temp_dir("isolate");
+        let mut v = Settings::default();
+        v.takeover_region = Region::Global;
+        v.schedule_time = "08:00".into();
+        v.proxy_enabled = true;
+        save_settings(&dir, &v);
+
+        set_region(&dir, Region::Cn).unwrap();
+        let mut v = load_settings(&dir);
+        v.schedule_time = "20:00".into();
+        save_settings(&dir, &v);
+
+        // 落盘格式确认：嵌套表，两个区域各有切片，顶层指针指向当前区域
+        let raw = read_raw(&dir);
+        assert_eq!(raw["takeover_region"], "cn", "{raw}");
+        assert_eq!(raw["regions"]["global"]["schedule_time"], "08:00", "{raw}");
+        assert_eq!(raw["regions"]["cn"]["schedule_time"], "20:00", "{raw}");
+
+        // 切回国际版：完好如初（切换与另一区域的保存都不许碰它）
+        set_region(&dir, Region::Global).unwrap();
+        let s = load_settings(&dir);
+        assert_eq!(s.schedule_time, "08:00", "另一区域的保存不许盖掉这里的定时时刻");
+        assert!(s.proxy_enabled);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 通知项的**唯一可信来源是 global**：即使某区域切片里残留了过时的 `notify_*`
+    /// 副本（它们是序列化时顺带写下的），拼视图时也必须被 global 覆盖。
+    #[test]
+    fn notify_fields_always_come_from_the_global_half() {
+        let dir = temp_dir("notify");
+        let mut v = Settings::default();
+        v.takeover_region = Region::Cn;
+        v.notify_webhook = "https://only-global".into();
+        save_settings(&dir, &v);
+
+        // 篡改 cn 切片里的冗余副本 —— 视图必须无视它
+        let mut raw = read_raw(&dir);
+        raw["regions"]["cn"]["notify_webhook"] = serde_json::json!("https://stale-copy");
+        fs::write(settings_file(&dir), serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let s = load_settings(&dir);
+        assert_eq!(s.notify_webhook, "https://only-global", "切片里的通知副本只是冗余，不许生效");
+
+        // 反向同样成立：在 cn 视图里改 webhook，切回 global 后拿到的也是新值
+        let mut v = s;
+        v.notify_webhook = "https://updated".into();
+        save_settings(&dir, &v);
+        v.takeover_region = Region::Global;
+        save_settings(&dir, &v);
+        assert_eq!(load_settings(&dir).notify_webhook, "https://updated");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 遗留值迁移（`09:07` → `10:00`）现在按**切片逐个**跑：两个区域可能都带着
+    /// 老默认值落过盘，只修当前区域会把坏的定时留在另一侧，切过去照样每天领不到。
+    #[test]
+    fn legacy_schedule_time_is_migrated_in_every_slice() {
+        let dir = temp_dir("migrate");
+        fs::write(
+            settings_file(&dir),
+            r#"{"takeover_region":"global","regions":{"global":{"schedule_time":"09:07"},"cn":{"schedule_time":"09:07"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_settings(&dir).schedule_time, "10:00");
+
+        let mut v = load_settings(&dir);
+        v.takeover_region = Region::Cn;
+        save_settings(&dir, &v);
+        // ⚠️ 这里必须重新 load 而不是看内存里的 v：另一侧的修正在盘上
+        assert_eq!(load_settings(&dir).schedule_time, "10:00", "另一区域的遗留值也要被修掉");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 没有 `regions` 里对应条目（老数据 + 新区域的组合、或手工删过）不能炸，
+    /// 也不能把当前区域整体兜成默认值——全局项仍要生效。
+    #[test]
+    fn missing_region_slice_falls_back_to_defaults_but_keeps_globals() {
+        let dir = temp_dir("missing");
+        fs::write(
+            settings_file(&dir),
+            r#"{"global":{"notify_webhook":"https://g"},"takeover_region":"cn","regions":{"global":{"schedule_time":"08:30"}}}"#,
+        )
+        .unwrap();
+        let s = load_settings(&dir);
+        assert_eq!(s.takeover_region, Region::Cn);
+        assert_eq!(s.schedule_time, "10:00", "缺切片 = 该区域从没配过，用默认值");
+        assert_eq!(s.notify_webhook, "https://g");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── 重复条目自愈（2026-09-19 的「凭空多一个国际版账号」）────────────────

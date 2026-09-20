@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { Account, DayEntry, HourEntry, Settings } from "../types";
+import type { Account, BriefAccount, DayEntry, HourEntry, Settings } from "../types";
 import {
   BRIEFING_SEALED_EVENT,
   clearCreditBriefing,
@@ -17,6 +17,57 @@ import { IconActivity, IconClock, IconInfo, IconTrash } from "../components/Icon
 
 /** 小时写成 `09:00`：补零之后整列数字才对得齐 */
 const hh = (h: number) => `${String(h).padStart(2, "0")}:00`;
+
+/**
+ * 把整份简报投影到**当前区域的账号**上。
+ *
+ * 简报的落盘数据是整机的（采样覆盖全部账号），而展示要按区域分开 —— 过滤只能
+ * 发生在前端。口径：时条目只留本区域账号的行，消耗 / 新增 / 余额全部**重算**；
+ * 日条目再由过滤后的时条目相加得出（这与后端「日 = 时之和」的口径一致，
+ * 只是把求和挪到了过滤之后）。`balance` 取「最后一个读到了本区域余额的时点」，
+ * 而不是简单取最后一条 —— 基准条目之外某些小时可能一个账号都没采到。
+ */
+function projectRegionDays(days: DayEntry[], ids: Set<string>): DayEntry[] {
+  const inRegion = (a: BriefAccount) => ids.has(a.account_id);
+  const sumBal = (rows: BriefAccount[]) => {
+    const got = rows.map((a) => a.balance).filter((b): b is number => b != null);
+    return got.length === 0 ? null : got.reduce((x, y) => x + y, 0);
+  };
+  return days.map((d) => {
+    const hours = d.hours.map((h) => {
+      const accounts = h.accounts.filter(inRegion);
+      return {
+        ...h,
+        consumed: accounts.reduce((s, a) => s + a.consumed, 0),
+        gained: accounts.reduce((s, a) => s + a.gained, 0),
+        balance: sumBal(accounts),
+        accounts,
+      };
+    });
+    let balance: number | null = null;
+    for (const h of hours) if (h.balance != null) balance = h.balance;
+    // 当天各账号合计：逐小时相加（与后端口径一致），按消耗降序
+    const byId = new Map<string, BriefAccount>();
+    for (const h of hours)
+      for (const a of h.accounts) {
+        const acc =
+          byId.get(a.account_id) ??
+          ({ account_id: a.account_id, name: a.name, phone: a.phone, consumed: 0, gained: 0, balance: null } as BriefAccount);
+        acc.consumed += a.consumed;
+        acc.gained += a.gained;
+        if (a.balance != null) acc.balance = a.balance;
+        byId.set(a.account_id, acc);
+      }
+    return {
+      ...d,
+      consumed: hours.reduce((s, h) => s + h.consumed, 0),
+      gained: hours.reduce((s, h) => s + h.gained, 0),
+      balance,
+      hours,
+      accounts: [...byId.values()].sort((x, y) => y.consumed - x.consumed),
+    };
+  });
+}
 
 /**
  * 「积分简报」页：**列表里只有日条目**，每一条展开后是当天的小时条目，
@@ -37,6 +88,7 @@ const hh = (h: number) => `${String(h).padStart(2, "0")}:00`;
  */
 export function BriefingPage({
   accounts,
+  region,
   settings,
   askConfirm,
   onSettings,
@@ -44,6 +96,8 @@ export function BriefingPage({
 }: {
   /** 账号列表（只用来算「当前剩余」的合计与逐账号明细；积分值本身来自全局积分对象） */
   accounts: Account[];
+  /** 当前区域（左下角选择器）：简报按它过滤展示 */
+  region: string;
   settings: Settings;
   askConfirm: (opts: Omit<ConfirmReq, "resolve">) => Promise<boolean>;
   /** 开关落库后把最新 settings 同步回外层（后端可能代为改写字段） */
@@ -91,15 +145,23 @@ export function BriefingPage({
     };
   }, [refresh]);
 
+  // 落盘的简报是整机数据，展示口径收到当前区域：日 / 时条目与汇总全部
+  // 重算自「本区域账号」的明细行（见 projectRegionDays）。
+  const regionIds = new Set(
+    accounts.filter((a) => a.region === region).map((a) => a.id)
+  );
+  const shownAccounts = accounts.filter((a) => regionIds.has(a.id));
+  const regionDays = projectRegionDays(days, regionIds);
+
   /** 当前剩余：由**与账号页同一份**全局积分对象算出的合计（实时读数，不是快照） */
-  const nowTotal = totalCredits(book, accounts);
+  const nowTotal = totalCredits(book, shownAccounts);
   /** 最近一次读数时刻（全部账号里最新的那条），用来告诉用户这个数是「什么时候的」 */
   const readAt = latestAt(book);
 
-  const latest = days[0] ?? null;
+  const latest = regionDays[0] ?? null;
   // 「累计」= 已保留的全部日条目之和。日条目本身是当天时条目之和，
   // 而且都是完整时段 ⇒ 直接相加就是总量。
-  const lifetime = days.reduce(
+  const lifetime = regionDays.reduce(
     (acc, d) => ({
       consumed: acc.consumed + d.consumed,
       gained: acc.gained + d.gained,
@@ -180,6 +242,7 @@ export function BriefingPage({
           消耗与新增都按资源包的<b>累计量</b>取差值，多个客户端同时消耗也都算得进来。
           应用没运行的时段不会采样，那几格是空的；恢复运行后的第一次采样会把这段
           攒下的量整块记进恢复后的那个小时。
+          <b>这里展示的是当前区域</b>的账号（用左下角的选择器切换）。
         </span>
       </p>
 
@@ -193,7 +256,7 @@ export function BriefingPage({
           <span className="bp-toggle-text">{on ? "已开启" : "已关闭"}</span>
         </label>
         <span className="count">
-          {loading ? "加载中…" : `共 ${days.length} 天`}
+          {loading ? "加载中…" : `共 ${regionDays.length} 天`}
         </span>
         <span className="spacer" />
         {/* 与账号页同源的「当前剩余」：后台每采一次就更新，不是某条时条目里冻结的快照。
@@ -211,7 +274,7 @@ export function BriefingPage({
         </span>
         <button
           className="btn small danger"
-          disabled={days.length === 0}
+          disabled={regionDays.length === 0}
           onClick={() => void doClear()}
         >
           <IconTrash size={15} />
@@ -232,7 +295,7 @@ export function BriefingPage({
 
       {loading ? (
         <p className="empty">加载中…</p>
-      ) : days.length === 0 ? (
+      ) : regionDays.length === 0 ? (
         <EmptyState
           icon={<IconActivity size={26} />}
           title={on ? "还没有简报" : "简报未开启"}
@@ -274,7 +337,7 @@ export function BriefingPage({
           </div>
 
           <div className="brief-list">
-            {days.map((d) => {
+            {regionDays.map((d) => {
               const open = openDate === d.date;
               return (
                 <article className="card brief" key={d.date}>

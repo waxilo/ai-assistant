@@ -114,6 +114,8 @@ pub fn run() {
             commands::get_settings,
             // 区域清单（国际版 / 国内版）：界面下拉的唯一来源
             commands::regions,
+            // 切换「当前区域」（左下角选择器的落点）：只动指针，不碰任何区域的设置
+            commands::set_region,
             commands::save_settings,
             commands::apply_settings,
             commands::test_notify,

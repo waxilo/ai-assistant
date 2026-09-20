@@ -16,6 +16,7 @@ import {
   refreshAll,
   getSettings,
   saveSettings as saveSettingsApi,
+  setRegion as setRegionApi,
   appVersion,
   brokerState,
   brokerUpload,
@@ -24,6 +25,7 @@ import {
 } from "./api";
 import { accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
 import { bindCredits, seedCredits } from "./credits";
+import { regionLabel, useRegions } from "./regions";
 import {
   checkAndInstall,
   downloadProgress,
@@ -103,6 +105,19 @@ const PAGE_TITLES: Record<Page, string> = {
 const UPDATE_FIRST_DELAY_MS = 8_000;
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * 把「被更新的那一批」按 id 合回全量列表。
+ *
+ * 签到 / 刷新现在只作用**当前区域**（后端 `checkin_all` / `refresh_all` 的返回同理只有
+ * 这一区域的账号），整包 `setAccounts(updated)` 会把另一区域的行从界面上抹掉 ——
+ * 而那份数据既没丢也没坏，只是这次没轮到它。
+ */
+function mergeById(list: Account[], updated: Account[]): Account[] {
+  if (updated.length === 0) return list;
+  const map = new Map(updated.map((a) => [a.id, a]));
+  return list.map((a) => map.get(a.id) ?? a);
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("accounts");
   /** 日志页的初始账号筛选（从账号条目点「日志」跳转时带上） */
@@ -122,6 +137,14 @@ export default function App() {
    */
   const [updateStatus, setUpdateStatus] = useState<UpdateProgress | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  /**
+   * 区域切换进行中（左下角选择器与接管页的提示按钮共用这一个闸）：
+   * 切换是一条 IPC + 一次整表换血（settings 视图整个换成另一区域的），
+   * 连点两下会把后一次建立在前一次**还没回来**的旧视图上。
+   */
+  const [busyRegion, setBusyRegion] = useState(false);
+  /** 区域清单（国际版 / 国内版）：后端 `Region::ALL` 的投影，进程内缓存只拉一次 */
+  const regionOpts = useRegions();
   const [modal, setModal] = useState<Modal>(null);
   const [toast, setToast] = useState<Toast>(null);
   const [confirmReq, setConfirmReq] = useState<ConfirmReq | null>(null);
@@ -344,7 +367,8 @@ export default function App() {
     setBusyAll(true);
     try {
       const updated = await checkinAll();
-      setAccounts(updated);
+      // 只签当前区域：按 id 合回全量，另一区域的行原样留在列表里（见 mergeById）
+      setAccounts((list) => mergeById(list, updated));
       seedCredits(updated);
       const { ok, already, fail } = tally(
         updated.map((a) => a.last).filter((r): r is NonNullable<typeof r> => r != null)
@@ -366,7 +390,8 @@ export default function App() {
     setBusyRefresh(true);
     try {
       const updated = await refreshAll();
-      setAccounts(updated);
+      // 只刷当前区域（与「全部签到」同一条界线）：按 id 合并，别把另一区域刷没
+      setAccounts((list) => mergeById(list, updated));
       // 刷新是「手工触发的一次采集」：读数并进全局对象，两个页面跟着一起变
       seedCredits(updated);
       const got = updated.filter((a) => a.credits?.credits != null).length;
@@ -411,8 +436,9 @@ export default function App() {
         // 导入新账号后补查真实状态（只读查询，持久化），列表直接反映服务端真相。
         // 结果必须收回来：`void refreshAll()` 会把返回的账号（含刚查到的 checked_today
         // 与台账读数）整包丢掉，列表就只剩导入那一刻的陈旧状态。
+        // 现在刷新只回当前区域那一批，所以是**合并**而不是整包替换（见 mergeById）。
         void refreshAll().then((list) => {
-          setAccounts(list);
+          setAccounts((cur) => mergeById(cur, list));
           seedCredits(list);
         });
       }
@@ -467,16 +493,21 @@ export default function App() {
   );
 
   /**
-   * 解绑：摘掉本机 uuid，**云端那一池保留**；本机会移除与云端重复的凭证，只留本机独有的。
+   * 解绑**当前区域**的池：摘掉本机 uuid，**云端那一池保留**；本机会移除与云端
+   * 重复的凭证，只留本机独有的。只作用于这一区域 —— 另一区域的绑定与账号不受影响。
    *
    * 不影响其他绑定同一 uuid 的机器。会动本机账号，所以先确认一次。
    */
   const runBrokerUnbind = useCallback(async () => {
+    const regionName =
+      regionLabel(regionOpts, settings?.takeover_region) ??
+      settings?.takeover_region ??
+      "当前区域";
     const ok = await askConfirm({
-      title: "解除绑定？",
-      body: `解绑后本机回到单机运行：与云端那一池（${
+      title: `解除${regionName}的绑定？`,
+      body: `解绑后本机${regionName}回到单机运行：与云端那一池（${
         brokerStatus?.uuid?.slice(0, 8) ?? ""
-      }…）重复的凭证会从本机移除，本机独有的账号保留；云端那一池保留，其他机器不受影响。`,
+      }…）重复的凭证会从本机移除，本机独有的账号保留；云端那一池保留，其他机器不受影响。另一个区域的绑定不受影响。`,
       okText: "解除绑定",
       danger: true,
     });
@@ -485,14 +516,14 @@ export default function App() {
     try {
       setBrokerStatus(await brokerUnbind());
       await load();
-      showToast({ kind: "ok", text: "已解绑，本机与云端重复的凭证已移除" });
+      showToast({ kind: "ok", text: "已解绑，本区域与云端重复的凭证已移除" });
     } catch (e) {
       // 拿不到云端那一池时后端会拒绝，并保留本地绑定 —— 照实说，别让用户以为已经解绑了
       showToast({ kind: "err", text: String(e) });
     } finally {
       setBrokerBusy(false);
     }
-  }, [askConfirm, brokerStatus?.uuid, load, showToast]);
+  }, [askConfirm, brokerStatus?.uuid, load, showToast, regionOpts, settings?.takeover_region]);
 
   const saveSettings = useCallback(async (s: Settings) => {
     // 设置页已改为「改动自动保存」，这里只负责落盘并刷新内存中的 settings，
@@ -500,6 +531,40 @@ export default function App() {
     const saved = await saveSettingsApi(s);
     setSettings(saved);
   }, []);
+
+  /**
+   * 切换「当前区域」—— 左下角选择器与接管页提示按钮共用的唯一落点。
+   *
+   * 走后端 `set_region` 而不是 `saveSettings({...settings, takeover_region})`：
+   * 视图带着**离开区域**的全部取值，保存进「进入区域」等于把对方的设置整个盖掉
+   * （后端两条路都已拦，这里别再撞上去要报错）。接管开启中拒绝切换（产品决定），
+   * 界面上选择器已禁用；这里兜住的是竞态（正开着接管时点了切换的按钮）。
+   */
+  const switchRegion = useCallback(
+    async (key: string) => {
+      if (!settings || key === settings.takeover_region || busyRegion) return;
+      setBusyRegion(true);
+      try {
+        // 返回的是**新区域那份**设置视图：定时/简报/风控全部跟着换，
+        // 各页从这一份读状态，所以切完之后整页天然是另一区域的口径
+        setSettings(await setRegionApi(key));
+        // 凭证池按区域各绑一池，状态也是按区域读的：切了区域必须重问一次，
+        // 否则账号页那栏还挂着上一个区域的 uuid 和绑定状态
+        setBrokerStatus(await brokerState());
+        showToast({
+          kind: "ok",
+          text: `已切到${regionLabel(regionOpts, key) ?? key}`,
+        });
+      } catch (e) {
+        showToast({ kind: "err", text: String(e) });
+        // 后端拒了（多半是竞态撞上接管开着）：把内存视图拉回盘上真相
+        void reloadSettings().catch(() => undefined);
+      } finally {
+        setBusyRegion(false);
+      }
+    },
+    [settings, busyRegion, regionOpts, showToast, reloadSettings]
+  );
 
   return (
     <div className="app">
@@ -550,39 +615,78 @@ export default function App() {
           ))}
         </nav>
 
-        {/* 全局更新状态：检查/下载/安装进行中时在侧边栏底部常驻，切页不丢进度。
-            error / no-update 已由 runUpdate 弹 toast，不在这里占位。 */}
-        {updateStatus &&
-          (updateStatus.status === "checking" ||
-            updateStatus.status === "downloading" ||
-            updateStatus.status === "installing" ||
-            updateStatus.status === "updated") && (
-            <div className="sidebar-update">
-              <div className="sidebar-update-title">应用更新</div>
-              <div className="upd-status">{updateStatus.message}</div>
-              {(() => {
-                const dl = downloadProgress(updateStatus);
-                if (!dl) return null;
-                return (
-                  <div className="upd-row">
-                    {dl.percent !== null && (
-                      <div className="upd-progress-wrap">
-                        <div
-                          className="upd-progress-bar"
-                          style={{ width: `${dl.percent}%` }}
-                        />
+        {/* ── 侧栏脚：区域选择器 + 应用更新进度条，整块靠底（margin-top:auto 在这里）── */}
+        <div className="sidebar-foot">
+          {/* 全局更新状态：检查/下载/安装进行中时在侧边栏底部常驻，切页不丢进度。
+              error / no-update 已由 runUpdate 弹 toast，不在这里占位。 */}
+          {updateStatus &&
+            (updateStatus.status === "checking" ||
+              updateStatus.status === "downloading" ||
+              updateStatus.status === "installing" ||
+              updateStatus.status === "updated") && (
+              <div className="sidebar-update">
+                <div className="sidebar-update-title">应用更新</div>
+                <div className="upd-status">{updateStatus.message}</div>
+                {(() => {
+                  const dl = downloadProgress(updateStatus);
+                  if (!dl) return null;
+                  return (
+                    <div className="upd-row">
+                      {dl.percent !== null && (
+                        <div className="upd-progress-wrap">
+                          <div
+                            className="upd-progress-bar"
+                            style={{ width: `${dl.percent}%` }}
+                          />
+                        </div>
+                      )}
+                      <div className="upd-progress-text">
+                        {dl.percent === null
+                          ? `已下载 ${formatBytes(dl.downloaded)}`
+                          : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
                       </div>
-                    )}
-                    <div className="upd-progress-text">
-                      {dl.percent === null
-                        ? `已下载 ${formatBytes(dl.downloaded)}`
-                        : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
                     </div>
-                  </div>
-                );
-              })()}
-            </div>
-          )}
+                  );
+                })()}
+              </div>
+            )}
+
+          {/*
+            区域选择器：**全应用唯一的「现在看哪套部署」入口**。
+            它改的是后端那个全局指针（`set_region`），各功能页的展示与设置都随它换 ——
+            账号签到 / 智能接管 / 积分简报 / 签到日志分区域各存各的，设置页编辑的
+            也是当前区域那份（通知项除外，那是整机行为）。
+            接管开启中禁用（产品决定：先关再切，杜绝「A 的客户端指着代理、
+            代理却按 B 的账号扣费」的中间态）；标题把原因写进 tooltip。
+          */}
+          <div
+            className="region-switch"
+            role="group"
+            aria-label="当前区域"
+            title={
+              settings?.proxy_enabled
+                ? "接管开启中不能切换区域：请先在「智能接管」页关闭接管"
+                : "切换后各页展示与设置都换成另一套部署（分区域各存一份）"
+            }
+          >
+            {regionOpts.map((r) => {
+              const active = settings?.takeover_region === r.key;
+              return (
+                <button
+                  key={r.key}
+                  className={`region-btn ${active ? "active" : ""}`}
+                  disabled={active || settings?.proxy_enabled || busyRegion}
+                  onClick={() => void switchRegion(r.key)}
+                >
+                  {/* 窄窗口收成图标轨道时靠 title 说明这一整条是什么（与导航项同一套做法） */}
+                  <span className="region-btn-label" title={r.hint}>
+                    {r.label}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
       </aside>
 
       <div className="main">
@@ -677,6 +781,7 @@ export default function App() {
           {page === "accounts" && (
             <AccountsPage
               accounts={accounts}
+              region={settings?.takeover_region ?? null}
               loading={loading}
               busyIds={busyIds}
               brokerStatus={brokerStatus}
@@ -701,11 +806,13 @@ export default function App() {
               onSettings={setSettings}
               onReloadSettings={reloadSettings}
               onToast={showToast}
+              onSwitchRegion={(key) => void switchRegion(key)}
             />
           )}
           {page === "briefing" && settings && (
             <BriefingPage
               accounts={accounts}
+              region={settings.takeover_region}
               settings={settings}
               askConfirm={askConfirm}
               onSettings={setSettings}
@@ -715,6 +822,7 @@ export default function App() {
           {page === "logs" && (
             <LogsPage
               accounts={accounts}
+              region={settings?.takeover_region ?? null}
               initialAccountId={logsInitialId ?? undefined}
               askConfirm={askConfirm}
               onToast={showToast}

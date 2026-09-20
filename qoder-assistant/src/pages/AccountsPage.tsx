@@ -43,6 +43,7 @@ const STATUS_LABEL: Record<SignState, string> = {
  */
 export function AccountsPage({
   accounts,
+  region,
   loading,
   busyIds,
   onCheckinOne,
@@ -55,6 +56,8 @@ export function AccountsPage({
   onBrokerUnbind,
 }: {
   accounts: Account[];
+  /** 当前区域（左下角选择器）；null = 还没读到 settings（首屏那一瞬），此时展示全部 */
+  region: string | null;
   loading: boolean;
   busyIds: Set<string>;
   onCheckinOne: (id: string) => void;
@@ -74,6 +77,11 @@ export function AccountsPage({
   // 当前被点开「资源包列表」的账号（null = 没有弹窗打开）
   const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
 
+  // 只展示当前区域的账号：签到 / 批量动作在后端就只作用于当前区域，
+  // 列表若混着另一区域，卡片数字（已签 / 未签）会对不上实际能签的集合。
+  // 全量 `accounts` 只留给凭证池那一栏 —— 那是**整台机器**的池子，不分区域。
+  const shown = region ? accounts.filter((a) => a.region === region) : accounts;
+
   // 顶部四张卡全部取自本页已有的事实，**不打任何额外接口**：
   // 总数来自账号列表、已签/未签来自每行的 `signState`、剩余额度来自那个全局积分对象。
   //
@@ -87,7 +95,7 @@ export function AccountsPage({
   const poolBar = (
     <PoolBar
       status={brokerStatus}
-      accountCount={accounts.length}
+      accountCount={shown.length}
       busy={brokerBusy}
       onUpload={onBrokerUpload}
       onLink={onBrokerLink}
@@ -112,13 +120,26 @@ export function AccountsPage({
         />
       </section>
     );
+  // 机器上有账号、但当前区域一个都没有：登录入口是全局的，账号落在哪个区域
+  // 由它登录的部署决定 —— 该提示切区域，而不是让人在这页找不到账号以为丢了。
+  if (shown.length === 0)
+    return (
+      <section className="panel-page">
+        {poolBar}
+        <EmptyState
+          icon={<IconUser size={26} />}
+          title="当前区域还没有账号"
+          hint="本机的账号都属于另一个区域。用左下角的区域选择器切过去即可看到；新登录的账号会归到它登录的那个部署。"
+        />
+      </section>
+    );
 
-  const total = accounts.length;
-  const credits = totalCredits(book, accounts);
+  const total = shown.length;
+  const credits = totalCredits(book, shown);
   // 已签 / 未签用**行内那一套** `signState` 逐账号数，所以卡片数字与下面每行的状态点
   // 永远一致 —— 汇总和明细各算一套，正是这类数字最容易分叉的地方。
   // 正在签的（`signing`）算进「未签到」：它确实还没签完，签完那一行会自己翻过去。
-  const signedCount = accounts.filter((a) => signState(a, busyIds.has(a.id)) === "done").length;
+  const signedCount = shown.filter((a) => signState(a, busyIds.has(a.id)) === "done").length;
   const unsignedCount = total - signedCount;
 
   return (
@@ -165,7 +186,7 @@ export function AccountsPage({
             </tr>
           </thead>
           <tbody>
-            {accounts.map((a) => {
+            {shown.map((a) => {
               const busy = busyIds.has(a.id);
               const st = signState(a, busy);
               const bal = creditsOf(book, a.id);
@@ -377,12 +398,14 @@ function CopyChip({ uuid }: { uuid: string }) {
 }
 
 /**
- * 账号页的「云端凭证池」一栏：本机这批账号有没有托管到云端、要不要接上别的机器。
+ * 账号页的「云端凭证池」一栏：**当前区域**的账号有没有托管到云端、要不要接上别的机器。
  *
  * 为什么它是**一整栏**而不是表格里的一列：一池一个 uuid、池内一把闸，绑定只有
  * 「全都绑了」和「全都没绑」两种状态。画到每一行上，会让人以为能逐个账号决定 ——
  * 而按账号分粒度恰恰是错的（两台机器可以各自拿着不同账号的闸、同时提交同一批账号，
  * 于是出现「一半新一半旧」这种谁也没签错的错状态）。
+ * 绑定按区域各是一池：这里的数字与状态都只说当前区域的账号（`accountCount` 由外层
+ * 传本区域行数），另一区域的池在切换区域后由同一栏展示。
  */
 function PoolBar({
   status,
@@ -406,12 +429,12 @@ function PoolBar({
     // 错误优先：出过错的绑定状态比「已绑定」更该被看见
     if (status?.error) return status.error;
     if (bound) {
-      return `本机这 ${accountCount} 个账号与云端共用，续签仍在本机执行${syncNote(status)}`;
+      return `本区域这 ${accountCount} 个账号与云端共用，续签仍在本机执行${syncNote(status)}`;
     }
     if (accountCount === 0) {
-      return "本机还没有账号。别的机器上已有的话，直接绑定它那串 uuid 即可把账号接过来。";
+      return "本区域还没有账号。别的机器上已有的话，直接绑定它那串 uuid 即可把账号接过来。";
     }
-    return `把本机这 ${accountCount} 个账号放到云端，其他机器绑定同一串 uuid 就能共用（续签始终在本机执行）`;
+    return `把本区域这 ${accountCount} 个账号放到云端（每个区域各绑一池），其他机器绑定同一串 uuid 就能共用（续签始终在本机执行）`;
   })();
 
   return (
@@ -445,12 +468,12 @@ function PoolBar({
               onClick={onUpload}
               title={
                 accountCount === 0
-                  ? "本机还没有账号可上传"
-                  : "在云端新建一池并把本机账号放进去，之后会给你一串 uuid"
+                  ? "本区域还没有账号可上传"
+                  : "在云端新建一池并把本区域的账号放进去，之后会给你一串 uuid（每个区域各绑一池）"
               }
             >
               <IconUpload size={13} />
-              {accountCount === 0 ? "上传本机账号" : `上传本机 ${accountCount} 个账号`}
+              {accountCount === 0 ? "上传本区域账号" : `上传本区域 ${accountCount} 个账号`}
             </button>
             <button className="btn small ghost" disabled={busy} onClick={onLink}>
               <IconLink size={13} />

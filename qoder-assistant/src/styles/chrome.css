@@ -140,11 +140,63 @@
   animation: nav-dot-pulse 1.8s ease-in-out infinite;
 }
 
+/* ── 侧栏脚：整块靠底，装「应用更新进度条 + 区域选择器」──────────
+   margin-top:auto 从 .sidebar-update 挪到这里：更新条只有下载中才渲染，
+   靠底的活儿不能压在一个「可能不存在」的元素上 —— 区域选择器是常驻的，
+   「左下角」这个位置由它钉住。 */
+.sidebar-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 区域选择器（国际版 / 国内版）：全应用唯一的「现在看哪套部署」入口。
+   做成两枚等宽的段控件而不是下拉：当前是谁一眼可见，点另一枚即切换，
+   少一次展开操作，也把「另一套部署此刻就在手边」这件事摆在明面上。 */
+.region-switch {
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--card-glass);
+}
+.region-btn {
+  flex: 1;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 7px 4px;
+  border-radius: calc(var(--radius-sm) - 4px);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.region-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+.region-btn.active {
+  background: var(--primary-soft);
+  color: var(--primary-d);
+  font-weight: 600;
+  cursor: default;
+}
+/* 接管开启中整条禁用：tooltip（挂在容器上）解释为什么点不动 */
+.region-btn:disabled:not(.active) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ── 侧栏底部：应用更新全局状态条 ────────────────────────────
    状态持在 App 层（下载是整机动作），侧栏底部常驻一条，切换页面进度不丢。
    内部 .upd-* 复用 ui.css 的进度样式，此处只负责卡片容器与字号微调。 */
 .sidebar-update {
-  margin-top: auto;
   padding: 11px 12px;
   border-radius: var(--radius-sm);
   background: var(--primary-soft);

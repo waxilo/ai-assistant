@@ -1768,8 +1768,9 @@ async fn choose_account(
     let settings = accounts::load_settings(dir);
     // ⚠️ 整池同步必须在**读账号之前**：它会把云端那一份并进 accounts.json，
     // 而闸带回来的才是最新凭证。顺序颠倒 = 整轮请求都在用已作废的 token。
-    // 它是热路径，但节流（`broker::SYNC_TTL_MS`）让绝大多数调用只是读一下内存。
-    crate::commands::sync_pool_if_bound(dir).await;
+    // 它是热路径，但节流（`broker::SYNC_TTL_MS`）让绝大多数调用只是读一下内存；
+    // 区域用上面刚读到的设置，别为它多翻一遍盘。
+    crate::commands::sync_pool_if_bound_in(dir, settings.takeover_region).await;
     let all = accounts::load_accounts(dir);
     if all.is_empty() {
         return None;

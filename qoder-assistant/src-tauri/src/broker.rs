@@ -8,11 +8,15 @@
 //!
 //! 所以这里做的事不是「同步凭证」，而是**保证同一时刻只有一台机器在续签**。
 //!
-//! ## 粒度是「一整池」
+//! ## 粒度是「一整池」，且**每个区域各绑一池**
 //!
 //! 一池一个 uuid，闸也按池给。上传 = 新建一池并把本机账号放进去；绑定 = 把别处的 uuid
 //! 抄过来。**解绑只摘本机绑定，云端那一池不动**，其他机器不受影响；本机与云端重复的
 //! 凭证会从本机移除，只留本机独有的。
+//!
+//! 国际版、国内版的账号是两套部署的两份凭证，续签链也各是各的 —— 所以**绑池这件事
+//! 本身就按区域分开**：上传 / 绑定 / 解绑 / 整池同步都只作用于指定的那个区域，
+//! 一个区域绑了不影响另一个区域继续单机续签。
 //!
 //! 上传**只在未绑定时可用**：服务端建池永远是新建，不会覆盖，所以「已绑定再上传」会在
 //! 云端留下第二池 —— 本机切到新池、旧池原地不删，两台机器于是各持一把闸，正是
@@ -32,15 +36,16 @@
 //!
 //! 抢闸带回的池内容**必须**用它去签：本地那份 refresh token 可能早就被别的机器换掉了。
 //!
-//! ## 落盘只有 uuid 一项
+//! ## 落盘只有「区域 → uuid」
 //!
 //! 版本号、上次同步时刻、上次错误都是**运行时**才知道的东西，写进文件只会多一份可能与云端
-//! 对不上的副本。`broker.json` 里只有 `pool_uuid` —— 有它就等于绑定了。
+//! 对不上的副本。`broker.json` 里只有每个区域的池 uuid —— 有它就等于那个区域绑定了。
+//! 旧版的单一 `pool_uuid` 读进来归到国际版名下（那会儿只有国际版），保存时不再写出。
 
 use crate::accounts::{self, Account};
 use crate::region::Region;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -58,15 +63,31 @@ const BROKER_FILE: &str = "broker.json";
 
 // ── 状态 ──────────────────────────────────────────────────────────────────
 
-/// 落盘配置。**只有 uuid 一项** —— 见模块头「落盘只有 uuid 一项」。
+/// 落盘配置。**每个区域各一条 uuid** —— 见模块头「落盘只有 uuid 一项」。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct BrokerConfig {
-    pub pool_uuid: Option<String>,
+    /// 区域 → 该区域绑定的池 uuid；缺席 = 那个区域未绑定。
+    pub pools: HashMap<Region, String>,
+    /// 旧版的单一 uuid（那时只有一池、且只有国际版）。读入后归到国际版名下，
+    /// 新格式保存时不再写出。
+    #[serde(rename = "pool_uuid", skip_serializing)]
+    legacy_pool_uuid: Option<String>,
 }
 
-/// 只存在于内存的运行时状态（进程重启就重来，不影响正确性）
-#[derive(Default)]
+impl BrokerConfig {
+    /// 旧版单池 → 国际版名下（用户确认现存那一池就是国际版的）。
+    /// 用 `or_insert`：新格式里国际版已经有自己的池时，以新格式为准。
+    fn normalized(mut self) -> Self {
+        if let Some(u) = self.legacy_pool_uuid.take() {
+            self.pools.entry(Region::Global).or_insert(u);
+        }
+        self
+    }
+}
+
+/// 只存在于内存的运行时状态（进程重启就重来，不影响正确性）。**一池一份**。
+#[derive(Default, Clone)]
 struct Runtime {
     /// 上次「真的问过管家」的时刻，用于节流
     last_sync_ms: i64,
@@ -83,7 +104,8 @@ struct Runtime {
 struct State {
     dir: PathBuf,
     cfg: BrokerConfig,
-    rt: Runtime,
+    /// 每个区域各自的运行时状态；没绑过的区域根本不会有条目
+    rt: HashMap<Region, Runtime>,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -95,7 +117,7 @@ pub fn init(dir: &Path) {
         Mutex::new(State {
             dir: dir.to_path_buf(),
             cfg,
-            rt: Runtime::default(),
+            rt: HashMap::new(),
         })
     });
 }
@@ -106,6 +128,7 @@ fn load_config(dir: &Path) -> BrokerConfig {
         .ok()
         .and_then(|t| serde_json::from_str::<BrokerConfig>(&t).ok())
         .unwrap_or_default()
+        .normalized()
 }
 
 fn save_config(dir: &Path, cfg: &BrokerConfig) -> std::io::Result<()> {
@@ -121,13 +144,16 @@ fn save_config(dir: &Path, cfg: &BrokerConfig) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 读一份快照（uuid + 运行时状态），**不持锁跨 await**。
-fn snapshot() -> (Option<String>, Runtime) {
+/// 读某区域的一份快照（uuid + 运行时状态），**不持锁跨 await**。
+fn snapshot_in(region: Region) -> (Option<String>, Runtime) {
     let Some(lock) = STATE.get() else {
         return (None, Runtime::default());
     };
     match lock.lock() {
-        Ok(s) => (s.cfg.pool_uuid.clone(), clone_runtime(&s.rt)),
+        Ok(s) => (
+            s.cfg.pools.get(&region).cloned(),
+            s.rt.get(&region).cloned().unwrap_or_default(),
+        ),
         Err(_) => (None, Runtime::default()),
     }
 }
@@ -141,16 +167,6 @@ fn data_dir() -> Option<PathBuf> {
     }
 }
 
-fn clone_runtime(rt: &Runtime) -> Runtime {
-    Runtime {
-        last_sync_ms: rt.last_sync_ms,
-        last_ok_ms: rt.last_ok_ms,
-        version: rt.version,
-        error: rt.error.clone(),
-        syncing: rt.syncing,
-    }
-}
-
 fn mutate<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     let lock = STATE.get()?;
     match lock.lock() {
@@ -159,60 +175,71 @@ fn mutate<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     }
 }
 
-/// 这台机器绑定到某一池了吗？**续签路径的分岔判据**（见 `commands::ensure_fresh_token`）。
-pub fn bound() -> bool {
-    snapshot().0.is_some()
+/// 这台机器在**这个区域**绑定到某一池了吗？续签路径按账号自己的区域分岔
+/// （见 `commands::ensure_fresh_token`）：一个区域绑了池，另一个区域照常本地续签。
+pub fn bound_in(region: Region) -> bool {
+    snapshot_in(region).0.is_some()
 }
 
-/// 当前绑定的池 uuid
-pub fn uuid() -> Option<String> {
-    snapshot().0
+fn uuid_of(region: Region) -> Option<String> {
+    snapshot_in(region).0
 }
 
-fn set_uuid(uuid: Option<String>) {
+fn set_uuid(region: Region, uuid: Option<String>) {
     mutate(|s| {
-        s.cfg.pool_uuid = uuid;
+        match uuid {
+            Some(u) => {
+                s.cfg.pools.insert(region, u);
+            }
+            None => {
+                s.cfg.pools.remove(&region);
+            }
+        }
         let _ = save_config(&s.dir, &s.cfg);
     });
 }
 
-fn note_start() {
-    mutate(|s| s.rt.syncing = true);
+fn note_start(region: Region) {
+    mutate(|s| s.rt.entry(region).or_default().syncing = true);
 }
 
-fn note_ok(version: Option<i64>) {
+fn note_ok(region: Region, version: Option<i64>) {
     mutate(|s| {
-        s.rt.syncing = false;
-        s.rt.error = None;
+        let rt = s.rt.entry(region).or_default();
+        rt.syncing = false;
+        rt.error = None;
         if let Some(v) = version {
-            s.rt.version = Some(v);
+            rt.version = Some(v);
         }
         let now = chrono::Utc::now().timestamp_millis();
-        s.rt.last_sync_ms = now;
-        s.rt.last_ok_ms = now;
+        rt.last_sync_ms = now;
+        rt.last_ok_ms = now;
     });
 }
 
-fn note_touched() {
+fn note_touched(region: Region) {
     // 被闸拒 / 被节流：也算「问过了」，否则热路径会每一跳都再打一次接口
     mutate(|s| {
-        s.rt.syncing = false;
-        s.rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
+        let rt = s.rt.entry(region).or_default();
+        rt.syncing = false;
+        rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
     });
 }
 
-fn note_error(message: impl Into<String>) {
+fn note_error(region: Region, message: impl Into<String>) {
     let msg = message.into();
     mutate(|s| {
-        s.rt.syncing = false;
-        s.rt.error = Some(msg);
-        s.rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
+        let rt = s.rt.entry(region).or_default();
+        rt.syncing = false;
+        rt.error = Some(msg);
+        rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
     });
 }
 
 // ── 发给前端的形状 ────────────────────────────────────────────────────────
 
-/// `inline`：绑定状态。前端只读它，改配置一律走 upload / link / unbind 三个动作。
+/// `inline`：某个区域那池的绑定状态。前端只读它，改配置一律走 upload / link / unbind
+/// 三个动作（都作用于当前区域）。
 #[derive(Serialize, Clone, Debug)]
 pub struct BrokerStatus {
     pub bound: bool,
@@ -224,8 +251,8 @@ pub struct BrokerStatus {
     pub syncing: bool,
 }
 
-pub fn status() -> BrokerStatus {
-    let (uuid, rt) = snapshot();
+pub fn status(region: Region) -> BrokerStatus {
+    let (uuid, rt) = snapshot_in(region);
     BrokerStatus {
         bound: uuid.is_some(),
         uuid,
@@ -660,11 +687,11 @@ struct VersionResp {
     version: i64,
 }
 
-/// 把 `(FailKind, msg)` 变成给用户看的一句话。`Gone` 额外清掉本地 uuid。
-fn on_failure(kind: FailKind, message: String) -> String {
+/// 把 `(FailKind, msg)` 变成给用户看的一句话。`Gone` 额外清掉**该区域**的本地 uuid。
+fn on_failure(kind: FailKind, message: String, region: Region) -> String {
     match kind {
         FailKind::Gone => {
-            set_uuid(None);
+            set_uuid(region, None);
             "云端那一池已经不存在了（可能已被清理），本机已退回单机运行，请重新上传或绑定"
                 .to_string()
         }
@@ -682,56 +709,65 @@ fn on_failure(kind: FailKind, message: String) -> String {
 fn upload_guard(already_bound: bool) -> Result<(), String> {
     if already_bound {
         return Err(
-            "本机已经绑定了云端凭证池。要重新上传，请先解绑（解绑只摘本机绑定，云端那一池保留）。"
+            "本区域已经绑定了云端凭证池。要重新上传，请先解绑（解绑只摘本机绑定，云端那一池保留）。"
                 .to_string(),
         );
     }
     Ok(())
 }
 
-/// 把本机这一批账号整体上传：管家颁发一串 uuid 并当场绑定。
+/// 把本机**这个区域**的账号整体上传：管家颁发一串 uuid 并当场绑定该区域。
 ///
-/// 这是**整台机器**的动作，不是「某个账号」的 —— 所以不收账号参数。
+/// 区域由调用方给定（当前选中的区域）：每个区域各绑一池，把另一区域的账号塞进来，
+/// 会在绑定这一池的机器上被收养成「不属于那边日常使用部署」的账号 ——
+/// 同一条过滤在 `sync` 里也有一份。
 ///
 /// ⚠️ **已绑定时直接拒绝**（见 [`upload_guard`]）：服务端建池永远是新建、不会覆盖，
 /// 放行一次就会在云端留下第二池，让两台机器各持一把闸。
-pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
-    upload_guard(bound())?;
-    let accounts = accounts::load_accounts(dir);
-    if accounts.is_empty() {
-        return Err("本机还没有账号，先「导入本机账号」或「登录新账号」".to_string());
+pub async fn upload(dir: &Path, region: Region) -> Result<PoolOp, String> {
+    upload_guard(bound_in(region))?;
+    let items: Vec<PoolItem> = accounts::load_accounts(dir)
+        .iter()
+        .filter(|a| a.region == region)
+        .map(to_item)
+        .collect();
+    if items.is_empty() {
+        return Err(format!(
+            "本区域（{}）还没有账号，先「登录新账号」或「导入本机账号」",
+            region.label()
+        ));
     }
-    let items: Vec<PoolItem> = accounts.iter().map(to_item).collect();
     let v = request(
         reqwest::Method::POST,
         "/v1/pool",
         Some(serde_json::json!({ "items": items })),
     )
     .await
-    .map_err(|(k, m)| on_failure(k, m))?;
+    .map_err(|(k, m)| on_failure(k, m, region))?;
     let created: CreateResp = serde_json::from_value(v)
         .map_err(|e| format!("凭证管家返回的建池结果看不懂：{e}"))?;
 
-    set_uuid(Some(created.uuid.clone()));
+    set_uuid(region, Some(created.uuid.clone()));
     mutate(|s| {
-        s.rt.version = Some(created.version);
-        s.rt.error = None;
+        let rt = s.rt.entry(region).or_default();
+        rt.version = Some(created.version);
+        rt.error = None;
     });
-    note_ok(Some(created.version));
+    note_ok(region, Some(created.version));
 
     Ok(PoolOp {
         uuid: created.uuid,
         account_count: items.len(),
         merged: 0,
-        message: format!("已把本机的 {} 个账号放上云端", items.len()),
+        message: format!("已把本机{}的 {} 个账号放上云端", region.label(), items.len()),
     })
 }
 
-/// 绑定别处复制过来的 uuid：先验证这一池真的存在，再并进本地。
+/// 绑定别处复制过来的 uuid：先验证这一池真的存在，再并进本地。只作用于指定区域。
 ///
 /// 先验证是必要的防呆：把一串打不通的 uuid 写进本地配置，之后每次同步都失败，
 /// 而用户以为已经绑好了。
-pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
+pub async fn link(dir: &Path, region: Region, raw_uuid: &str) -> Result<PoolOp, String> {
     let uuid = raw_uuid.trim();
     if uuid.is_empty() {
         return Err("请先粘贴云端凭证池的 uuid".to_string());
@@ -757,11 +793,12 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
         .unwrap_or_default();
     let version = v.get("version").and_then(|x| x.as_i64());
 
-    set_uuid(Some(uuid.to_string()));
+    set_uuid(region, Some(uuid.to_string()));
     mutate(|s| {
-        s.rt.version = version;
-        s.rt.error = None;
-        s.rt.last_sync_ms = 0; // 下一次调用立刻做一轮完整同步
+        let rt = s.rt.entry(region).or_default();
+        rt.version = version;
+        rt.error = None;
+        rt.last_sync_ms = 0; // 下一次调用立刻做一轮完整同步
     });
 
     let mut accounts = accounts::load_accounts(dir);
@@ -770,7 +807,7 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
 
     // 绑定后立刻整池同步一轮：把「本地独有的账号」也推上云（并集才是这一池的真相）。
     // 失败不影响绑定本身 —— 已经绑上了，下一跳还会再试。
-    let sync_note = match sync(dir, true).await {
+    let sync_note = match sync(dir, true, region).await {
         Ok(r) => r.message,
         Err(e) => format!("已绑定，但首次同步未完成：{e}"),
     };
@@ -783,18 +820,19 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
     })
 }
 
-/// 解绑：**只摘掉本地 uuid，云端那一池不动**。
+/// 解绑指定区域：**只摘掉本地 uuid，云端那一池不动**。
 ///
 /// 同时把本机与云端重复的账号（token）从本地移除 —— 凭证已托管在云端，本机不再持有副本，
 /// 免得解绑后本机单机续签把云端那条链轮换掉；本机独有的账号（云端没有的）原样保留。
+/// 重复判据是 key（带区域前缀），所以天然只删**这个区域**的重复账号。
 ///
 /// 云端那一池还在时，必须先拿到池内容才知道哪些是重复的：拿不到（网络不可达 / 被拒绝）
 /// 就返回 Err 且**保留本地绑定** —— 静默只摘 uuid，会让本机继续持有一批与云端相同的凭证，
 /// 而用户以为自己已经解绑了。`gone`（池已不存在）例外：云端都没了，本机没有「与云端
 /// 相同」的东西，全部保留、照常解绑。
-pub async fn unbind() -> Result<BrokerStatus, String> {
-    let Some(uuid) = uuid() else {
-        return Ok(status());
+pub async fn unbind(region: Region) -> Result<BrokerStatus, String> {
+    let Some(uuid) = uuid_of(region) else {
+        return Ok(status(region));
     };
     let cloud: Vec<PoolItem> = match request(reqwest::Method::GET, &format!("/v1/pool/{uuid}"), None).await {
         Ok(v) => v
@@ -824,16 +862,17 @@ pub async fn unbind() -> Result<BrokerStatus, String> {
         accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     }
 
-    set_uuid(None);
+    set_uuid(region, None);
     mutate(|s| {
-        s.rt = Runtime::default();
+        s.rt.remove(&region);
     });
-    Ok(status())
+    Ok(status(region))
 }
 
-/// 一轮完整同步（三步握手）。**未绑定、被节流、抢不到闸都是正常返回**，不是错误。
-pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
-    let Some(uuid) = uuid() else {
+/// 一轮完整同步（三步握手），只作用于指定区域的池。
+/// **未绑定、被节流、抢不到闸都是正常返回**，不是错误。
+pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport, String> {
+    let Some(uuid) = uuid_of(region) else {
         return Ok(SyncReport {
             changed: false,
             deferred: true,
@@ -841,12 +880,12 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             refreshed: 0,
             failed: 0,
             version: None,
-            message: "本机未绑定凭证池".to_string(),
+            message: "本区域未绑定凭证池".to_string(),
         });
     };
 
     let now = chrono::Utc::now().timestamp_millis();
-    let (_, rt) = snapshot();
+    let (_, rt) = snapshot_in(region);
     if !force && now - rt.last_sync_ms < SYNC_TTL_MS {
         return Ok(SyncReport {
             changed: false,
@@ -859,7 +898,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         });
     }
 
-    note_start();
+    note_start(region);
     let lease_value = match request(
         reqwest::Method::POST,
         &format!("/v1/pool/{uuid}/lease"),
@@ -869,8 +908,8 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     {
         Ok(v) => v,
         Err((kind, m)) => {
-            let msg = on_failure(kind, m);
-            note_error(msg.clone());
+            let msg = on_failure(kind, m, region);
+            note_error(region, msg.clone());
             return Err(msg);
         }
     };
@@ -880,7 +919,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     if !lease.granted {
         // 别的机器正在签。**不更新本地凭证**，但记下「问过了」，
         // 否则热路径每一跳都会再打一次接口。
-        note_touched();
+        note_touched(region);
         // 「冷却中」比「闸在别人手里」更需要说清楚：前者意味着整池都在等，
         // 后者下一秒可能就好了
         let cooldown_s = (lease.retry_after - chrono::Utc::now().timestamp_millis()) / 1000;
@@ -903,19 +942,33 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
 
     let version = lease.version;
 
-    // ① 池并进本地（并集，本地独有的保留）
+    // ① 池并进本地（并集，本地独有的保留）。只采纳**本区域**的池条目：
+    //    池按区域各绑一个，但老池（或手工绑错）里可能混着别的区域的条目 ——
+    //    采纳它们会在本机凭空长出另一区域的账号。
+    let cloud: Vec<PoolItem> = lease
+        .items
+        .iter()
+        .filter(|i| item_region(i) == region)
+        .cloned()
+        .collect();
     let mut accounts = accounts::load_accounts(dir);
-    let merged = merge_into(&mut accounts, &lease.items);
+    let merged = merge_into(&mut accounts, &cloud);
 
     // ② 本机执行需要做的续签。**只用抢闸带回来的那一份**做判断：
     //    本地那份可能早就被别的机器换掉了。
     //
     //    提交的初值取「云端 ∪ 本机」：`PUT` 是**整池替换**，若从 `lease.items` 起步，
     //    本机独有的账号就永远进不了正文，等于每同步一次都把并集缩回云端那份。
-    let mut pool = union_pool(&lease.items, &accounts);
+    //    两侧都只碰**本区域**：续签与提交正文都轮不到另一区域的账号。
+    let local: Vec<Account> = accounts
+        .iter()
+        .filter(|a| a.region == region)
+        .cloned()
+        .collect();
+    let mut pool = union_pool(&cloud, &local);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
-    for acct in accounts.iter_mut() {
+    for acct in accounts.iter_mut().filter(|a| a.region == region) {
         if acct.refresh_token.is_none()
             || !crate::refresh::should_refresh(acct.expires_at, now)
         {
@@ -954,7 +1007,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             Some(serde_json::json!({ "note": note })),
         )
         .await;
-        note_error(format!("{note}，已让管家进入冷静期"));
+        note_error(region, format!("{note}，已让管家进入冷静期"));
         return Ok(SyncReport {
             changed: merged > 0 || refreshed > 0,
             deferred: false,
@@ -979,18 +1032,18 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             .ok()
             .map(|r| r.version)
             .or(Some(version + 1)),
-        Err((FailKind::Gone, _)) => return Err(on_failure(FailKind::Gone, String::new())),
+        Err((FailKind::Gone, _)) => return Err(on_failure(FailKind::Gone, String::new(), region)),
         Err((kind, m)) => {
             // 提交失败不改本地：本机的续签结果已经落盘了，下一次同步再推上去。
             // 服务端那份还是旧版本 → 下次抢闸拿到它，接着重走一遍。
-            note_error(format!("整池提交失败：{m}"));
+            note_error(region, format!("整池提交失败：{m}"));
             return Err(match kind {
                 FailKind::Unreachable => format!("整池提交失败（本机凭证已更新）：{m}"),
                 _ => m,
             });
         }
     };
-    note_ok(next_version);
+    note_ok(region, next_version);
 
     Ok(SyncReport {
         changed: merged > 0 || refreshed > 0,
@@ -1398,18 +1451,43 @@ mod tests {
     }
 
     #[test]
-    fn config_file_only_carries_the_uuid() {
+    fn config_carries_one_uuid_per_region_and_adopts_the_legacy_one() {
         let cfg = BrokerConfig {
-            pool_uuid: Some("abc".into()),
+            pools: HashMap::from([
+                (Region::Global, "g-pool".to_string()),
+                (Region::Cn, "c-pool".to_string()),
+            ]),
+            legacy_pool_uuid: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(json.contains("pool_uuid"));
+        assert!(json.contains("pools"));
         assert!(!json.contains("version"), "版本号是运行时状态，不该落盘");
+        assert!(!json.contains("legacy"), "旧字段只读不写");
+
+        // 旧版的单一 pool_uuid 归到国际版名下 —— 那时只有国际版，且用户确认
+        // 现存的池就是国际版的。归错了区域 = 续签闸落到另一套部署的凭证上。
+        let restored: BrokerConfig =
+            serde_json::from_str(r#"{"pool_uuid":"legacy-uuid"}"#).unwrap();
+        let restored = restored.normalized();
+        assert_eq!(
+            restored.pools.get(&Region::Global).map(String::as_str),
+            Some("legacy-uuid")
+        );
+        assert!(!restored.pools.contains_key(&Region::Cn), "不能顺手扩散到另一区域");
+
+        // 新格式里国际版已有自己的池时，以新格式为准，旧值直接丢掉
+        let restored: BrokerConfig =
+            serde_json::from_str(r#"{"pools":{"global":"new"},"pool_uuid":"old"}"#).unwrap();
+        let restored = restored.normalized();
+        assert_eq!(
+            restored.pools.get(&Region::Global).map(String::as_str),
+            Some("new")
+        );
 
         // 旧版本残留的未知字段要能读进来而不是整份报废
         let restored: BrokerConfig =
-            serde_json::from_str(r#"{"pool_uuid":"abc","enabled":true,"url":"x"}"#).unwrap();
-        assert_eq!(restored.pool_uuid.as_deref(), Some("abc"));
+            serde_json::from_str(r#"{"pools":{"cn":"c"},"enabled":true,"url":"x"}"#).unwrap();
+        assert_eq!(restored.pools.get(&Region::Cn).map(String::as_str), Some("c"));
     }
 
     /// 真实接口冒烟：上传一池 → 整池同步 → 解绑（云端保留），跑完手动把测试池删干净。
@@ -1440,19 +1518,19 @@ mod tests {
         accounts::save_accounts(&dir, &[fake]).expect("写测试账号");
 
         init(&dir);
-        assert!(!bound(), "测试开始前不该是绑定的");
+        assert!(!bound_in(Region::Global), "测试开始前不该是绑定的");
 
-        let op = upload(&dir).await.expect("上传失败");
+        let op = upload(&dir, Region::Global).await.expect("上传失败");
         println!("[冒烟] 上传成功：uuid={} 条数={} 说明={}", op.uuid, op.account_count, op.message);
-        assert!(bound());
+        assert!(bound_in(Region::Global));
         assert_eq!(op.account_count, 1);
 
-        let rep = sync(&dir, true).await.expect("整池同步失败");
+        let rep = sync(&dir, true, Region::Global).await.expect("整池同步失败");
         println!("[冒烟] 同步：{}（deferred={}）", rep.message, rep.deferred);
         assert!(!rep.deferred, "强制同步不该被跳过");
         assert!(rep.version.is_some(), "同步后应拿到云端版本号");
 
-        let st = status();
+        let st = status(Region::Global);
         println!(
             "[冒烟] 状态：version={:?} last_ok_ms={:?} error={:?}",
             st.version, st.last_ok_ms, st.error
@@ -1461,11 +1539,11 @@ mod tests {
         assert!(st.error.is_none(), "成功路径不该留下错误：{:?}", st.error);
 
         // 再同步一轮：这次会被节流挡下（两分钟窗口），是正常的
-        let throttled = sync(&dir, false).await.expect("节流路径不该报错");
+        let throttled = sync(&dir, false, Region::Global).await.expect("节流路径不该报错");
         assert!(throttled.deferred, "两分钟内第二次同步应被节流");
 
-        unbind().await.expect("解绑失败");
-        assert!(!bound());
+        unbind(Region::Global).await.expect("解绑失败");
+        assert!(!bound_in(Region::Global));
         // 解绑只摘本机绑定、云端保留：本机与云端重复的账号（这里就是那 1 个）应从本机移除
         assert_eq!(
             accounts::load_accounts(&dir).len(),

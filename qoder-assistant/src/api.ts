@@ -97,7 +97,16 @@ export const getSettings = () => invoke<Settings>("get_settings");
 export const saveSettings = (settings: Settings) =>
   invoke<Settings>("save_settings", { settings });
 
-/** 原子应用设置；接管启停 / 换端口 / 换区域全程只改配置，不动 Qoder 进程 */
+/**
+ * 切换「当前区域」（左下角区域选择器的落点）：只改后端的全局指针，
+ * **不碰任何区域的设置** —— 走 saveSettings 切区域会被后端拒绝（那会拿旧区域的
+ * 取值盖掉新区域的切片）。接管开启中后端直接报错，界面上应先把选择器禁掉。
+ * 返回切换后的设置视图（新区域的定时/简报/风控配置）。
+ */
+export const setRegion = (region: string) =>
+  invoke<Settings>("set_region", { region });
+
+/** 原子应用设置；接管启停 / 换端口全程只改配置，不动 Qoder 进程（换区域走 [`setRegion`]，后端已拒绝其它路径改区域） */
 export const applySettings = (settings: Settings) =>
   invoke<Settings>("apply_settings", { settings });
 

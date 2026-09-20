@@ -16,8 +16,9 @@
 //! 签到结果的通知里也带上真实触发时刻（[`notify::trigger_line`]）。两处合起来，
 //! 「今天到底几点签的」在任何时候都答得出来。
 //!
-//! 跨启动去重靠 `schedule_state.json`（只记最后一次执行的日期），
-//! 这样重启应用不会在补跑窗口内重复签一遍。
+//! 跨启动去重靠 `schedule_state.json`，且**每个区域各记一份**（定时签到只跑当前区域，
+//! 「今天跑过了没有」「今天摇到几点」都是那个区域自己的事；切了区域就是另一条排期，
+//! 互不顶替），这样重启应用不会在补跑窗口内重复签一遍。
 //!
 //! 自动续签：常驻期间每 12 小时扫一遍账号，**剩余有效期不足 48 小时就静默续一次**；
 //! 启动后也会立刻扫一次（久未开应用的情况靠它兜住）。
@@ -38,8 +39,10 @@ use crate::accounts::{self, Settings};
 use crate::briefing;
 use crate::commands;
 use crate::notify;
+use crate::region::Region;
 use chrono::Timelike;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -78,22 +81,19 @@ pub(crate) struct DayTarget {
 
 #[derive(Serialize, Deserialize, Default)]
 struct ScheduleState {
-    /// 最后一次定时执行的日期（`YYYY-MM-DD`）
+    /// 定时签到的排期：**每个区域各记一份**（key = [`Region::key`]）。
+    ///
+    /// 「今天跑过了没有」「今天摇到几点」「预告推了没」全都是*这个区域*的事：
+    /// 定时签到只跑当前区域（用户决定），切区域 = 换一条排期，互不顶替。
+    /// 缺某个区域的键是合法状态（该区域从没跑过定时签到，默认值即正确起点）。
     #[serde(default)]
-    last_run_date: Option<String>,
+    regions: HashMap<String, RegionSchedule>,
     /// 最后一次自动续签扫描的时刻（毫秒时间戳）
+    ///
+    /// 以下三项都是**整机**事实，不按区域拆：续签扫的是全部账号（保命操作跨区域照跑），
+    /// 简报采样/推送的节拍也不认区域。
     #[serde(default)]
     last_refresh_scan_ms: Option<i64>,
-    /// 今天随机挑定的触发时刻（跨天自动重挑；见 [`target_time`]）
-    #[serde(default)]
-    today_target: Option<DayTarget>,
-    /// 已经推送过预告的那个目标时刻（见 [`preview_time`]）
-    ///
-    /// 与 `today_target` 分开记：前者是「今天几点签」，这里是「这点**已经告诉过用户**」。
-    /// 合并成一个字段就没法区分「摇定了」和「通知过了」，重启或每 30s 一跳都会重推。
-    /// 时刻被重新摇过（用户改了设置）时它自然不再相等，于是会补推新时刻。
-    #[serde(default)]
-    notified_target: Option<DayTarget>,
     /// 最后一次积分简报采样所属的小时（`YYYY-MM-DD HH`）
     ///
     /// 用来保证**每小时只采一次**：采样窗口有 5 分钟、轮询 30s 一跳，
@@ -108,6 +108,61 @@ struct ScheduleState {
     last_briefing_push_date: Option<String>,
 }
 
+/// 一个区域的定时签到排期。字段含义见各处注释（与拆分前的全局同名字段一致）。
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct RegionSchedule {
+    /// 最后一次定时执行的日期（`YYYY-MM-DD`）
+    #[serde(default)]
+    last_run_date: Option<String>,
+    /// 今天随机挑定的触发时刻（跨天自动重挑；见 [`target_time`]）
+    #[serde(default)]
+    today_target: Option<DayTarget>,
+    /// 已经推送过预告的那个目标时刻（见 [`preview_time`]）
+    ///
+    /// 与 `today_target` 分开记：前者是「今天几点签」，这里是「这点**已经告诉过用户**」。
+    /// 合并成一个字段就没法区分「摇定了」和「通知过了」，重启或每 30s 一跳都会重推。
+    /// 时刻被重新摇过（用户改了设置）时它自然不再相等，于是会补推新时刻。
+    #[serde(default)]
+    notified_target: Option<DayTarget>,
+}
+
+/// 反序列化用的中间形态：认新格式的 `regions`，也兜住老格式的**扁平**签到三字段。
+#[derive(Deserialize)]
+struct RawState {
+    #[serde(default)]
+    regions: Option<HashMap<String, RegionSchedule>>,
+    #[serde(default)]
+    last_refresh_scan_ms: Option<i64>,
+    #[serde(default)]
+    last_sample_hour: Option<String>,
+    #[serde(default)]
+    last_briefing_push_date: Option<String>,
+    #[serde(flatten, default)]
+    legacy: RegionSchedule,
+}
+
+impl RawState {
+    /// 老状态（`regions` 键不存在）里的扁平排期**复制给两个区域**。
+    ///
+    /// 为什么不是只迁给「当时的当前区域」：状态文件里根本没记当时是谁 —— 而老排期来自
+    /// 「整机只有一条时间线」的年代，那条记录对两个区域都成立（当时能签的账号也只有一批）。
+    /// 复制不猜身份，最坏结果是切过去的那侧今天少补跑一次（签到本就幂等）。
+    fn into_state(self) -> ScheduleState {
+        let regions = self.regions.unwrap_or_else(|| {
+            Region::ALL
+                .iter()
+                .map(|r| (r.key().to_string(), self.legacy.clone()))
+                .collect()
+        });
+        ScheduleState {
+            regions,
+            last_refresh_scan_ms: self.last_refresh_scan_ms,
+            last_sample_hour: self.last_sample_hour,
+            last_briefing_push_date: self.last_briefing_push_date,
+        }
+    }
+}
+
 fn state_file(dir: &Path) -> PathBuf {
     dir.join("schedule_state.json")
 }
@@ -115,7 +170,8 @@ fn state_file(dir: &Path) -> PathBuf {
 fn load_state(dir: &Path) -> ScheduleState {
     fs::read_to_string(state_file(dir))
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<RawState>(&s).ok())
+        .map(RawState::into_state)
         .unwrap_or_default()
 }
 
@@ -291,7 +347,16 @@ pub fn spawn(app: AppHandle) {
             if !settings.schedule_enabled {
                 continue;
             }
+            // 排期按区域各记一份：这条循环只服务**当前区域**（左下角选择器选中的那个）。
+            // 用户改的 `schedule_*` 也是当前区域那份设置里的值 —— 两个区域各自定时、
+            // 各自摇号、各自去重，切过去看到的就是那条排期的真实进度。
+            let region_key = settings.takeover_region.key().to_string();
             let mut state = load_state(&dir);
+            let mut sched = state
+                .regions
+                .get(&region_key)
+                .cloned()
+                .unwrap_or_default();
             let now = chrono::Local::now().naive_local();
             let today = now.date().format("%Y-%m-%d").to_string();
             // 当天目标时刻：第一次算出来后立刻落盘，之后每一跳都复用同一个值，
@@ -300,16 +365,20 @@ pub fn spawn(app: AppHandle) {
                 &today,
                 &settings.schedule_time,
                 settings.schedule_window_minutes,
-                state.today_target.as_ref(),
+                sched.today_target.as_ref(),
             );
-            if state.today_target.as_ref() != Some(&target) {
-                state.today_target = Some(target.clone());
+            if sched.today_target.as_ref() != Some(&target) {
+                sched.today_target = Some(target.clone());
+                state.regions.insert(region_key.clone(), sched.clone());
                 save_state(&dir, &state);
                 log_event(
                     &dir,
                     &format!(
-                        "今日签到目标已定：{}（设定 {}，随机时间窗 {} 分钟）",
-                        target.at, settings.schedule_time, settings.schedule_window_minutes
+                        "今日签到目标已定（{}）：{}（设定 {}，随机时间窗 {} 分钟）",
+                        settings.takeover_region.label(),
+                        target.at,
+                        settings.schedule_time,
+                        settings.schedule_window_minutes
                     ),
                 );
             }
@@ -319,13 +388,14 @@ pub fn spawn(app: AppHandle) {
                 &settings.schedule_time,
                 settings.schedule_window_minutes,
                 &target,
-                state.notified_target.as_ref(),
+                sched.notified_target.as_ref(),
                 now,
             ) {
                 // 通知关着时**不记账**：这样用户中途打开通知仍能收到这条（否则白等一天）。
                 // 判定本身是纯函数、不打接口，每 30s 重算一次没有代价。
                 if settings.notify_enabled && settings.notify_on_schedule {
-                    state.notified_target = Some(target.clone());
+                    sched.notified_target = Some(target.clone());
+                    state.regions.insert(region_key.clone(), sched.clone());
                     save_state(&dir, &state);
                     let outcome = match tauri::async_runtime::block_on(notify::send(
                         &settings.notify_webhook,
@@ -341,12 +411,13 @@ pub fn spawn(app: AppHandle) {
                     log_event(&dir, &outcome);
                 }
             }
-            if !due_at(now, &target.at, state.last_run_date.as_deref()) {
+            if !due_at(now, &target.at, sched.last_run_date.as_deref()) {
                 continue;
             }
 
             // 先落盘「今天已跑」再执行：万一执行中崩溃，也不会在补跑窗口里反复重试
-            state.last_run_date = Some(today.clone());
+            sched.last_run_date = Some(today.clone());
+            state.regions.insert(region_key, sched);
             save_state(&dir, &state);
             let actual = now.format("%H:%M").to_string();
             log_event(
@@ -737,42 +808,85 @@ mod tests {
     #[test]
     fn state_round_trips_on_disk() {
         let dir = std::env::temp_dir().join(format!("wba-sched-{}", uuid::Uuid::new_v4()));
-        assert!(load_state(&dir).last_run_date.is_none());
-        assert!(load_state(&dir).today_target.is_none());
+        let st = load_state(&dir);
+        assert!(st.regions.is_empty(), "没有文件 = 谁都没跑过");
+        assert!(st.last_sample_hour.is_none());
+        // 缺某个区域的键是合法状态：那条排期默认「从没跑过」，而不是报错或全局兜底
+        let sched = RegionSchedule::default();
+        assert!(sched.last_run_date.is_none() && sched.today_target.is_none());
         save_state(
             &dir,
             &ScheduleState {
-                last_run_date: Some("2026-09-12".into()),
+                regions: [(
+                    "global".to_string(),
+                    RegionSchedule {
+                        last_run_date: Some("2026-09-12".into()),
+                        today_target: Some(DayTarget {
+                            date: "2026-09-12".into(),
+                            at: "10:12".into(),
+                        }),
+                        notified_target: Some(DayTarget {
+                            date: "2026-09-12".into(),
+                            at: "10:12".into(),
+                        }),
+                    },
+                )]
+                .into(),
                 last_refresh_scan_ms: Some(1_700_000_000_000),
-                today_target: Some(DayTarget {
-                    date: "2026-09-12".into(),
-                    at: "10:12".into(),
-                }),
-                notified_target: Some(DayTarget {
-                    date: "2026-09-12".into(),
-                    at: "10:12".into(),
-                }),
                 last_sample_hour: Some("2026-09-12 09".into()),
                 last_briefing_push_date: Some("2026-09-13".into()),
             },
         );
         let loaded = load_state(&dir);
-        assert_eq!(loaded.last_run_date.as_deref(), Some("2026-09-12"));
+        let g = loaded.regions.get("global").expect("global 切片");
+        assert_eq!(g.last_run_date.as_deref(), Some("2026-09-12"));
         assert_eq!(loaded.last_refresh_scan_ms, Some(1_700_000_000_000));
         // 当天目标必须扛得住重启，否则「随机窗口」会被重启重新摇一次
-        assert_eq!(
-            loaded.today_target.as_ref().map(|t| t.at.as_str()),
-            Some("10:12")
-        );
-        // 简报的两个标记独立于签到：开关互不影响，去重也必须独立。
+        assert_eq!(g.today_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
+        // 简报的两个标记是整机事实，独立于区域排期：开关互不影响，去重也必须独立。
         // 采样标记必须扛得住重启，否则每次启动都会重采一遍（多打一轮接口）
         assert_eq!(loaded.last_sample_hour.as_deref(), Some("2026-09-12 09"));
         assert_eq!(loaded.last_briefing_push_date.as_deref(), Some("2026-09-13"));
         // 「预告已推过」也必须扛得住重启，否则每次开应用都会把今天的时刻重推一遍
-        assert_eq!(
-            loaded.notified_target.as_ref().map(|t| t.at.as_str()),
-            Some("10:12")
-        );
+        assert_eq!(g.notified_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
+        // 没写过的区域不被 global 那份排期污染
+        assert!(!loaded.regions.contains_key("cn"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 升级路径：老状态文件是**扁平**的（签到三字段直接在顶层，没有 `regions` 键），
+    /// 必须原样读进**两个区域**的排期（理由见 [`RawState::into_state`]），
+    /// 否则升级当天就会「今天已跑过」失忆，在补跑窗口里重复签一遍。
+    #[test]
+    fn legacy_flat_state_migrates_into_both_regions() {
+        let dir = std::env::temp_dir().join(format!("wba-sched-legacy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            state_file(&dir),
+            r#"{"last_run_date":"2026-09-12","last_refresh_scan_ms":1700000000000,
+               "today_target":{"date":"2026-09-12","at":"10:12"},
+               "notified_target":{"date":"2026-09-12","at":"10:12"},
+               "last_sample_hour":"2026-09-12 09","last_briefing_push_date":"2026-09-13"}"#,
+        )
+        .unwrap();
+
+        let st = load_state(&dir);
+        for key in ["global", "cn"] {
+            let s = st.regions.get(key).unwrap_or_else(|| panic!("{key} 切片应存在"));
+            assert_eq!(s.last_run_date.as_deref(), Some("2026-09-12"));
+            assert_eq!(s.today_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
+            assert_eq!(s.notified_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
+        }
+        // 整机三项不能被 flatten 吞进排期里弄丢
+        assert_eq!(st.last_refresh_scan_ms, Some(1_700_000_000_000));
+        assert_eq!(st.last_sample_hour.as_deref(), Some("2026-09-12 09"));
+        assert_eq!(st.last_briefing_push_date.as_deref(), Some("2026-09-13"));
+
+        // 迁移要**持久化**：下一次保存后文件必须已是新格式（顶层不再有扁平三字段）
+        save_state(&dir, &st);
+        let raw = fs::read_to_string(state_file(&dir)).unwrap();
+        assert!(raw.contains("\"regions\""), "{raw}");
+        assert!(!raw.contains("\"last_run_date\":\"2026-09-12\""), "老键不该被写回顶层：{raw}");
         let _ = fs::remove_dir_all(&dir);
     }
 

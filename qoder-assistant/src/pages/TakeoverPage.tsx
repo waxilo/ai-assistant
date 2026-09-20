@@ -54,7 +54,8 @@ function eventKind(e: JournalEvent): {
 /**
  * 全选归一：勾选集覆盖**整池**时存空（= 默认全选，之后新增的账号自动可扣费）。
  *
- * 池 = 接管目标区域的账号；换区域时会被清空（见 `onChangeRegion`）。
+ * 池 = 当前区域的账号。设置本身按区域各存一份，切走再切回来勾选集原样还在，
+ * 所以这里不需要（也不应该）在换区域时做任何清理。
  */
 function normalizeBilling(list: string[], pool: string[]): string[] {
   return pool.length > 0 && list.length === pool.length ? [] : list;
@@ -98,6 +99,7 @@ export function TakeoverPage({
   onSettings,
   onReloadSettings,
   onToast,
+  onSwitchRegion,
 }: {
   settings: Settings;
   accounts: Account[];
@@ -107,6 +109,12 @@ export function TakeoverPage({
   /** 从磁盘重读设置：任何一次操作失败后都要用它把界面拉回与后端一致 */
   onReloadSettings: () => Promise<void>;
   onToast: (t: Toast) => void;
+  /**
+   * 请求切换「当前区域」—— 本页不再自己切：切区域是全局动作（左下角选择器的职责），
+   * 且接管开启中是一律禁止的（产品决定）。这里只把空态提示那颗按钮转交给同一个
+   * 处理器，让它带上全局的闸门（proxy 检查、防连点、失败回读）。
+   */
+  onSwitchRegion: (key: string) => void;
 }) {
   // ⚠️ 这一页曾经有 6 个镜像 state（`proxyOn` / `proxyPort` / `region` / `billing` /
   // `rlModels` / `rlFailover`，逐个 `useState(settings.x)`）。它们是这页最贵的 bug：
@@ -343,52 +351,11 @@ export function TakeoverPage({
     }
   };
 
-  /**
-   * 换区域：**属于拓扑变更**，不是普通保存。
-   *
-   * 换区域 = 换一套官方客户端来接管 —— 端点写进的配置文件（`~/.qoder` ↔ `~/.qoder-cn`）、
-   * 反代的上游网关、以及扣费账号所在的那一池，全都跟着换。接管开着的时候必须走
-   * 安全切换流程（摘掉旧区域的端点 → 把端点装进新区域）；关着的时候只是把设置存下来。
-   * 两种情况下都**不动任何客户端进程**。
-   *
-   * 同时把扣费池清回「全选」：原来选的是另一个区域的账号 id，那些 id 在新区域里
-   * 一个都不存在，留着会让代理选不出任何账号。
-   */
-  const onChangeRegion = async (next: string) => {
-    if (next === region) return;
-    if (proxyOn) {
-      const ok = await askConfirm({
-        title: `把接管切换到${labelOf(next)}`,
-        body:
-          `接管正开着，换区域需要先摘掉旧区域的端点，再把端点装进新区域的配置。` +
-          `不需要重启任何客户端 —— 各自的下一次对话自然读到新配置。` +
-          `另外扣费账号会重置为「全部」—— 两个区域的账号互不通用。现在继续吗？`,
-        okText: "切换区域",
-      });
-      if (!ok) return;
-    }
-    setBusy(true);
-    setErr("");
-    try {
-      // 关着的时候走 saveSettings：此时没有任何端点装着，也没有拓扑要动
-      const body = { takeover_region: next, billing_account_ids: [] as string[] };
-      const saved = proxyOn
-        ? await applySettings(patched(body))
-        : await saveSettings(patched(body));
-      onSettings(saved);
-      if (proxyOn) await refreshStealth();
-      onToast({
-        kind: "ok",
-        text: proxyOn
-          ? `接管已切换到${labelOf(next)}，下一次对话生效`
-          : `接管区域已设为${labelOf(next)}，开启接管时生效`,
-      });
-    } catch (e) {
-      await resync(e);
-    } finally {
-      setBusy(false);
-    }
-  };
+  // 这里曾有 `onChangeRegion`：本页自己切区域（开着接管走安全切换流程、关着走
+  // saveSettings）。两个理由让它退役了：① 产品决定「接管开启中不允许切换区域」；
+  // ② 设置按区域各存一份之后，「带着当前区域取值的视图存进另一区域」会把对方的
+  // 设置整个盖掉 —— 后端已把 save_settings / apply_settings 两条路的改区域一律拒掉，
+  // 切区域只剩左下角选择器一条路（`set_region`，只动全局指针不碰切片）。
 
   /** 端口只在接管关闭时可改；失焦时若变了就立即落盘（纯配置，不动任何进程） */
   const onPortBlur = async () => {
@@ -460,14 +427,6 @@ export function TakeoverPage({
         ? base.filter((x) => x !== id)
         : [...base, id];
     });
-
-  /**
-   * 某个区域下的账号数。
-   *
-   * 直接标在区域下拉的选项里：两个区域各登了几个账号是**决定这一页有没有得选**的
-   * 前提（扣费池、模型清单的口径都跟着区域走），不该等用户点开下拉再猜。
-   */
-  const countIn = (key: string) => accounts.filter((a) => a.region === key).length;
 
   const live = stealth?.installed && stealth.alive;
 
@@ -653,24 +612,14 @@ export function TakeoverPage({
           className="tk-field"
           title={
             regionHint(regionOpts, region) ??
-            "接管哪一套部署的客户端（换区域只改配置，不重启客户端）"
+            "当前接管区域；切换请用左下角的区域选择器"
           }
         >
           区域
-          <select
-            value={region}
-            disabled={busy || regionOpts.length === 0}
-            onChange={(e) => void onChangeRegion(e.target.value)}
-          >
-            {/* 只在**没有账号**的那个区域上打标记：那才是「选了它就没得选」的情况，
-                而给所有选项都缀上账号数会把下拉撑宽、把整条控制条挤到换行。
-                正常态保持原样，异常态自己冒出来。 */}
-            {regionOpts.map((r) => (
-              <option key={r.key} value={r.key}>
-                {countIn(r.key) > 0 ? r.label : `${r.label}（无账号）`}
-              </option>
-            ))}
-          </select>
+          {/* 只读展示：切区域的唯一入口在左下角选择器（`set_region`）。这页曾经
+              自己放了个下拉，但设置按区域各存一份后，「带着本页取值存进另一区域」
+              会把对方的设置整个盖掉，后端已把这条路拒掉。 */}
+          <span className="tk-region-static">{labelOf(region)}</span>
         </label>
         <label
           className="tk-field"
@@ -701,7 +650,9 @@ export function TakeoverPage({
           <span className="spacer" />
           <button
             className="btn small"
-            onClick={() => void onChangeRegion(regionNudge.key)}
+            disabled={proxyOn}
+            title={proxyOn ? "接管开启中不能切换区域：请先关闭接管" : undefined}
+            onClick={() => onSwitchRegion(regionNudge.key)}
           >
             切到{regionNudge.label}（{regionNudge.n} 个账号）
           </button>
