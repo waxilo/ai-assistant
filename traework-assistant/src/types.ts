@@ -69,6 +69,11 @@ export interface Settings {
    * 并把已经走完的小时固化成「时条目」。默认关：开启那一刻才对齐基线。
    */
   briefing_enabled: boolean;
+  /**
+   * 已成功推送过简报的日期（`YYYY-MM-DD`）—— 后端所有的简报去重凭据，界面不编辑它。
+   * 落盘是为了**重启后不再重推**（调度线程每次启动都补推一次，原先去重只在内存）。
+   */
+  last_briefing_push_date: string | null;
 }
 
 export interface CheckinResult {

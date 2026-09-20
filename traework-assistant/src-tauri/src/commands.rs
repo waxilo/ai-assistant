@@ -242,6 +242,11 @@ pub fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<Settin
     //
     // 只在**真的变了**时才写（`update()` 是整体覆盖保存，别的字段一改也会走到这里）。
     let before = accounts::load_settings(&dir).billing_account_ids;
+    // `last_briefing_push_date` 是**后端所有**的简报去重凭据（调度线程推送成功后写盘），
+    // 界面从不编辑它。但 `update()` 整体覆盖保存会把界面上的旧内存副本写回盘上，
+    // 冲掉调度线程刚落的日期 ⇒ 简报又会重推。这里以**盘上的值为准**把它保回来。
+    let mut settings = settings;
+    settings.last_briefing_push_date = accounts::load_settings(&dir).last_briefing_push_date;
     accounts::save_settings(&dir, &settings)?;
     if before != settings.billing_account_ids {
         crate::journal::append(

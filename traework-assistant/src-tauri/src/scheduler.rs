@@ -399,26 +399,49 @@ fn maybe_seal_briefing(
     }
 
     // 每天最多推一条，且只推最近一个**已经走完**的日子。
-    // 先占掉推送日期再推：推送失败也不该让同一份简报反复重推。
+    //
+    // 去重看两层：内存标记挡「本进程内同一跳反复进来」，落盘的
+    // `settings.last_briefing_push_date` 挡**重启之后**（原先只有内存标记，
+    // 于是每次更新 / 重开助手都会把最近一天的简报重推一遍 —— 2026-09-20 用户实测）。
+    // 与旧写法的差别：**成功才落盘**。推送失败不记账 ⇒ 下次启动还能补上那一天；
+    // 代价是本进程内失败后不再重试（内存标记已占位）—— 简报不是告警，跨进程补一次足够。
     let days = briefing::day_entries(&briefing::load(dir), &today);
     let Some(day) = days.iter().find(|d| d.sealed) else {
         return;
     };
-    let mut st = briefing_state().lock().unwrap_or_else(|e| e.into_inner());
-    if st.last_briefing_push_date.as_deref() == Some(day.date.as_str()) {
+    {
+        let st = briefing_state().lock().unwrap_or_else(|e| e.into_inner());
+        if st.last_briefing_push_date.as_deref() == Some(day.date.as_str()) {
+            return;
+        }
+    }
+    if settings.last_briefing_push_date.as_deref() == Some(day.date.as_str()) {
+        // 盘上说推过（多半是上一个进程推成功的凭据）⇒ 同步内存标记，别再试
+        let mut st = briefing_state().lock().unwrap_or_else(|e| e.into_inner());
+        st.last_briefing_push_date = Some(day.date.clone());
         return;
     }
-    st.last_briefing_push_date = Some(day.date.clone());
-    drop(st);
     let webhook = settings.webhook_url.trim();
     if webhook.is_empty() {
         return;
     }
-    let _ = tauri::async_runtime::block_on(crate::notify::send(
+    // 先占内存名额再发：同一进程里这一天的判定只会真发一次（成功或失败都是）
+    {
+        let mut st = briefing_state().lock().unwrap_or_else(|e| e.into_inner());
+        st.last_briefing_push_date = Some(day.date.clone());
+    }
+    let sent = tauri::async_runtime::block_on(crate::notify::send(
         webhook,
         "积分简报",
         &briefing::message(day),
     ));
+    if sent.is_ok() {
+        // 成功才落盘。这里重读一份设置再改单个字段：调度线程与界面可能并发写设置，
+        // 整体覆盖会把界面刚改的字段吃掉；读-改-写把窗口缩到最小。
+        let mut s = accounts::load_settings(dir);
+        s.last_briefing_push_date = Some(day.date.clone());
+        let _ = accounts::save_settings(dir, &s);
+    }
 }
 
 #[cfg(test)]

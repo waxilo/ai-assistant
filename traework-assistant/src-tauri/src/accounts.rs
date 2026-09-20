@@ -202,6 +202,16 @@ pub struct Settings {
     /// 并把已经走完的小时固化成「时条目」（见 `ledger` / `briefing`）。
     /// 默认关：开启那一刻才对齐基线，用户不会在拨开关之前就有一堆历史账。
     pub briefing_enabled: bool,
+    /// **已成功推送过简报的日期**（`YYYY-MM-DD`）—— 简报去重的落盘凭据。
+    ///
+    /// 为什么必须落盘：去重原先只在内存（`scheduler::BriefingState`），而调度线程
+    /// 每次启动都带 `at_startup` 补推 —— 于是**每重启一次助手就把最近一天的简报重推一遍**
+    /// （2026-09-20 用户报「更新重启 trae 助手，又触发了积分简报推送」）。
+    /// 只在推送**成功**后写入：失败不落盘，下次启动还能补上那一天。
+    ///
+    /// ⚠️ 前端 `Settings` 类型必须带上这个字段：界面走的是**整体覆盖保存**
+    /// （`save_settings`），前端不认识它就会被抹掉。
+    pub last_briefing_push_date: Option<String>,
 }
 
 impl Default for Settings {
@@ -215,6 +225,7 @@ impl Default for Settings {
             billing_account_ids: Vec::new(),
             webhook_url: String::new(),
             briefing_enabled: false,
+            last_briefing_push_date: None,
         }
     }
 }
