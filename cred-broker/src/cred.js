@@ -125,6 +125,11 @@ export function regionOf(raw, key) {
  * 只要在池里被当成新账号收养一次，就会在界面上凭空多出一个「国际版」的重复账号，
  * 且因为区域不同，之后再怎么导入都不会与真身合并。区域与 key 是**两个独立字段**：
  * key 里的前缀只是历史包袱，不能当作区域本身（老条目靠它回填）。
+ *
+ * `email` 同理**必须透传**，但它和 `region` 的地位不同：它是**展示用的身份标识**
+ * （国际版首选邮箱、国内版首选手机号），**不进 key、不参与认人**。客户端把它一路带着，
+ * 别的机器收养这条账号时就不必再打一次 `/api/v1/userinfo` 才显示得出来邮箱。
+ * 老条目没有这个字段 → 空串，客户端按「缺这个字段」处理。
  */
 export function normalizeItem(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -132,6 +137,7 @@ export function normalizeItem(raw) {
   const refresh = str(raw.refresh_token);
   if (!access && !refresh) return null;
   const phone = str(raw.phone);
+  const email = str(raw.email);
   const name = str(raw.name);
   const localId = str(raw.local_id);
   const key = str(raw.key) || phone || name || localId;
@@ -141,6 +147,7 @@ export function normalizeItem(raw) {
     key,
     name,
     phone,
+    email,
     access_token: access,
     refresh_token: refresh,
     expires_at: ms(raw.expires_at),

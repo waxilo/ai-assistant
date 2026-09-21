@@ -476,3 +476,30 @@ test("落库的旧条目在读出口就被补上区域（不必等下一次提�
   assert.equal(r.status, 200);
   assert.equal(r.data.items[0].region, "cn");
 });
+
+// ── 邮箱：纯展示标识，随池搬运但**不进锚点**（2026-09-21） ─────────────────
+
+test("normalizeItem：email 原样透传并抹掉空白", () => {
+  const it = normalizeItem({ key: "global:k", access_token: "t", email: "  a@b.c  " });
+  assert.equal(it.email, "a@b.c");
+});
+
+test("normalizeItem：email 不进 key（锚点仍是 key → 手机号 → 昵称 → 本地 id）", () => {
+  assert.equal(normalizeItem({ key: "global:k", access_token: "t", email: "a@b.c" }).key, "global:k");
+  // 没有显式 key 时也只兜到手机号，不会被邮箱顶替
+  assert.equal(normalizeItem({ phone: "138", access_token: "t", email: "a@b.c" }).key, "138");
+});
+
+test("normalizeItem：老条目没有 email → 空串（不是错误，客户端按缺字段处理）", () => {
+  assert.equal(normalizeItem({ key: "global:k", access_token: "t" }).email, "");
+});
+
+test("email 跟着池走一个来回（别的机器收养时就有，不必自己再打接口）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [
+    { key: "global:a@b.c", name: "n", email: "a@b.c", access_token: "at", refresh_token: "rt" },
+  ]);
+  const r = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.equal(r.status, 200);
+  assert.equal(r.data.items[0].email, "a@b.c");
+});
