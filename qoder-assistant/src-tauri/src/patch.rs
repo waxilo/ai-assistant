@@ -75,15 +75,24 @@ pub struct Marker {
 }
 
 /// 解析 worker 产物路径。客户端没装 / 换了布局时返回 None。
+///
+/// 探的是「安装根 × 相对候选」的笛卡尔积：安装根本身按平台有多个候选
+/// （见 [`Region::worker_sdk_roots`]，Windows 上 per-user 与全机安装各一个），
+/// 相对候选见 [`CANDIDATES`]。顺序即优先级，第一个命中的就是客户端会去执行的那个。
 pub fn worker_path(region: Region) -> Option<PathBuf> {
-    let root = match sdk_root_override() {
-        Some(base) => base.join(region.key()),
-        None => region.worker_sdk_root()?,
+    let roots = match sdk_root_override() {
+        Some(base) => vec![base.join(region.key())],
+        None => region.worker_sdk_roots(),
     };
-    CANDIDATES
-        .iter()
-        .map(|c| root.join(c))
-        .find(|p| p.is_file())
+    for root in &roots {
+        for c in CANDIDATES {
+            let p = root.join(c);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -784,5 +793,66 @@ mod tests {
         assert!(err.contains("尚未支持"), "{err}");
         assert_eq!(fs::read_to_string(&p).unwrap(), ORIGINAL, "失败不能改文件");
         let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    // ── 真机探针（默认 ignored：依赖这台机器上真的装了客户端） ─────────────
+
+    /// 本机装的官方客户端必须能被解析到。
+    ///
+    /// 这条就是「Windows 上找不到客户端、报错却照着 macOS 说 /Applications」那个
+    /// bug 的回归线 —— 上面所有用例都跑在临时沙箱里，谁也发现不了真实安装根写错了。
+    /// `cargo test --lib -- --ignored the_installed_client_is_found`
+    #[test]
+    #[ignore]
+    fn the_installed_client_is_found_on_this_machine() {
+        let found: Vec<String> = Region::ALL
+            .iter()
+            .filter_map(|r| worker_path(*r).map(|p| format!("{} → {}", r.label(), p.display())))
+            .collect();
+        for line in &found {
+            println!("{line}");
+        }
+        assert!(!found.is_empty(), "两个区域的客户端一个都没解析到");
+    }
+
+    /// 对**真实那份产物**做一次注入 → 校验 → 还原，逐字节比对。
+    ///
+    /// 假产物测不出真机上的三件事：文件权限、被别的进程占用、Windows 上 `rename`
+    /// 顶替失败。只动国内版这一份（本机装了它），跑完必须还原成官方原样。
+    /// `cargo test --lib -- --ignored a_real_injection_round_trip`
+    #[test]
+    #[ignore]
+    fn a_real_injection_round_trip_leaves_the_artifact_byte_identical() {
+        let Some(worker) = worker_path(Region::Cn) else {
+            println!("本机没装国内版客户端，跳过");
+            return;
+        };
+        let backup = backup_path(&worker);
+        let backup_existed = backup.is_file();
+        let before = fs::read_to_string(&worker).unwrap();
+        assert_eq!(
+            read_marker(&worker),
+            None,
+            "产物里已经有注入段（先关掉接管再跑这条）：{}",
+            worker.display()
+        );
+
+        let url = "https://127.0.0.1:8789";
+        assert!(install_at(&worker, Region::Cn, url, FAKE_CA).unwrap(), "首次注入应写盘");
+        assert_eq!(read_marker(&worker).unwrap().url, url);
+        assert!(uninstall_at(&worker).unwrap(), "摘除应写盘");
+        assert_eq!(
+            fs::read_to_string(&worker).unwrap(),
+            before,
+            "还原必须逐字节一致：{}",
+            worker.display()
+        );
+
+        // 往返本身会留一份备份；它不该成为这台机器上的新垃圾（正式启用接管时
+        // 应用会自己维护这一份，所以只清理「本来没有」的那种）。
+        if !backup_existed {
+            let _ = fs::remove_file(&backup);
+        }
+        println!("往返成功（逐字节还原）：{}", worker.display());
     }
 }

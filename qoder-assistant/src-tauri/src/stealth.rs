@@ -448,8 +448,9 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
     }
     let target = target_file(region).ok_or_else(|| {
         format!(
-            "找不到{}客户端的 worker 产物，无法接管：请确认官方客户端已装在 /Applications。",
-            region.label()
+            "找不到{}客户端的 worker 产物，无法接管：请确认官方客户端已安装在 {}。",
+            region.label(),
+            region.install_hint()
         )
     })?;
 

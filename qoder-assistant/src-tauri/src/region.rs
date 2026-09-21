@@ -22,6 +22,7 @@
 //! | CLI 配置目录 | `~/.qoder` | `~/.qoder-cn` |
 //! | 桌面端数据目录 | `com.qoder.app.stable` | `com.qodercn.app.stable` |
 //! | macOS 应用 | `/Applications/Qoder.app` | `/Applications/Qoder CN.app` |
+//! | Windows 安装目录 | `%LOCALAPPDATA%\Programs\Qoder` | `%LOCALAPPDATA%\Programs\Qoder CN` |
 //! | 可执行名（`CFBundleExecutable`） | `Qoder` | `Qoder CN` |
 //!
 //! 证据来源：
@@ -281,7 +282,60 @@ impl Region {
         }
     }
 
-    /// 智能接管的落点：官方 agent SDK 在 `app.asar.unpacked` 里的根目录。
+    /// 官方客户端的**安装根候选**（按探测顺序）。
+    ///
+    /// ⚠️ 这里曾经只有一个写死的 `/Applications/<名>.app`，于是 Windows 上
+    /// **永远找不到客户端**：引擎在装端点之前就放弃，界面端出来的却是一句
+    /// 「请检查端口是否被占用、以及官方客户端是否已安装在 /Applications」——
+    /// 两句在 Windows 上都是错的，用户只能干瞪眼。
+    ///
+    /// 平台差异**到此为止**：往下 `…/app.asar.unpacked/node_modules/@qoder-ai/<sdk>`
+    /// 两边逐字相同 —— Windows 那份的相对路径取自客户端自己的 `fast-update` 清单
+    /// （`resources/app.asar.unpacked/…`），macOS 那份在应用包内的 `Contents/Resources` 下。
+    pub fn client_install_dirs(self) -> Vec<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            vec![PathBuf::from(self.macos_app_dir())]
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let name = match self {
+                Region::Global => "Qoder",
+                Region::Cn => "Qoder CN",
+            };
+            let mut out = Vec::new();
+            // 默认是 per-user 安装（客户端 `resources/install-type.json` 里就是 "user"）：
+            // `%LOCALAPPDATA%\Programs\<名>`。装到 Program Files 的是全机安装。
+            if let Some(local) = dirs::data_local_dir() {
+                out.push(local.join("Programs").join(name));
+            }
+            if let Some(pf) = std::env::var_os("ProgramFiles") {
+                out.push(PathBuf::from(pf).join(name));
+            }
+            out
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// `resources` 那一层在安装根里的位置。
+    ///
+    /// macOS 在应用包内叫 `Contents/Resources`，Windows 直接就是安装目录下的
+    /// `resources` —— 这是两个平台**唯一**的路径差异。
+    fn resources_dir() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            PathBuf::from("Contents").join("Resources")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PathBuf::from("resources")
+        }
+    }
+
+    /// 智能接管的落点候选：官方 agent SDK 在 `app.asar.unpacked` 里的根目录。
     ///
     /// # 为什么是 asar 外这份
     ///
@@ -292,16 +346,44 @@ impl Region {
     /// 可以直接改；而 asar 内那份永远轮不到。
     ///
     /// 具体文件由 [`crate::patch`] 按与客户端一致的顺序探测。
-    pub fn worker_sdk_root(self) -> Option<std::path::PathBuf> {
+    pub fn worker_sdk_roots(self) -> Vec<PathBuf> {
         let sdk = match self {
-            Region::Global => "@qoder-ai/qoder-agent-sdk",
-            Region::Cn => "@qoder-ai/qoder-cn-agent-sdk",
+            Region::Global => "qoder-agent-sdk",
+            Region::Cn => "qoder-cn-agent-sdk",
         };
-        Some(
-            std::path::Path::new(self.macos_app_dir())
-                .join("Contents/Resources/app.asar.unpacked/node_modules")
-                .join(sdk),
-        )
+        self.client_install_dirs()
+            .into_iter()
+            .map(|root| {
+                root.join(Self::resources_dir())
+                    .join("app.asar.unpacked")
+                    .join("node_modules")
+                    .join("@qoder-ai")
+                    .join(sdk)
+            })
+            .collect()
+    }
+
+    /// 主落点：探测顺序里第一个**真的存在**的候选；一个都不在时给第一个 ——
+    /// 让「客户端没装」的报错指向最可能的那个路径，而不是一句无从下手的「没装」。
+    pub fn worker_sdk_root(self) -> Option<PathBuf> {
+        let roots = self.worker_sdk_roots();
+        roots
+            .iter()
+            .find(|p| p.is_dir())
+            .cloned()
+            .or_else(|| roots.into_iter().next())
+    }
+
+    /// 报错文案里那句「客户端该装在哪」：把候选路径用「或」连起来。
+    pub fn install_hint(self) -> String {
+        let dirs = self.client_install_dirs();
+        if dirs.is_empty() {
+            return "官方客户端的默认安装位置".to_string();
+        }
+        dirs.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" 或 ")
     }
 }
 
@@ -405,24 +487,70 @@ mod tests {
     }
 
     /// 接管落点必须指向 asar **之外**那份被执行的产物，并且两个客户端各指各的 SDK。
+    ///
+    /// 两个平台的安装根不同（macOS 在应用包内、Windows 在 `%LOCALAPPDATA%\Programs`），
+    /// 而**往下逐字相同** —— 所以共同的不变量两边都查，各自的根按平台钉住。
+    /// 这条曾经只按 macOS 写（`/Applications`），于是 Windows 上的接管永远找不到
+    /// 客户端、报错还照着 macOS 说「装在 /Applications」。
     #[test]
     fn takeover_target_points_at_the_unpacked_sdk_of_each_client() {
-        let cn = Region::Cn.worker_sdk_root().unwrap();
-        assert_eq!(
-            cn.to_string_lossy(),
-            "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk"
-        );
-        let g = Region::Global.worker_sdk_root().unwrap();
-        assert_eq!(
-            g.to_string_lossy(),
-            "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk"
-        );
+        // 路径里的分隔符统一成 `/`：断言只关心层级，不关心平台写法
+        fn norm(p: PathBuf) -> String {
+            p.to_string_lossy().replace('\\', "/")
+        }
+        let cn = norm(Region::Cn.worker_sdk_root().unwrap());
+        let g = norm(Region::Global.worker_sdk_root().unwrap());
+
         // 关键不变量：路径里必须是 `app.asar.unpacked`，不能落在 `app.asar` 内
         // （asar 内那份不受我们控制，也不会被执行）
-        for p in [cn, g] {
-            let s = p.to_string_lossy().to_string();
-            assert!(s.contains("app.asar.unpacked"), "{s}");
-            assert!(!s.contains("app.asar/node_modules"), "{s}");
+        for s in [&cn, &g] {
+            assert!(s.contains("/app.asar.unpacked/"), "{s}");
+            assert!(!s.contains("/app.asar/node_modules"), "{s}");
         }
+        // 两个客户端各指各的 SDK，混了就是「把端点装到另一个客户端上」（不报错、只空转）
+        assert!(
+            cn.ends_with("/node_modules/@qoder-ai/qoder-cn-agent-sdk"),
+            "国内版要指 cn 那份 SDK：{cn}"
+        );
+        assert!(
+            g.ends_with("/node_modules/@qoder-ai/qoder-agent-sdk"),
+            "国际版要指非 cn 那份 SDK：{g}"
+        );
+        // 两个客户端的安装根不能是同一个
+        assert_ne!(cn, g);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                cn,
+                "/Applications/Qoder CN.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk"
+            );
+            assert_eq!(
+                g,
+                "/Applications/Qoder.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // 默认 per-user 安装：`%LOCALAPPDATA%\Programs\<名>`；
+            // 装到全机位置时才落到 Program Files —— 两种都要认得
+            assert!(cn.contains("/Programs/Qoder CN/resources/"), "{cn}");
+            assert!(g.contains("/Programs/Qoder/resources/"), "{g}");
+        }
+    }
+
+    /// 「客户端该装在哪」这句话必须按平台说：Windows 上照 macOS 说 `/Applications`
+    /// 会把用户送去一个在这台机器上根本不存在的地方。
+    #[test]
+    fn install_hint_names_the_platforms_real_install_root() {
+        let hint = Region::Cn.install_hint();
+        #[cfg(target_os = "macos")]
+        assert!(hint.contains("/Applications/Qoder CN.app"), "{hint}");
+        #[cfg(target_os = "windows")]
+        assert!(
+            hint.contains("Programs") && hint.contains("Qoder CN"),
+            "Windows 的提示要指向安装目录：{hint}"
+        );
+        assert!(hint.contains("Qoder CN"), "要分区域点名：{hint}");
     }
 }

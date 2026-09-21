@@ -422,8 +422,15 @@ Qoder 把**当前登录的那一个账号**写在自己的 Electron 用户数据
 ### 它怎么真正生效的
 
 1. **注入点 = 真正被执行的那个文件。** Qoder 每次会话起的一次性进程，argv 指向
-   `…/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs`
+   `…/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs`
    —— 它在 **asar 之外**（不受完整性校验），也正是 worker 实际执行的入口。
+   **两个平台只有安装根不同**（再往下逐字相同，落点由 `Region::client_install_dirs` 按平台给出）：
+
+   | 平台 | 安装根 |
+   |---|---|
+   | macOS | `/Applications/Qoder CN.app`（包内 `Contents/Resources/…`） |
+   | Windows | `%LOCALAPPDATA%\Programs\Qoder CN`（目录下 `resources/…`；全机安装才在 `Program Files`） |
+
    我们在**文件头**插入一段注入（`/*qoder-assistant-takeover:begin … end*/`）：先
    `process.env.QODERCN_SERVER_ENDPOINT = "https://127.0.0.1:8789"`，再把官方原文原样接在后面。
 2. **TLS 用「只对回环地址」的本地 CA 解决，不动系统信任库。** 注入段 monkeypatch
@@ -529,6 +536,12 @@ cargo test --lib -- --ignored --nocapture cosy_probe   # 打印固定密钥下�
 误点一下就丢掉全部请求级细节是不可接受的代价。
 
 ### 前置条件：应用必须是**签名**的（macOS「App 管理」）
+
+> **这一段整段只讲 macOS。** Windows 上没有 TCC / 「App 管理」这一层：默认的 per-user
+> 安装（`%LOCALAPPDATA%\Programs\…`）本来就可写，注入不需要任何授权；只有把客户端装到
+> `Program Files`（全机安装）时才需要以管理员身份运行本应用。所以下面这些坑在 Windows 上
+> 一个都不会遇到 —— 相应地，**「开不了接管」在 Windows 上先看客户端装在哪儿**
+> （路径解析不出来时，界面会直接把它找过的目录列出来）。
 
 写别人的应用包受 macOS 的 TCC「App 管理」管辖，而**授权记在代码身份上**：
 

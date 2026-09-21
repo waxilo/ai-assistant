@@ -1115,6 +1115,30 @@ struct TakeoverTopology {
     region: Region,
 }
 
+/// 租约里查不到失败原因时的**就地诊断**。
+///
+/// 有两类失败发生在 [`crate::stealth::install`] **写租约之前**，因此租约的
+/// `last_error` 里必然什么都读不到：客户端找不到（产物路径解析不出来）、以及该区域
+/// 根本不支持端点覆盖。它们恰恰是最常见的两种 —— 于是界面只能端出那句
+/// 「检查端口是否被占用、客户端是否装在 /Applications」，而这两句在 Windows 上
+/// 都是错的（那里的客户端装在 `%LOCALAPPDATA%\Programs`，端口也从没被占）。
+fn diagnose_enable_failure(region: Region) -> Option<String> {
+    if region.endpoint_env_key().is_none() {
+        return Some(format!(
+            "{}的端点覆盖尚未支持：该区域的客户端不读这个键。",
+            region.label()
+        ));
+    }
+    if crate::patch::worker_path(region).is_none() {
+        return Some(format!(
+            "找不到{}客户端的 worker 产物：请确认官方客户端已安装在 {}。",
+            region.label(),
+            region.install_hint()
+        ));
+    }
+    None
+}
+
 fn topology(s: &Settings) -> TakeoverTopology {
     TakeoverTopology {
         enabled: s.proxy_enabled,
@@ -1181,7 +1205,12 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                 // 这条路径最常撞上的原因恰恰是唯一需要用户动手的那一项：macOS
                 // 「App 管理」未授权，而自签应用**永远不会弹授权框**（系统只往 tccd
                 // 记一条拒绝）。原样端出去，用户才知道该开哪个开关。
-                let cause = crate::stealth::last_error(&dir);
+                //
+                // 租约只覆盖「注入那一步失败」；**客户端找不到 / 区域不支持**发生在
+                // 写租约之前 —— 那里什么都不会留下，所以补一遍就地诊断（见
+                // [`diagnose_enable_failure`]），别让这两类也端出那句误导的兜底。
+                let cause = crate::stealth::last_error(&dir)
+                    .or_else(|| diagnose_enable_failure(next.takeover_region));
                 // 端点没装上（端口被占 / 客户端没装 / 未授权）→ 连设置一起退回去。
                 // 绝不留下「设置说已开启、磁盘上却没有端点」的半成品：那种状态会让开关与
                 // 事实长期相反，而且此后这一页的每次保存都会被拓扑守卫拒掉 ——
@@ -1192,7 +1221,7 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                     Some(c) => format!("接管没能开启（设置已回滚）。\n{c}"),
                     None => format!(
                         "无法在 127.0.0.1:{} 上就位接管（设置已回滚）。\
-                         请检查端口是否被占用、以及官方客户端是否已安装在 /Applications。",
+                         请检查端口是否被占用、以及本应用有没有权限改客户端文件。",
                         next.proxy_port
                     ),
                 });
@@ -1215,13 +1244,24 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
             crate::stealth::uninstall(old_region, &dir)?;
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
             if !wait_for_takeover(next.takeover_region, &dir, next.proxy_port) {
+                // 原因同样要在回滚**之前**取走（回滚会把新区域的租约摘掉），
+                // 且租约只覆盖注入那一步 —— 客户端找不到这类走就地诊断。
+                let cause = crate::stealth::last_error(&dir)
+                    .or_else(|| diagnose_enable_failure(next.takeover_region));
                 let _ = accounts::save_settings(&dir, &old);
                 let _ = wait_for_takeover(old_region, &dir, old.proxy_port);
-                return Err(format!(
-                    "无法把接管切换到{}（127.0.0.1:{}），已回滚。",
-                    next.takeover_region.label(),
-                    next.proxy_port
-                ));
+                return Err(match cause {
+                    Some(c) => format!(
+                        "无法把接管切换到{}（127.0.0.1:{}），已回滚。\n{c}",
+                        next.takeover_region.label(),
+                        next.proxy_port
+                    ),
+                    None => format!(
+                        "无法把接管切换到{}（127.0.0.1:{}），已回滚。",
+                        next.takeover_region.label(),
+                        next.proxy_port
+                    ),
+                });
             }
         }
         // 两端都关着：那说明变的是**区域**（关着的时候端口本来就能随手改，
