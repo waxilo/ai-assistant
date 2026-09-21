@@ -1,7 +1,7 @@
 {
   "name": "qoder-assistant",
   "private": true,
-  "version": "0.1.19",
+  "version": "0.1.20",
   "type": "module",
   "description": "Qoder 助手（Tauri）：多账号签到、定时签到、token 自动续签",
   "scripts": {

@@ -30,7 +30,7 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
    `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（本包条目）、
    `package.json`、`package-lock.json` 的**顶层与 `packages[""]` 两处**
    （lock 里每个依赖都有 `version`，**不能 replace_all**，要用带 `"name"` 的上下文一次覆盖相邻两处）
-2. 打 tag 推送：`traework-v0.1.26` / `workbuddy-v0.1.39` / `qoder-v0.1.19`（版本以 tag 为准）
+2. 打 tag 推送：`traework-v0.1.26` / `workbuddy-v0.1.39` / `qoder-v0.1.20`（版本以 tag 为准）
 3. CI 构建两个平台 → 由 `scripts/build-latest.mjs` 用 `.sig` 生成 `latest.json`
    （v2 的 `tauri build` 不产 manifest）→ delete+recreate 各自的固定 tag Release
 
@@ -47,7 +47,7 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
 |---|---|---|
 | TraeWorkAssistant | `0.1.26` | 0.1.x（自身历史） |
 | WorkBuddyAssistant | `0.1.39` | 0.1.x（自身历史） |
-| QoderAssistant | `0.1.19` | **从 `0.1.0` 起算** |
+| QoderAssistant | `0.1.20` | **从 `0.1.0` 起算** |
 
 > 上面两处（发版流程里的 tag 示例、本表的「当前版本」）**每次发版后都要同步**，
 > 否则下一版对照时会拿旧值推算。
