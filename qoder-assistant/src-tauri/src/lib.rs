@@ -7,6 +7,9 @@ mod broker;
 // 反代必须真的能终止 TLS —— 见 certs 模块说明。
 mod certs;
 mod checkin;
+// 官方客户端的进程操作（探活 / 优雅退出 / 重新拉起）：产物要**客户端重启**才被读到，
+// 所以开关接管的最后一环是重启它 —— 见 client_proc 模块说明。
+mod client_proc;
 mod commands;
 mod cosy;
 mod http;
@@ -17,9 +20,12 @@ mod netfix;
 mod notify;
 mod oauth;
 // 智能接管的注入补丁器：直接改客户端 `app.asar.unpacked` 里那个**真正被执行**的
-// worker 产物（在 asar 之外，每次会话新起进程 → 改完下一次对话即生效，无需重启）。
+// worker 产物（在 asar 之外，不受归档完整性校验约束）。**客户端只在启动时读它**，
+// 所以改完要重启客户端才生效（见 client_proc）。
 // 端点键与本地 CA 都从这里写进去 —— 见 patch 模块说明。
 mod patch;
+// 辅助进程的统一入口（唯一的目的：Windows 上不弹黑色命令框）——见 proc 模块说明。
+mod proc;
 mod proxy;
 mod qoder_api;
 mod refresh;
@@ -151,8 +157,9 @@ pub fn run() {
         .expect("error while running tauri application");
 
     // 退出时安全关闭接管：摘掉端点、停掉监听，不给用户留下「配置指向一个已经不在
-    // 的本地端口」这种残留。不用碰 Qoder 的进程 —— 它的每一次推理都是新起的
-    // 一次性 `--print` 进程，下一次会话读到的就是还原后的配置。
+    // 的本地端口」这种残留 —— **对下次启动的客户端**。正在运行的那一个要到它自己
+    // 重启才会看到磁盘上的还原（客户端启动时才读产物），这里不动它的进程：
+    // 因为本应用退出而重启用户正在用的客户端，比让残留多活一会儿更打扰。
     app.run(|handle, event| {
         static CLEANED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         match &event {
@@ -165,11 +172,10 @@ pub fn run() {
                     return;
                 }
                 if let Ok(dir) = commands::try_data_dir(handle) {
-                    let mut settings = accounts::load_settings(&dir);
-                    if settings.proxy_enabled {
-                        settings.proxy_enabled = false;
-                        let _ = commands::apply_settings_inner(handle, settings);
-                    }
+                    // 只改磁盘、**不重启任何客户端**（理由见 commands::shutdown_takeover）。
+                    // 为此不能走 apply_settings_inner —— 那条路会顺手重启客户端，
+                    // 而在「本应用退出」这个时刻去关用户的编辑器再拉起来是过分的打扰。
+                    commands::shutdown_takeover(&dir);
                 }
             }
             _ => {}

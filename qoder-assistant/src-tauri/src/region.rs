@@ -274,6 +274,15 @@ impl Region {
         }
     }
 
+    /// 官方客户端在本机叫什么 —— 安装目录名（Windows）与应用包名（macOS 去掉 `.app`）
+    /// 用的是同一个名字，也用在「重启客户端」这类面向用户的话术里。
+    pub fn client_name(self) -> &'static str {
+        match self {
+            Region::Global => "Qoder",
+            Region::Cn => "Qoder CN",
+        }
+    }
+
     /// macOS 应用包路径。
     pub fn macos_app_dir(self) -> &'static str {
         match self {
@@ -299,10 +308,7 @@ impl Region {
         }
         #[cfg(target_os = "windows")]
         {
-            let name = match self {
-                Region::Global => "Qoder",
-                Region::Cn => "Qoder CN",
-            };
+            let name = self.client_name();
             let mut out = Vec::new();
             // 默认是 per-user 安装（客户端 `resources/install-type.json` 里就是 "user"）：
             // `%LOCALAPPDATA%\Programs\<名>`。装到 Program Files 的是全机安装。

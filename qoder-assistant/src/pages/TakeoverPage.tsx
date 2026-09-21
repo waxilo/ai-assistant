@@ -140,6 +140,9 @@ export function TakeoverPage({
   const [stealth, setStealth] = useState<StealthStatus | null>(null);
   const [events, setEvents] = useState<JournalEvent[]>([]);
   const [busy, setBusy] = useState(false);
+  // 只覆盖「开关接管」这一步：它比别的保存慢得多（要等客户端优雅退出再拉起来，
+  // 最长约半分钟），副文案要专门说明「在等什么」，不能让用户以为界面卡死了
+  const [switching, setSwitching] = useState(false);
   const [err, setErr] = useState("");
   // 接管动态手动刷新：独立于 15s 自动轮询，点按即重拉状态与事件流
   const [feedBusy, setFeedBusy] = useState(false);
@@ -313,11 +316,12 @@ export function TakeoverPage({
   };
 
   /**
-   * 开关即拨即用。
+   * 开关即拨即用，**要重启客户端**才生效。
    *
-   * **不碰官方客户端进程**：Qoder 的推理进程是每次会话按需起的一次性 `--print` 进程，
-   * 端点由它在启动时读客户端配置决定 —— 所以写配置就够了，正在登录的账号、
-   * 正在进行的对话都不受影响（详见 `commands.rs` 顶部那段说明）。
+   * 端点写的是客户端 `app.asar.unpacked` 里那份 worker 产物（见 `patch.rs`），
+   * 而桌面端是长驻进程：产物在**它启动时**被读进内存，之后每次会话都用内存里那一份。
+   * 所以改了产物必须让客户端重启一次 —— 后端会**自动**优雅退出正在运行的那台再拉起来
+   * （见 `client_proc.rs`），用户只需知道「关/开之间可能要等十几秒、未保存的内容自己确认」。
    */
   const doToggle = async (next: boolean) => {
     const action = next ? "开启接管" : "关闭接管";
@@ -325,14 +329,17 @@ export function TakeoverPage({
       title: action,
       body: next
         ? "接管开启后，Qoder 的下一次对话将按备选账号扣费。" +
-          "端点写进客户端配置即生效，**不需要重启或退出 Qoder**，" +
-          "正在登录的账号与正在进行的对话都不受影响。现在开启吗？"
+          "端点写进客户端产物，**需要 Qoder 重启一次才会被读到** —— " +
+          "若它正在运行，本应用会自动优雅重启它（请先保存好未保存的内容）；" +
+          "没在运行则等你下次打开时自然生效。现在开启吗？"
         : "接管关闭后，Qoder 的下一次对话恢复直连官方。" +
-          "端点会从客户端配置里摘掉，同样**不需要重启 Qoder**。现在关闭吗？",
+          "注入会从客户端产物里摘掉，同样**需要 Qoder 重启一次才回到直连** —— " +
+          "若它正在运行，本应用会自动优雅重启它（请先保存好未保存的内容）。现在关闭吗？",
       okText: action,
     });
     if (!ok) return; // 取消：开关状态不动
     setBusy(true);
+    setSwitching(true);
     setErr("");
     try {
       const saved = await applySettings(patched({ proxy_enabled: next }));
@@ -340,13 +347,14 @@ export function TakeoverPage({
       onToast({
         kind: "ok",
         text: next
-          ? "接管已开启，下一次对话生效"
-          : "接管已关闭，下一次对话恢复直连",
+          ? "接管已开启：Qoder 重启后才读到新端点（正在运行的话本应用已自动重启它，结果见下方接管动态）"
+          : "接管已关闭：Qoder 重启后才恢复直连（正在运行的话本应用已自动重启它，结果见下方接管动态）",
       });
       await refreshStealth();
     } catch (e) {
       await resync(e);
     } finally {
+      setSwitching(false);
       setBusy(false);
     }
   };
@@ -482,14 +490,20 @@ export function TakeoverPage({
     );
   }, [regionAccounts.length, regionOpts, accounts, region]);
 
-  /** 状态副文案。只说盘上为真的事：端点写没写进去、反代在不在听。 */
-  const stateText = live
-    ? "配置已就绪：端点已写入，本地反代正在监听"
+  /**
+   * 状态副文案。只说盘上为真的事：端点写没写进去、反代在不在听。
+   * 「要重启才被读到」这件事只陈述机制，不替客户端进程下结论 —— 它重启成功没有
+   * 记在下方接管动态里（三条结局各不相同）。
+   */
+  const stateText = switching
+    ? "处理中：正在写入端点，并重启 Qoder 让它被读到（最长约半分钟，请稍候）"
+    : live
+    ? "配置已就绪：端点已写入，本地反代正在监听（Qoder 重启后即走这里）"
     : stealth?.installed
     ? "状态异常：关闭开关即可把配置还原成直连"
     : proxyOn
-    ? "应用中：正在写入端点配置（不重启 Qoder）"
-    : "开启后会把端点写进客户端配置，按备选账号分流扣费";
+    ? "应用中：正在写入端点（需重启 Qoder 才被读到，本应用会自动重启它）"
+    : "开启后会把端点写进客户端产物，按备选账号分流扣费（需重启 Qoder 生效）";
 
   /**
    * 连续相同（类型 + 内容都一样）的事件聚合为一条，附重复次数。
@@ -533,12 +547,16 @@ export function TakeoverPage({
           下方记录每一次开关、路由与异常。
           <b>接管作用于当前区域</b>（跟随后台左下角的全局区域选择器）：端点写进那一套客户端的 worker 产物，
           扣费也只在该区域的账号里选（跨区域的 token 在对方网关上无效）。
-          <b>全程不重启 Qoder</b>：Qoder 每次会话自己起一次性推理进程，会重新读一遍产物，
-          所以改完下一次对话就生效，正在登录的账号与正在进行的对话都不受影响。
+          <b>改动要 Qoder 重启才被读到</b>：桌面端是长驻进程，产物只在<b>它启动时</b>读一次，
+          之后每次会话都用内存里那一份 —— 所以开关接管时本应用会<b>自动优雅重启</b>正在运行的
+          Qoder（请先保存好未保存的内容；它没在运行就等你下次打开时自然生效）。
+          这一步只服务「立刻生效」：不重启的话，打开的客户端仍按旧的那一份走。
           <b>本机 TLS</b>：端点被客户端强制成 https，所以反代会用一张只签给 127.0.0.1 的
           自签证书终止 TLS；这张 CA 随注入一起写进产物，<b>不改系统信任库、不需要管理员</b>。
           <b>官方客户端更新会覆盖注入</b>，本应用每次心跳都会复查文件指纹并自动重打；
-          想恢复原样就在上面关掉开关（注入会被逐字节剥离）。
+          但重打也只改磁盘，同样要 Qoder 重启才被读到 —— 所以更新后若发现对话不再走本应用，
+          把上面开关关掉再开一次即可（那一步会自动重启它）。
+          想恢复原样也在上面关掉开关（注入会被逐字节剥离）。
           {/*
             「App 管理」是 macOS 专有授权：写官方客户端的产物要它放行，而本应用是
             **固定自签证书**签的 —— 系统只拦截、**永远不弹授权框**（只往 tccd 记一条

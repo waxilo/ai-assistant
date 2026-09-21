@@ -53,9 +53,12 @@ pub const LEASE_TTL: Duration = Duration::from_secs(30);
 //    （CodeBuddy 时代的残留键）—— Qoder 客户端**根本不读**，它的推理进程 env 来自
 //    `buildEnv(){ let e = this.options.env ?? {...process.env} }`，配置文件里的 `env`
 //    块没有任何消费者。于是「写成功 / 界面已开启 / 端口在听」而请求全直连官方。
-// 2. 配套动作也是假的。当时还跟着一套「退出客户端 → 重启客户端」，理由是「长驻 CLI
-//    host 会把旧端点留在 process.env」—— 而 Qoder 的推理进程是每次会话按需 spawn 的
-//    一次性 `--print` 进程，跑完即退，没有可重启的东西。
+// 2. 配套动作一度被**误删**。那时跟着一套「退出客户端 → 重启客户端」，理由是「长驻
+//    CLI host 会把旧端点留在 process.env」—— 这个理由不成立（Qoder 的推理进程是每次
+//    会话按需 spawn 的一次性 `--print` 进程，跑完即退），但结论恰好是对的：桌面端是
+//    长驻进程，产物在**它启动时**被读进内存，之后每次会话都用内存里那一份 —— 所以改
+//    产物**必须重启客户端**才生效。2026-09-21 重启回来了，形态是开关接管这一步的
+//    明确收尾（见 [`crate::client_proc`]），不再是切换拓扑时的隐式副作用。
 //
 // 现在落点是**客户端真正执行的那份产物**（见 [`crate::patch`]），且状态文案只陈述
 // 可以当场核验的事实：注入在不在、心跳在不在、日志里到底有没有收到过请求。
@@ -70,8 +73,11 @@ const LEASE_FILE: &str = "stealth.json";
 /// 什么时候摘的，全在这里。
 ///
 /// ⚠️ 这里曾有「长驻 CLI host 会把旧端点留在 process.env，所以要按日志判断它有没有
-/// 把缓存清掉」的说法 —— 那个前提不成立：Qoder 的推理进程是**每次会话按需 spawn 的
-/// 一次性 `--print` 进程**（跑完即退），没有长驻 host，也就不存在跨重启的 env 缓存。
+/// 把缓存清掉」的说法。**「长驻 CLI host」并不存在**（Qoder 的推理进程是每次会话按需
+/// spawn 的一次性 `--print` 进程，跑完即退），但「有个东西揣着已摘除的端点」是真的 ——
+/// 是**桌面端自己**：产物在它启动时被读进内存，之后每次会话都用那份副本。
+/// 所以「重启客户端」既不多余、也不靠这份日志去判断：它由 [`crate::client_proc`]
+/// 当场做完，并留一条 `restart_qoder`（三条结局各不相同，见那里）。
 const JOURNAL_FILE: &str = "takeover-journal.jsonl";
 
 /// 接管调试日志（纯文本、一行一条）。**请求级细节全在这里**：反代收到的每个路径、
@@ -108,8 +114,7 @@ pub struct JournalEvent {
     /// 本地时间（展示用）
     pub at: String,
     /// install / uninstall / route_start / proxy_request / proxy_upstream_error / …
-    /// （历史日志里还可能见到 `restart_qoder` —— 那是「切换拓扑要重启客户端」时代的
-    /// 遗留事件，产它的代码已删除，展示层仍能把它读成人话。）
+    /// （`restart_qoder` 是开关接管后的收尾重启，见 [`crate::client_proc`]。）
     pub event: String,
     #[serde(default)]
     pub detail: String,
@@ -534,9 +539,11 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
 /// 「文件里这个端点值是不是我们写进去的」，因为那是别人的文件，
 /// 而且补丁模型本就不需要「记住原来是什么」（摘除是精确剥离）。
 ///
-/// 这里**不碰任何客户端进程**：Qoder 的推理进程是每次会话按需起的一次性 `--print`
-/// 进程，没有可重启的长驻 host。摘掉注入后客户端的**下一次会话**就会读到干净的产物、
-/// 恢复直连；正在登录的账号与正在进行的对话都不受影响。
+/// 这里**不碰任何客户端进程**，但这不是「不用重启」：桌面端只在启动时读产物，
+/// 所以正开着的那台**还揣着注入**，得重启它才回到直连。进程的事交给调用方收尾 ——
+/// 关开关走 [`crate::commands`] 的安全切换流程、网络体检走 [`crate::netfix`]，
+/// 两处都会调 [`crate::client_proc`] 把正在运行的那台重启一遍。
+/// 本模块只负责把磁盘改对（谁都不在跑时，光把磁盘改对就够了）。
 pub fn uninstall(region: Region, data_dir: &Path) -> Result<(), String> {
     let label = region.label();
     let changed = match target_file(region) {
@@ -548,7 +555,7 @@ pub fn uninstall(region: Region, data_dir: &Path) -> Result<(), String> {
         journal_append(
             data_dir,
             "uninstall",
-            &format!("接管已关闭（{label}）：客户端已恢复直连，下一次对话不再经过本应用"),
+            &format!("接管已关闭（{label}）：客户端产物已还原成官方原样，重启后即恢复直连"),
         );
         // 「还原了哪个文件的哪一段」只有排查时用得上
         debug_append(
@@ -655,12 +662,12 @@ pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
     let label = region.label();
     let note = match (settings.proxy_enabled, installed, alive) {
         (false, _, _) => format!(
-            "未开启。开启后 {label} 客户端的对话请求会自动走本机反代（按选定的扣费账号轮换），\
-             全程不需要重启或退出 Qoder。"
+            "未开启。开启后 {label} 客户端的对话请求会自动走本机反代（按选定的扣费账号轮换）；\
+             注入要**客户端启动时**才被读到 —— 开启时若它正在运行，本应用会自动重启它。"
         ),
         (true, true, true) => format!(
-            "接管生效中（{label}）：端点已注入 {target}，本机反代在 {url} 上监听 TLS；\
-             客户端的下一次对话就会走这里。"
+            "接管生效中（{label}）：端点已注入 {target}，本机反代在 {url} 上监听 TLS。\
+             客户端只在启动时读这份产物，所以开启接管时本应用会把正在运行的那台自动重启一遍。"
         ),
         (true, true, false) => {
             format!("注入还在 {target}，但心跳已停 —— 本应用的反代可能已退出，请点「停止接管」清理。")
@@ -754,9 +761,10 @@ pub fn stealth_status(app: tauri::AppHandle) -> Result<StealthStatus, String> {
 /// [`DEBUG_ONLY_EVENTS`]）。
 ///
 /// 这里曾有一步 `merge_install_restart`：把「开启接管」与紧随其后的「重启 Qoder」
-/// 合并成一条，免得同一个动作在时间线上占两格。切换拓扑不再重启客户端之后，
-/// 就再也没有 `restart_qoder` 事件产出了 —— 聚合逻辑随之删除（历史日志里的旧事件
-/// 照常单独显示，展示层仍认得它）。
+/// 合并成一条，免得同一个动作在时间线上占两格。2026-09-21 起 `restart_qoder` 又有了
+/// 产出（见 [`crate::client_proc`]），但**合并逻辑没有跟着回来**：重启现在是独立、
+/// 且会单独失败的一步（三条结局各不相同），挤进「端点已注入」那一行的话，用户正好
+/// 看不到这里最该看清的事 —— 它到底重启成功了没有。
 #[tauri::command]
 pub fn takeover_events(app: tauri::AppHandle) -> Vec<JournalEvent> {
     let Ok(dir) = crate::commands::try_data_dir(&app) else {

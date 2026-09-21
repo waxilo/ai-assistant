@@ -1093,29 +1093,34 @@ pub fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 // ⛔ 这里曾有一整套「退出客户端 → 收割长驻 CLI host → 重新拉起」的进程操作
 // （`process_pids` / `wait_processes_gone` / `kill_processes` / `quit_qoder_and_wait`
-// / `open_qoder` / `restart_qoder_process` / `running_apps`），用来在切换接管拓扑时
-// 把官方客户端整个重启一遍。它建立在两个**在 Qoder 上并不成立**的前提上：
+// / `open_qoder` / `restart_qoder_process` / `running_apps`）。2026-09-19 它们被整段
+// 删掉，理由是「Qoder 没有长驻 host、产物每次会话重读 ⇒ 没有要重启的东西」。
+// **2026-09-21 真机实测推翻了后一半结论**：
 //
-// 1. 「CLI 是长驻 host，它进程环境里的端点值是 spawn 那一刻定死的，所以只有重启客户端
-//    才能纠正」——那是 CodeBuddy 时代的形态。Qoder 0.3.3（CLI 1.1.53）的推理进程是
-//    **每次会话按需 spawn 的一次性 `--print` 进程**：证据在
-//    `~/.qoder[-cn]/logs/runs/<时间戳>-p<桌面端pid>/manifest.json`（`argv` 就是
-//    `.../app.asar.unpacked/node_modules/@qoder-ai/qoder-*-agent-sdk/.../qoder-worker-runtime.obf.mjs
-//    --print ...`），跑完即退，`ps` 里几乎抓不到。没有长驻 host ⇒ 没有「要重启的东西」。
+// 1. 「没有长驻 CLI host」这半仍然成立：推理进程是每次会话按需 spawn 的一次性
+//    `--print` 进程（证据：`~/.qoder[-cn]/logs/runs/<时间戳>-p<桌面端pid>/manifest.json`
+//    的 `argv`），跑完即退，`ps` 里几乎抓不到。
+// 2. 但「产物每次会话重读」**不成立**：桌面端是长驻进程，产物在**客户端启动时**被读进
+//    内存，之后每次会话都用内存里那一份 —— 磁盘改了它不看。所以**开关接管必须重启
+//    Qoder 才生效**（与用户在 Windows 上的实测一致：开了接管不重启，对话仍然直连）。
+// 3. 「改配置就等于生效」同样不成立（这半没变）：那个一次性进程的 env 是**桌面端
+//    spawn 时构造**的（`new Worker(runtime,{argv,env})`，`env` 不继承桌面端自己的
+//    `process.env`），而 `~/.qoder[-cn]/settings.json` 的 `env` 块**没有任何消费者**。
+//    注入点只能是**产物本身**（见 [`crate::patch`]），且要重启客户端它才被读到。
 //
-//    ⚠️ 但**别**由此推出「改配置就等于生效」：那个一次性进程的 env 是**桌面端 spawn 时
-//    构造**的（`new Worker(runtime,{argv,env})`，`env` 来自 SDK 调用方、**不继承桌面端自己的
-//    process.env**），而 `~/.qoder[-cn]/settings.json` 的 `env` 块**没有任何消费者**。
-//    所以「写配置 → 下次会话读到」这条链根本不存在。现在改的是**产物本身**
-//    （见 [`crate::patch`]）：端点跟着产物一起被那次会话读到，所以「不重启客户端」这条
-//    结论仍然成立 —— 它是靠「根本不需要重启」而不是靠「改了配置就会生效」站住的。
-// 2. 顺带，`open -a` 紧跟在 AppleScript `quit` 之后会撞上 LaunchServices 的注册竞态，
-//    返回 `exit status: 1`；而 `.status()` 把 stderr 一并丢掉，只剩一个状态码。
-//    旧实现在这一步失败后**不回滚**，于是磁盘说「已开启」、界面还停在「已关闭」——
-//    用户报的「接管报错、随后又显示接管成功」正是这条链路。
+// 于是进程操作又回来了，但形态不同：不再是「切换拓扑时把客户端整个重启一遍」的隐式
+// 副作用，而是**开关接管这一步的明确收尾**（见 [`crate::client_proc`]）：正在运行的
+// 客户端优雅退出并重新拉起，没在运行就一个进程都不碰。三条硬规矩（不强杀、不 wait、
+// 三种结局都留痕）都在 client_proc 的模块文档里。
 //
-// 所以接管现在只做**写配置**这一件事，对正在登录、正在对话的客户端零打扰：
-// 唯一的事实源是 `settings.json`（见 [`crate::stealth`]）与落盘设置。
+// 顺带记一笔旧实现翻过车的地方（别再犯）：`open -a` 紧跟在 AppleScript `quit` 之后会
+// 撞上 LaunchServices 的注册竞态返回 `exit status: 1`，而 `.status()` 把 stderr 一并
+// 丢掉、只剩一个状态码；旧实现在这一步失败后**不回滚**，于是磁盘说「已开启」、界面还
+// 停在「已关闭」——用户报的「接管报错、随后又显示接管成功」正是这条链路。现在
+// `apply_settings` 的每一步要么全成、要么整体回滚；重启失败只如实记进接管动态，
+// 不把已经写好的拓扑拖回去。
+//
+// 唯一的事实源仍然是 `settings.json`（见 [`crate::stealth`]）与落盘设置。
 
 /// 当前**实际装着**端点的是哪个区域。
 ///
@@ -1125,6 +1130,33 @@ fn installed_region(dir: &Path, fallback: Region) -> Region {
     crate::stealth::load_lease(dir)
         .map(|l| l.region)
         .unwrap_or(fallback)
+}
+
+/// 应用**退出时**的收尾：摘掉端点、把开关落回关闭，但**一个客户端进程都不动**。
+///
+/// 为什么不复用 [`apply_settings_inner`]：那条路会顺手重启客户端（见 [`note_restart`]）。
+/// 那在用户主动点开关时是对的（他要的就是「立刻生效」），在退出路径上却是错的 ——
+/// 这里服务的是**下一次启动**，为此把用户正开着的编辑器关掉再拉起来，代价远大于收益。
+/// 代价是那台客户端会继续敲一个已经没人听的端口，直到它自己下次启动；
+/// 这个取舍本身记在 `lib.rs` 的退出路径注释里。
+pub(crate) fn shutdown_takeover(dir: &Path) {
+    let old = accounts::load_settings(dir);
+    if !old.proxy_enabled {
+        return;
+    }
+    let region = installed_region(dir, old.takeover_region);
+    if let Err(e) = crate::stealth::uninstall(region, dir) {
+        // 摘不掉就**别把开关落回关闭**：那会留下「设置说已关、产物里却还有注入」的
+        // 僵尸态（netfix 判它会断网）。让它继续显示「开着」，下次启动监督线程会把
+        // 注入重新打一遍 —— 反正产物也还是脏的。
+        eprintln!("[commands] 退出时还原客户端产物失败：{e}");
+        return;
+    }
+    let mut off = old;
+    off.proxy_enabled = false;
+    if let Err(e) = accounts::save_settings(dir, &off) {
+        eprintln!("[commands] 退出时保存设置失败：{e}");
+    }
 }
 
 fn normalize_settings(mut settings: Settings) -> Result<Settings, String> {
@@ -1169,6 +1201,26 @@ fn wait_for_takeover(region: Region, dir: &std::path::Path, port: u16) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// 开关接管的收尾：把正在运行的客户端重启一遍，让新的产物**立刻**被读到，
+/// 再把三种结局如实记进接管动态（真重启了 / 它没在运行 / 关了却拉不起来）。
+///
+/// 重启失败**不算开关失败**：产物与反代都就位了，拓扑是完整的，只是客户端要等用户
+/// 手动重启才会读到它。把这句话说清楚，比把整个开关弹回去有用得多。
+fn note_restart(dir: &std::path::Path, region: Region) {
+    use crate::client_proc::RestartOutcome;
+    let name = region.client_name();
+    let detail = match crate::client_proc::restart_if_running(region) {
+        RestartOutcome::Restarted => {
+            format!("为让改动即刻生效，已自动重启 {name}（未保存的编辑内容请自行确认）")
+        }
+        RestartOutcome::NotRunning => format!("{name} 没在运行 —— 改动在它下次打开时生效"),
+        RestartOutcome::Failed(e) => {
+            format!("自动重启 {name} 失败：{e}（它要到下次启动才会读到改动）")
+        }
+    };
+    crate::stealth::journal_append(dir, "restart_qoder", &detail);
 }
 
 /// 接管的「拓扑」= 决定**装不装、装在哪个区域、转发到哪个端口**的那三项。
@@ -1295,11 +1347,10 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                     ),
                 });
             }
-            // 客户端一个进程都不动（也不需要动）：Qoder 每次会话自己起一次性进程，
-            // 没有长驻 host 可重启。
+            // 产物写好了，但它要**客户端重启**才被读到 —— 正在运行的请出去、再拉起来。
+            note_restart(&dir, next.takeover_region);
         }
         (true, false) => {
-            // 摘掉注入即可 —— 不碰任何客户端进程，正在进行的对话不受影响
             if let Err(e) = crate::stealth::uninstall(old_region, &dir) {
                 return Err(disable_blocked(old_region, e));
             }
@@ -1307,6 +1358,9 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                 reinstate(old_region, &dir, old.proxy_port);
                 return Err(e.to_string());
             }
+            // 注入摘了，但运行中的客户端还揣着启动时读进去的那一份 —— 它**不会**因为
+            // 磁盘被还原就恢复直连，只会一直去敲一个已经没人听的端口。重启它才算关干净。
+            note_restart(&dir, old_region);
         }
         (true, true) => {
             // 换端口 / 换区域：摘掉旧区域的注入 → 落盘 → 等新端点就位；任一环节失败整体回滚
@@ -1332,6 +1386,13 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                     ),
                 });
             }
+            // 换了端口或换了区域：两边客户端的产物都变了，各自重启才生效。
+            // 旧区域那台在摘注入时已被还原，可它的内存里还揣着旧端点 —— 也要请它重启，
+            // 否则它会一直朝一个已经没人听的端口说话（同 (true, false) 分支）。
+            if old_region != next.takeover_region {
+                note_restart(&dir, old_region);
+            }
+            note_restart(&dir, next.takeover_region);
         }
         // 两端都关着：那说明变的是**区域**（关着的时候端口本来就能随手改，
         // 那条路走 `save_settings`）。此时没有任何端点装着、也没有客户端受影响 ——
@@ -1347,7 +1408,11 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
     Ok(next)
 }
 
-#[tauri::command]
+/// 走线程池（`command(async)`）而不是主线程：安全切换流程的最后一步是**重启客户端**，
+/// 而客户端优雅退出最长等 [`crate::client_proc::GRACE_QUIT_MS`]、拉起再等
+/// [`crate::client_proc::RELAUNCH_VERIFY_MS`]（换区域时两个客户端都要过一遍）。
+/// 同步命令默认在主线程上跑，堵在那里会让整个窗口「未响应」。
+#[tauri::command(async)]
 pub fn apply_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
     apply_settings_inner(&app, settings)
 }
