@@ -301,6 +301,11 @@ pub struct PoolItem {
     pub key: String,
     pub name: String,
     pub phone: String,
+    /// **展示用的身份标识**（国际版首选邮箱、国内版首选手机号），纯携带：
+    /// 和 `phone` 一样**不进 key、不参与认人**（锚点见 [`item_key_of`]）。
+    /// 有了它，别的机器收养这条账号时当场就显示得出邮箱，不必自己再打一次
+    /// `/api/v1/userinfo`。老云端数据没有这个字段 → `#[serde(default)]` 落成空串。
+    pub email: String,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: Option<i64>,
@@ -384,6 +389,7 @@ pub fn to_item(account: &Account) -> PoolItem {
         key: item_key_of(account),
         name: account.name.clone(),
         phone: account.phone.clone().unwrap_or_default(),
+        email: account.email.clone().unwrap_or_default(),
         access_token: account.token.clone(),
         refresh_token: account.refresh_token.clone().unwrap_or_default(),
         expires_at: account.expires_at,
@@ -408,9 +414,9 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         // 直接用 `item.region` 会把老池里的国内版条目全标成国际版。
         region: item_region(item),
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
-        // 池的数据契约里没有邮箱（跨机搬运不靠它认人）；国际版账号的那一份
-        // 由刷新时的 `fill_identity_if_missing` 就地补回来。
-        email: None,
+        // 池里带着就带上；老条目那条是空串 → `None`，留给刷新时的
+        // `fill_identity_if_missing` 就地补回来。
+        email: Some(item.email.clone()).filter(|s| !s.trim().is_empty()),
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
         expires_at: item.expires_at,
@@ -462,6 +468,10 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
             account.phone = Some(item.phone.clone());
             touched = true;
         }
+        if account.email.is_none() && !item.email.trim().is_empty() {
+            account.email = Some(item.email.clone());
+            touched = true;
+        }
         return touched;
     }
     if !item.access_token.trim().is_empty() {
@@ -474,6 +484,9 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
     account.rt_expires_at = item.rt_expires_at.or(account.rt_expires_at);
     if account.phone.is_none() && !item.phone.trim().is_empty() {
         account.phone = Some(item.phone.clone());
+    }
+    if account.email.is_none() && !item.email.trim().is_empty() {
+        account.email = Some(item.email.clone());
     }
     if account.name.trim().is_empty() && !item.name.trim().is_empty() {
         account.name = item.name.clone();
@@ -1100,6 +1113,7 @@ mod tests {
             key: key.into(),
             name: key.into(),
             phone: key.into(),
+            email: String::new(),
             access_token: token.into(),
             refresh_token: format!("rt-{token}"),
             expires_at: expires,
@@ -1141,6 +1155,7 @@ mod tests {
             key: key.into(),
             name: name.into(),
             phone: phone.into(),
+            email: String::new(),
             access_token: at.into(),
             refresh_token: format!("rt-{at}"),
             expires_at: Some(1_000),
@@ -1334,6 +1349,7 @@ mod tests {
             key: "138".into(),
             name: "n".into(),
             phone: "138".into(),
+            email: String::new(),
             access_token: "t2".into(),
             refresh_token: String::new(),
             expires_at: Some(i64::MAX),
@@ -1391,6 +1407,51 @@ mod tests {
         let mut no_phone = item("x", "t", Some(1));
         no_phone.phone = String::new();
         assert_eq!(account_from_item(&no_phone).phone, None);
+    }
+
+    // ── 邮箱是纯携带：随池走，但**不进锚点**（2026-09-21） ───────────────
+
+    #[test]
+    fn email_stays_out_of_the_cross_machine_key() {
+        // 用户明确要的是「只携带、不改锚点」：邮箱进 key 会让老池的 key 漂一次，
+        // 且「一台机器补过邮箱、另一台还没有」的两台机器会来回改写池里那条。
+        let mut a = acct("n", None, "t");
+        a.email = Some("a@b.c".into());
+        assert_eq!(item_key_of(&a), "global:n", "锚点仍是手机号 → 昵称 → 本地 id");
+        assert_eq!(to_item(&a).key, "global:n");
+    }
+
+    #[test]
+    fn email_travels_with_the_pool_both_ways() {
+        let mut a = acct("n", Some("138"), "at");
+        a.email = Some("a@b.c".into());
+        assert_eq!(to_item(&a).email, "a@b.c");
+
+        // 另一台机器收养：邮箱跟着过来，不必等自己那次 `/api/v1/userinfo`
+        assert_eq!(account_from_item(&to_item(&a)).email.as_deref(), Some("a@b.c"));
+
+        // 老条目没有邮箱（空串）→ 落成 `None`，与「本机还没有」是同一种状态
+        let mut no_email = item("138", "t", Some(1));
+        no_email.email = String::new();
+        assert_eq!(account_from_item(&no_email).email, None);
+    }
+
+    #[test]
+    fn adopt_fills_a_missing_email_and_keeps_a_present_one() {
+        // 本机缺、池里有 → 补上（这条路径省掉一次刷新）
+        let mut blank = acct("n", Some("138"), "at");
+        let mut full = item("138", "older", Some(1));
+        full.email = "from-pool@b.c".into();
+        assert!(adopt(&mut blank, &full), "补空字段算改动");
+        assert_eq!(blank.email.as_deref(), Some("from-pool@b.c"));
+
+        // 本机有 → 池里那条空的不许抹掉它（同理不许被池里另一个值顶掉）
+        let mut mine = acct("n", Some("138"), "at");
+        mine.email = Some("keep@x.y".into());
+        let mut stale = item("138", "older", Some(1));
+        stale.email = "other@z.w".into();
+        adopt(&mut mine, &stale);
+        assert_eq!(mine.email.as_deref(), Some("keep@x.y"));
     }
 
     // ── 提交正文必须带全本机账号 ────────────────────────────────────────
@@ -1571,5 +1632,6 @@ mod tests {
         assert_eq!(parsed.key, "k");
         assert_eq!(parsed.access_token, "");
         assert_eq!(parsed.expires_at, None);
+        assert_eq!(parsed.email, "", "老云端数据没有 email → 空串，不是解析失败");
     }
 }
