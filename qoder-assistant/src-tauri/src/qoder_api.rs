@@ -1066,4 +1066,116 @@ mod tests {
             }
         }
     }
+
+    /// 本机数据目录（池内账号所在）。优先环境变量，否则按平台的 Tauri 约定。
+    fn pool_data_dir() -> std::path::PathBuf {
+        if let Ok(p) = std::env::var("QODER_ASSISTANT_DATA_DIR") {
+            return std::path::PathBuf::from(p);
+        }
+        if cfg!(target_os = "windows") {
+            std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+                .join("com.waxilo.qoder-assistant")
+        } else {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join("Library/Application Support/com.waxilo.qoder-assistant")
+        }
+    }
+
+    /// 打一次活动接口，回 `(HTTP 状态, 响应体)`；连不上回 `(0, 错误原文)`。
+    async fn raw_campaigns(region: Region, token: &str) -> (u16, String) {
+        let req = apply_machine_headers(
+            client()
+                .get(format!("{}{CAMPAIGN_PATH}", region.openapi_base()))
+                .bearer_auth(token),
+            region,
+        );
+        match req.send().await {
+            Ok(r) => {
+                let st = r.status().as_u16();
+                (st, r.text().await.unwrap_or_default())
+            }
+            Err(e) => (0, e.to_string()),
+        }
+    }
+
+    /// 前 `n` 个字符（打印响应体用）。
+    fn head(s: &str, n: usize) -> String {
+        s.chars().take(n).collect()
+    }
+
+    /// 真实接口冒烟（**只读**）：**池内每个账号**今天各自拿到什么活动。
+    ///
+    /// 「活动未开」有两个完全不同的来源，界面上的文案却是同一句：
+    /// ① 服务端对这个账号没下发当天的每日活动（资格 / 地区 / 时刻）；
+    /// ② 本地把响应解错了（`showCampaign` 缺失、`claimStatus` 不认）。
+    /// 这里逐个打印 HTTP 状态与每日活动那条的 `claimStatus`，
+    /// 并**交叉打一次另一套部署**：同一个 token 若在对面也返回 200，
+    /// 说明账号的 `region` 登记错了（真·地区问题）；对面 401 而本区 200 却没活动，
+    /// 那就是服务端对这个账号没下发 —— 与地区无关。
+    ///
+    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_pool_campaigns`
+    #[tokio::test]
+    #[ignore = "真实网络调用（只读 GET），读本机 accounts.json"]
+    async fn smoke_real_pool_campaigns() {
+        let dir = pool_data_dir();
+        let accounts = crate::accounts::load_accounts(&dir);
+        println!("数据目录：{}（{} 个账号）", dir.display(), accounts.len());
+        for a in &accounts {
+            let who = a
+                .email
+                .clone()
+                .or_else(|| a.phone.clone())
+                .unwrap_or_else(|| a.name.clone());
+            println!(
+                "\n=== {} / {} / token {} 字 ===",
+                who,
+                a.region.label(),
+                a.token.len()
+            );
+            let (st, body) = raw_campaigns(a.region, &a.token).await;
+            match serde_json::from_str::<Value>(&body) {
+                Ok(v) => match parse_campaigns(&v) {
+                    Some(view) => {
+                        println!(
+                            "  HTTP {st} show={} claimable={} 活动数={}",
+                            view.show_campaign,
+                            view.claimable,
+                            view.campaigns.len()
+                        );
+                        match view.daily_claim() {
+                            Some(c) => println!(
+                                "  每日活动：{} key={} status={} {}..{}",
+                                c.id, c.key, c.claim_status, c.start_at, c.end_at
+                            ),
+                            None => println!("  每日活动：没有（campaigns 里没有当天的 CLAIM_BENEFIT）"),
+                        }
+                        for c in &view.campaigns {
+                            println!(
+                                "    - {} {} {} status={} title={:?} benefit={:?}",
+                                c.id,
+                                c.key,
+                                c.action_type,
+                                c.claim_status,
+                                c.title,
+                                c.benefit.as_ref().map(|b| (b.kind.as_str(), b.amount, b.validity_days))
+                            );
+                        }
+                    }
+                    None => println!("  HTTP {st} 解析失败（无 showCampaign 布尔）：{}", head(&body, 200)),
+                },
+                Err(_) => println!("  HTTP {st} 非 JSON：{}", head(&body, 200)),
+            }
+            for other in Region::ALL.iter().copied().filter(|r| *r != a.region) {
+                let (ost, obody) = raw_campaigns(other, &a.token).await;
+                println!("  交叉（换 {} 打同一 token）：HTTP {} {}", other.label(), ost, head(&obody, 120));
+            }
+            let view = crate::usage::fetch_usage(a.region, &a.token).await;
+            println!(
+                "  额度：剩余={:?} 最早到期={:?} 包数={}",
+                view.credits,
+                view.earliest_expiry_ms,
+                view.packages.len()
+            );
+        }
+    }
 }
