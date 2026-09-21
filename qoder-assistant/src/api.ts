@@ -34,7 +34,14 @@ export const removeAccount = (id: string) =>
 export const checkinOne = (id: string) =>
   invoke<Account>("checkin_one", { id });
 
-export const checkinAll = () => invoke<Account[]>("checkin_all");
+/**
+ * 批量签到。
+ *
+ * `allRegions` 决定范围（默认只签当前区域）：手动按钮点的是「把这一屏签完」，
+ * 而「启动应用时自动签到」许给用户的是**全部账号** —— 它传 `true`，两套部署一起签。
+ */
+export const checkinAll = (allRegions = false) =>
+  invoke<Account[]>("checkin_all", { allRegions });
 
 /** 一键刷新：不打签到接口，重拉并持久化全部账号的积分快照 / 签到状态 / 积分余量 */
 export const refreshAll = () => invoke<Account[]>("refresh_all");

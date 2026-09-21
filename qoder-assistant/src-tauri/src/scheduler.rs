@@ -16,9 +16,12 @@
 //! 签到结果的通知里也带上真实触发时刻（[`notify::trigger_line`]）。两处合起来，
 //! 「今天到底几点签的」在任何时候都答得出来。
 //!
-//! 跨启动去重靠 `schedule_state.json`，且**每个区域各记一份**（定时签到只跑当前区域，
-//! 「今天跑过了没有」「今天摇到几点」都是那个区域自己的事；切了区域就是另一条排期，
-//! 互不顶替），这样重启应用不会在补跑窗口内重复签一遍。
+//! 跨启动去重靠 `schedule_state.json`（每个区域各记一份）。一跑是**整机**的 ——
+//! 两套部署的账号一起签（见 [`commands::Scope::AllRegions`]：每日活动窗口两边本来就是
+//! 同一个 10:00 UTC+8 → 次日 09:59），所以触发时**所有区域都记上「今天跑过了」**：
+//! 只记当前区域的话，用户当天切一下区域，那边一看自己还没跑，在补跑窗口里就会再签一遍
+//! （见 [`mark_all_ran`]）。「今天摇到几点」「预告推了没」则仍是当前区域自己的事 ——
+//! 排期读的就是用户正在看的那份设置。
 //!
 //! 自动续签：常驻期间每 12 小时扫一遍账号，**剩余有效期不足 48 小时就静默续一次**；
 //! 启动后也会立刻扫一次（久未开应用的情况靠它兜住）。
@@ -83,8 +86,9 @@ pub(crate) struct DayTarget {
 struct ScheduleState {
     /// 定时签到的排期：**每个区域各记一份**（key = [`Region::key`]）。
     ///
-    /// 「今天跑过了没有」「今天摇到几点」「预告推了没」全都是*这个区域*的事：
-    /// 定时签到只跑当前区域（用户决定），切区域 = 换一条排期，互不顶替。
+    /// 排期（今天摇到几点、预告推没推）跟着**用户正在看的那份设置**走：切区域 = 换一条
+    /// 排期。但「今天跑过了没有」是整机的 —— 触发一次签的是两边的账号（见
+    /// [`mark_all_ran`]），那一刻每个区域都会记上，所以切过去不会再来一遍。
     /// 缺某个区域的键是合法状态（该区域从没跑过定时签到，默认值即正确起点）。
     #[serde(default)]
     regions: HashMap<String, RegionSchedule>,
@@ -347,9 +351,9 @@ pub fn spawn(app: AppHandle) {
             if !settings.schedule_enabled {
                 continue;
             }
-            // 排期按区域各记一份：这条循环只服务**当前区域**（左下角选择器选中的那个）。
-            // 用户改的 `schedule_*` 也是当前区域那份设置里的值 —— 两个区域各自定时、
-            // 各自摇号、各自去重，切过去看到的就是那条排期的真实进度。
+            // 排期读**当前区域**那份设置（左下角选择器选中的那个）：时刻、时间窗、开关
+            // 都是用户在这一屏上改的，切过去看到的就是那条排期的真实进度。
+            // 但触发一次签的是**两边的账号**（见 [`run_once`]），去重因此也必须按整机算。
             let region_key = settings.takeover_region.key().to_string();
             let mut state = load_state(&dir);
             let mut sched = state
@@ -359,6 +363,12 @@ pub fn spawn(app: AppHandle) {
                 .unwrap_or_default();
             let now = chrono::Local::now().naive_local();
             let today = now.date().format("%Y-%m-%d").to_string();
+            // 今天已经跑过（不管当时停在哪个区域 —— 触发即两边全签）就什么都不再判。
+            // 特别是切区域之后：不能再摇号、更不能推预告，否则用户会收到一条「今天定在
+            // 几点」的预告，而今天其实早就签完了。
+            if sched.last_run_date.as_deref() == Some(today.as_str()) {
+                continue;
+            }
             // 当天目标时刻：第一次算出来后立刻落盘，之后每一跳都复用同一个值，
             // 否则「随机窗口」每跳重摇一次，等于没加（详见 DayTarget）
             let target = target_time(
@@ -415,9 +425,11 @@ pub fn spawn(app: AppHandle) {
                 continue;
             }
 
-            // 先落盘「今天已跑」再执行：万一执行中崩溃，也不会在补跑窗口里反复重试
+            // 先落盘「今天已跑」再执行：万一执行中崩溃，也不会在补跑窗口里反复重试。
+            // 记账要盖到**每个区域**（见 [`mark_all_ran`]）：这一跑签的是两边的账号。
             sched.last_run_date = Some(today.clone());
             state.regions.insert(region_key, sched);
+            mark_all_ran(&mut state, &today);
             save_state(&dir, &state);
             let actual = now.format("%H:%M").to_string();
             log_event(
@@ -433,6 +445,24 @@ pub fn spawn(app: AppHandle) {
             tauri::async_runtime::block_on(run_once(&app, &settings, &dir, &trigger));
         }
     });
+}
+
+/// 把「今天跑过了」记到**每个区域**的排期上。
+///
+/// 定时签到一跑签的是两套部署的全部账号（见 [`run_once`]），去重因此也得按整机算：
+/// 排期是按区域各存一份的，而 [`due_at`] 只看自己那份的 `last_run_date` —— 只记当前
+/// 区域的话，用户当天切一下区域，那边一看「今天还没跑」，在补跑窗口里就会再签一遍，
+/// 多打一轮写接口，结果却与刚才那遍完全一样。
+///
+/// 其余字段原样保留：`today_target` / `notified_target` 是**排期**，属于各个区域自己
+/// （当前区域那份刚在上面写过，另一区域那份留着它自己的进度）。
+fn mark_all_ran(state: &mut ScheduleState, today: &str) {
+    for r in Region::ALL {
+        let key = r.key().to_string();
+        let mut sched = state.regions.get(&key).cloned().unwrap_or_default();
+        sched.last_run_date = Some(today.to_string());
+        state.regions.insert(key, sched);
+    }
 }
 
 /// 自动续签扫描：距上次扫描超过 `REFRESH_SCAN_MS` 才真跑。
@@ -657,13 +687,18 @@ pub(crate) fn log_event(dir: &Path, msg: &str) {
 
 /// 执行一次「全部签到」并推送结果。
 ///
+/// 范围是**两套部署的全部账号**（[`commands::Scope::AllRegions`]）：定时签到是整机
+/// 行为，设置页那条「在指定时刻为全部账号自动签到」说的就是它 —— 用户库里有国际版
+/// 账号时，不能只签国内那批。活动窗口两边本来就是同一个（见 [`commands::Scope`]），
+/// 所以统一的触发时刻对哪个区域都不算早。
+///
 /// `trigger` 是本次触发时刻的说明（[`notify::trigger_line`]），拼在通知正文之后 ——
 /// 随机窗口 / 补跑都会让真实时刻与用户配置的值对不上，通知里得说清楚是哪个。
 async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &str) {
     let _ = app.emit(EVENT, serde_json::json!({ "stage": "start" }));
 
     let notify_on = settings.notify_enabled && settings.notify_on_schedule;
-    match commands::checkin_all_inner(app, true).await {
+    match commands::checkin_all_inner(app, true, commands::Scope::AllRegions).await {
         Ok(views) => {
             // 与 notify 一致：「已签」与「成功」互斥计数（已签的响应 success 也是 true）。
             // 视图里的账号那一半就是签到结果，积分读数在这里不参与统计。
@@ -752,6 +787,40 @@ mod tests {
         assert!(!due_at(at(9, 20), "09:07", Some("2026-09-12")));
         // 昨天的记录不影响今天
         assert!(due_at(at(9, 7), "09:07", Some("2026-09-11")));
+    }
+
+    /// 一跑是整机的：**每个区域**都要记上「今天跑过了」。
+    ///
+    /// 这条不变式挡的是「切区域 → 再签一遍」：排期按区域各记一份，而 [`due_at`] 只看
+    /// 自己那份的 `last_run_date` —— 少了这一步，用户当天切一下区域，那边就会在补跑
+    /// 窗口里再触发一次整机全签。
+    #[test]
+    fn a_run_marks_every_region() {
+        let mut st = ScheduleState::default();
+        st.regions.insert(
+            Region::Cn.key().to_string(),
+            RegionSchedule {
+                today_target: Some(DayTarget {
+                    date: "2026-09-21".to_string(),
+                    at: "10:37".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        mark_all_ran(&mut st, "2026-09-21");
+        for r in Region::ALL {
+            assert_eq!(
+                st.regions[r.key()].last_run_date.as_deref(),
+                Some("2026-09-21"),
+                "{} 也要记上",
+                r.label()
+            );
+        }
+        // 摇好的当天时刻不能被抹掉：切回去时界面与预告读的还是它
+        assert_eq!(
+            st.regions[Region::Cn.key()].today_target.as_ref().map(|t| t.at.as_str()),
+            Some("10:37")
+        );
     }
 
     #[test]

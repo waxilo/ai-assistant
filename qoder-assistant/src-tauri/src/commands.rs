@@ -770,12 +770,24 @@ pub async fn checkin_one(app: AppHandle, id: String) -> Result<accounts::Account
     Ok(view)
 }
 
+/// 手动/启动「全部签到」。
+///
+/// `all_regions` 区分两条来路：手动按钮只签**当前区域**（界面上那一屏就是用户说的
+/// 「全部」，见 [`Scope`]），而「启动应用时自动签到」写的是「为全部账号签到一次」——
+/// 那是自动路径，用户库里有国际版账号时不能只签国内那批，所以它传 `true`。
 #[tauri::command]
-pub async fn checkin_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, String> {
+pub async fn checkin_all(
+    app: AppHandle,
+    all_regions: Option<bool>,
+) -> Result<Vec<accounts::AccountView>, String> {
     let dir = data_dir(&app);
     let settings = accounts::load_settings(&dir);
+    let scope = match all_regions {
+        Some(true) => Scope::AllRegions,
+        _ => Scope::CurrentRegion,
+    };
     // 手动「全部签到」走短间隔档（manual_stagger_*）：同样打散顺序与节奏，只是等待短得多
-    let results = checkin_all_inner(&app, false).await?;
+    let results = checkin_all_inner(&app, false, scope).await?;
     // 手动批量签到是否推送由设置决定（默认关，免得连点几下就把通知刷屏）
     if settings.notify_enabled && settings.notify_on_manual {
         let _ = notify::send(&settings.notify_webhook, &notify::summary_message(&results)).await;
@@ -798,9 +810,10 @@ pub async fn checkin_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
 /// 不打领取接口——已领的活动再打只会拿到 409，看最新状态没必要绕这一圈。
 /// 逐账号查询、单个失败不改原值（界面保留旧数），最后整体保存一次。
 ///
-/// **只刷当前区域**（与「全部签到」同一条界线）：刷新是「把界面上看得见的数对齐」，
+/// **只刷当前区域**（与手动「全部签到」同一条界线）：刷新是「把界面上看得见的数对齐」，
 /// 另一区域的行根本不在这一屏上，替它打一轮接口既多一倍请求，也把风控面摊宽。
-/// 凭证续签（`auto_refresh_all`）不受这条限制 —— 那是保命操作，跨区域照跑。
+/// 凭证续签（`auto_refresh_all`）与定时签到（[`Scope::AllRegions`]）不受这条限制
+/// —— 前者是保命操作，后者要签的就是两边的账号。
 #[tauri::command]
 pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, String> {
     let dir = data_dir(&app);
@@ -871,6 +884,27 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
 // 响应形态与实测证据都还在 `basedata/20260918_Qoder缺失接口逆向.md` 与
 // `basedata/20260918_Qoder活动权益接口逆向.md`，将来要接照那两份接。
 
+/// 一次批量签到的**账号范围**。
+///
+/// 三处调用点，界线由产品语义决定：
+/// - 手动「全部签到」（[`checkin_all`] 不带 `all_regions`）：只签**当前区域**。界面上
+///   那一屏就是用户说的「全部」，替另一区域动手属于「用户没选过的写操作」；
+/// - 启动即签到（[`checkin_all`] 带 `all_regions = true`）与定时签到
+///   （[`crate::scheduler`]）：**两套部署一起签**。这两条都是自动路径，设置页写的就是
+///   「为全部账号签到」，用户库里有国际版账号时不能只签国内那批。
+///
+/// 跨区域之所以成立：两边的每日活动窗口本来就是同一个 —— 国内版 10:00（UTC+8）刷新，
+/// 国际版实测那条 `act-20260921-308` 的窗口是 02:00 UTC → 次日 01:59 UTC，换成 UTC+8
+/// 也是 10:00 → 次日 09:59。所以一个触发时刻对两边都不算早；「另一区域有自己的刷新点，
+/// 跟着这批签没意义」那个旧结论是错的。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scope {
+    /// 只签当前区域（`settings.takeover_region`）
+    CurrentRegion,
+    /// 跨区域全签（[`Region::ALL`]）
+    AllRegions,
+}
+
 /// 「全部签到」的实际实现：逐账号签到、逐条落库，最后整体保存。
 ///
 /// ⚠️ **签到是写操作**（领取活动权益），但每个账号**只尝试一次**：没有可领的就直接
@@ -880,10 +914,11 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
 /// 抽成独立函数是因为定时调度（`scheduler`）与手动命令共用同一套逻辑——
 /// 后台线程走不了 Tauri 的 invoke，只能直接调它。
 ///
-/// **只签当前区域**（`settings.takeover_region`，即左下角选择器选中的那一套部署）：
-/// 另一区域的账号有自己的活动权益与刷新点，跟着这批签既没意义、又替用户做了他没选的写操作。
-/// 落盘仍是**全量账号**（只改了本区域那几条的 `last`），返回视图只含本区域 ——
-/// 前端按 id 合并回列表，另一区域的行保持原样。
+/// **范围由 `scope` 决定**（见 [`Scope`]）。落盘一律是**全量账号**（只改了签过的那批
+/// 的 `last`），返回视图的范围跟着 `scope` 走 —— 前端按 id 合并回列表，没签的行保持原样。
+///
+/// 节奏（间隔 / 打乱 / 顺序）仍读**当前区域**那份设置：那是「整机风控偏好」，
+/// 用户在设置页改的就是它，跨区域那一跑没有第二份可读。
 ///
 /// `scheduled` 决定用哪一档「风控节奏」（见 [`gap_seconds`]）：
 /// - `true`：定时/自动触发，两次请求之间随机歇 `stagger_max_seconds` 以内（默认 45s 档）；
@@ -895,16 +930,26 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
 pub(crate) async fn checkin_all_inner(
     app: &AppHandle,
     scheduled: bool,
+    scope: Scope,
 ) -> Result<Vec<accounts::AccountView>, String> {
     let dir = data_dir(app);
-    sync_pool_if_bound(&dir).await;
+    // 池同步跟着范围走：跨区域那一跑，另一个区域若绑了池，也得先把云端那批拉下来
+    // （与自动续签同一条规矩，见 [`auto_refresh_all`]）
+    match scope {
+        Scope::CurrentRegion => sync_pool_if_bound(&dir).await,
+        Scope::AllRegions => {
+            for r in Region::ALL {
+                sync_pool_if_bound_in(&dir, r).await;
+            }
+        }
+    }
     let mut accounts = accounts::load_accounts(&dir);
     let settings = accounts::load_settings(&dir);
-    // 本区域账号在原列表里的下标：签到只碰这一批，其余条目连 `last` 都不动
+    // 本次要签的账号在原列表里的下标：范围外的条目连 `last` 都不动
     let idx: Vec<usize> = accounts
         .iter()
         .enumerate()
-        .filter(|(_, a)| a.region == settings.takeover_region)
+        .filter(|(_, a)| scope == Scope::AllRegions || a.region == settings.takeover_region)
         .map(|(i, _)| i)
         .collect();
     if idx.is_empty() {
@@ -924,10 +969,10 @@ pub(crate) async fn checkin_all_inner(
     }
     // 签到顺手把刚读到的余额写进台账 —— 那是「积分事实」的唯一来源，
     // 账户管理与积分简报都读它，所以这里不用、也不许另存一份。
-    // 本区域的每个账号都真的签到过（`visit_order` 是本批下标的一个排列），所以这批都算新读数。
+    // 本批的每个账号都真的签到过（`visit_order` 是本批下标的一个排列），所以这批都算新读数。
     let checked: Vec<String> = idx.iter().map(|&i| accounts[i].id.clone()).collect();
     record_checkin_credits(&dir, &accounts, &checked);
-    // 视图在台账写完**之后**取，才能带上刚读到的余额；落盘仍只写账号本身（全量，含没动的另一区域）
+    // 视图在台账写完**之后**取，才能带上刚读到的余额；落盘仍只写账号本身（全量，含没签的那批）
     let signed = idx.into_iter().map(|i| accounts[i].clone()).collect();
     let views = accounts::view_accounts(signed, &dir);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;

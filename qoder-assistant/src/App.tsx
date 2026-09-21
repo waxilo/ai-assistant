@@ -277,10 +277,10 @@ export default function App() {
     setUpdateBusy(false);
   }, [showToast, updateBusy]);
 
-  // 启动时若开启“自动签到”，则对全部账号执行一次
+  // 启动时若开启“自动签到”，则对**全部账号**（含另一区域）执行一次
   useEffect(() => {
     if (!loading && settings?.auto_checkin_on_start && accounts.length > 0) {
-      void runCheckinAll();
+      void runCheckinAll(true);
       // 仅在首次装配完成后触发一次
       // eslint-disable-next-line react-hooks/exhaustive-deps
       setSettings((s) => (s ? { ...s, auto_checkin_on_start: false } : s));
@@ -363,11 +363,13 @@ export default function App() {
     [showToast]
   );
 
-  const runCheckinAll = useCallback(async () => {
+  // 批量签到：`allRegions` 只有「启动即签到」那条自动路径才传 true（见 api.checkinAll）；
+  // 手动按钮默认只签当前区域，返回的也是当前区域那批，按 id 合回全量列表
+  const runCheckinAll = useCallback(async (allRegions = false) => {
     setBusyAll(true);
     try {
-      const updated = await checkinAll();
-      // 只签当前区域：按 id 合回全量，另一区域的行原样留在列表里（见 mergeById）
+      const updated = await checkinAll(allRegions);
+      // 跨区域那跑返回的是两边的账号，合并规则一样（见 mergeById），另一区域的行也在列表里
       setAccounts((list) => mergeById(list, updated));
       seedCredits(updated);
       const { ok, already, fail } = tally(
@@ -765,7 +767,7 @@ export default function App() {
                 <button
                   className="btn primary"
                   disabled={busyAll || accounts.length === 0}
-                  onClick={runCheckinAll}
+                  onClick={() => void runCheckinAll()}
                 >
                   {busyAll ? "签到中…" : "全部签到"}
                 </button>
