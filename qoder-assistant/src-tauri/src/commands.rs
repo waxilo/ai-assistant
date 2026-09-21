@@ -1675,6 +1675,32 @@ mod tests {
         assert!(topology_conflict(&off, &next).is_some());
     }
 
+    /// 「客户端找不到」这条诊断必须同时说清**找过哪里** —— 它缺席过，代价就是
+    /// 用户 2026-09-21 报的那句「无法在 127.0.0.1:8789 上就位接管」：真实失败
+    /// （Windows 上安装根写死成 macOS 路径）发生在写租约之前，租约里什么都不会留，
+    /// 界面只剩一句让人去查端口和 /Applications 的兜底 —— 在 Windows 上两句都是错的。
+    #[test]
+    fn a_missing_client_is_diagnosed_with_the_dirs_that_were_searched() {
+        let base = std::env::temp_dir().join("qoder-diagnose-missing-client");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let msg = crate::patch::with_sdk_root(&base, || {
+            diagnose_enable_failure(Region::Cn).expect("空 SDK 根下必须给出诊断")
+        });
+        assert!(msg.contains(Region::Cn.label()), "{msg}");
+        assert!(msg.contains(&Region::Cn.install_hint()), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 国际版没有端点键：要直说「尚未支持」，而不是误报成「客户端没装」。
+    #[test]
+    fn a_region_without_an_endpoint_key_is_diagnosed_as_unsupported() {
+        let msg = diagnose_enable_failure(Region::Global).expect("Global 必须给出诊断");
+        assert!(msg.contains("尚未支持"), "{msg}");
+    }
+
     #[test]
     fn stagger_seconds_bounds_and_disabled() {
         assert_eq!(stagger_seconds(false, 45), None);
