@@ -1,6 +1,6 @@
 [package]
 name = "qoder-assistant"
-version = "0.1.18"
+version = "0.1.19"
 description = "Qoder 多账号签到桌面助手"
 authors = ["waxilo"]
 edition = "2021"
