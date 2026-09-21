@@ -500,7 +500,7 @@ mod tests {
     /// 真实链路冒烟：**免费号的「积分过期」列终于有日期**。
     ///
     /// 走完整的那条链，一步不省：真实 usage 采样（免费号那份里根本没有到期时间）→
-    /// 真实发放凭据 → 台账（`observe` + `note_grant_expiry`）→ 投影给界面的
+    /// 真实发放凭据 → 台账（`observe` + `note_grant`）→ 投影给界面的
     /// `CreditFact`。断言最后那一份里，附加额度包带着凭据给的日期，
     /// 而不是改造前的「不过期」或「未知」。
     ///
@@ -538,10 +538,11 @@ mod tests {
             .await
             .expect("已领的活动应当能回放");
         let exp = receipt.expires_at.expect("回放必须带 expiresAt");
-        ledger::note_grant_expiry(
+        ledger::note_grant(
             led.accts.get_mut("smoke").unwrap(),
             crate::usage::KEY_ADDON,
             exp,
+            receipt.amount,
         );
 
         // 3) 投影给界面的那一份
@@ -565,12 +566,16 @@ mod tests {
         );
     }
 
-    /// 一次性**补录**：给历史上那几笔领取回放到期时间，写进本机台账。
+    /// 一次性**补录**（网络版）：给历史上那几笔领取回放到期时间，写进本机台账。
     ///
-    /// 为什么要有这一条：本机的签到记录里 `expires_at` 全是 null —— 那几笔领发生在
-    /// 「记录发放凭据」这套代码上线之前，于是界面上「附加额度 · 到期」只能显示「未知」。
-    /// 领取接口幂等（见 [`crate::qoder_api::claim_campaign`]），回放一次就能把日期补上，
-    /// 写入走的正是生产写点 [`crate::ledger::Store::note_grant_expiries`]。
+    /// 为什么要有这一条：签到日志里可能有些行没记 `expires_at`（那几笔领发生在
+    /// 「记录发放凭据」这套代码上线之前），单靠日志补不全。领取接口幂等
+    /// （见 [`crate::qoder_api::claim_campaign`]），回放一次就能把日期补上，
+    /// 写入走的正是生产写点 [`crate::ledger::Store::note_grants`]。
+    ///
+    /// 与启动时的日志补录（`commands::backfill_grants_from_logs`）的关系：
+    /// 那条路不用网络、每次启动自动跑，覆盖「日志里记着日期」的笔；
+    /// 这条只处理「日志没日期、但接口还愿意回放」的笔，是手动的一次性工具。
     ///
     /// ⚠️ **只处理「今天已领」的账号**：没领会落进 [`do_checkin`] 的领取分支，
     /// 那是真的往账号上发额度 —— 不在「补录」这件事的授权范围里，所以直接跳过。
@@ -588,7 +593,7 @@ mod tests {
                 PathBuf::from(std::env::var("HOME").unwrap())
                     .join("Library/Application Support/com.waxilo.qoder-assistant")
             });
-        let mut grants: Vec<(String, String, i64)> = Vec::new();
+        let mut grants: Vec<ledger::GrantWrite> = Vec::new();
         for a in crate::accounts::load_accounts(&dir)
             .into_iter()
             .filter(|a| !a.token.is_empty())
@@ -616,7 +621,12 @@ mod tests {
                 as_date(ms),
                 ms
             );
-            grants.push((a.id.clone(), crate::usage::KEY_ADDON.to_string(), ms));
+            grants.push(ledger::GrantWrite {
+                account_id: a.id.clone(),
+                pkg_key: crate::usage::KEY_ADDON.to_string(),
+                expires_ms: ms,
+                credits: rec.credit,
+            });
         }
         assert!(
             !grants.is_empty(),
@@ -625,18 +635,26 @@ mod tests {
 
         let store = ledger::store(&dir);
         store
-            .note_grant_expiries(&grants)
+            .note_grants(&grants)
             .expect("台账写入失败（权限 / 磁盘）");
-        for (id, _, ms) in &grants {
-            let f = store.fact_of(id).expect("刚写过就该有投影");
+        for g in &grants {
+            let f = store.fact_of(&g.account_id).expect("刚写过就该有投影");
             for p in &f.packages {
-                println!("  投影：{} 包 {} 剩余={} 到期={:?}", id, p.name, p.remaining, p.expiry_ms);
+                println!(
+                    "  投影：{} 包 {} 剩余={} 到期={:?} 逐笔={}",
+                    g.account_id,
+                    p.name,
+                    p.remaining,
+                    p.expiry_ms,
+                    p.grants.len()
+                );
             }
             assert!(
                 f.packages
                     .iter()
-                    .any(|p| p.expiry_ms == Some(*ms) && !p.never_expires),
-                "{id} 的附加额度要带上补录的日期"
+                    .any(|p| p.expiry_ms == Some(g.expires_ms) && !p.never_expires),
+                "{} 的附加额度要带上补录的日期",
+                g.account_id
             );
         }
     }

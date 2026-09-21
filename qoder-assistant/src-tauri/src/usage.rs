@@ -66,7 +66,7 @@
 //!
 //! 于是现在的口径是：计划额度沿用 `expiresAt`；附加额度的 `never_expires` 恒 `false`，
 //! 真实到期由**发放凭据**（`POST …/{campaignId}/claim` 响应里的 `expiresAt`）补上，
-//! 见 [`crate::ledger::note_grant_expiry`]。凭据到位前如实显示「未知」——
+//! 见 [`crate::ledger::note_grant`]。凭据到位前如实显示「未知」——
 //! 那比「不过期」正确，因为后者会让人以为这批积分永远不会作废。
 //!
 //! ## 网页控制台那个「逐包到期」接口走不通（2026-09-19 实测，别再试第二遍）
@@ -114,7 +114,7 @@ const KEY_PLAN: &str = "qoder:plan";
 /// 附加额度槽位的稳定键（同上）。
 ///
 /// 公开给 crate 内：签到路径拿到**发放凭据**后，要把那笔积分的真实到期时间记到这个包上
-/// （`ledger::note_grant_expiry`），而「签到的 100 Credits 落在哪一格」这件事
+/// （`ledger::note_grant`），而「签到的 100 Credits 落在哪一格」这件事
 /// 只有本模块知道 —— 由调用方另写一份字面量，迟早会有一处写错。
 pub const KEY_ADDON: &str = "qoder:addon";
 
@@ -259,7 +259,7 @@ fn packages_from_slots(usage: &Value) -> Vec<PkgView> {
             //（`benefit.validity = RELATIVE_DAYS/30`）。旧代码正是这么抄的，
             // 于是界面对免费号显示「不过期」，比「未知」更错。
             //
-            // 所以这里恒 `false`：真实到期等发放凭据补（`ledger::note_grant_expiry`），
+            // 所以这里恒 `false`：真实到期等发放凭据补（`ledger::note_grant`），
             // 补上之前如实显示「未知」。
             never_expires: key == KEY_PLAN && never_expires,
             remaining: s.remaining,
@@ -447,7 +447,7 @@ mod tests {
     /// 2026-09-19 更正第 ③ 条：旧版把附加额度也标成 `never_expires = true`，
     /// 于是界面对免费号显示「不过期」。那比「未知」更错 —— 它会让人以为这批积分
     /// 永远不会作废，而真实到期（实测 2026-10-19）由发放凭据补上，见
-    /// `ledger::note_grant_expiry`。
+    /// `ledger::note_grant`。
     #[test]
     fn a_free_account_reports_never_expires_instead_of_a_year_9999_date() {
         let v = parse(PERSONAL_FREE_NEVER_EXPIRES).expect("免费号也必须能解析出额度");

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Account, BrokerStatus, CreditPackage } from "../types";
+import type { Account, BrokerStatus, CreditGrant, CreditPackage } from "../types";
 import {
   AccountCell,
   EmptyState,
@@ -354,16 +354,52 @@ function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>
         </thead>
         <tbody>
           {packs.map((p, i) => (
-            <tr key={i}>
-              <td>{p.name || "未命名额度包"}</td>
-              <td className="num">{formatCredits(p.remaining)}</td>
-              <td className="num num-muted">{packageExpiry(p).text}</td>
-            </tr>
+            <PkgRows key={i} p={p} />
           ))}
         </tbody>
       </table>
     </div>
   );
+}
+
+/**
+ * 一个资源包的行（+ 可选的一行**逐笔明细**）。
+ *
+ * 聚合包（「附加额度」把每天领的 100 分合成一格）在后端只有一个到期日，
+ * 而它按笔到期：主行的日期是**最早一笔**（快作废的那批），
+ * 下面那行列清楚每一笔各是哪天 —— 只报一个日期的话，
+ * 用户没法判断「那天是只用掉一笔，还是全都没了」。
+ * 只有一笔发放（或压根没有逐笔数据）时就只渲染主行。
+ */
+function PkgRows({ p }: { p: CreditPackage }) {
+  return (
+    <>
+      <tr>
+        <td>{p.name || "未命名额度包"}</td>
+        <td className="num">{formatCredits(p.remaining)}</td>
+        <td className="num num-muted">
+          {packageExpiry(p).text}
+          {/* 多笔时把口径说清楚：这个日期是**最早一笔**的，不是「全部用完」的那天 */}
+          {p.grants.length > 1 ? "（最早一笔）" : ""}
+        </td>
+      </tr>
+      {p.grants.length > 1 && (
+        <tr>
+          <td colSpan={3} style={{ paddingTop: 0 }}>
+            <span className="num-muted" style={{ fontSize: "var(--fs-cap)" }}>
+              {`共 ${p.grants.length} 笔：${p.grants.map(grantLabel).join("、")}`}
+            </span>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/** 一笔发放的说明文字：「100（2026-10-18 到期）」；凭据没带回量时只报日期 */
+function grantLabel(g: CreditGrant): string {
+  const date = packageExpiry({ expiry_ms: g.expires_ms, never_expires: false }).text;
+  return g.credits != null ? `${formatCredits(g.credits)}（${date} 到期）` : `${date} 到期`;
 }
 
 /** 毫秒时间戳 → 人话的「多久之前」。与 `common.relativeTime` 同一套档位，只是吃毫秒 */

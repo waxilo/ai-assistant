@@ -571,24 +571,33 @@ fn checkin_credit_readings(
         .collect()
 }
 
-/// 本次签到带回的**发放凭据到期时刻** → `(账号 id, 包键, 到期毫秒)`。
+/// 本次签到带回的**发放凭据** → 台账的逐笔记账入参。
 ///
 /// 签到为什么能拿到它：领取接口的响应里就有这一笔积分自己的 `expiresAt`，
 /// 而且**已领取时靠幂等回放同样能拿到**（见 `qoder_api::ClaimReceipt`、
 /// `checkin::do_checkin` 的 `Plan::Done` 分支）。它是「积分过期」列对**免费号**
 /// 唯一的日期来源 —— `/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵。
 ///
+/// `credits` 取的是这次领到的量：领取成功那条记录里是实际发放量，
+/// 回放路径（当天已领）通常只有日期 —— 台账两个都收（`None` 就不显示量）。
+///
 /// 与 [`checkin_credit_readings`] 同一套「只认本次签到过的账号」规则：`last` 里那条
 /// 记录属于某次具体签到，拿别的账号（或很旧）的 `last` 去写台账同样是「用旧记录覆盖新读数」。
-fn checkin_grant_expiries(accounts: &[Account], checked: &[String]) -> Vec<(String, String, i64)> {
+fn checkin_grant_writes(accounts: &[Account], checked: &[String]) -> Vec<ledger::GrantWrite> {
     accounts
         .iter()
         .filter(|a| checked.iter().any(|id| id == &a.id))
         .filter_map(|a| {
-            let ms = a.last.as_ref()?.expires_at?;
-            // 落在「附加额度」那一栏：签到领的 100 Credits 在 usage 响应里就是那一格。
-            // 键取自 `usage`（唯一知道包结构的地方），不在这里写第二份字面量。
-            Some((a.id.clone(), crate::usage::KEY_ADDON.to_string(), ms))
+            let last = a.last.as_ref()?;
+            let expires_ms = last.expires_at?;
+            Some(ledger::GrantWrite {
+                account_id: a.id.clone(),
+                // 落在「附加额度」那一栏：签到领的 100 Credits 在 usage 响应里就是那一格。
+                // 键取自 `usage`（唯一知道包结构的地方），不在这里写第二份字面量。
+                pkg_key: crate::usage::KEY_ADDON.to_string(),
+                expires_ms,
+                credits: last.credit,
+            })
         })
         .collect()
 }
@@ -608,20 +617,58 @@ fn checkin_grant_expiries(accounts: &[Account], checked: &[String]) -> Vec<(Stri
 ///
 /// 写两样东西，都是签到这条路径独有的产物：
 /// - **余额读数**（`apply_credits`）：只更新读数，不产生小时桶；
-/// - **发放凭据的到期时刻**（`note_grant_expiries`）：落在「附加额度」包上，
-///   并让 `earliest_expiry_ms` 把这份也算进去（接管路由按那个排序）。
-///   口径是「接口那份与凭据那份**取更早者**」，所以采样报的那份不会被弄丢；
-///   一个包都没有时不写，也不会凭空造出一个最早到期时间。
+/// - **发放凭据**（`note_grants`）：逐笔记在「附加额度」包上，并让 `earliest_expiry_ms`
+///   把这份也算进去（接管路由按那个排序）。口径是「接口那份与凭据那份**取更早者**」，
+///   所以采样报的那份不会被弄丢；一个包都没有时不写，也不会凭空造出一个最早到期时间。
 fn record_checkin_credits(dir: &Path, accounts: &[Account], checked: &[String]) {
     let readings = checkin_credit_readings(accounts, checked);
     if !readings.is_empty() {
         // 落盘失败不影响签到结果：下一次任意拉取都会再写一遍
         let _ = ledger::store(dir).apply_credits(&readings);
     }
-    let grants = checkin_grant_expiries(accounts, checked);
+    let grants = checkin_grant_writes(accounts, checked);
     if !grants.is_empty() {
-        let _ = ledger::store(dir).note_grant_expiries(&grants);
+        let _ = ledger::store(dir).note_grants(&grants);
     }
+}
+
+/// 启动时的**补录**：把签到日志里每一笔领取登记进台账的逐笔发放。
+///
+/// 为什么要补：逐笔明细上线之前签到的那些笔，只有 `checkin_logs.json` 记得
+/// （那份日志从签到功能第一天就在记 `expires_at`），台账里只有一个「最晚一笔」的标量。
+/// 不补的话，界面上「附加额度」的明细要从零攒起 —— 而本机可能已经领了几十笔。
+///
+/// **幂等**：台账按到期时刻去重（见 `ledger::note_grant`），日志里的老记录在每次启动
+/// 都会被重放一遍，但只会留下一条 —— 所以这里不需要「补过了吗」的标记，
+/// 也无所谓每次启动都跑。写失败不致命：下次启动再试。
+///
+/// 与 [`record_checkin_credits`] 的分工：那条路是「签到当场」写，这条是「把历史补齐」；
+/// 两者最终都收口到同一个写点（`note_grants`），口径不会分叉。
+pub(crate) fn backfill_grants_from_logs(dir: &Path) {
+    let items = grant_writes_from_logs(logs::load_logs(dir));
+    if items.is_empty() {
+        return;
+    }
+    let _ = ledger::store(dir).note_grants(&items);
+}
+
+/// 签到日志 → 待补录的逐笔发放：只取**成功的**行、且确实记着到期时刻的。
+///
+/// 失败行本来就没有领取发生（`checkin::claim` 的失败分支把 `expires_at` 留空），
+/// 所以「成功」与「有日期」两道筛选各管各的，谁都不用替对方兜底。
+fn grant_writes_from_logs(rows: Vec<CheckinLog>) -> Vec<ledger::GrantWrite> {
+    rows.into_iter()
+        .filter(|l| l.success)
+        .filter_map(|l| {
+            let expires_ms = l.expires_at?;
+            Some(ledger::GrantWrite {
+                account_id: l.account_id,
+                pkg_key: crate::usage::KEY_ADDON.to_string(),
+                expires_ms,
+                credits: l.credit,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -1733,13 +1780,14 @@ mod tests {
         assert!(checkin_credit_readings(&accounts, &all).is_empty());
     }
 
-    /// 签到带回来的**发放凭据到期时刻**：只挑本次签到过的账号，且只挑真有那个值的。
+    /// 签到带回来的**发放凭据**：只挑本次签到过的账号，且只挑真有到期时刻的；
+    /// 金额一并带上（回放路径没有量 → `None`，台账照收）。
     ///
     /// 与上面那个函数同一套「只认本次签到」的规则 —— 拿没签到账号的旧记录去写台账，
-    /// 等于把**上一笔**积分的到期时间当成这一笔记进去（而它只认更晚的值，
-    /// 于是那一笔永远不会被纠正）。
+    /// 等于把**上一笔**积分的到期时间当成这一笔记进去（那会让逐笔明细里多出一条
+    /// 根本不是这轮发生的记录）。
     #[test]
-    fn checkin_grant_expiries_only_take_this_rounds_receipts() {
+    fn checkin_grant_writes_only_take_this_rounds_receipts() {
         const MS: i64 = 1_792_384_855_460; // 2026-10-19T04:40:55.460Z（实测凭据）
         let mut signed = acct_with_last("a1", "2026-09-19 13:16:49", Some(400.0));
         signed.last.as_mut().unwrap().expires_at = Some(MS);
@@ -1750,10 +1798,130 @@ mod tests {
         stale.last.as_mut().unwrap().expires_at = Some(1_700_000_000_000);
         let accounts = vec![signed, no_receipt, stale];
 
+        let got: Vec<(String, String, i64, Option<f64>)> =
+            checkin_grant_writes(&accounts, &["a1".to_string(), "a2".to_string()])
+                .into_iter()
+                .map(|g| (g.account_id, g.pkg_key, g.expires_ms, g.credits))
+                .collect();
         assert_eq!(
-            checkin_grant_expiries(&accounts, &["a1".to_string(), "a2".to_string()]),
-            vec![("a1".to_string(), crate::usage::KEY_ADDON.to_string(), MS)]
+            got,
+            vec![(
+                "a1".to_string(),
+                crate::usage::KEY_ADDON.to_string(),
+                MS,
+                Some(100.0)
+            )]
         );
-        assert!(checkin_grant_expiries(&accounts, &[]).is_empty());
+        assert!(checkin_grant_writes(&accounts, &[]).is_empty());
+    }
+
+    /// 启动补录的纯函数部分：日志 → 逐笔发放。成功、且带着日期的才补 ——
+    /// 逐笔记录上线之前的老行没有日期（补不出东西来），失败行压根没有领取发生。
+    #[test]
+    fn grant_backfill_takes_only_dated_successes_from_the_log() {
+        const MS: i64 = 1_792_460_000_000;
+        let row = |success: bool, expires_at: Option<i64>| CheckinLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_id: "a1".into(),
+            account_name: "甲".into(),
+            account_phone: None,
+            at: "2026-09-20 14:10:00".into(),
+            success,
+            already: false,
+            inactive: false,
+            message: String::new(),
+            credit: Some(100.0),
+            balance: Some(500.0),
+            campaign_key: Some("act-x".into()),
+            expires_at,
+        };
+        let got = grant_writes_from_logs(vec![
+            row(true, Some(MS)),
+            row(true, None),
+            row(false, Some(MS)),
+        ]);
+        let one: Vec<(String, String, i64, Option<f64>)> = got
+            .into_iter()
+            .map(|g| (g.account_id, g.pkg_key, g.expires_ms, g.credits))
+            .collect();
+        assert_eq!(
+            one,
+            vec![(
+                "a1".to_string(),
+                crate::usage::KEY_ADDON.to_string(),
+                MS,
+                Some(100.0)
+            )]
+        );
+    }
+
+    /// 真实数据**干跑**：拿本机那份 `checkin_logs.json` + `credit_ledger.json`
+    /// 在临时目录里演一遍启动补录 —— 只读本机数据，写的是临时目录，
+    /// 不碰正在运行的那个应用手里那份台账。
+    ///
+    /// 钉住的是这次改造的要点：补录之后聚合包（「附加额度」）的到期日变成
+    /// **最早一笔未过期的领取**（而不是台账里那个「最晚一笔」的标量），
+    /// 且逐笔明细与日志里的成功领取一一对应（同一天的回放只留一条）。
+    ///
+    /// 运行：`cargo test --lib -- --ignored --nocapture backfill_dry_run`
+    #[test]
+    #[ignore = "读本机真实数据（只读），写临时目录"]
+    fn backfill_dry_run_on_this_machines_real_data() {
+        use std::fs;
+        let live = dirs::data_dir()
+            .expect("应有系统数据目录")
+            .join("com.waxilo.qoder-assistant");
+        let tmp = std::env::temp_dir().join(format!("wba-dryrun-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        for f in ["checkin_logs.json", "credit_ledger.json"] {
+            let src = live.join(f);
+            if src.exists() {
+                fs::copy(&src, tmp.join(f)).unwrap();
+            }
+        }
+
+        // 补录前的投影（读的是拷贝过来的那份老台账）
+        let before = ledger::load_ledger(&tmp);
+        backfill_grants_from_logs(&tmp);
+        let store = ledger::store(&tmp);
+
+        let mut checked = 0;
+        for id in before.accts.keys() {
+            let Some(old) = ledger::fact(&before, id) else { continue };
+            let Some(new) = store.fact_of(id) else { continue };
+            for (o, n) in old.packages.iter().zip(new.packages.iter()) {
+                println!(
+                    "{id} 包 {}：剩余 {}｜过期 {:?} → {:?}｜逐笔 {:?}",
+                    n.name,
+                    n.remaining,
+                    o.expiry_ms,
+                    n.expiry_ms,
+                    n.grants
+                        .iter()
+                        .map(|g| (g.expires_ms, g.credits))
+                        .collect::<Vec<_>>()
+                );
+                if n.grants.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                // 逐笔列表自身：升序、无重复、都不早于此刻
+                let now = crate::timeutil::now_ms();
+                let ms: Vec<i64> = n.grants.iter().map(|g| g.expires_ms).collect();
+                let mut sorted = ms.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(ms, sorted, "逐笔必须升序且无重复");
+                assert!(ms.iter().all(|m| *m >= now), "过期的笔不该留下");
+                // 展示口径 = 最早一笔（而不是最晚一笔）
+                assert_eq!(n.expiry_ms, Some(ms[0]), "到期日要取最早一笔");
+                // 老台账那个标量是「最晚一笔」，所以新值只会更早或持平
+                if let Some(old_ms) = o.expiry_ms {
+                    assert!(ms[0] <= old_ms, "最早一笔不可能晚于旧口径");
+                }
+            }
+        }
+        println!("共校验 {checked} 个带逐笔明细的包");
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

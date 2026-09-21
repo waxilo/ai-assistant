@@ -25,7 +25,7 @@ export interface CheckinRecord {
    *
    * 来自领取接口发放凭据里的 `expiresAt` —— 已领取的账号靠**幂等回放**同样能拿到，
    * 所以「今日已领」不等于「拿不到到期时间」。它是「积分过期」列对免费号唯一的日期来源：
-   * `/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵（见 `ledger::note_grant_expiry`）。
+   * `/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵（见 `ledger::note_grant`）。
    */
   expires_at: number | null;
   at: string;
@@ -322,6 +322,20 @@ export interface CreditFact {
 }
 
 /**
+ * 一笔发放（签到领到的 100 Credits 那一下）的落账形态。
+ *
+ * 聚合包（「附加额度」把每天领的 100 分合并成一格）只有一个 `expiry_ms`，
+ * 而它是**最早一笔**的到期日；要回答「到底几笔、分别哪天到期」就得看这份明细。
+ * 前端只在资源包弹窗里展开它。
+ */
+export interface CreditGrant {
+  /** 这一笔自己的到期时刻（毫秒） */
+  expires_ms: number;
+  /** 这一笔实际发下来的量；凭据没给（回放路径常见）就是 null */
+  credits: number | null;
+}
+
+/**
  * 一个资源包的展示快照：名字 + 剩余积分 + 到期。
  *
  * 「到期」是**三态**，靠两个字段联用表示（不是冗余字段）：
@@ -331,6 +345,9 @@ export interface CreditFact {
  *
  * 后端在**解析响应时**就已经把哨兵归一掉了（`ledger::normalize_expiry`），
  * 所以这里永远收不到 9999 年的假日期；界面只需要把三态分别说清楚。
+ *
+ * `expiry_ms` 对聚合包是「**最早一笔**未过期的发放」的到期日（不是最晚那笔）——
+ * 那才是「快作废的积分」是什么时候，见 `CreditGrant`。
  */
 export interface CreditPackage {
   name: string;
@@ -340,6 +357,8 @@ export interface CreditPackage {
   expiry_ms: number | null;
   /** 服务端明说这个包不会过期 */
   never_expires: boolean;
+  /** 逐笔发放明细（只含还没过期的，升序）；老台账或纯接口采样来的包是空数组 */
+  grants: CreditGrant[];
 }
 
 /**
