@@ -59,6 +59,13 @@ export interface Account {
   id: string;
   name: string;
   phone: string | null;
+  /**
+   * 邮箱。与手机号是一对**展示标识**：国内版看手机号、国际版看邮箱
+   * （选哪一个见 `common.tsx` 的 `accountIdent`，与后端 `Account::identity` 同源）。
+   * 来源：本机登录文件的 `user.email`、登录时的 `/api/v1/userinfo`、
+   * 以及刷新时给老账号补一次的那个请求。null = 还没拿到。
+   */
+  email: string | null;
   token: string;
   /** 续签用的 refresh token（有它才能自动续期） */
   refresh_token: string | null;
@@ -175,6 +182,8 @@ export interface LocalAccount {
   uid: string | null;
   nickname: string | null;
   phone: string | null;
+  /** 邮箱（登录文件里的 `user.email`）；国际版账号的展示标识 */
+  email: string | null;
   /** access token 过期时间（毫秒时间戳） */
   expires_at: number | null;
   /** refresh token 过期时间（毫秒时间戳）；登录文件里没写就是 null */
@@ -222,6 +231,8 @@ export interface ImportItem {
   token: string;
   name?: string | null;
   phone?: string | null;
+  /** 邮箱（国际版账号的展示标识）；后端导入合并时与 token / 手机号同为识别键 */
+  email?: string | null;
   refresh_token?: string | null;
   expires_at?: number | null;
   rt_expires_at?: number | null;
@@ -293,6 +304,8 @@ export interface OAuthPoll {
   uid: string | null;
   nickname: string | null;
   phone: string | null;
+  /** 邮箱（`/api/v1/userinfo` 的 `email`）；国际版账号的展示标识 */
+  email: string | null;
   /** access token 过期时间（毫秒时间戳） */
   expires_at: number | null;
   /** refresh token 过期时间（毫秒时间戳）；授权响应没给就是 null */
@@ -382,6 +395,8 @@ export interface CheckinLog {
   account_id: string;
   account_name: string;
   account_phone: string | null;
+  /** 邮箱（国际版账号的展示标识）；老日志没有这个字段就是 null */
+  account_email: string | null;
   at: string;
   success: boolean;
   already: boolean;
@@ -524,6 +539,8 @@ export interface BriefAccount {
   account_id: string;
   name: string;
   phone: string | null;
+  /** 邮箱（国际版账号的展示标识） */
+  email: string | null;
   consumed: number;
   gained: number;
   /** 读数时刻的剩余积分（取不到为 null —— 不谎报 0） */

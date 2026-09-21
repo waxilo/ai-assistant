@@ -130,6 +130,9 @@ pub struct OAuthPoll {
     pub uid: Option<String>,
     pub nickname: Option<String>,
     pub phone: Option<String>,
+    /// 邮箱（`/api/v1/userinfo` 的 `email`）。国际版账号认的就是它
+    /// —— 国内版的那套按手机号登录，邮箱常为空。
+    pub email: Option<String>,
     /// access token 过期时间（毫秒时间戳）
     pub expires_at: Option<i64>,
     /// refresh token 过期时间（毫秒时间戳）；授权响应给了才有
@@ -147,6 +150,7 @@ impl OAuthPoll {
             uid: None,
             nickname: None,
             phone: None,
+            email: None,
             expires_at: None,
             rt_expires_at: None,
             error: None,
@@ -346,7 +350,7 @@ pub(crate) fn parse_poll_response(v: &Value, now_ms: i64) -> Option<TokenReady> 
     })
 }
 
-/// 从 `/api/v1/userinfo` 响应里取 uid / 昵称 / 手机号（失败不致命）。
+/// 从 `/api/v1/userinfo` 响应里取 uid / 昵称 / 手机号 / 邮箱（失败不致命）。
 ///
 /// # 手机号就在这个响应里，字段叫 `security_mobile`
 ///
@@ -357,9 +361,22 @@ pub(crate) fn parse_poll_response(v: &Value, now_ms: i64) -> Option<TokenReady> 
 /// 身份锚点是「手机号 → 昵称 → 本地 id」）都拿它当第一顺位，于是一个本该最稳的锚点
 /// 直接退化成昵称。
 ///
+/// # 邮箱也在同一个响应里，字段叫 `email`
+///
+/// 两套部署的登录身份不同：国内版手机号、国际版邮箱（实测响应见
+/// `basedata/20260918_Qoder缺失接口逆向.md`，两个字段同框）。这里一次取全，
+/// 免得再为邮箱单开一趟请求 —— 界面按区域选一个展示（见前端 `accountIdent`）。
+///
 /// 只认官方那**一个**键：这里不是「猜服务端可能叫什么」，而是抄官方实现，
 /// 多列几个近义词反而会让「字段真的改名了」这件事被静默掩盖。
-pub(crate) fn parse_userinfo(v: &Value) -> (Option<String>, Option<String>, Option<String>) {
+pub(crate) struct UserInfo {
+    pub uid: Option<String>,
+    pub name: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}
+
+pub(crate) fn parse_userinfo(v: &Value) -> UserInfo {
     let pick = |keys: &[&str]| -> Option<String> {
         keys.iter()
             .find_map(|k| v.get(*k))
@@ -368,10 +385,12 @@ pub(crate) fn parse_userinfo(v: &Value) -> (Option<String>, Option<String>, Opti
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let uid = pick(&["id", "user_id", "uid"]);
-    let name = pick(&["name", "username", "user_name"]);
-    let phone = pick(&["security_mobile"]);
-    (uid, name, phone)
+    UserInfo {
+        uid: pick(&["id", "user_id", "uid"]),
+        name: pick(&["name", "username", "user_name"]),
+        phone: pick(&["security_mobile"]),
+        email: pick(&["email"]),
+    }
 }
 
 /// 第一步：生成 PKCE 材料并给出授权地址。
@@ -468,22 +487,27 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         return Ok(OAuthPoll::waiting());
     };
 
-    // 拿到 token 后取账号信息：失败不致命（token 已经到手，只是少了昵称与手机号）
-    let (uid, nickname, phone) =
-        match qoder_api::get_json(region, &ready.token, "/api/v1/userinfo", &[]).await {
-            Some(v) => parse_userinfo(&v),
-            None => (None, None, None),
-        };
+    // 拿到 token 后取账号信息：失败不致命（token 已经到手，只是少了几样标识）
+    let info = match qoder_api::get_json(region, &ready.token, "/api/v1/userinfo", &[]).await {
+        Some(v) => parse_userinfo(&v),
+        None => UserInfo {
+            uid: None,
+            name: None,
+            phone: None,
+            email: None,
+        },
+    };
 
     let result = OAuthPoll {
         done: true,
         token: Some(ready.token),
         refresh_token: ready.refresh_token,
-        uid,
-        nickname,
-        // 手机号来自同一个响应的 `security_mobile`（见 [`parse_userinfo`]）。
-        // 取不到就是取不到：不拿 uid / 昵称去凑一个「看起来像手机号」的值。
-        phone,
+        uid: info.uid,
+        nickname: info.name,
+        // 手机号 / 邮箱来自同一个响应（`security_mobile` 与 `email`，见 [`parse_userinfo`]）。
+        // 取不到就是取不到：不拿 uid / 昵称去凑一个「看起来像」的值。
+        phone: info.phone,
+        email: info.email,
         expires_at: ready.expires_at,
         rt_expires_at: ready.rt_expires_at,
         error: None,
@@ -657,22 +681,45 @@ mod tests {
     fn parses_userinfo_with_field_fallbacks() {
         // 这段是从实测响应抄来的，原始的 id / name / email / 手机号是**真实账号数据**，
         // 一律替换成占位值（uuid 尾部清零，与 `usage.rs` 的脱敏写法保持一致）。
-        let (uid, name, phone) = parse_userinfo(&json!({
+        let info = parse_userinfo(&json!({
             "id": "01a0b380-0000-0000-0000-000000000000",
             "name": "Example User",
             "email": "user@example.com",
             "security_mobile": "13800000000"
         }));
-        assert_eq!(uid.as_deref(), Some("01a0b380-0000-0000-0000-000000000000"));
-        assert_eq!(name.as_deref(), Some("Example User"));
-        assert_eq!(phone.as_deref(), Some("13800000000"));
+        assert_eq!(info.uid.as_deref(), Some("01a0b380-0000-0000-0000-000000000000"));
+        assert_eq!(info.name.as_deref(), Some("Example User"));
+        assert_eq!(info.phone.as_deref(), Some("13800000000"));
+        assert_eq!(info.email.as_deref(), Some("user@example.com"));
         // 只有 username 时也要能取到
-        let (uid, name, _) = parse_userinfo(&json!({"user_id": "u1", "username": "nick"}));
-        assert_eq!(uid.as_deref(), Some("u1"));
-        assert_eq!(name.as_deref(), Some("nick"));
+        let info = parse_userinfo(&json!({"user_id": "u1", "username": "nick"}));
+        assert_eq!(info.uid.as_deref(), Some("u1"));
+        assert_eq!(info.name.as_deref(), Some("nick"));
+        assert!(info.email.is_none());
         // 空对象不 panic，也不编造
-        let (uid, name, phone) = parse_userinfo(&json!({}));
-        assert!(uid.is_none() && name.is_none() && phone.is_none());
+        let info = parse_userinfo(&json!({}));
+        assert!(info.uid.is_none() && info.name.is_none());
+        assert!(info.phone.is_none() && info.email.is_none());
+    }
+
+    /// 邮箱字段的边界：只认 `email`，空白值不算数（与手机号同一条规矩）。
+    ///
+    /// 国际版账号的展示身份就是它 —— 落成 `Some("")` 会在界面上显示一个空格子，
+    /// 也会让「有身份标识」的判分（去重时用）把一条没用的记录算成完整的。
+    #[test]
+    fn email_comes_from_the_email_key_only_and_blank_is_none() {
+        let info = parse_userinfo(&json!({"email": " user@example.com "}));
+        assert_eq!(info.email.as_deref(), Some("user@example.com"), "两侧空白要剪掉");
+        for v in [
+            json!({"email": ""}),
+            json!({"email": "   "}),
+            json!({"mail": "user@example.com"}),
+            json!({"user_email": "user@example.com"}),
+            json!({"email": null}),
+        ] {
+            let info = parse_userinfo(&v);
+            assert!(info.email.is_none(), "不该把 {v} 认成邮箱");
+        }
     }
 
     /// 手机号字段的边界：只认官方那个键，且空白值不算数。
@@ -682,8 +729,8 @@ mod tests {
     /// （界面上会显示一个空格子，而合并键会把它当成一个真实身份）。
     #[test]
     fn phone_comes_from_security_mobile_only_and_blank_is_none() {
-        let (_, _, phone) = parse_userinfo(&json!({"security_mobile": " 13800000000 "}));
-        assert_eq!(phone.as_deref(), Some("13800000000"), "两侧空白要剪掉");
+        let info = parse_userinfo(&json!({"security_mobile": " 13800000000 "}));
+        assert_eq!(info.phone.as_deref(), Some("13800000000"), "两侧空白要剪掉");
         for v in [
             json!({"security_mobile": ""}),
             json!({"security_mobile": "   "}),
@@ -692,8 +739,8 @@ mod tests {
             json!({"security_mobile": null}),
             json!({"security_mobile": 13800000000i64}),
         ] {
-            let (_, _, phone) = parse_userinfo(&v);
-            assert!(phone.is_none(), "不该把 {v} 认成手机号");
+            let info = parse_userinfo(&v);
+            assert!(info.phone.is_none(), "不该把 {v} 认成手机号");
         }
     }
 

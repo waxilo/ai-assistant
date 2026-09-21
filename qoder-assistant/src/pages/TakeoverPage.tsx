@@ -10,7 +10,7 @@ import {
   freeModels,
   openAppManagement,
 } from "../api";
-import { AccountCell } from "../common";
+import { AccountCell, accountIdent } from "../common";
 import { regionLabel, useRegions } from "../regions";
 import type { ConfirmReq, Toast } from "../common";
 import { IconBolt, IconInfo, IconUser } from "../components/Icons";
@@ -509,13 +509,15 @@ export function TakeoverPage({
     return out;
   }, [events]);
 
-  /** 弹框内按用户名 / 手机号过滤（范围内本来就只有本区域的账号） */
+  /** 弹框内按用户名 / 手机号 / 邮箱过滤（范围内本来就只有本区域的账号） */
   const filteredAccounts = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return regionAccounts;
     return regionAccounts.filter(
       (a) =>
-        a.name.toLowerCase().includes(q) || (a.phone ?? "").includes(q)
+        a.name.toLowerCase().includes(q) ||
+        (a.phone ?? "").includes(q) ||
+        (a.email ?? "").toLowerCase().includes(q)
     );
   }, [regionAccounts, query]);
 
@@ -785,9 +787,12 @@ export function TakeoverPage({
                       onChange={() => toggleDraft(a.id)}
                       onClick={(e) => e.stopPropagation()}
                     />
-                    {/* 用全应用统一的账号单元格（头像 + 名称 + 手机号）——
+                    {/* 用全应用统一的账号单元格（头像 + 名称 + 展示标识）——
                         此前这里是手拼的两段文字，与表格里的账号列长得不一样 */}
-                    <AccountCell name={a.name} phone={a.phone} />
+                    <AccountCell
+                      name={a.name}
+                      ident={accountIdent(a.region, a.phone, a.email)}
+                    />
                     <span className="pick-tail">
                       <span className="pick-state">
                         {picked ? "可扣费" : "已排除"}

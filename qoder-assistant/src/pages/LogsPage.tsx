@@ -5,6 +5,7 @@ import {
   AccountCell,
   EmptyState,
   StatusDot,
+  accountIdent,
   accountLabel,
   expiryInfo,
   formatCredits,
@@ -73,7 +74,7 @@ export function LogsPage({
     const ok = await askConfirm({
       title: "清空日志",
       body: acc
-        ? `确认清空「${accountLabel(acc.name, acc.phone)}」的全部签到日志？`
+        ? `确认清空「${accountLabel(acc.name, accountIdent(acc.region, acc.phone, acc.email))}」的全部签到日志？`
         : "确认清空当前区域全部账号的签到日志？",
       okText: "清空",
       danger: true,
@@ -102,7 +103,7 @@ export function LogsPage({
             <option value="">全部账号</option>
             {regionAccounts.map((a) => (
               <option key={a.id} value={a.id}>
-                {accountLabel(a.name, a.phone)}
+                {accountLabel(a.name, accountIdent(a.region, a.phone, a.email))}
               </option>
             ))}
           </select>
@@ -149,7 +150,12 @@ export function LogsPage({
                 return (
                   <tr key={l.id}>
                     <td>
-                      <AccountCell name={l.account_name} phone={l.account_phone} />
+                      {/* 区域取自当前筛选（这页按区域过滤过，可见行的账号必属该区域）；
+                          没读到 settings 时 region 为 null ⇒ 退回手机号优先的展示 */}
+                      <AccountCell
+                        name={l.account_name}
+                        ident={accountIdent(region, l.account_phone, l.account_email)}
+                      />
                     </td>
                     <td>
                       <StatusDot tone={st.tone} label={st.label} />

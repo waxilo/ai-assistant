@@ -129,9 +129,9 @@
   .data-table tbody td {
     padding: 12px;
   }
-  /* 账号名与手机号在窄列里改为可省略：它们不参与布局决策，不该把表格撑宽 */
+  /* 账号名与展示标识在窄列里改为可省略：它们不参与布局决策，不该把表格撑宽 */
   .ac-name,
-  .ac-phone {
+  .ac-ident {
     overflow: hidden;
     text-overflow: ellipsis;
   }

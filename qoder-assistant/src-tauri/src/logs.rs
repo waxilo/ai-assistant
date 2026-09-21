@@ -15,6 +15,10 @@ pub struct CheckinLog {
     /// 账号手机号（展示用，可空）
     #[serde(default)]
     pub account_phone: Option<String>,
+    /// 账号邮箱（展示用，可空）。与手机号一样是「这个人的标识」——
+    /// 国内版看手机号、国际版看邮箱，日志页与账号页因此长得一样。
+    #[serde(default)]
+    pub account_email: Option<String>,
     pub at: String,
     pub success: bool,
     pub already: bool,
@@ -91,6 +95,7 @@ pub fn log_from_record(account: &Account, rec: &CheckinRecord) -> CheckinLog {
         account_id: account.id.clone(),
         account_name: account.name.clone(),
         account_phone: account.phone.clone(),
+        account_email: account.email.clone(),
         at: rec.at.clone(),
         success: rec.success,
         already: rec.already,

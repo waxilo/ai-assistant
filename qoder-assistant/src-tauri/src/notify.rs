@@ -169,8 +169,10 @@ pub fn summary_message(views: &[AccountView]) -> String {
     if !failed.is_empty() {
         s.push_str("\n失败明细：");
         for a in failed.iter().take(5) {
-            let who = match a.phone.as_deref().filter(|p| !p.is_empty()) {
-                Some(p) => format!("{}（{}）", a.name, p),
+            // 展示标识与界面同一套规则（国内版手机号 / 国际版邮箱，见 `Account::identity`）：
+            // 推送里的「谁失败了」与界面上看到的名字必须是同一条
+            let who = match a.identity() {
+                Some(id) => format!("{}（{}）", a.name, id),
                 None => a.name.clone(),
             };
             let why = a
@@ -203,6 +205,7 @@ mod tests {
                 id: name.to_string(),
                 name: name.to_string(),
                 phone: phone.map(|p| p.to_string()),
+                email: None,
                 token: "t".into(),
                 refresh_token: None,
                 expires_at: None,
@@ -353,6 +356,16 @@ mod tests {
         assert!(m.contains("小号（138****0000）：HTTP 401 (token expired)"), "{m}");
         // last 为 None 的账号算失败，原因写「未执行」
         assert!(m.contains("无记录：未执行"), "{m}");
+    }
+
+    /// 国际版账号的展示标识是邮箱：手机号为空的失败账号不能再退回「只有名字」，
+    /// 那会让多条失败记录在推送里长得一模一样、分不出是谁
+    #[test]
+    fn a_global_failure_is_named_by_its_email() {
+        let mut a = acct("小号", None, Some(rec(false, false, false, "HTTP 401 (token expired)")));
+        a.account.email = Some("a@b.c".into());
+        let m = summary_message(&[a]);
+        assert!(m.contains("小号（a@b.c）"), "{m}");
     }
 
     /// 随机窗口把「设定」与「今天真正的时刻」拉开了，通知里必须两个都写出来。

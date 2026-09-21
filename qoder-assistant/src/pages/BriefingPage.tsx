@@ -8,7 +8,7 @@ import {
   enableCreditBriefing,
   saveSettings,
 } from "../api";
-import { AccountCell, EmptyState, formatCredits } from "../common";
+import { AccountCell, EmptyState, accountIdent, formatCredits } from "../common";
 import { latestAt, totalCredits, useCredits } from "../credits";
 import type { ConfirmReq, Toast } from "../common";
 import { Dialog } from "../components/Dialog";
@@ -52,7 +52,7 @@ function projectRegionDays(days: DayEntry[], ids: Set<string>): DayEntry[] {
       for (const a of h.accounts) {
         const acc =
           byId.get(a.account_id) ??
-          ({ account_id: a.account_id, name: a.name, phone: a.phone, consumed: 0, gained: 0, balance: null } as BriefAccount);
+          ({ account_id: a.account_id, name: a.name, phone: a.phone, email: a.email, consumed: 0, gained: 0, balance: null } as BriefAccount);
         acc.consumed += a.consumed;
         acc.gained += a.gained;
         if (a.balance != null) acc.balance = a.balance;
@@ -384,7 +384,9 @@ export function BriefingPage({
         </>
       )}
 
-      {hour && <HourDialog entry={hour} onClose={() => setHour(null)} />}
+      {hour && (
+        <HourDialog entry={hour} region={region} onClose={() => setHour(null)} />
+      )}
     </section>
   );
 }
@@ -459,9 +461,13 @@ function DayHours({
  */
 function HourDialog({
   entry,
+  region,
   onClose,
 }: {
   entry: HourEntry;
+  /** 当前区域：弹窗里的账号已经过 `projectRegionDays` 过滤，全部属于它 ——
+   *  展示标识（手机号 / 邮箱）按它选，见 [`accountIdent`] */
+  region: string;
   onClose: () => void;
 }) {
   // 覆盖到下一个整点：`23` 的后一小时写成 `00:00`，别显示成 `24:00`
@@ -544,7 +550,10 @@ function HourDialog({
             {entry.accounts.map((a) => (
               <tr key={a.account_id}>
                 <td>
-                  <AccountCell name={a.name} phone={a.phone} />
+                  <AccountCell
+                    name={a.name}
+                    ident={accountIdent(region, a.phone, a.email)}
+                  />
                 </td>
                 <td className="num">
                   {a.consumed > 0 ? (

@@ -652,6 +652,7 @@ mod tests {
             id: "a1".into(),
             name: "甲".into(),
             phone: None,
+            email: None,
             token: "t".into(),
             refresh_token: None,
             expires_at: None,

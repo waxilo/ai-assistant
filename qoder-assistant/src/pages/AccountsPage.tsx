@@ -4,6 +4,7 @@ import {
   AccountCell,
   EmptyState,
   StatusDot,
+  accountIdent,
   copyText,
   formatCredits,
   packageExpiry,
@@ -200,7 +201,7 @@ export function AccountsPage({
                   <td>
                     <AccountCell
                       name={a.name}
-                      phone={a.phone}
+                      ident={accountIdent(a.region, a.phone, a.email)}
                       region={a.region}
                     />
                   </td>

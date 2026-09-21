@@ -13,7 +13,7 @@ import {
   oauthStart,
   openExternal,
 } from "../api";
-import { baseName, copyText, maskPhone, maskToken } from "../common";
+import { accountIdent, baseName, copyText, maskPhone, maskToken } from "../common";
 import { regionLabel, useRegions } from "../regions";
 import type { Toast } from "../common";
 import { Dialog } from "./Dialog";
@@ -41,7 +41,7 @@ import {
  * 「导入本机账号」：直接读 Qoder 写在本机的凭据文件（`auth.v1.dat`，Chromium safeStorage 加密）。
  *
  * 这是最省事的一条路——不需要 Qoder 正在运行、不用改启动方式，
- * 而且一次就能拿到 token + 昵称 + 手机号（导入时自动带上手机号）。
+ * 而且一次就能拿到 token + 昵称 + 手机号 / 邮箱（导入时一并带上）。
  * 代价是它只能拿到**已经在本机登录过**的账号；要收新账号请用「登录新账号」。
  *
  * 两套部署的目录都会扫（`com.qoder.app.stable` / `com.qodercn.app.stable`），
@@ -89,9 +89,10 @@ export function LocalAccountsModal({
     void scan();
   }, [scan]);
 
-  // 「已添加」的判据必须与后端的合并键一致：**区域 + token**。
-  // 只看 token 会在极端情况下把另一个区域里的凭据也算成「已添加」——
-  // 而两套部署签发的 token 本来就互不相通，区域是这条凭据的一半身份。
+  // 「已添加」的判据是**区域 + token**：只看 token 会在极端情况下把另一个区域里的
+  // 凭据也算成「已添加」—— 而两套部署签发的 token 本来就互不相通，区域是这条凭据的一半身份。
+  // 这里故意不做手机号 / 邮箱匹配（后端合并会认）：本机文件里的 token 一旦轮换过，
+  // 那条正是需要导进来刷新凭证的，判成「已添加」反而把该做的事挡在了门外。
   const addedKeys = useMemo(
     () => new Set(accounts.map((a) => `${a.region}\n${a.token}`)),
     [accounts]
@@ -116,6 +117,9 @@ export function LocalAccountsModal({
     token: d.token,
     name: d.nickname || d.phone,
     phone: d.phone,
+    // 邮箱与手机号同为识别键（国内版看手机号、国际版看邮箱），带着它导入才能
+    // 让「token 已轮换、手机号/邮箱没变」的账号并到同一条上，而不是新增一条
+    email: d.email,
     // 不带这三个字段的话，导入的账号永远无法自动续签（前两个换来新 token，
     // 第三个让界面能显示「续签链还能撑多久」）
     refresh_token: d.refresh_token,
@@ -184,7 +188,7 @@ export function LocalAccountsModal({
           Qoder 登录后会把账号与凭证写到本机的 <code>auth.v1.dat</code>（Chromium safeStorage
           加密；macOS 的密钥在系统钥匙串里，首次读取若弹出授权，点「始终允许」以后就不再问）。
           这里直接读取它，<b>只扫「当前区域」那个目录</b>（跟随左下角的区域选择器）；
-          <b>不需要 Qoder 正在运行，也不用改启动方式</b>，而且能一次拿到昵称与手机号。
+          <b>不需要 Qoder 正在运行，也不用改启动方式</b>，而且能一次拿到昵称与手机号 / 邮箱。
           仅读取、不外传。另一区域的账号切到左下角再看。
         </span>
       </p>
@@ -220,6 +224,8 @@ export function LocalAccountsModal({
           {visible.map((d) => {
             const added = isAdded(d);
             const rg = regionLabel(regionOpts, d.region);
+            // 展示标识按区域选（国内版手机号 / 国际版邮箱）：与导入后账号页看到的是同一个
+            const ident = accountIdent(d.region, d.phone, d.email);
             return (
               <li
                 key={d.file}
@@ -228,8 +234,8 @@ export function LocalAccountsModal({
                 <div className="pick-main">
                   <div className="pick-name">
                     {d.nickname || d.uid?.slice(0, 8) || "未命名账号"}
-                    {d.phone && (
-                      <span className="ac-phone">{maskPhone(d.phone)}</span>
+                    {ident && (
+                      <span className="ac-ident">{maskPhone(ident)}</span>
                     )}
                     {/* 这条凭据来自哪套部署：两个目录都会扫到，不标出来就分不清 */}
                     {rg && <span className="ac-region">{rg}</span>}
@@ -358,6 +364,10 @@ function OAuthPanel({
   const regionOpts = useRegions();
   const region = defaultRegion ?? regionOpts[0]?.key ?? "";
   const selLabel = regionLabel(regionOpts, region);
+  // 授权成功那条预览的展示标识（国内版手机号 / 国际版邮箱）：按本轮**实际**授权的区域选
+  const doneIdent = result
+    ? accountIdent(sessionRegion || region, result.phone, result.email)
+    : null;
 
   const timer = useRef<number | null>(null);
   const busy = useRef(false);
@@ -463,6 +473,9 @@ function OAuthPanel({
                     token: result.token as string,
                     name: result.nickname || result.phone,
                     phone: result.phone,
+                    // 邮箱与手机号同为识别键；登录接口一并返回，带上它导入才能
+                    // 让轮换过 token 的同一个人并到既有账号上（见 merge_import）
+                    email: result.email,
                     refresh_token: result.refresh_token,
                     expires_at: result.expires_at,
                     rt_expires_at: result.rt_expires_at,
@@ -552,8 +565,8 @@ function OAuthPanel({
           <div className="pick-main">
             <div className="pick-name">
               {result.nickname || result.uid?.slice(0, 8) || "新账号"}
-              {result.phone && (
-                <span className="ac-phone">{maskPhone(result.phone)}</span>
+              {doneIdent && (
+                <span className="ac-ident">{maskPhone(doneIdent)}</span>
               )}
               {regionLabel(regionOpts, sessionRegion) && (
                 <span className="ac-region">

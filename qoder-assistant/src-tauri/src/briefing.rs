@@ -52,6 +52,9 @@ pub struct BriefAccount {
     pub name: String,
     #[serde(default)]
     pub phone: Option<String>,
+    /// 邮箱（展示用标识；国际版账号看它，见 `accounts::Account::identity`）
+    #[serde(default)]
+    pub email: Option<String>,
     /// 这一小时（日条目里是这一天）的消耗
     pub consumed: f64,
     /// 这一小时（日条目里是这一天）的新增
@@ -212,6 +215,7 @@ fn build_entry(
             account_id: a.id.clone(),
             name: a.name.clone(),
             phone: a.phone.clone(),
+            email: a.email.clone(),
             consumed: ledger::round2(c),
             gained: ledger::round2(g),
             balance: balance.map(ledger::round2),
@@ -310,6 +314,7 @@ pub fn day_entries(hours: &[HourEntry], today: &str) -> Vec<DayEntry> {
                         account_id: a.account_id.clone(),
                         name: a.name.clone(),
                         phone: a.phone.clone(),
+                        email: a.email.clone(),
                         consumed: 0.0,
                         gained: 0.0,
                         balance: None,
@@ -319,12 +324,16 @@ pub fn day_entries(hours: &[HourEntry], today: &str) -> Vec<DayEntry> {
                     if a.balance.is_some() {
                         row.balance = a.balance;
                     }
-                    // 昵称中途改过时以最新一条为准；手机号同理（可能后来才补上）
+                    // 昵称中途改过时以最新一条为准；手机号 / 邮箱同理
+                    // （老账号是刷新时才补上的，早几小时的条目里可能还空着）
                     if !a.name.is_empty() {
                         row.name = a.name.clone();
                     }
                     if a.phone.is_some() {
                         row.phone = a.phone.clone();
+                    }
+                    if a.email.is_some() {
+                        row.email = a.email.clone();
                     }
                 }
             }
@@ -474,6 +483,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             phone: None,
+            email: None,
             token: "t".into(),
             refresh_token: None,
             expires_at: None,
@@ -493,6 +503,7 @@ mod tests {
                 account_id: (*id).into(),
                 name: (*id).to_string(),
                 phone: None,
+                email: None,
                 consumed: *c,
                 gained: *g,
                 balance: Some(1000.0),
@@ -821,6 +832,7 @@ mod tests {
                     account_id: "a".into(),
                     name: "甲".into(),
                     phone: None,
+                    email: None,
                     consumed: 12.5,
                     gained: 100.0,
                     balance: Some(1.0),
@@ -829,6 +841,7 @@ mod tests {
                     account_id: "b".into(),
                     name: "乙".into(),
                     phone: None,
+                    email: None,
                     consumed: 0.0,
                     gained: 0.0,
                     balance: Some(1.0),

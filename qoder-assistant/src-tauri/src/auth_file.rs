@@ -119,6 +119,9 @@ pub struct LocalAccount {
     pub uid: Option<String>,
     pub nickname: Option<String>,
     pub phone: Option<String>,
+    /// 邮箱（展示用标识）。**国际版账号认的就是它** —— 那套部署按邮箱登录，
+    /// 登录文件里的 `user.phone` 常为空，没了邮箱就只剩昵称可认。
+    pub email: Option<String>,
     /// access token 过期时间（毫秒时间戳）
     pub expires_at: Option<i64>,
     /// refresh token 过期时间（毫秒时间戳）
@@ -462,6 +465,7 @@ fn parse_credentials(region: Region, path: &Path, json: &Value) -> Option<LocalA
         uid: str_at(json, &["user", "id"]),
         nickname: str_at(json, &["user", "name"]).or_else(|| str_at(json, &["user", "username"])),
         phone: str_at(json, &["user", "phone"]).or_else(|| str_at(json, &["phone"])),
+        email: str_at(json, &["user", "email"]).or_else(|| str_at(json, &["email"])),
         // 有效期是 **ISO-8601 字符串**（实测 `"2026-10-18T07:51:53Z"`），不是毫秒数 ——
         // 这里必须走统一的时间戳归一化，否则 `parse::<i64>()` 静默失败、有效期变成 None。
         // `now_ms` 传 0：这两个字段是绝对时间，不涉及相对秒数换算。
@@ -781,6 +785,7 @@ mod tests {
         assert_eq!(acc.uid.as_deref(), Some("u-1"));
         assert_eq!(acc.nickname.as_deref(), Some("waxilo"));
         assert_eq!(acc.phone.as_deref(), Some("13800000000"));
+        assert_eq!(acc.email.as_deref(), Some("a@b.c"));
         assert_eq!(acc.expires_at, Some(1800000000000));
         assert_eq!(acc.rt_expires_at, Some(1700000000000));
         assert_eq!(acc.refresh_token.as_deref(), Some("rt"));

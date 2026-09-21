@@ -145,21 +145,29 @@ pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, St
     Ok(true)
 }
 
-/// 账号缺手机号时补一次（**只补空，绝不覆盖**）。
+/// 账号缺身份标识时补一次（**只补空，绝不覆盖**）。
 ///
 /// 为什么需要它：旧版认为 `/api/v1/userinfo` 不含手机号，于是「登录新账号」进来的账号
-/// 手机号恒空（更正见 `oauth::parse_userinfo`）。而手机号是跨机合并（`broker` 的身份锚点
-/// 第一顺位）与界面展示都要的东西，缺了就只能按昵称认人 —— 昵称是会改的。
-/// 新登录的账号现在登录那一刻就带手机号，这个函数是给**升级上来的老账号**补的。
+/// 手机号恒空（更正见 `oauth::parse_userinfo`）；邮箱更是从没解析过。而这两样正是
+/// 「认得出这是谁」的东西 —— 国内版看手机号、国际版看邮箱（见 [`Account::identity`]），
+/// 手机号还是跨机合并（`broker` 的身份锚点第一顺位）要的。缺了就只能按昵称认人，
+/// 而昵称是会改的。新登录的账号现在登录那一刻就带全，这个函数是给**升级上来的老账号**补的。
 ///
 /// 三条边界：
-/// - **只在为空时打这一下**：有值就不动（那个值可能正是云端合并键在用的）；
+/// - **这个区域的身份标识已经有值就不打这一下**：有值就不动（那个值可能正是云端
+///   合并键在用的）。判据按区域算而不是「两样都缺才打」—— 国际版账号的手机号
+///   本来就是空的，按后者会让每次刷新都白发一趟请求；
 /// - **失败静默**：拿不到就保持原样，绝不写入空串或占位；
-/// - **与续签各管各的**：它只认 `security_mobile`。
+/// - **只认响应里那两个键**（`security_mobile` / `email`），取不到不编。
 ///
 /// 返回值约定与 [`ensure_fresh_token`] 一致：`Ok(true)` = 账号字段有更新，调用方需落盘。
-pub(crate) async fn fill_phone_if_missing(account: &mut Account) -> Result<bool, String> {
-    if account.phone.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+pub(crate) async fn fill_identity_if_missing(account: &mut Account) -> Result<bool, String> {
+    let has = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let missing = match account.region {
+        Region::Cn => !has(&account.phone),
+        Region::Global => !has(&account.email),
+    };
+    if !missing {
         return Ok(false);
     }
     let Some(v) =
@@ -167,13 +175,22 @@ pub(crate) async fn fill_phone_if_missing(account: &mut Account) -> Result<bool,
     else {
         return Ok(false);
     };
-    match oauth::parse_userinfo(&v) {
-        (_, _, Some(phone)) => {
-            account.phone = Some(phone);
-            Ok(true)
+    let info = oauth::parse_userinfo(&v);
+    let mut changed = false;
+    // 一次响应两样都收：国内版账号绑了邮箱、或国际版账号绑了手机号时，顺手一起补上
+    if !has(&account.phone) {
+        if let Some(p) = info.phone {
+            account.phone = Some(p);
+            changed = true;
         }
-        _ => Ok(false),
     }
+    if !has(&account.email) {
+        if let Some(e) = info.email {
+            account.email = Some(e);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// 绑定凭证池时先整池同步一轮再让调用方去读账号（区域 = 当前选中的区域）。
@@ -272,6 +289,9 @@ pub struct ImportItem {
     pub name: Option<String>,
     #[serde(default)]
     pub phone: Option<String>,
+    /// 邮箱（国际版账号的展示身份，来源与手机号同一批）
+    #[serde(default)]
+    pub email: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
@@ -290,8 +310,10 @@ pub struct ImportReport {
 
 /// 批量导入账号：已存在的账号**合并补全**而不是跳过。
 ///
-/// 识别规则：**同一区域**内，手机号相同或 token 相同即视为同一账号
-/// （token 会轮换，手机号更稳定）。
+/// 识别规则：**同一区域**内，token / 手机号 / 邮箱任一相同即视为同一账号。
+/// 三样都认的理由是它们各自的失效窗口不同：token 会轮换；手机号是导入后才补上的；
+/// 而邮箱是国际版账号唯一天然的身份标识 —— 只认前两样的话，一个国际版账号在
+/// 客户端轮换 token 之后重新导入就会**变成第二条记录**（它没有手机号可匹配）。
 ///
 /// 区域必须先相等：同一个手机号在两套部署里是**两个不同的账号**（两套后端、两份
 /// token、各自的活动权益）。只按手机号匹配，会把国内版那条合并进国际版记录里 ——
@@ -342,11 +364,18 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let email = it
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let region = it.region;
         let found = accounts.iter_mut().find(|a| {
             a.region == region
                 && (a.token == token
-                    || phone.is_some() && a.phone.as_deref() == phone.as_deref())
+                    || phone.is_some() && a.phone.as_deref() == phone.as_deref()
+                    || email.is_some() && a.email.as_deref() == email.as_deref())
         });
         match found {
             Some(a) => {
@@ -364,6 +393,9 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                 }
                 if phone.is_some() {
                     a.phone = phone;
+                }
+                if email.is_some() {
+                    a.email = email;
                 }
                 if a.name.trim().is_empty() {
                     if let Some(n) = it.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -389,6 +421,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     phone,
+                    email,
                     region,
                     token,
                     refresh_token: it.refresh_token.filter(|s| !s.trim().is_empty()),
@@ -420,6 +453,7 @@ mod import_tests {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             phone: phone.map(str::to_string),
+            email: None,
             token: token.into(),
             refresh_token: None,
             expires_at: None,
@@ -442,6 +476,7 @@ mod import_tests {
             token: token.into(),
             name: None,
             phone: phone.map(str::to_string),
+            email: None,
             refresh_token: Some("rt-new".into()),
             expires_at: Some(123456),
             rt_expires_at: Some(234567),
@@ -464,6 +499,40 @@ mod import_tests {
         assert_eq!(a.expires_at, Some(123456));
         assert_eq!(a.rt_expires_at, Some(234567), "refresh token 的有效期也要落库");
         assert_eq!(a.name, "waxiloao", "已有名字不应被覆盖");
+    }
+
+    /// 国际版账号只认邮箱：客户端轮换 token 之后重新导入必须并进同一条，
+    /// 而不是多出一个「同一个人」—— 它没有手机号可匹配，邮箱是唯一的身份线索。
+    #[test]
+    fn a_rotated_token_still_merges_by_email() {
+        let mut accs = Vec::new();
+        let mut first = item("old-token", None);
+        first.email = Some("user@example.com".into());
+        let r = merge_import(&mut accs, vec![first]);
+        assert_eq!((r.added, r.updated), (1, 0));
+        assert_eq!(accs[0].email.as_deref(), Some("user@example.com"));
+
+        let mut second = item("new-token", None);
+        second.email = Some("user@example.com".into());
+        let r = merge_import(&mut accs, vec![second]);
+        assert_eq!((r.added, r.updated), (0, 1), "邮箱相同的国际版账号必须合并");
+        assert_eq!(accs.len(), 1, "不应产生重复条目");
+        assert_eq!(accs[0].token, "new-token", "凭证以新来源为准");
+    }
+
+    /// 重新导入要把缺的邮箱补上（老记录是邮箱还没被解析的那个版本导入的）。
+    #[test]
+    fn a_reimport_fills_in_the_missing_email() {
+        let mut accs = vec![acct("nick", None, "old-token")];
+        let mut it = item("old-token", None);
+        it.email = Some("user@example.com".into());
+        let r = merge_import(&mut accs, vec![it]);
+        assert_eq!((r.added, r.updated), (0, 1));
+        assert_eq!(
+            accs[0].email.as_deref(),
+            Some("user@example.com"),
+            "已存在的那条要补上邮箱，不是在旁边新建一条"
+        );
     }
 
     #[test]
@@ -759,10 +828,10 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
         }
         // 凭证临期的先续签，避免拿着过期 token 把「没积分」误判成「查不到」。
         let _ = ensure_fresh_token(&mut accounts[i]).await;
-        // 顺手给老账号补手机号（只在为空时打一下，见 [`fill_phone_if_missing`]）。
-        // 放在这里而不是签到路径：刷新本来就是「把该对齐的都对齐」的那一次，
-        // 而签到要多打一个请求、又不一定会被点到。
-        let _ = fill_phone_if_missing(&mut accounts[i]).await;
+        // 顺手给老账号补身份标识（手机号 / 邮箱，按区域只在缺时打一下，见
+        // [`fill_identity_if_missing`]）。放在这里而不是签到路径：刷新本来就是
+        // 「把该对齐的都对齐」的那一次，而签到要多打一个请求、又不一定会被点到。
+        let _ = fill_identity_if_missing(&mut accounts[i]).await;
         // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账
         let view = checkin::fetch_resource_view(accounts[i].region, &accounts[i].token).await;
         readings.push(ledger::Reading {
@@ -1785,6 +1854,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             phone: None,
+            email: None,
             token: "t".into(),
             refresh_token: None,
             expires_at: None,
@@ -1891,6 +1961,7 @@ mod tests {
             account_id: "a1".into(),
             account_name: "甲".into(),
             account_phone: None,
+            account_email: None,
             at: "2026-09-20 14:10:00".into(),
             success,
             already: false,

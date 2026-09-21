@@ -23,7 +23,7 @@ import {
   brokerLink,
   brokerUnbind,
 } from "./api";
-import { accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
+import { accountIdent, accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
 import { bindCredits, seedCredits } from "./credits";
 import { regionLabel, useRegions } from "./regions";
 import {
@@ -411,7 +411,7 @@ export default function App() {
     async (a: Account) => {
       const ok = await askConfirm({
         title: "删除账号",
-        body: `确认删除「${accountLabel(a.name, a.phone)}」？该账号的签到日志也会一并删除。`,
+        body: `确认删除「${accountLabel(a.name, accountIdent(a.region, a.phone, a.email))}」？该账号的签到日志也会一并删除。`,
         okText: "删除",
         danger: true,
       });
@@ -419,7 +419,7 @@ export default function App() {
       try {
         await removeAccount(a.id);
         setAccounts((l) => l.filter((x) => x.id !== a.id));
-        showToast({ kind: "ok", text: `已删除 ${accountLabel(a.name, a.phone)}` });
+        showToast({ kind: "ok", text: `已删除 ${accountLabel(a.name, accountIdent(a.region, a.phone, a.email))}` });
       } catch (e) {
         showToast({ kind: "err", text: "删除失败：" + String(e) });
       }
@@ -427,7 +427,7 @@ export default function App() {
     [askConfirm, showToast]
   );
 
-  // 批量导入：后端按「手机号或 token」识别已有账号并合并补全凭证，不会产生重复条目
+  // 批量导入：后端按「token / 手机号 / 邮箱」识别已有账号并合并补全凭证，不会产生重复条目
   const importItems = useCallback(
     async (items: ImportItem[]): Promise<ImportReport> => {
       const report = await importAccounts(items);

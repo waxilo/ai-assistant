@@ -408,6 +408,9 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         // 直接用 `item.region` 会把老池里的国内版条目全标成国际版。
         region: item_region(item),
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
+        // 池的数据契约里没有邮箱（跨机搬运不靠它认人）；国际版账号的那一份
+        // 由刷新时的 `fill_identity_if_missing` 就地补回来。
+        email: None,
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
         expires_at: item.expires_at,
@@ -483,7 +486,7 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
 /// 这一条池条目与这个本机账号**是不是同一份凭证**？
 ///
 /// 这是跨机认人的**兜底锚点**，也是唯一不会漂移的那个：key 由「区域 + 人」拼成，
-/// 而「人」的第一顺位是手机号 —— 手机号是**后来才补上**的（`fill_phone_if_missing`），
+/// 而「人」的第一顺位是手机号 —— 手机号是**后来才补上**的（`fill_identity_if_missing`），
 /// 昵称也可能被用户改掉，于是同一个账号的 key 会变；变的那一刻，池里按旧 key
 /// 存着的那条就再也认不出本机账号了。token 不会：它就是这份凭证本身。
 ///
@@ -1079,6 +1082,7 @@ mod tests {
             id: format!("id-{name}"),
             name: name.into(),
             phone: phone.map(str::to_string),
+            email: None,
             token: token.into(),
             refresh_token: None,
             expires_at: None,

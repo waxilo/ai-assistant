@@ -258,20 +258,20 @@
   color: var(--text);
   white-space: nowrap;
 }
-/* 手机号：弱化的次级信息 */
-.ac-phone {
+/* 展示标识（国内版手机号 / 国际版邮箱）：弱化的次级信息 */
+.ac-ident {
   font-size: var(--fs-cap);
   color: var(--muted);
 }
-/* 账号的次级行：手机号 + 区域标签并排一行（见 common.tsx 的 AccountCell） */
+/* 账号的次级行：展示标识 + 区域标签并排一行（见 common.tsx 的 AccountCell） */
 .ac-sub {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
-/* 窄窗口下要让手机号先被截断，而不是把区域标签挤出单元格 */
-.ac-sub .ac-phone {
+/* 窄窗口下要让标识先被截断，而不是把区域标签挤出单元格 */
+.ac-sub .ac-ident {
   min-width: 0;
 }
 /* 区域标签（国际版 / 国内版）：账号的「身份证」，只贴一个值 ——

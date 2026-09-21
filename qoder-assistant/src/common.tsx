@@ -75,9 +75,27 @@ export function formatCredits(v?: number | null): string {
 // 「全局积分内存对象」，见 `src/credits.ts`。留在公共 UI 件里会诱使调用方
 // 从 `Account` 上就地读 `credits / last.balance` —— 那正是两个页面数字对不上的老路。
 
-/** 手机号脱敏（纯展示）：11 位纯数字按 138****1234 处理，其它字符串原样返回 */
+/** 手机号脱敏（纯展示）：11 位纯数字按 138****1234 处理，其它字符串原样返回
+    （邮箱等标识没有要打码的部分，本来就该完整显示）。 */
 export function maskPhone(s: string): string {
   return /^\d{11}$/.test(s) ? s.slice(0, 3) + "****" + s.slice(7) : s;
+}
+
+/**
+ * 账号的**展示标识**：国内版看手机号、国际版看邮箱（另一项作为回退）。
+ *
+ * 区域决定哪一项才是「这个账号是谁」—— 与后端 `Account::identity` 是同一套规则。
+ * 两处各写一份的下场是「界面显示的那个」与「去重 / 补全认的那个」对不上。
+ * 区域未知时（历史日志没有这个字段、settings 还没读到）按手机号优先，
+ * 与加邮箱之前的展示保持一致。
+ */
+export function accountIdent(
+  region: string | null | undefined,
+  phone?: string | null,
+  email?: string | null
+): string | null {
+  const [first, second] = region === "global" ? [email, phone] : [phone, email];
+  return first || second || null;
 }
 
 /** 字节数展示：B / KB / MB（更新下载进度用）。非法输入返回「—」 */
@@ -88,10 +106,10 @@ export function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/// 账号在日志/筛选中的展示名：名称 + 手机号（手机号缺失时省略）。
-/// 名称本身是手机号时同样脱敏；过滤/匹配请直接用原始字段，不要经过这里。
-export function accountLabel(name: string, phone?: string | null): string {
-  return phone ? `${maskPhone(name)}（${maskPhone(phone)}）` : maskPhone(name);
+/// 账号在日志/筛选中的展示名：名称 + 展示标识（[`accountIdent`] 按区域选好的那个，
+/// 缺失时省略）。名称本身是手机号时同样脱敏；过滤/匹配请直接用原始字段，不要经过这里。
+export function accountLabel(name: string, ident?: string | null): string {
+  return ident ? `${maskPhone(name)}（${maskPhone(ident)}）` : maskPhone(name);
 }
 
 /** 解析「YYYY-MM-DD HH:MM:SS」为 Date；格式不符返回 null */
@@ -202,18 +220,23 @@ export function logStatus(log: CheckinLog): { tone: DotTone; label: string } {
 }
 
 /**
- * 账号单元格：头像 + 名称 + 手机号。
+ * 账号单元格：头像 + 名称 + 展示标识（手机号 / 邮箱，由 [`accountIdent`] 按区域选好）。
  *
  * 账号页与签到日志页共用，「同一个人在两处长得一样」由它保证；日志页此前只用
  * 一行文字拼接，名称本身就是手机号时会显示成 `191****2883（191****2883）`。
+ *
+ * `ident` 由调用方选好再传进来（而不是这里收 region + phone + email 自己挑）：
+ * 区域标签（`region`）是**可选**的，收成同一个字段会让「要标识但不要标签」的
+ * 地方（日志 / 简报）被迫带上一个它本不该有的区域胶囊。
  */
 export function AccountCell({
   name,
-  phone,
+  ident,
   region,
 }: {
   name: string;
-  phone?: string | null;
+  /** 展示标识：国内版手机号 / 国际版邮箱，用 [`accountIdent`] 选好 */
+  ident?: string | null;
   /**
    * 账号所属区域（`global` / `cn`）。**不传就不显示区域标签** ——
    * 签到日志与简报里没有这个字段，那里也就不该凭空补一个出来。
@@ -222,21 +245,21 @@ export function AccountCell({
 }) {
   const initial = /^\d/.test(name) ? null : name.slice(0, 1);
   const shown = maskPhone(name);
-  const alt = phone ? maskPhone(phone) : "";
+  const alt = ident ? maskPhone(ident) : "";
   // 区域名取自后端清单；清单还没到货时为 null ⇒ 不显示标签（而不是显示一个空胶囊）
   const badge = regionLabel(useRegions(), region);
-  // 手机号与名称相同时不再重复
+  // 标识与名称相同时不再重复
   const sub = alt && alt !== shown ? alt : "";
   return (
     <div className="ac-cell-name">
       <span className="ac-avatar">{initial ?? <IconUser size={16} />}</span>
       <div className="ac-id">
         <span className="ac-name">{shown}</span>
-        {/* 次级行：手机号 + 区域并排。两者都是「这个账号是谁」的补充信息，
+        {/* 次级行：展示标识 + 区域并排。两者都是「这个账号是谁」的补充信息，
             所以同一行；一个都没有就整行不渲染，不留空行。 */}
         {(sub || badge) && (
           <span className="ac-sub">
-            {sub && <span className="ac-phone">{sub}</span>}
+            {sub && <span className="ac-ident">{sub}</span>}
             {badge && <span className="ac-region">{badge}</span>}
           </span>
         )}

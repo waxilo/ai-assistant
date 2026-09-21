@@ -59,6 +59,16 @@ pub struct Account {
     /// 手机号（展示用标识，手动录入，可空）
     #[serde(default)]
     pub phone: Option<String>,
+    /// 邮箱（展示用标识，可空）。
+    ///
+    /// 与 [`Account::phone`] 是一对：两套部署的登录身份不同 —— 国内版手机号、
+    /// 国际版邮箱 —— 界面按区域选一个展示（见前端 `accountIdent`）。所以**两个都要存**：
+    /// 只留手机号，国际版账号就只剩一个昵称可认（昵称会改，也常为空）。
+    ///
+    /// 来源与手机号同一批：本机登录文件的 `user.email`、登录时的 `/api/v1/userinfo`、
+    /// 以及给老账号惰性补一次的那个请求（见 `commands::fill_identity_if_missing`）。
+    #[serde(default)]
+    pub email: Option<String>,
     /// **这个账号属于哪套部署**（国际版 / 国内版，见 [`Region`]）。
     ///
     /// 这是账号的**身份属性**，不是「可选覆盖」：同一个手机号在两套部署里是两个
@@ -117,6 +127,29 @@ pub struct Account {
     /// 所以老账号第一次接管会多一次查询、之后走缓存。
     #[serde(default)]
     pub cosy_uid: Option<String>,
+}
+
+impl Account {
+    /// 这个账号**在自己那套部署里认人的那一样**：国内版手机号、国际版邮箱。
+    ///
+    /// 另一套部署的那个标识在缺失时兜底（国内版账号也可能绑了邮箱）—— 规则与界面
+    /// 选择展示哪一个同源（前端 `accountIdent`），两处必须一起改。
+    ///
+    /// 它有两个消费方，都是「缺了它就认不出这是谁」的地方：
+    /// - 界面上的次级标识（国内版显示手机号、国际版显示邮箱）；
+    /// - [`completeness`] 的「有身份标识」判分 —— 只数手机号会让国际版账号在去重里
+    ///   永远比不出高低：真实账号（有邮箱）与池里收养的幽灵条目（没有邮箱）打平后
+    ///   按「谁在前」决胜，幽灵就可能留下，而它的 id 没有台账、日志挂账也跟着断。
+    pub fn identity(&self) -> Option<&str> {
+        fn pick(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+        let (first, second) = match self.region {
+            Region::Cn => (&self.phone, &self.email),
+            Region::Global => (&self.email, &self.phone),
+        };
+        pick(first).or_else(|| pick(second))
+    }
 }
 
 /// 发给前端的账号视图 = **账号本身** + 从唯一台账投影出来的积分事实。
@@ -614,10 +647,11 @@ fn same_credential(a: &Account, b: &Account) -> bool {
 
 /// 信息完整度（越高越该保留这条）。三项的含义：
 /// 有签到结果 = 这份凭证真的在**这个区域**的后端上签成功过；
-/// 有手机号 = 跨机认人的第一顺位可用；问过服务端状态 = 至少确认过一次真实状态。
+/// 有身份标识 = 认得出这是谁（见 [`Account::identity`]）；
+/// 问过服务端状态 = 至少确认过一次真实状态。
 fn completeness(a: &Account) -> u8 {
     u8::from(a.last.is_some()) * 4
-        + u8::from(a.phone.as_deref().is_some_and(|p| !p.trim().is_empty())) * 2
+        + u8::from(a.identity().is_some()) * 2
         + u8::from(a.checked_today.is_some())
 }
 
@@ -632,6 +666,9 @@ fn merge_gaps(into: &mut Account, from: &Account) {
     }
     if into.phone.as_deref().map(str::trim).unwrap_or("").is_empty() {
         into.phone = from.phone.clone().filter(|s| !s.trim().is_empty());
+    }
+    if into.email.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        into.email = from.email.clone().filter(|s| !s.trim().is_empty());
     }
     if into.name.trim().is_empty() {
         into.name = from.name.clone();
@@ -844,6 +881,7 @@ mod tests {
                 id: "a1".into(),
                 name: "主号".into(),
                 phone: Some("190****9775".into()),
+                email: Some("zh@example.com".into()),
                 token: "t".into(),
                 refresh_token: None,
                 expires_at: None,
@@ -881,6 +919,7 @@ mod tests {
         // 扁平：账号字段与 credits 同级，前端不必为一个实现细节改结构
         assert_eq!(json["id"], "a1", "{json}");
         assert_eq!(json["name"], "主号", "{json}");
+        assert_eq!(json["email"], "zh@example.com", "{json}");
         assert!(json.get("account").is_none(), "不该多出一层包装：{json}");
     }
 
@@ -1172,6 +1211,7 @@ mod tests {
             region,
             name: name.into(),
             phone: phone.map(str::to_string),
+            email: None,
             token: token.into(),
             refresh_token: Some(format!("rt-{token}")),
             expires_at: None,
@@ -1214,6 +1254,29 @@ mod tests {
         assert_eq!(out[0].id, "real");
     }
 
+    /// 国际版的「谁更全」要看**邮箱**：那是它那套部署的身份标识。
+    ///
+    /// 幽灵条目从池子里收养出来时没有邮箱（`PoolItem` 里就没有这个字段），
+    /// 而真实账号有 —— 若邮箱不计分，两条会打平、按「谁在前」决胜，
+    /// 幽灵留在原地就把台账挂账的 id 换掉了。
+    #[test]
+    fn global_dedupe_prefers_the_row_with_the_email() {
+        let mut real = mk("real", Region::Global, "nick", None, "dt-abc");
+        real.email = Some("user@example.com".into());
+        real.checked_today = Some(true);
+        let ghost = mk("ghost", Region::Global, "nick", None, "dt-abc");
+
+        // 幽灵排在前：没有邮箱加分时它会留下
+        let out = dedupe_by_credential(vec![ghost.clone(), real.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "real", "有邮箱的那条才是真账号");
+
+        let out = dedupe_by_credential(vec![real, ghost]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "real");
+        assert_eq!(out[0].email.as_deref(), Some("user@example.com"));
+    }
+
     /// 被并掉那条的独有字段要补进保留的那条，不能因为「它不是主角」就丢。
     /// 注意方向：**只补空，绝不覆盖** —— 保留方已有的值一律不动。
     #[test]
@@ -1235,6 +1298,7 @@ mod tests {
         let mut loser = mk("lose", Region::Global, "昵称", None, "dt-t");
         loser.refresh_token = Some("rt-new".into());
         loser.rt_expires_at = Some(1_790_898_980_000);
+        loser.email = Some("lose@example.com".into());
 
         // 昵称为空的那条反而更完整（有签到结果）→ 它留下，昵称/续签信息补进来
         let out = dedupe_by_credential(vec![loser, keeper]);
@@ -1242,6 +1306,11 @@ mod tests {
         assert_eq!(out[0].name, "昵称", "空昵称应从被并方补上");
         assert_eq!(out[0].refresh_token.as_deref(), Some("rt-new"));
         assert_eq!(out[0].rt_expires_at, Some(1_790_898_980_000));
+        assert_eq!(
+            out[0].email.as_deref(),
+            Some("lose@example.com"),
+            "被并方的邮箱也要补进来"
+        );
 
         // 反过来：保留方有值，被并方也有值 → 保留方的值不许被覆盖
         let mut a = mk("a", Region::Global, "n", Some("138"), "dt-t");
