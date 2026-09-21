@@ -383,15 +383,6 @@ fn pack_expiry_ms(pack: &Value) -> Option<i64> {
     None
 }
 
-/// 从台账键（`{描述}@{到期毫秒}`，见 [`parse_packages`]）反解出到期毫秒时间戳。
-///
-/// 只在 `fetch_credit_snapshot` 投影逐包展示时用：该处拿到的已是 `ledger::PkgView`，
-/// 原始 `pack` 响应早已丢弃，到期时间只留在 key 尾巴上（`@` 之后那段毫秒）。
-fn pack_expiry_ms_from_key(key: &str) -> Option<i64> {
-    let ms = key.rsplit_once('@')?.1;
-    ms.parse::<i64>().ok().filter(|&v| v > 0)
-}
-
 /// 汇总 `ide_user_ent_usage` 响应 —— 逐行照搬官方 `hHe()`（`out/main.js`）：
 /// 遍历 `user_entitlement_pack_list`，对 `credits_limit > 0` 的包累加
 /// `max(credits_limit − usage.credits_amount, 0)`；`credits_limit == -1` 视为不限量。
@@ -529,10 +520,13 @@ pub async fn fetch_resource_view_with(client: &reqwest::Client, account: &Accoun
 /// 适配要点（与参考项目 billing 的 `get-user-resource` 不同）：
 /// - `size` = `entitlement_base_info.quota.credits_limit`（授予量）
 /// - `used` = `usage.credits_amount`（已用量，缺省视为 0）
-/// - **本项目的包没有 ResourceId**，键 = `{描述}@{到期毫秒}`；描述或到期时间缺失的包
-///   无法构成稳定唯一键，直接跳过（宁可不记，也不能让同一个包在两次采样间
-///   「换了个键」而重复记账）。同一键出现多个包（如真实响应里两个同描述的
-///   「老用户福利」）由台账合并取最大值，增量口径不受影响。
+/// - **键 = `entitlement_id`**（`source_id`；`product_id` 208/209 的区分字段）。这是
+///   **实测逼出来的**：同一批「老用户福利」（产品 208 与 209，`expire_time` 相同、
+///   描述相同）里，一个包的 `credits_amount` 是 2000（已用满）、另一个是 1288.93（还在
+///   消耗）。若拿「描述@到期」当键，台账合并取最大值会把唯一那条钉在用满的包上，
+///   另一个继续消耗的包的增量永远算不进来 → 简报不再更新（见 [`crate::ledger::PkgView::key`]）。
+///   响应里没有 `entitlement_id` 的包（低版本接口）无法构成稳定唯一键，直接跳过
+///   （宁可不记，也不能让同一个包在两次采样间「换了个键」而重复记账）。
 /// - `cycle_start` 恒为空串：本项目无周期概念，「翻周期归档」分支不会触发。
 pub fn parse_packages(v: &Value) -> Vec<crate::ledger::PkgView> {
     let Some(packs) = v.get("user_entitlement_pack_list").and_then(Value::as_array) else {
@@ -545,8 +539,8 @@ pub fn parse_packages(v: &Value) -> Vec<crate::ledger::PkgView> {
                 .get("display_desc")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let limit = pack
-                .get("entitlement_base_info")
+            let base = pack.get("entitlement_base_info");
+            let limit = base
                 .and_then(|b| b.get("quota"))
                 .and_then(|q| q.get("credits_limit"))
                 .and_then(Value::as_f64)?;
@@ -559,13 +553,20 @@ pub fn parse_packages(v: &Value) -> Vec<crate::ledger::PkgView> {
                 .and_then(|u| u.get("credits_amount"))
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
-            let expiry_ms = pack_expiry_ms(pack)?;
+            // 键必须逐包唯一：优先 `entitlement_base_info.entitlement_id`，
+            // 退而求其次包级 `source_id`（真实响应里两者同值）。
+            let id = base
+                .and_then(|b| b.get("entitlement_id"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| pack.get("source_id").and_then(Value::as_str).filter(|s| !s.is_empty()))?;
             Some(crate::ledger::PkgView {
-                key: format!("{desc}@{expiry_ms}"),
+                key: id.to_string(),
                 name: desc.to_string(),
                 size: limit,
                 used,
                 cycle_start: String::new(),
+                expiry_ms: pack_expiry_ms(pack),
             })
         })
         .collect()
@@ -574,8 +575,8 @@ pub fn parse_packages(v: &Value) -> Vec<crate::ledger::PkgView> {
 /// 把解析出的逐包台账输入投影成前端展示用的 `CreditPackage` 列表。
 ///
 /// 只保留**还有余量**（size − used > 0）的包：用光的包到期再早也没有意义，
-/// 不该出现在「资源包列表」里让用户去盯一对没用的数字。到期时间从台账键
-/// （`{描述}@{到期毫秒}`）反解。
+/// 不该出现在「资源包列表」里让用户去盯一对没用的数字。到期时间直接取台账条目的
+/// `expiry_ms`（不再从键里反解 —— 键现在是 `entitlement_id`，不含到期时间）。
 pub fn to_credit_packages(packages: Vec<crate::ledger::PkgView>) -> Vec<crate::accounts::CreditPackage> {
     packages
         .into_iter()
@@ -584,7 +585,7 @@ pub fn to_credit_packages(packages: Vec<crate::ledger::PkgView>) -> Vec<crate::a
             if remaining <= 0 {
                 return None;
             }
-            let expiry_ms = pack_expiry_ms_from_key(&p.key)?;
+            let expiry_ms = p.expiry_ms?;
             Some(crate::accounts::CreditPackage {
                 name: p.name,
                 remaining,
@@ -934,44 +935,60 @@ mod tests {
         assert_eq!(parse_ent_usage(&empty).remaining, None);
     }
 
-    /// 用 2026-09-14 实机抓到的真实响应（与上面汇总测试同一份 body）核对**逐包解析**。
+    /// 用 2026-09-14 / 09-21 实机抓到的真实响应核对**逐包解析**（与上面汇总测试同一份 body）。
     #[test]
     fn packages_parse_real_ent_usage_shape() {
         let real = r#"{
           "is_credits_billing": true,
           "user_entitlement_pack_list": [
-            {"display_desc":"老用户福利","expire_time":1791979006,
-             "entitlement_base_info":{"quota":{"credits_limit":2000},"end_time":1791979006},"usage":{}},
-            {"display_desc":"老用户福利","expire_time":1791979006,
-             "entitlement_base_info":{"quota":{"credits_limit":2000},"end_time":1791979006},
-             "usage":{"credits_amount":579.3308}},
-            {"display_desc":"免费","expire_time":1790783999,
+            {"display_desc":"老用户福利","expire_time":1791979006,"source_id":"357880625410",
+             "entitlement_base_info":{"entitlement_id":"357880625410","quota":{"credits_limit":2000},"end_time":1791979006},"usage":{}},
+            {"display_desc":"老用户福利","expire_time":1791979006,"source_id":"357880625666",
+             "entitlement_base_info":{"entitlement_id":"357880625666","quota":{"credits_limit":2000},"end_time":1791979006},
+             "usage":{"credits_amount":2000}},
+            {"display_desc":"免费","expire_time":1790783999,"source_id":"free_utc20269_1",
              "entitlement_base_info":{"quota":{"solo_agent_parallel_limit":2},"end_time":1790783999},
              "usage":{}},
-            {"display_desc":"每月登录赠送","expire_time":1790783999,
+            {"display_desc":"每月登录赠送","expire_time":1790783999,"source_id":"monthly_bonus_20269_1",
              "entitlement_base_info":{"quota":{"credits_limit":500},"end_time":1790783999},
              "usage":{"credits_amount":500}},
-            {"display_desc":"签到奖励","expire_time":1791979013,
+            {"display_desc":"签到奖励","expire_time":1791979013,"source_id":"checkin_20260913_1",
              "entitlement_base_info":{"quota":{"credits_limit":150},"end_time":1791979013},"usage":{}},
-            {"display_desc":"签到奖励","expire_time":1792057191,
+            {"display_desc":"签到奖励","expire_time":1792057191,"source_id":"checkin_20260914_1",
              "entitlement_base_info":{"quota":{"credits_limit":150},"end_time":1792057191},"usage":{}}
           ]
         }"#;
         let pkgs = parse_packages(&serde_json::from_str::<Value>(real).unwrap());
 
-        // 无 credits_limit 的「免费」包应被跳过；同 key 的合并由台账 merge 承担，这里原样返回
-        assert_eq!(pkgs.len(), 5, "老用户福利两包同 key 各占一条（合并发生在 ledger）；免费包被跳过");
+        // 无 credits_limit 的「免费」包应被跳过
+        assert_eq!(pkgs.len(), 5, "「免费」包没有 credits_limit，不进台账");
         let old: Vec<_> = pkgs.iter().filter(|p| p.name == "老用户福利").collect();
-        assert_eq!(old.len(), 2);
-        assert!(old.iter().all(|p| p.key == "老用户福利@1791979006000"), "键 = 描述@到期毫秒（秒级 expire_time 应放大）");
+        assert_eq!(old.len(), 2, "描述与到期都相同的两个包必须各自成条");
+        assert_eq!(
+            old.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(),
+            vec!["357880625410", "357880625666"],
+            "键 = entitlement_id：退化成「描述@到期」这两个包会并成一条，\
+             台账取最大值后被那个用满的钉死，另一个还在消耗的包再也记不进来"
+        );
         assert!(old.iter().any(|p| p.size == 2000.0 && p.used == 0.0));
-        assert!(old.iter().any(|p| p.size == 2000.0 && p.used == 579.3308), "used 取已用量 credits_amount");
+        assert!(old.iter().any(|p| p.size == 2000.0 && p.used == 2000.0), "used 取已用量 credits_amount");
         assert!(old.iter().all(|p| p.cycle_start.is_empty()), "本项目无周期概念，cycle_start 恒空");
+        assert!(
+            old.iter().all(|p| p.expiry_ms == Some(1791979006000)),
+            "到期时间随包带出（秒级 expire_time 应放大成毫秒），展示侧不再从键里反解"
+        );
         // 两个「签到奖励」到期时间不同 → 两个独立条目
         let ck: Vec<_> = pkgs.iter().filter(|p| p.name == "签到奖励").collect();
         assert_eq!(ck.len(), 2);
-        // 无 credits_limit 的包不进台账；异常响应不 panic
+        // 无 credits_limit 的包不进台账
         assert!(!pkgs.iter().any(|p| p.name == "免费"));
+        // 既没有 entitlement_id 也没有 source_id 的包无法构成唯一键 ⇒ 不记账（宁可漏，不要错账）
+        assert!(parse_packages(&serde_json::from_str::<Value>(
+            r#"{"user_entitlement_pack_list":[{"display_desc":"老用户福利","expire_time":1791979006,
+                 "entitlement_base_info":{"quota":{"credits_limit":2000}},"usage":{}}]}"#
+        ).unwrap())
+        .is_empty());
+        // 异常响应不 panic
         assert!(parse_packages(&Value::from(0)).is_empty());
         assert!(parse_packages(&serde_json::from_str::<Value>(r#"{"code":0}"#).unwrap()).is_empty());
     }
