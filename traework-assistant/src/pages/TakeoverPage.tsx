@@ -90,7 +90,10 @@ function eventKind(e: JournalEvent): { label: string; cls: Kind } {
     case "legacy_proxy_clear":
       return { label: "清理旧版痕迹", cls: "off" };
     case "restart_trae":
-      return { label: "重启应用", cls: "restart" };
+      // ⚠️ 「强制」这两个字必须留在标签上：结束是 `taskkill /f`（2026-09-23 起），
+      // 也就是说这一行背后**可能丢掉未保存的输入**。详情里已经把代价写全了
+      // （后端 `FORCED_RESTART_CAVEAT`），标签只负责让人一眼看出它不是「请求它关一下」。
+      return { label: "强制重启", cls: "restart" };
     case "restart_skipped":
       // 「本该重启、却没有」：被接管的应用当时没在运行，而 `target::with_restart` **只碰在跑的**
       // （也不替你打开）。以前这件事一个字都不写，于是「没重启」和「重启这步没跑到」
@@ -98,7 +101,7 @@ function eventKind(e: JournalEvent): { label: string; cls: Kind } {
       // 中性色：这是正常结果，不是故障。
       return { label: "无需重启", cls: "restart" };
     case "restart_fail":
-      // 应用**已被我们退出**、却没拉起来 —— 用户手上少了一个窗口，而且它不会自己回来。
+      // 应用**已被我们强制结束**、却没拉起来 —— 用户手上少了一个窗口，而且它不会自己回来。
       // 这是接管能做出来的最坏结果之一，必须最显眼。
       return { label: "重启失败", cls: "err" };
     // 开关拨了、但这一趟没生效（已回滚成关闭）。名字取通用形态是因为它有两条来路：
@@ -547,8 +550,8 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
             }
             title={
               enabled
-                ? "关闭接管：恢复官方直连，并还原给这些应用打的免证书补丁（正在运行的会被重启；没开着的下次启动自然生效）"
-                : "开启接管：给选中的应用打免证书补丁、把端点改到本机反代（正在运行的会被重启；没开着的下次启动自然生效）"
+                ? "关闭接管：恢复官方直连，并还原给这些应用打的免证书补丁（正在运行的会被强制重启，未保存的输入可能丢失；没开着的下次启动自然生效）"
+                : "开启接管：给选中的应用打免证书补丁、把端点改到本机反代（正在运行的会被强制重启，未保存的输入可能丢失；没开着的下次启动自然生效）"
             }
             onChange={(v) => void onToggle(v)}
           />

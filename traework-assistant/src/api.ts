@@ -53,11 +53,14 @@ export const getTakeoverStatus = () => invoke<TakeoverStatus>("takeover_status")
 export const enableTakeover = () => invoke<TakeoverStatus>("takeover_enable");
 export const disableTakeover = () => invoke<TakeoverStatus>("takeover_disable");
 /**
- * 改「接管哪些应用」——**开关开着时也能改**（命令存在的全部理由）。
+ * 改「接管哪些应用」——⚠️ **接管开着时会被后端拒绝**（`takeover_set_apps`）。
  *
  * `ids` 语义与界面一致：**空数组 = 全部**（与「参与扣费的账号」同一套），非空 = 只接管这些。
- * 已开启时后端做**增量协调**：新勾上的补丁 + 改道并重启它，取消的还原并重启它，
- * 没变的应用一个字节都不碰；未开启时只记设置。
+ * 改动名单的代价是**重启那些应用**（而用户此刻正在用它们），所以路径只有一条：
+ * **关接管 → 改名单 → 开接管**，由 `takeover_enable` 统一做补丁、改道与重启。
+ *
+ * （旧注释说「开关开着也能改、后端做增量协调」—— 那条路径已随增量协调一起删除，
+ * 界面上的 chip 在开启时也是灰的。注释留着会让人以为还有第二种入口。）
  */
 export const setTakeoverApps = (ids: string[]) =>
   invoke<TakeoverStatus>("takeover_set_apps", { ids });

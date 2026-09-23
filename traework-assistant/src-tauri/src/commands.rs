@@ -743,10 +743,12 @@ fn enable_endpoint(dir: PathBuf) -> Result<TakeoverStatus, String> {
         }
         Ok(())
     }) {
+        // ⚠️ `done` 里**不再**重复写「未保存的输入请自行确认」——强杀的代价由
+        //    [`note_restart`] 统一附加（`FORCED_RESTART_CAVEAT`），文案只有一个出处。
         Ok((_unit, outcome)) => note_restart(
             &dir,
             &outcome,
-            "为让端点改写生效，已重启（未保存的输入请自行确认）",
+            "为让端点改写生效，已重启",
             "开启接管时被接管的那些应用都没在运行，所以**没有应用重启** —— 这不是失败",
         ),
         Err(e) => {
@@ -776,6 +778,14 @@ fn enable_endpoint(dir: PathBuf) -> Result<TakeoverStatus, String> {
     Ok(build_status(&dir, &s3))
 }
 
+/// 强杀重启**必须跟「已重启」一起说出去**的那句话。
+///
+/// 退出是**强制**的（`target::AppTarget::quit`，2026-09-23 起），所以「已重启」这四个字本身
+/// **不够** —— 它没把代价告诉用户。这句话放在这里、而不是写进两个调用方各自的 `done` 文案里，
+/// 是因为它是**这条代码路径的性质**（凡是走 `with_restart` 的都会被强杀），不是一个调用点的
+/// 措辞：以后新增的路径会自动带上它，不会漏。
+const FORCED_RESTART_CAVEAT: &str = "退出是强制结束的，未保存的输入可能已丢失";
+
 /// 记一条「重启」动态 —— **三种结局都要留痕**：真重启了 / 本该重启但没在跑 / 关了却拉不起来。
 ///
 /// [`crate::target::with_restart`] 只处理**那一刻正在运行**的应用：没在跑的跳过，也刻意
@@ -786,19 +796,23 @@ fn enable_endpoint(dir: PathBuf) -> Result<TakeoverStatus, String> {
 /// ⚠️ 更糟的一种是「退出成功、拉起失败」：用户的窗口被我们关掉了，而且不会自己回来。
 /// 以前它被 `spawn().is_ok()` 吞成 `false`，于是和「本来就没在跑」共用同一句话 ——
 /// **一句话把真相盖住**。现在它有自己的事件（`restart_fail`）和自己的原因。
+///
+/// ⚠️ 还有一件**每次都要说**的事：结束是强制的（见 [`FORCED_RESTART_CAVEAT`]）。
+/// 「把应用从用户手里关掉是一笔必须交代清楚的账」—— 强杀把这句话的分量又加重了一档，
+/// 因为**这次真的可能丢东西**，而不是「请他确认一下有没有存」。
 fn note_restart(
     dir: &Path,
     outcome: &crate::target::RestartOutcome,
     done: &str,
     why: &str,
 ) {
-    // 最坏的一种先说（红色）：应用被退出了，却没拉回来。
+    // 最坏的一种先说（红色）：应用被结束了，却没拉回来。
     for (id, err) in &outcome.failed {
         crate::journal::append(
             dir,
             "restart_fail",
             &format!(
-                "「{id}」已被退出，但**没能重新启动**：{err}。请手动打开它 —— \
+                "「{id}」已被强制结束，但**没能重新启动**：{err}。请手动打开它 —— \
                  配置已经写好，重开即生效"
             ),
         );
@@ -807,7 +821,10 @@ fn note_restart(
         crate::journal::append(
             dir,
             "restart_trae",
-            &format!("{done}：{}", outcome.restarted.join("、")),
+            &format!(
+                "{done}：{}（{FORCED_RESTART_CAVEAT}）",
+                outcome.restarted.join("、")
+            ),
         );
     }
     // 一个都没碰过 ⇒ 这句才是真的：不是失败了，是本来就没在跑

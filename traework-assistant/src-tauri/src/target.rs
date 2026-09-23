@@ -40,11 +40,14 @@ use std::path::{Path, PathBuf};
 pub const PRODUCT_FILE: &str = "product.json";
 /// 闸门补丁所在文件（相对 [`AppTarget::app_dir`]）。
 pub const MAIN_JS_REL: &str = "out/main.js";
-/// 等应用优雅退出的上限。
+/// 发出**强制**结束后，等它从进程表里消失的上限。
 ///
-/// 实测（Trae CN，15 个进程）**2 秒内**就退干净了，15 秒是留给「它在存盘」的余量。
-/// 上界不能太长：`with_restart` 是同步命令里的阻塞段，用户在界面上等着。
-pub const GRACE_QUIT_MS: u64 = 15_000;
+/// ⚠️ 这里等的**不是**「它肯不肯退」，而是「强杀有没有生效」。2026-09-23 起退出方式改为
+/// **一律强杀**（用户决定，理由见 [`AppTarget::quit`]），所以原先那 15 秒的「留给它在存盘」
+/// 余量已经不存在了 —— 实测（Trae CN，15 个进程）强杀是亚秒级的，10 秒是留给系统回收进程表
+/// 的账，以及「杀不动」时能把原因说出来。
+/// 上界仍然不能太长：`with_restart` 是同步命令里的阻塞段，用户在界面上等着。
+pub const KILL_WAIT_MS: u64 = 10_000;
 /// 发出启动命令后，等应用**出现**在进程表里的上限。
 ///
 /// 正常几百毫秒内就出现；这是「它到底起来了没有」的确认窗口，不是启动超时。
@@ -118,38 +121,60 @@ impl AppTarget {
         }
     }
 
-    /// 请求该应用退出并等待其结束。**失败时必须把原因带回去**（返回 `Err`）。
+    /// 结束该应用 —— **强制**，不等它优雅退出。**失败时必须把原因带回去**（返回 `Err`）。
     ///
-    /// Windows 用 `taskkill /im <exe>`，两个「不加」都是刻意的：
-    /// - **不加 `/f`** —— 这是编辑器，强杀可能丢未保存内容；
-    /// - **不加 `/t`** —— ⚠️ 2026-09-16 实测定论。`/t` 会让 `taskkill` 要求「先把子进程退掉」，
-    ///   而 Chromium 系应用那十几个**没有窗口**的子进程收不到关闭消息（它对每个都报
-    ///   「只能强行终止这个进程(带 /F 选项)」），于是父进程被卡在
-    ///   「一个或多个此进程的子进程仍然在运行」上 ⇒ **15 个进程一个都不退**，
-    ///   界面上就是「已发起退出请求，但「Trae CN」未在限时内退出，请手动关闭后重试」。
-    ///   去掉 `/t` 后同一台机器 **2 秒内全部干净退出**（实测，无 `/f`）。
+    /// ## 为什么是强杀（2026-09-23 按用户要求）
     ///
-    /// 为什么这个 bug 藏了这么久：[`AppTarget::running`] 曾经恒为 false（见 [`image_running`]），
+    /// 在这之前这里是「优雅退出 + 等 15 秒」，而它的失败模式很讨厌：应用**卡在一个确认框上**
+    /// 时它一步都不退，于是整个开关回滚、配置一个字没改，用户看到的是「已发起退出请求，
+    /// 但「Trae CN」未在限时内退出，请手动关闭后重试」。而拨这个开关的人**本来就已经接受了
+    /// 「会重启我的应用」** —— 再让他手动去关一次，是把机器的活推回给人。所以改成直接结束。
+    ///
+    /// 代价是照旧那一条，必须写在最显眼处：**未保存的输入会丢**。它由 [`AppTarget::relaunch`]
+    /// 之后的接管动态**明说**（见 `commands::note_restart`），而不是留给用户自己想起来 ——
+    /// 「把应用从用户手里关掉，是一笔必须交代清楚的账」。
+    ///
+    /// ## 两个平台各用各的强杀原语，且判据与探活同源
+    ///
+    /// - Windows：`taskkill /f /im <exe>`；
+    /// - macOS：`pkill -9 -f <bundle 路径>`。
+    ///
+    /// 两边都刻意复用 [`AppTarget::running`] 的判据（Windows 按映像名、macOS 按
+    /// `pgrep -f <bundle 路径>`）：于是「我们认为它在跑的进程」与「这里杀掉的进程」是同一批。
+    /// 这是 [`wait_for_presence`] 那条规矩在退出方向上的投影 —— **两个方向必须是同一套判据**。
+    ///
+    /// ## ⚠️ 仍然不加 `/t`（与「要不要强杀」是两件事，别顺手加回来）
+    ///
+    /// 2026-09-16 实测定论：`/t` 会让 `taskkill` 要求「先把子进程退掉」，而 Chromium 系应用
+    /// 那十几个**没有窗口**的子进程收不到关闭消息（它对每个都报「只能强行终止这个进程
+    /// (带 /F 选项)」），于是父进程被卡在「一个或多个此进程的子进程仍然在运行」上 ⇒
+    /// **15 个进程一个都不退**。而 `/im` 本来就覆盖全部同名进程 —— Chromium 的 helper 与主进程
+    /// **共用同一个 exe 名**，`/t` 不但多余，还会把一次亚秒级的强杀重新变成一次卡死。
+    ///
+    /// 为什么这类 bug 以前能藏住：[`AppTarget::running`] 曾经恒为 false（见 [`image_running`]），
     /// 于是**根本走不到这里**；修掉那个之后，这里又把 `taskkill` 的退出码和输出一起
     /// `let _ =` 丢掉了 —— 「它拒绝执行」（`/t` 那种：退出码 128、满屏错误）和
     /// 「它执行了但应用不理它」在日志里长得一模一样。**同一个盲区换了层皮。**
-    pub fn quit_graceful(&self) -> Result<(), String> {
+    pub fn quit(&self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            // `quit app "<路径>"` 而不是 `tell application "<名字>"`：路径能精确定位到
-            // 这一个应用包，不依赖 LaunchServices 的名字解析（`~/Applications` 里的同名副本
-            // 与 `/Applications` 里的会被解析成谁，不该由我们猜）。
-            let out = crate::proc::cmd("osascript")
-                .arg("-e")
-                .arg(format!("quit app {:?}", self.bundle.to_string_lossy()))
+            // `pkill -9 -f <bundle 路径>`：与 `running()` 的判据**完全同源**（同一段路径
+            // pattern），所以「它认得的进程」与「这里杀掉的进程」是同一批。
+            // 用路径而不是应用名，理由同 `running()`：名字要经 LaunchServices 解析，
+            // `~/Applications` 里的同名副本与 `/Applications` 里的会被解析成谁，不该由我们猜。
+            let pattern = self.bundle.to_string_lossy().to_string();
+            let out = crate::proc::cmd("pkill")
+                .arg("-9")
+                .arg("-f")
+                .arg(&pattern)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .output()
-                .map_err(|e| format!("调用 osascript 失败：{e}"))?;
+                .map_err(|e| format!("调用 pkill 失败：{e}"))?;
             if !out.status.success() {
                 return Err(format!(
-                    "系统拒绝了结束「{}」的请求（osascript 退出码 {:?}）",
+                    "系统拒绝了强制结束「{}」的请求（pkill 退出码 {:?}）",
                     self.id,
                     out.status.code()
                 ));
@@ -158,7 +183,7 @@ impl AppTarget {
         #[cfg(target_os = "windows")]
         {
             let out = crate::proc::cmd("taskkill")
-                .args(graceful_kill_args(&self.exe_name()))
+                .args(kill_args(&self.exe_name()))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -168,27 +193,27 @@ impl AppTarget {
             // 报错文本是本地化的（中文系统上是 GBK），塞进界面只会是一串乱码 —— 只留码。
             if !out.status.success() {
                 return Err(format!(
-                    "系统拒绝了结束「{}」的请求（taskkill 退出码 {:?}）",
+                    "系统拒绝了强制结束「{}」的请求（taskkill 退出码 {:?}）",
                     self.id,
                     out.status.code()
                 ));
             }
         }
-        if wait_for_exit(self, GRACE_QUIT_MS) {
+        if wait_for_exit(self, KILL_WAIT_MS) {
             return Ok(());
         }
-        // 报「还剩几个进程」而不是笼统的「没退出」：「一个都没退」和「退了一半」
-        // 是两种不同的病（前者系统没接受请求，后者应用自己卡住了），分开才查得动。
+        // 报「还剩几个进程」而不是笼统的「没杀掉」：「一个都没杀成」和「杀掉一半」
+        // 是两种不同的病（前者系统压根没接受请求，后者杀不动），分开才查得动。
         Err(format!(
-            "「{}」没有在 {} 秒内退出（进程表里还剩 {} 个进程）—— \
-             它没有响应系统的关闭请求，可能正卡在一个确认框上。请手动关闭它后重试。",
+            "「{}」被强制结束后，{} 秒内进程表里还剩 {} 个进程 —— \
+             强杀没生效，多半是权限不足（试试以管理员身份运行本助手）。",
             self.id,
-            GRACE_QUIT_MS / 1000,
+            KILL_WAIT_MS / 1000,
             self.image_count()
         ))
     }
 
-    /// 进程表里还剩下几个属于它的进程。见 [`quit_graceful`](Self::quit_graceful) 末尾。
+    /// 进程表里还剩下几个属于它的进程。见 [`quit`](Self::quit) 末尾。
     fn image_count(&self) -> usize {
         #[cfg(target_os = "windows")]
         {
@@ -365,16 +390,21 @@ impl RestartOutcome {
     }
 }
 
-/// 在「这些应用运行中则先退出」的前提下执行 `op`，执行完再把**原先在跑的那些**拉起来。
+/// 在「这些应用运行中则先**强制**结束」的前提下执行 `op`，执行完再把**原先在跑的那些**拉起来。
 ///
 /// 返回 `(op 结果, 重启结果)`。
 ///
-/// 四件事是刻意的：
+/// 五件事是刻意的：
 /// 1. **只碰传进来的目标** —— 改一个应用的配置不该重启另一个应用；
-/// 2. `op` 失败也要把应用拉回来（`op` 被闸门挡住时应用已经被我们关掉了，
+/// 2. **没在运行的不碰，也不替你打开** —— 改配置跟「现在就要用这个应用」是两件事；
+///    它下次自己启动时读到的已经是新配置（`commands::note_restart` 会把这件事写成一条
+///    「无需重启」，好让「没重启」和「重启这步没跑到」不再长得一样）；
+/// 3. 结束方式是**强杀**（见 [`AppTarget::quit`]）⇒ **未保存的输入会丢**。这条代价必须由
+///    调用方写进用户看得见的接管动态里，不能只活在注释里；
+/// 4. `op` 失败也要把应用拉回来（`op` 被闸门挡住时应用已经被我们关掉了，
 ///    不能因为返回 `Err` 就把它留在关闭状态，2026-09-14 实测踩过）；
-/// 3. 中途有应用退不掉时，把**已经退出的那些**先拉回来再报错 —— 半关半开是最糟的状态。
-/// 4. **拉起失败不算致命，但必须回传**：`op` 已经写盘成功，此刻报错会让用户以为整件事失败了；
+/// 5. 中途有应用结束不掉时，把**已经结束的那些**先拉回来再报错 —— 半关半开是最糟的状态；
+///    拉起失败不算致命，但**必须回传**：`op` 已经写盘成功，此刻报错会让用户以为整件事失败了，
 ///    真正要做的是告诉他「应用被关了、没拉起来、请手动打开」（见 [`RestartOutcome`]）。
 pub fn with_restart<T>(
     targets: &[AppTarget],
@@ -385,9 +415,9 @@ pub fn with_restart<T>(
         if !t.running() {
             continue;
         }
-        if let Err(e) = t.quit_graceful() {
-            // 半关半开是最糟的状态：把**已经退出的那些**先拉回来，再如实报错。
-            // 报「拉回来了谁」是因为它们确实被我们关过一次 —— 那笔账不能省。
+        if let Err(e) = t.quit() {
+            // 半关半开是最糟的状态：把**已经结束的那些**先拉回来，再如实报错。
+            // 报「拉回来了谁」是因为它们确实被我们杀过一次 —— 那笔账不能省。
             let back: Vec<String> = stopped
                 .iter()
                 .filter(|d| d.relaunch().is_ok())
@@ -597,17 +627,19 @@ fn image_count(images: &[String], exe: &str) -> usize {
 
 /// 结束一个应用时 `taskkill` 的**全部参数**。
 ///
-/// **只有这两个，这是刻意的：**
-/// - 不加 `/f` —— 这是编辑器，强杀会丢未保存内容；
-/// - 不加 `/t` —— ⚠️ 它是 2026-09-16 那个「开关接管却不重启应用」的根因，
-///   机理见 [`AppTarget::quit_graceful`]。**别再把它加回来。**
+/// **只有这三个，这是刻意的：**
+/// - **`/f` = 强制**（2026-09-23 用户决定，理由见 [`AppTarget::quit`]）：拨这个开关的人
+///   已经接受了「会重启我的应用」，所以不再为「它可能在存盘」放弃整次操作。
+///   代价 —— **未保存内容会丢** —— 由调用方写进接管动态，用户看得见。
+/// - **不加 `/t`** —— ⚠️ 它是 2026-09-16 那个「开关接管却不重启应用」的根因，
+///   机理见 [`AppTarget::quit`]。`/im` 已覆盖全部同名进程，**别把它加回来**。
 ///
 /// 抽成自由函数的理由和 [`image_running`] 一模一样：上一版把 `["/im", exe, "/t"]`
 /// 直接写在 `#[cfg(target_os = "windows")]` 分支里，**任何单测都看不见它**，
 /// 于是这个 bug 活过了整套测试。凡是「藏在平台 cfg 里的判断」，都得抽出来。
 #[cfg(any(target_os = "windows", test))]
-fn graceful_kill_args(exe: &str) -> [String; 2] {
-    ["/im".to_string(), exe.to_string()]
+fn kill_args(exe: &str) -> [String; 3] {
+    ["/f".to_string(), "/im".to_string(), exe.to_string()]
 }
 
 /// Windows 进程映像名（`tasklist` 里那一列）。
@@ -668,24 +700,31 @@ mod tests {
         assert!(!image_running(&[], "Trae CN.exe"), "没有进程就是没在跑");
     }
 
-    /// 结束一个应用时**绝不能带 `/t`，也不能带 `/f`**。
+    /// 结束一个应用时**必须带 `/f`，且绝不能带 `/t`**。
     ///
-    /// `/t` 会要求「先把子进程退掉」，而 Chromium 系应用那十几个**无窗口**的子进程
-    /// 收不到关闭消息（taskkill 对每个都报「只能强行终止这个进程(带 /F 选项)」），
-    /// 于是父进程被卡在「一个或多个此进程的子进程仍然在运行」上 —— 实测 15 个进程
-    /// **一个都不退**，界面上就是「已发起退出请求，但未在限时内退出」。
-    /// 去掉 `/t` 后同一台机器 2 秒内全部干净退出。这条测试就是那次实测的存档。
+    /// `/f` 的来历：2026-09-23 按用户要求，把「优雅退出 + 等 15 秒」换成强杀。
+    /// 优雅那条路的失败模式是「应用卡在确认框上 ⇒ 整次开关回滚、配置一个字没改」，
+    /// 而拨这个开关的人本来就接受了「会重启我的应用」。**这条测试是那次决定的存档** ——
+    /// 哪天想把优雅等回来，请先把 [`AppTarget::quit`] 上那段理由反驳掉。
+    ///
+    /// `/t` 的反驳与 `/f` 无关，是 2026-09-16 的实测：它要求「先把子进程退掉」，而 Chromium 系
+    /// 应用那十几个**无窗口**的子进程收不到关闭消息 ⇒ 父进程卡在「一个或多个子进程仍然在
+    /// 运行」上，**15 个进程一个都不退**（界面文案：「已发起退出请求，但未在限时内退出」）。
+    /// `/im` 已经覆盖全部同名进程，`/t` 只会把一次亚秒级强杀变成一次卡死。
     #[test]
-    fn graceful_kill_must_not_force_or_recurse() {
-        let args = graceful_kill_args("Trae CN.exe");
-        assert_eq!(args, ["/im".to_string(), "Trae CN.exe".to_string()]);
+    fn kill_must_force_but_never_recurse() {
+        let args = kill_args("Trae CN.exe");
+        assert_eq!(
+            args,
+            ["/f".to_string(), "/im".to_string(), "Trae CN.exe".to_string()]
+        );
+        assert!(
+            args.iter().any(|a| a.eq_ignore_ascii_case("/f")),
+            "不带 /f 就退回「优雅退出 + 等 15 秒」，它的失败模式是整次开关回滚：{args:?}"
+        );
         assert!(
             !args.iter().any(|a| a.eq_ignore_ascii_case("/t")),
             "带 /t 会把父进程卡在「子进程仍然在运行」上：{args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a.eq_ignore_ascii_case("/f")),
-            "带 /f 是强杀编辑器，会丢未保存内容：{args:?}"
         );
     }
 

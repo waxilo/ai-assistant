@@ -1112,15 +1112,18 @@ pub fn repair(target: &AppTarget, dir: &Path, endpoint_base: &str) -> bool {
 //
 // 「这个应用在不在跑 / 怎么让它退出、再拉起来」是关于**应用**的事实，与「怎么改写它的
 // `product.json`」无关，而且现在**按目标**工作（改一个应用不该重启另一个）。
-// 所以 `is_trae_running` / `quit_graceful` / `relaunch` / `with_trae_restart` 这一组
+// 所以 `is_trae_running` / `quit` / `relaunch` / `with_restart` 这一组
 // 都在 `crate::target` 里，署名也从「TraeWork」改成了「某个目标」。
+//
+// ⚠️ 结束方式是**强制**（`/f`），理由与代价见 `target::AppTarget::quit` 的文档 ——
+// 它不再是「请求它退出」，而是直接结束。改这一层之前先读那一段。
 //
 // ⚠️ 唯一要记住的不变量（原本就在这里，现在在 `target::with_restart` 的实现里）：
 // **端点配置只在应用启动时被读取** ⇒ 改完必须重启那个应用才生效；
 // 而 `op` 无论成败都要把应用拉回来 —— 它被闸门挡住时应用已经被我们关掉了。
 // ---------------------------------------------------------------------------
 
-// 进程控制见 `crate::target`：`AppTarget::running` / `quit_graceful` / `relaunch` / `with_restart`。
+// 进程控制见 `crate::target`：`AppTarget::running` / `quit` / `relaunch` / `with_restart`。
 
 
 #[cfg(test)]
