@@ -16,14 +16,20 @@
 //!
 //! 它在 asar **之外**（不受归档完整性校验约束）。
 //!
-//! # 但**改完要重启客户端**（2026-09-21 修正）
+//! # 但**改完要重启客户端**（2026-09-21 修正）—— 已再次被推翻（2026-09-24 终审）
 //!
-//! 曾经这里写的是「客户端每次会话都重新起一个进程执行它，所以改完下一次对话就生效、
-//! 不需要重启」—— 前半句对（`runs/<时间戳>-p<桌面端pid>/` 每次会话确实新增一份），
-//! **后半句错**：桌面端是长驻进程，产物在**它启动时**被读进内存，之后每次会话都用
-//! 内存里那一份，磁盘改了它不看。（用户实测：开了接管不重启，对话仍然直连。）
-//! 所以本模块只负责把**磁盘**改对 —— 「让改动被读到」是 [`crate::client_proc`] 的事，
-//! 由开关接管的收尾（[`crate::commands`]）与网络体检的恢复流程（[`crate::netfix`]）调用。
+//! 这一节的历史完整记下来，因为这个判断反转了两次，第三次才有实验钉死：
+//!
+//! - **2026-09-21 之前**：以为「客户端每次会话都重新起进程执行产物，改完即生效」；
+//! - **2026-09-21**：真机观察「开接管不重启，对话仍直连」，于是改成「桌面端启动时
+//!   读一次、之后用内存副本，必须重启」，并为此造了整套进程收尾（`client_proc`）；
+//! - **2026-09-24**：惰性标记活体实验（给产物注入一段只写日志的代码 → 用户不重启
+//!   直接发对话 → 标记命中）证明 **0.3.4 起的客户端每次会话都新起 worker 线程、
+//!   从磁盘重读产物**，CN / 国际两个变体都不例外 —— 09-21 的「必须重启」描述的是
+//!   旧版（≤0.3.3）独立长驻子进程架构，该架构已经不存在，`client_proc` 据此整体删除。
+//!
+//! 所以上面第 1 节里「客户端 SDK 起推理进程时 env 由桌面端构造」仍然成立，落点仍然
+//! 只能是产物文件本身；变的只是「改动何时被读到」：**下一次对话**，无需重启。
 //!
 //! # 注入段做两件事
 //!
@@ -81,25 +87,36 @@ pub struct Marker {
     pub ca: String,
 }
 
-/// 解析 worker 产物路径。客户端没装 / 换了布局时返回 None。
+/// 解析 worker 产物的**全部候选路径**：每个 SDK 根 × [`CANDIDATES`]，
+/// 只收**真实存在**的文件，按探测顺序去重。
 ///
-/// 探的是「安装根 × 相对候选」的笛卡尔积：安装根本身按平台有多个候选
-/// （见 [`Region::worker_sdk_roots`]，Windows 上 per-user 与全机安装各一个），
-/// 相对候选见 [`CANDIDATES`]。顺序即优先级，第一个命中的就是客户端会去执行的那个。
-pub fn worker_path(region: Region) -> Option<PathBuf> {
+/// 为什么是复数：客户端 fast-update 之后，安装根里可能同时存在
+/// 顶层原件与 `.qoder-versions/<版本>/` 里的多份副本，而「应用此刻执行哪一份」
+/// 只有它自己知道（本机实测 0.4.1 已 stage 而应用仍跑 0.3.4）。
+/// 接管因此**全量注入**：漏掉任何一份都可能「补丁打在没人读的文件上」
+/// —— 2026-09-24 真机踩过：顶层与国际版版本目录并存，应用读的是版本目录那份。
+pub fn worker_paths(region: Region) -> Vec<PathBuf> {
     let roots = match sdk_root_override() {
         Some(base) => vec![base.join(region.key())],
         None => region.worker_sdk_roots(),
     };
+    let mut out = Vec::new();
     for root in &roots {
         for c in CANDIDATES {
             let p = root.join(c);
-            if p.is_file() {
-                return Some(p);
+            if p.is_file() && !out.contains(&p) {
+                out.push(p);
             }
         }
     }
-    None
+    out
+}
+
+/// 主落点：[`worker_paths`] 的第一个（版本目录优先于顶层，见
+/// [`crate::region::Region::worker_sdk_roots`]）。报错文案与还原提示用它 ——
+/// 真正的装卸走 [`install_everywhere`] / [`uninstall_everywhere`]，不认这个。
+pub fn worker_path(region: Region) -> Option<PathBuf> {
+    worker_paths(region).into_iter().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -514,18 +531,76 @@ fn shell_quote(path: &Path) -> String {
 // `install_at` / `uninstall_at`。留着这两个封装只会变成一份没人走、却会被误当成
 // 正门的分叉。
 
-/// 该区域当前是否已注入（不看内容是否最新，只看有没有）。
-pub fn is_installed(region: Region) -> bool {
-    worker_path(region)
-        .and_then(|p| read_marker(&p))
-        .is_some()
+/// 把注入写进**每一份**真实存在的产物副本（见 [`worker_paths`]）。
+///
+/// 返回 `(已确认注入的路径（新写或原本就一致）, 失败的 (路径, 原因))`。
+/// 一份都不存在 → `Err`（客户端没装的形态，调用方照 [`crate::region::Region::install_hint`]
+/// 报错）；**部分失败不算整体失败** —— 真正在跑的那份可能已经在成功的那部分里，
+/// 把整体推翻回滚反而会让接管「看着开着、其实被摘了」。失败清单由调用方记进调试日志。
+pub fn install_everywhere(
+    region: Region,
+    url: &str,
+    ca_pem: &str,
+) -> Result<(Vec<PathBuf>, Vec<(PathBuf, String)>), String> {
+    let paths = worker_paths(region);
+    if paths.is_empty() {
+        return Err(format!(
+            "找不到{}客户端的 worker 产物：请确认官方客户端已安装在 {}",
+            region.label(),
+            region.install_hint()
+        ));
+    }
+    let mut installed = Vec::new();
+    let mut failed = Vec::new();
+    for p in paths {
+        match install_at(&p, region, url, ca_pem) {
+            Ok(_) => installed.push(p),
+            Err(e) => failed.push((p, e)),
+        }
+    }
+    if installed.is_empty() {
+        // 一份都没写上：把第一个原因端出去（其余在 failed 里，调用方可留痕）
+        let first = failed.remove(0);
+        return Err(first.1);
+    }
+    Ok((installed, failed))
 }
 
-/// 该区域当前注入的端点。
+/// 从**每一份**真实存在的产物里剥离注入（见 [`worker_paths`]）。
+///
+/// 返回确实改了盘的份数。**失败不打断**：一份剥离失败（注入段不完整 / 被占用）时
+/// 继续剥其余的，最后把第一个原因报出去 —— 关接管的路上「留下一份还指着死端口的
+/// 副本」比「报错」恶劣，能救几份是几份。没有副本时不报错（客户端已卸载的形态）。
+pub fn uninstall_everywhere(region: Region) -> Result<usize, String> {
+    let paths = worker_paths(region);
+    let mut changed = 0;
+    let mut first_err: Option<String> = None;
+    for p in paths {
+        match uninstall_at(&p) {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(changed),
+    }
+}
+
+/// 该区域当前是否已注入（不看内容是否最新，只看有没有）——
+/// **任何一份**副本上还在，就算还在（`uninstall_everywhere` 会把每一份都剥掉）。
+pub fn is_installed(region: Region) -> bool {
+    worker_paths(region).iter().any(|p| read_marker(p).is_some())
+}
+
+/// 该区域当前注入的端点：第一份带标记的副本上写的那个。
 pub fn current_url(region: Region) -> Option<String> {
-    worker_path(region)
-        .and_then(|p| read_marker(&p))
-        .map(|m| m.url)
+    worker_paths(region)
+        .iter()
+        .find_map(|p| read_marker(p).map(|m| m.url))
 }
 
 #[cfg(test)]

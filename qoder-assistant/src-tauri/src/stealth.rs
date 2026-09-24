@@ -53,12 +53,12 @@ pub const LEASE_TTL: Duration = Duration::from_secs(30);
 //    （CodeBuddy 时代的残留键）—— Qoder 客户端**根本不读**，它的推理进程 env 来自
 //    `buildEnv(){ let e = this.options.env ?? {...process.env} }`，配置文件里的 `env`
 //    块没有任何消费者。于是「写成功 / 界面已开启 / 端口在听」而请求全直连官方。
-// 2. 配套动作一度被**误删**。那时跟着一套「退出客户端 → 重启客户端」，理由是「长驻
-//    CLI host 会把旧端点留在 process.env」—— 这个理由不成立（Qoder 的推理进程是每次
-//    会话按需 spawn 的一次性 `--print` 进程，跑完即退），但结论恰好是对的：桌面端是
-//    长驻进程，产物在**它启动时**被读进内存，之后每次会话都用内存里那一份 —— 所以改
-//    产物**必须重启客户端**才生效。2026-09-21 重启回来了，形态是开关接管这一步的
-//    明确收尾（见 [`crate::client_proc`]），不再是切换拓扑时的隐式副作用。
+// 2. 配套动作在「要不要重启客户端」上反转了两次。09-19 删过一套「退出客户端 →
+//    重启客户端」；09-21 又加了回来（当时真机观察「开接管不重启仍直连」，于是认定
+//    桌面端启动时读一次产物、必须重启）；**09-24 惰性标记活体实验终审**：0.3.4 起
+//    客户端每次会话都新起 worker 线程、从磁盘重读产物，CN / 国际两变体都不例外
+//    —— 09-21 的观察描述的是旧版（≤0.3.3）长驻子进程架构，`client_proc` 据此删除，
+//    开关接管**不再碰任何客户端进程**，改动在下一次对话自然生效。
 //
 // 现在落点是**客户端真正执行的那份产物**（见 [`crate::patch`]），且状态文案只陈述
 // 可以当场核验的事实：注入在不在、心跳在不在、日志里到底有没有收到过请求。
@@ -73,11 +73,10 @@ const LEASE_FILE: &str = "stealth.json";
 /// 什么时候摘的，全在这里。
 ///
 /// ⚠️ 这里曾有「长驻 CLI host 会把旧端点留在 process.env，所以要按日志判断它有没有
-/// 把缓存清掉」的说法。**「长驻 CLI host」并不存在**（Qoder 的推理进程是每次会话按需
-/// spawn 的一次性 `--print` 进程，跑完即退），但「有个东西揣着已摘除的端点」是真的 ——
-/// 是**桌面端自己**：产物在它启动时被读进内存，之后每次会话都用那份副本。
-/// 所以「重启客户端」既不多余、也不靠这份日志去判断：它由 [`crate::client_proc`]
-/// 当场做完，并留一条 `restart_qoder`（三条结局各不相同，见那里）。
+/// 把缓存清掉」的说法。**「长驻 CLI host」并不存在**（0.3.4 起推理跑在桌面主进程的
+/// worker 线程里），而「有个东西揣着已摘除的端点」在旧版客户端上是真的 ——
+/// 现在每次会话重读产物，摘除在下一次对话即生效，进程上没有任何要收尾的东西。
+/// 旧 journal 里的 `restart_qoder` 事件来自已删除的自动重启（见 [`crate::commands`]）。
 const JOURNAL_FILE: &str = "takeover-journal.jsonl";
 
 /// 接管调试日志（纯文本、一行一条）。**请求级细节全在这里**：反代收到的每个路径、
@@ -114,7 +113,8 @@ pub struct JournalEvent {
     /// 本地时间（展示用）
     pub at: String,
     /// install / uninstall / route_start / proxy_request / proxy_upstream_error / …
-    /// （`restart_qoder` 是开关接管后的收尾重启，见 [`crate::client_proc`]。）
+    /// （`restart_qoder` 是 09-21~09-23 期间「开关接管后自动重启客户端」的产物，
+    /// 该机制已随 `client_proc` 的删除而退役 —— 留在这里只为读懂历史日志。）
     pub event: String,
     #[serde(default)]
     pub detail: String,
@@ -416,23 +416,13 @@ fn url_for_port(port: u16) -> String {
     format!("https://127.0.0.1:{port}")
 }
 
-/// 装卸的落点：**被执行的**那份 worker 产物（asar 之外，见 [`crate::patch`]）。
-///
-/// 这里曾经写的是 `~/.qoder[-cn]/settings.json` 的 `env.CODEBUDDY_BASE_URL` ——
-/// 一个客户端根本不读的键：SDK 起推理进程时 env 取自
-/// `buildEnv(){ let e = this.options.env ?? {...process.env} }`，配置文件里的
-/// `env` 块**没有任何消费者**。于是端点写成功、界面显示已开启、端口在听，
-/// 而对话一直直连官方（用户看到的「接管没生效、扣的是另一个账号」正是这个）。
-fn target_file(region: Region) -> Option<PathBuf> {
-    crate::patch::worker_path(region)
-}
-
 /// 读取**指定区域**当前注入的端点（另一个区域装了什么不影响这个答案）。
 pub fn current_endpoint(region: Region) -> Option<String> {
     crate::patch::current_url(region)
 }
 
-/// **装**：把端点注入**指定区域**客户端的 worker 产物，并落下租约。
+/// **装**：把端点注入**指定区域**客户端的 worker 产物（**所有真实存在的副本**，
+/// 见 [`crate::patch::install_everywhere`]），并落下租约。
 ///
 /// 幂等：已装着、且区域与端口都一致 → 只续一次心跳，不重复写 33MB 的产物文件。
 /// 但**每次都复查一遍注入是否还在**：官方更新会把整个文件换掉，那样注入就没了，
@@ -451,21 +441,22 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
             region.label()
         ));
     }
-    let target = target_file(region).ok_or_else(|| {
-        format!(
+    if crate::patch::worker_paths(region).is_empty() {
+        return Err(format!(
             "找不到{}客户端的 worker 产物，无法接管：请确认官方客户端已安装在 {}。",
             region.label(),
             region.install_hint()
-        )
-    })?;
+        ));
+    }
 
     if let Some(mut lease) = load_lease(data_dir) {
         if lease.region == region && lease.port == port && lease.url == url {
             lease.heartbeat_ms = now_ms();
             let _ = save_lease(data_dir, &lease);
             // 值可能被官方更新覆盖掉，这里保证它仍是我们期望的那个（已一致则空操作）
-            return match crate::patch::install_at(&target, region, &url, ca_pem) {
-                Ok(_) => {
+            return match crate::patch::install_everywhere(region, &url, ca_pem) {
+                Ok((_, failed)) => {
+                    record_install_failures(data_dir, &failed);
                     // 上一次失败过、这次好了 → 把旧错误清掉，别让界面继续报陈年故障
                     if lease.last_error.take().is_some() {
                         let _ = save_lease(data_dir, &lease);
@@ -493,13 +484,17 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
     };
     // 先落租约再改产物：中途崩了也留有记录，sweep 能收尾
     save_lease(data_dir, &lease).map_err(|e| format!("写入租约失败：{e}"))?;
-    if let Err(e) = crate::patch::install_at(&target, region, &url, ca_pem) {
-        // 注入失败：把原文留在租约里，界面会照读 —— 别让它变成一句只有 stderr 知道的秘密
-        let mut failed = lease;
-        failed.last_error = Some(e.clone());
-        let _ = save_lease(data_dir, &failed);
-        return Err(e);
-    }
+    let (installed, failed) = match crate::patch::install_everywhere(region, &url, ca_pem) {
+        Ok(ok) => ok,
+        Err(e) => {
+            // 注入失败：把原文留在租约里，界面会照读 —— 别让它变成一句只有 stderr 知道的秘密
+            let mut failed_lease = lease;
+            failed_lease.last_error = Some(e.clone());
+            let _ = save_lease(data_dir, &failed_lease);
+            return Err(e);
+        }
+    };
+    record_install_failures(data_dir, &failed);
     // 事件里带上扣费备选名单，界面时间线能直接回答「开启时当前账号池是什么」
     let settings = crate::accounts::load_settings(data_dir);
     let names = billing_account_names(data_dir, &settings.billing_account_ids);
@@ -525,46 +520,61 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
         data_dir,
         "install_target",
         &format!(
-            "端点已注入 {}（env.{}={url}），并注入了本机 CA 以信任本地 TLS",
-            target.display(),
+            "端点已注入 {} 份产物副本：{}（env.{}={url}），并注入了本机 CA 以信任本地 TLS",
+            installed.len(),
+            joined_paths(&installed),
             region.endpoint_env_key().unwrap_or("")
         ),
     );
     Ok(())
 }
 
+/// 部分副本写失败**不算装失败**（真正在跑的那份可能已在成功的那部分里），
+/// 但失败这件事必须留痕 —— 进调试日志，不进界面时间线。
+fn record_install_failures(data_dir: &Path, failed: &[(PathBuf, String)]) {
+    for (path, why) in failed {
+        debug_append(data_dir, "install_target_failed", &format!("{}：{why}", path.display()));
+    }
+}
+
+/// 把一组路径拼成「a、b、c」的形态（调试日志用）。
+fn joined_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 /// **卸**：剥掉 worker 产物里的注入段（逐字节还原成官方原样），删掉租约。
 ///
+/// 剥的是**所有真实存在的副本**（见 [`crate::patch::uninstall_everywhere`]）——
+/// fast-update 之后同一份客户端可能有多份副本，漏一份就留一份指向死端口的注入。
 /// 只认**我们自己的注入标记**：产物里没有那段就什么都不做 —— 不去猜
 /// 「文件里这个端点值是不是我们写进去的」，因为那是别人的文件，
 /// 而且补丁模型本就不需要「记住原来是什么」（摘除是精确剥离）。
 ///
-/// 这里**不碰任何客户端进程**，但这不是「不用重启」：桌面端只在启动时读产物，
-/// 所以正开着的那台**还揣着注入**，得重启它才回到直连。进程的事交给调用方收尾 ——
-/// 关开关走 [`crate::commands`] 的安全切换流程、网络体检走 [`crate::netfix`]，
-/// 两处都会调 [`crate::client_proc`] 把正在运行的那台重启一遍。
-/// 本模块只负责把磁盘改对（谁都不在跑时，光把磁盘改对就够了）。
+/// 这里**不碰任何客户端进程**，也不需要碰：客户端每次会话都新起 worker 线程、
+/// 从磁盘重读产物，摘除在下一次对话即生效（2026-09-24 活体标记实验裁决）。
 pub fn uninstall(region: Region, data_dir: &Path) -> Result<(), String> {
     let label = region.label();
-    let changed = match target_file(region) {
-        Some(target) => crate::patch::uninstall_at(&target)?,
-        // 客户端已经卸载了：没有可摘的东西，也不算错误
-        None => false,
-    };
-    if changed {
+    let targets = crate::patch::worker_paths(region);
+    let changed = crate::patch::uninstall_everywhere(region)?;
+    if changed > 0 {
         journal_append(
             data_dir,
             "uninstall",
-            &format!("接管已关闭（{label}）：客户端产物已还原成官方原样，重启后即恢复直连"),
+            &format!("接管已关闭（{label}）：客户端产物已还原成官方原样，下一次对话起恢复直连"),
         );
-        // 「还原了哪个文件的哪一段」只有排查时用得上
+        // 「还原了哪些文件的哪一段」只有排查时用得上
         debug_append(
             data_dir,
             "uninstall_target",
-            &match target_file(region) {
-                Some(t) => format!("已从 {} 精确剥离注入段（逐字节还原官方原样）", t.display()),
-                None => "客户端产物不存在，没有可剥离的注入段".to_string(),
-            },
+            &format!(
+                "已从 {} 份产物副本精确剥离注入段（逐字节还原官方原样）：{}",
+                changed,
+                joined_paths(&targets)
+            ),
         );
     }
     let _ = fs::remove_file(lease_path(data_dir));
@@ -655,7 +665,9 @@ pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
     // 于是这里立刻变回 false —— 界面如实回落，而不是继续显示「生效中」。
     // 反过来，判据也从不是「我们写过没有」，而是**文件现在是什么样**。
     let installed = current_endpoint(region).as_deref() == Some(url.as_str());
-    let target = target_file(region)
+    // 展示用落点：主候选（版本目录优先于顶层）。真正注入的是**所有**存在的副本
+    // （见 [`crate::patch::install_everywhere`]），这里只挑主落点进文案。
+    let target = crate::patch::worker_path(region)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "（未找到客户端产物）".to_string());
 
@@ -663,11 +675,11 @@ pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
     let note = match (settings.proxy_enabled, installed, alive) {
         (false, _, _) => format!(
             "未开启。开启后 {label} 客户端的对话请求会自动走本机反代（按选定的扣费账号轮换）；\
-             注入要**客户端启动时**才被读到 —— 开启时若它正在运行，本应用会自动重启它。"
+             端点在下一次对话被客户端读到，无需重启。"
         ),
         (true, true, true) => format!(
             "接管生效中（{label}）：端点已注入 {target}，本机反代在 {url} 上监听 TLS。\
-             客户端只在启动时读这份产物，所以开启接管时本应用会把正在运行的那台自动重启一遍。"
+             客户端每次会话都重读这份产物，改动在下一次对话起生效。"
         ),
         (true, true, false) => {
             format!("注入还在 {target}，但心跳已停 —— 本应用的反代可能已退出，请点「停止接管」清理。")
@@ -761,10 +773,9 @@ pub fn stealth_status(app: tauri::AppHandle) -> Result<StealthStatus, String> {
 /// [`DEBUG_ONLY_EVENTS`]）。
 ///
 /// 这里曾有一步 `merge_install_restart`：把「开启接管」与紧随其后的「重启 Qoder」
-/// 合并成一条，免得同一个动作在时间线上占两格。2026-09-21 起 `restart_qoder` 又有了
-/// 产出（见 [`crate::client_proc`]），但**合并逻辑没有跟着回来**：重启现在是独立、
-/// 且会单独失败的一步（三条结局各不相同），挤进「端点已注入」那一行的话，用户正好
-/// 看不到这里最该看清的事 —— 它到底重启成功了没有。
+/// 合并成一条，免得同一个动作在时间线上占两格。2026-09-21~09-23 期间 `restart_qoder`
+/// 有产出（当时相信「产物要重启才被读到」）；2026-09-24 起自动重启已整体删除
+/// （每次会话重读产物，无需重启），这个事件只会出现在那段时间的历史日志里。
 #[tauri::command]
 pub fn takeover_events(app: tauri::AppHandle) -> Vec<JournalEvent> {
     let Ok(dir) = crate::commands::try_data_dir(&app) else {
@@ -937,11 +948,20 @@ mod tests {
             s.takeover_region = Region::Cn;
             crate::accounts::save_settings(&data, &s).unwrap();
 
-            // 把产物所在目录设成只读 ⇒ **备份那一步**就写不进去（EACCES = PermissionDenied）
-            let dir = official_file(&sdk, Region::Cn).parent().unwrap().to_path_buf();
-            let mut perms = fs::metadata(&dir).unwrap().permissions();
-            perms.set_readonly(true);
-            fs::set_permissions(&dir, perms.clone()).unwrap();
+            // 把产物与其所在目录都设成只读 ⇒ 写回必然失败（EPERM/EACCES）。
+            // ⚠️ 两个都要锁，平台差异就在这里（预置测试只在 macOS 绿过的教训）：
+            // - 锁目录 → macOS 上**备份那一步**写不进去；
+            //   Windows 上目录的 readonly 属性不阻止创建文件，锁了也白锁；
+            // - 锁文件 → Windows 上写回失败、且 rename 兜底顶不掉只读文件；
+            //   macOS 上 rename 兜底能顶掉只读文件，单锁文件不够。
+            let file = official_file(&sdk, Region::Cn);
+            let dir = file.parent().unwrap().to_path_buf();
+            let mut dperms = fs::metadata(&dir).unwrap().permissions();
+            dperms.set_readonly(true);
+            fs::set_permissions(&dir, dperms.clone()).unwrap();
+            let mut fperms = fs::metadata(&file).unwrap().permissions();
+            fperms.set_readonly(true);
+            fs::set_permissions(&file, fperms.clone()).unwrap();
 
             let err = install(Region::Cn, &data, default_port(&data), CA).unwrap_err();
             assert!(err.contains("失败"), "错误得说清是哪一步失败：{err}");
@@ -955,8 +975,10 @@ mod tests {
             );
 
             // 还原，否则临时目录自己都删不干净
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(&dir, perms);
+            fperms.set_readonly(false);
+            let _ = fs::set_permissions(&file, fperms);
+            dperms.set_readonly(false);
+            let _ = fs::set_permissions(&dir, dperms);
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }

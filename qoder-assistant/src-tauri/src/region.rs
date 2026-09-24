@@ -52,7 +52,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Qoder 的部署区域。新增区域只需往这里加一个变体 + 补全下面四组常量。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -341,7 +342,7 @@ impl Region {
         }
     }
 
-    /// 智能接管的落点候选：官方 agent SDK 在 `app.asar.unpacked` 里的根目录。
+    /// 智能接管的落点候选（按探测顺序）：官方 agent SDK 在 `app.asar.unpacked` 里的根目录。
     ///
     /// # 为什么是 asar 外这份
     ///
@@ -351,22 +352,31 @@ impl Region {
     /// 也就是说**被执行的正是 asar 之外那一份** —— 它不在归档完整性校验范围内，
     /// 可以直接改；而 asar 内那份永远轮不到。
     ///
-    /// 具体文件由 [`crate::patch`] 按与客户端一致的顺序探测。
+    /// # 顺序：fast-update 的版本目录在前，顶层垫后
+    ///
+    /// 客户端有 fast-update：更新解到安装根下的 `.qoder-versions/<版本>/`，
+    /// 之后**实际执行的是版本目录里那份**（2026-09-24 真机实测：顶层
+    /// `resources` 与 `.qoder-versions/0.3.4` 并存，桌面日志的
+    /// `[WorkerTransport]` 行指向版本目录那份）；顶层那份是首次安装的原件，
+    /// 只在还没 fast-update 过时才被执行。所以版本目录**优先**、顶层**垫底**；
+    /// 具体注入哪几份由 [`crate::patch`] 决定（存在的全量注入）。
     pub fn worker_sdk_roots(self) -> Vec<PathBuf> {
         let sdk = match self {
             Region::Global => "qoder-agent-sdk",
             Region::Cn => "qoder-cn-agent-sdk",
         };
-        self.client_install_dirs()
-            .into_iter()
-            .map(|root| {
+        let mut out = Vec::new();
+        for root in self.client_install_dirs() {
+            out.extend(versioned_sdk_dirs(&root, sdk));
+            out.push(
                 root.join(Self::resources_dir())
                     .join("app.asar.unpacked")
                     .join("node_modules")
                     .join("@qoder-ai")
-                    .join(sdk)
-            })
-            .collect()
+                    .join(sdk),
+            );
+        }
+        out
     }
 
     /// 主落点：探测顺序里第一个**真的存在**的候选；一个都不在时给第一个 ——
@@ -398,6 +408,56 @@ impl fmt::Display for Region {
         f.write_str(self.key())
     }
 }
+
+/// fast-update 的版本目录（`<安装根>/.qoder-versions/<版本>/`）里的 SDK 根，
+/// **按版本从高到低**排；目录不存在或没有版本目录时返回空。
+///
+/// 只挑「名字能解析成 semver」的子目录 —— `*.qoder-update-ready.json` 这类
+/// 同级文件、以及将来可能出现的非版本目录都天然被排除。
+///
+/// ⚠️ 「选最高版本」≠「应用正在跑的那份」：本机实测 0.4.1 已 stage 而应用仍跑
+/// 0.3.4。所以这里把**所有**版本目录都列出来交给上层全量注入（见 [`crate::patch`]），
+/// 排序只为让「主落点」（报错文案 / 提示用）尽量贴近最新。
+fn versioned_sdk_dirs(install_root: &Path, sdk: &str) -> Vec<PathBuf> {
+    let root = install_root.join(".qoder-versions");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<(SemVer, PathBuf)> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_string_lossy().to_string();
+            Some((semver(&name)?, p))
+        })
+        .collect();
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    versions
+        .into_iter()
+        .map(|(_, v)| {
+            v.join(Region::resources_dir())
+                .join("app.asar.unpacked")
+                .join("node_modules")
+                .join("@qoder-ai")
+                .join(sdk)
+        })
+        .collect()
+}
+
+/// 解析 `X.Y.Z` 形式的版本号（客户端 fast-update 目录名就是这种形态）。
+/// 解析不出的名字返回 None —— 宁可少认一个目录，也不把乱七八糟的名字排进去。
+fn semver(name: &str) -> Option<SemVer> {
+    let mut it = name.split('.');
+    let parse = |s: &str| s.parse::<u64>().ok();
+    Some((
+        parse(it.next()?)?,
+        parse(it.next()?)?,
+        parse(it.next()?)?,
+    ))
+}
+
+/// `(major, minor, patch)`，排序用。
+type SemVer = (u64, u64, u64);
 
 #[cfg(test)]
 mod tests {
@@ -538,11 +598,76 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
-            // 默认 per-user 安装：`%LOCALAPPDATA%\Programs\<名>`；
-            // 装到全机位置时才落到 Program Files —— 两种都要认得
-            assert!(cn.contains("/Programs/Qoder CN/resources/"), "{cn}");
-            assert!(g.contains("/Programs/Qoder/resources/"), "{g}");
+            // 默认 per-user 安装：`%LOCALAPPDATA%\Programs\<名>`。
+            // ⚠️ fast-update 之后主落点可能落在 `.qoder-versions/<版本>/` 里
+            // （见 [`Region::worker_sdk_roots`]），所以这里只钉「安装根 + SDK 包名」，
+            // 不钉 `resources` 那一层 —— 本机实测两份并存，应用跑的是版本目录那份。
+            assert!(cn.contains("/Programs/Qoder CN/"), "{cn}");
+            assert!(g.contains("/Programs/Qoder/"), "{g}");
         }
+    }
+
+    /// fast-update 版本目录必须按版本**从高到低**排，且非版本名被排除。
+    ///
+    /// 这条守的是「主落点尽量贴近最新」：0.10 排在 0.9 前面（字符串序会排反），
+    /// `*.qoder-update-ready.json` 这类同名文件不该被当成版本目录。
+    #[test]
+    fn versioned_sdk_dirs_are_sorted_newest_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "qa-region-versions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = dir.join("Qoder");
+        for v in ["0.3.3", "0.3.4", "0.10.0", "0.9.2"] {
+            fs::create_dir_all(root.join(".qoder-versions").join(v)).unwrap();
+        }
+        // 同级的非版本文件与目录：都必须被排除
+        fs::write(
+            root.join(".qoder-versions").join("0.3.4.qoder-update-ready.json"),
+            b"{}",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".qoder-versions").join("junk")).unwrap();
+
+        let got = versioned_sdk_dirs(&root, "qoder-agent-sdk");
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| {
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .split("/.qoder-versions/")
+                    .nth(1)
+                    .unwrap()
+                    .split('/')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["0.10.0", "0.9.2", "0.3.4", "0.3.3"],
+            "版本要从高到低：{names:?}"
+        );
+        // 每条都要指到 SDK 根：resources 层按平台、往下逐字相同
+        for p in &got {
+            let s = p.to_string_lossy().replace('\\', "/");
+            assert!(s.ends_with("/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk"), "{s}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 没有 `.qoder-versions` 时（CN 版当前如此）就一个版本候选都不给，
+    /// 落点自然回到顶层 —— 绝不能因为扫描失败而凭空造路径。
+    #[test]
+    fn versioned_sdk_dirs_are_empty_without_the_versions_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "qa-region-noversions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(versioned_sdk_dirs(&dir, "qoder-cn-agent-sdk").is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// 「客户端该装在哪」这句话必须按平台说：Windows 上照 macOS 说 `/Applications`

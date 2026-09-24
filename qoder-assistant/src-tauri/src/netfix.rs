@@ -30,14 +30,19 @@
 //! 修正）：「有个进程揣着已摘除的端点」这件事是真的，只是他不叫 CLI host ——
 //! 是**桌面端自己**。
 //!
-//! # 2026-09-21 修正：僵尸注入的影响面比「产物脏了」更宽
+//! # 2026-09-21 修正（其结论已于 2026-09-24 再次修正）：僵尸注入的影响面
 //!
 //! 上面把僵尸注入定义成「产物里留着本机端点、而反代已经不在」—— 那只覆盖了磁盘这一半。
-//! 另一半是**产物干净了、运行中的客户端还揣着脏的那一份**：桌面端是长驻进程，产物在它
-//! **启动时**被读进内存，之后每次会话都用内存里的副本（磁盘改了它不看，见
-//! [`crate::client_proc`] 的模块文档）。于是「一键恢复」把注入摘干净之后，正开着的那台
-//! 客户端仍然会去敲本机端口 —— 恢复的效果要等它下次启动才出现。所以恢复流程补了
-//! 最后一步：把**刚被摘掉注入**的客户端重启一遍。
+//! 09-21 曾认为另一半是「产物干净了、运行中的客户端还揣着脏的那一份，要重启才清掉」，
+//! 并为此在恢复流程里补了「重启刚被摘掉注入的客户端」一步。
+//!
+//! **2026-09-24 惰性标记活体实验推翻了那一半**：0.3.4 起的客户端每次会话都新起
+//! worker 线程、从磁盘重读产物（CN / 国际两变体都是，run manifest 的 pid = 桌面主进程
+//! pid），所以摘干净磁盘之后，运行中的客户端在**下一次对话**就回到直连 ——
+//! 重启步骤整体删除。09-21 观察到的「不重启就直连」描述的是旧版（≤0.3.3）独立
+//! 长驻子进程架构，且当时多半混入了「补丁打在没人读的副本上」的干扰（见
+//! [`crate::patch`] 的全量注入）。真正的僵尸态只剩磁盘那一半，`takeover_issues`
+//! 读产物判定即可。
 //!
 //! 家目录是**参数**而不是到处调 `dirs::home_dir()`：这样整条恢复流程能在临时目录里跑完
 //! 单测，不会碰到用户真实配置（见文末 tests）。
@@ -624,88 +629,40 @@ fn disable_proxy(data_dir: &Path) -> (Vec<NetStep>, bool) {
     (steps, true)
 }
 
-/// 把刚被摘掉注入的客户端重启一遍 —— 摘磁盘上的注入**不会**改变它们内存里那一份，
-/// 只有重启它们才真的回到直连（理由见模块文档的 2026-09-21 修正）。
-///
-/// 三种结局都如实报出来：真重启了 / 它没在运行（无需打扰）/ 拉不起来（要用户动手，
-/// 因为那台客户端会继续敲一个已经没人听的端口）。
-fn restart_clients(regions: &[Region]) -> Vec<NetStep> {
-    use crate::client_proc::RestartOutcome;
-    let mut steps = Vec::new();
-    for region in regions {
-        let name = region.client_name();
-        let (ok, detail) = match crate::client_proc::restart_if_running(*region) {
-            RestartOutcome::Restarted => (
-                true,
-                format!(
-                    "注入已从磁盘摘除，为让它立刻生效又重启了 {name}\
-                     （未保存的编辑内容请自行确认）。"
-                ),
-            ),
-            RestartOutcome::NotRunning => (
-                true,
-                format!("{name} 没在运行，无需重启 —— 它下次打开时读到的就是官方原样。"),
-            ),
-            RestartOutcome::Failed(e) => (
-                false,
-                format!(
-                    "自动重启 {name} 失败：{e}。请手动重启它 —— \
-                     否则它会继续去连本机端口。"
-                ),
-            ),
-        };
-        steps.push(NetStep {
-            action: format!("重启 {name}"),
-            ok,
-            detail,
-        });
-    }
-    steps
-}
-
-/// 关开关 → 摘接管端点 → 重启刚被摘掉注入的客户端 → 清配置文件 → 取消 launchd 全局变量 → 复检。
+/// 关开关 → 摘接管端点 → 清配置文件 → 取消 launchd 全局变量 → 复检。
 ///
 /// 每一步都记进 `steps`，失败不中断（尽量多救一点），最后给出复检结果。
 pub fn restore(home: &Path, data_dir: &Path) -> NetRestoreReport {
-    restore_impl(home, data_dir, true, true)
+    restore_impl(home, data_dir, true)
 }
 
-/// `touch_launchd=false` 时只处理文件与设置，不碰 launchd；
-/// `touch_processes=false` 时**一个客户端进程都不动**。
+/// `touch_launchd=false` 时只处理文件与设置，不碰 launchd。
 ///
-/// 单测必须两个都传 `false` —— 否则跑一次 `cargo test` 就会动到整机环境
-/// （launchctl 的全局变量，或者用户正开着的 Qoder）。
-fn restore_impl(
-    home: &Path,
-    data_dir: &Path,
-    touch_launchd: bool,
-    touch_processes: bool,
-) -> NetRestoreReport {
+/// 这里曾有第三个开关 `touch_processes`（「重启刚被摘掉注入的客户端」），
+/// 2026-09-24 随自动重启机制一起删除：客户端每次会话重读产物，摘干净磁盘
+/// 之后它下一次对话就回到直连，进程上没有任何要收尾的东西。
+/// 单测传 `false` 只是为了别去动 launchctl 的整机状态。
+fn restore_impl(home: &Path, data_dir: &Path, touch_launchd: bool) -> NetRestoreReport {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
 
     let mut steps = Vec::new();
-
-    // 0) 先记下哪些区域**确实装着**注入：只有它们需要在摘除后重启 ——
-    //    没装过的客户端内存里根本没有那一份，重启它纯属打扰。
-    //    必须在下面的摘除之前取：摘完这一问就恒为假了。
-    let injected: Vec<Region> = Region::ALL
-        .iter()
-        .copied()
-        .filter(|r| crate::patch::is_installed(*r))
-        .collect();
 
     // 1) 先关开关：否则反代监督线程会把端点重新装回去
     let (proxy_steps, proxy_disabled) = disable_proxy(data_dir);
     steps.extend(proxy_steps);
 
-    // 2) 摘掉接管注入（逐字节还原客户端产物，并删掉租约文件）
+    // 2) 摘掉接管注入（逐字节还原客户端产物，并删掉租约文件）。
+    //    摘干净之后，运行中的客户端在下一次对话重读磁盘、自然回到直连 ——
+    //    这里曾有一步「重启刚被摘掉注入的客户端」，2026-09-24 已删（见模块文档）。
     match crate::stealth::uninstall_all(data_dir) {
         Ok(()) => {
             if crate::stealth::load_lease(data_dir).is_none() {
                 steps.push(NetStep {
                     action: "摘除接管端点".into(),
                     ok: true,
-                    detail: "客户端 worker 产物已还原成官方原样，租约已清除。".into(),
+                    detail: "客户端 worker 产物已还原成官方原样，租约已清除；\
+                             正在运行的客户端下一次对话起恢复直连。"
+                        .into(),
                 });
             }
         }
@@ -714,17 +671,6 @@ fn restore_impl(
             ok: false,
             detail: format!("失败：{e}"),
         }),
-    }
-
-    // 3) 让摘除对**正在运行**的客户端生效：磁盘还原了，但它们内存里那一份还是脏的。
-    //    只重启**确实已经摘干净**的那些 —— 摘失败的区域产物没变，重启它既没用、
-    //    还会让下面的文案说一句假话（失败那步已经单独报出来了）。
-    if touch_processes {
-        let cleaned: Vec<Region> = injected
-            .into_iter()
-            .filter(|r| !crate::patch::is_installed(*r))
-            .collect();
-        steps.extend(restart_clients(&cleaned));
     }
 
     // 4) 兜底清掉其余污染键（上面已删的会报「没有需要清理」，无害）
@@ -782,9 +728,8 @@ pub fn net_diagnose(app: tauri::AppHandle) -> Result<NetReport, String> {
     Ok(diagnose(&home_dir()?, &dir))
 }
 
-/// 走线程池（`command(async)`）而不是主线程：这条流程里可能要**重启客户端**，
-/// 而客户端优雅退出最长等 [`crate::client_proc::GRACE_QUIT_MS`]、拉起再等
-/// [`crate::client_proc::RELAUNCH_VERIFY_MS`] —— 两个区域都撞满就是近一分钟。
+/// 走线程池（`command(async)`）而不是主线程：这条流程可能经
+/// [`crate::commands::apply_settings_inner`] 等端点就位（最长 8 秒）。
 /// 堵在主线程上会让整个窗口「未响应」。
 #[tauri::command(async)]
 pub fn net_restore(app: tauri::AppHandle) -> Result<NetRestoreReport, String> {
@@ -1112,8 +1057,8 @@ mod tests {
                 "端点必须被注入（且是 https —— 客户端只认 https origin）"
             );
 
-            // 不走 launchctl、也不动任何客户端进程，免得测试动到整机环境
-            let rep = restore_impl(&home, &data, false, false);
+            // 不走 launchctl，免得测试动到整机环境
+            let rep = restore_impl(&home, &data, false);
             assert!(rep.proxy_disabled, "恢复应报告反代被关掉");
 
             let after = crate::accounts::load_settings(&data);
