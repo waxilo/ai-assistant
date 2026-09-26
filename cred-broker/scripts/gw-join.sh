@@ -19,10 +19,10 @@
 # 当年排在后面的「去 Cloudflare 删 custom domain 路由」已经做完：Worker 与 D1 都删了，
 # 这个名字现在只有本机这一条应答路径。
 #
-# ⚠️ 上游端口必须是容器名 + 容器端口（cred-broker:8787），不能写宿主发布端口（8789）：
+# ⚠️ 上游端口必须是容器名 + 容器端口（cred-broker:80），不能写宿主发布端口（7003）：
 #    那个端口只绑在宿主回环上，gw 容器连不到，结果是**经域名进来的流量全 502**，
 #    而本机 curl 因为 /etc/hosts 接管照样正常。本脚本会检测并重写（--overwrite）。
-#    真正的判据是从网关那一侧探：docker exec gw wget -qO- http://cred-broker:8787/healthz
+#    真正的判据是从网关那一侧探：docker exec gw wget -qO- http://cred-broker:80/healthz
 #
 # 这里**没有** TRUST_PROXY 那一步（notify-hub 有）：本服务从不回绝对 URL，
 # src/cred.js 只用 new URL(request.url).pathname 做路由，容器看到 http 还是 https
@@ -36,7 +36,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 PUBLIC_HOSTNAME="${1:-cred-broker.sloan.dpdns.org}"
-CONTAINER_TARGET="cred-broker:8787"   # 必须是容器名：网关容器里的 127.0.0.1 是它自己
+CONTAINER_TARGET="cred-broker:80"   # 必须是容器名：网关容器里的 127.0.0.1 是它自己
 GW_DIR="${GW_DIR:-$ROOT_DIR/../../gw}"
 NETWORK=gw_default
 
@@ -63,8 +63,8 @@ docker compose up -d
 
 echo "==> 登记域名 $PUBLIC_HOSTNAME → $CONTAINER_TARGET"
 # vhost 已存在时带 --overwrite 重写：这台机器上出现过管理台手写的 conf 把上游写成
-# 宿主机发布端口（cred-broker:8789）的情况 —— 那个端口只在宿主回环上存在，容器网内
-# 连不上，网关一律 502。本脚本以「容器名:8787」为唯一正确写法，重跑一次即可纠正。
+# 宿主机发布端口（cred-broker:7003）的情况 —— 那个端口只在宿主回环上存在，容器网内
+# 连不上，网关一律 502。本脚本以「容器名:80」为唯一正确写法，重跑一次即可纠正。
 gw_args=("$PUBLIC_HOSTNAME" "$CONTAINER_TARGET")
 if [ -f "$GW_DIR/conf.d/${PUBLIC_HOSTNAME%%.*}.conf" ]; then
   echo "    ${PUBLIC_HOSTNAME%%.*}.conf 已存在 → 带 --overwrite 重写"

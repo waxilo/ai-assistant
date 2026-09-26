@@ -9,7 +9,7 @@
 # 比 notify-hub 多一层：数据库是 ../../mysql-server，网关是 ../../gw。脚本里的默认值已按此写死。
 #
 # 公网入口走共享网关 ../../gw（cloudflared 已带 *.sloan.dpdns.org 通配，由网关上的 nginx
-# 按 Host 分发）：./scripts/gw-join.sh 把 cred-broker.sloan.dpdns.org 指到 cred-broker:8787。
+# 按 Host 分发）：./scripts/gw-join.sh 把 cred-broker.sloan.dpdns.org 指到 cred-broker:80。
 # 应用自己不开公网端口，也不做 TLS。
 services:
   app:
@@ -20,11 +20,18 @@ services:
     container_name: cred-broker
     restart: unless-stopped
     env_file: .env
-    # 只绑 127.0.0.1，且只发布一个端口：80/443 归 ../../gw（公网域名实际由它应答），
-    # 8787 归 writing-assistant、8788 归 notify-hub，这里用 8789 是为了本机直连调试不撞车；
-    # 网关注入的是容器名:8787，不经过这个映射。
+    environment:
+      # 应用监听端口。约定：容器内一律 80（网关转发用的就是这个号）。
+      - PORT=80
+    # 容器以非 root 的 `node` 用户跑，默认绑不了 1024 以下的特权端口。这个 sysctl 是
+    # 网络命名空间级、只作用于本容器，把「非特权端口起点」降到 80，比提权或给二进制 setcap
+    # 都干净——宿主和其它容器不受影响，也不引入常驻特权。
+    sysctls:
+      - net.ipv4.ip_unprivileged_port_start=80
+    # 只绑 127.0.0.1，且只发布一个端口：80/443 归 ../../gw（公网域名实际由它应答）。
+    # 宿主这边给 7003 只是本机直连调试的入口号；网关注入的是容器名:80，不经过这个映射。
     ports:
-      - "${APP_BIND_ADDR:-127.0.0.1}:${APP_PORT:-8789}:8787"
+      - "${APP_BIND_ADDR:-127.0.0.1}:${APP_PORT:-7003}:80"
     healthcheck:
       # /healthz 会真的 SELECT 1（接口活着但连不上库要能被看出来）。
       # 不用 /v1/health：那个接口按设计只回闸参数、不碰数据库，库挂了它照样 200。
@@ -34,7 +41,7 @@ services:
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+          "fetch('http://127.0.0.1:80/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
         ]
       interval: 30s
       timeout: 5s
@@ -44,7 +51,7 @@ services:
       # 共享 MySQL 的网络：库里的主机名就是 `mysql`。
       # 声明为 external —— 本项目不拥有这两个网络，也就不会在 down 时把别人的摘掉。
       - mysql-server_default
-      # 共享公网网关的网络：让它的 nginx 能以 cred-broker:8787 打到本容器。
+      # 共享公网网关的网络：让它的 nginx 能以 cred-broker:80 打到本容器。
       - gw_default
 
 networks:

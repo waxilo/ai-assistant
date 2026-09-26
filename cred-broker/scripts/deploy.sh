@@ -57,7 +57,7 @@ docker compose ps
 
 bind=$(sed -n 's/^APP_BIND_ADDR=//p' .env | head -1)
 port=$(sed -n 's/^APP_PORT=//p' .env | head -1)
-bind=${bind:-127.0.0.1}; port=${port:-8789}
+bind=${bind:-127.0.0.1}; port=${port:-7003}
 echo ""
 echo "✅ 部署完成： http://${bind}:${port}   （健康检查：${status}）"
 
@@ -77,17 +77,17 @@ GW_CONF="$GW_DIR/conf.d/cred-broker.conf"
 if [ -f "$GW_CONF" ]; then
   gw_state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' gw 2>/dev/null || echo 未启动)
   echo "   公网入口： https://cred-broker.sloan.dpdns.org   （网关 gw：${gw_state}）"
-  # 上游必须是容器网络里的 8787。写成宿主端口 8789 时网关连不上（那端口只在回环上），
+  # 上游必须是容器网络里的 80。写成宿主端口 7003 时网关连不上（那端口只在回环上），
   # 而本机 curl 因为 hosts 接管一切正常 —— 只有从网关那一侧才看得出来。
-  if grep -qE 'cred-broker:(8788|8789)' "$GW_CONF"; then
+  if grep -qE 'cred-broker:(7003|8789)' "$GW_CONF"; then
     cat <<'EOF'
    ⚠️  网关的上游端口是宿主发布端口，gw 容器连不到，域名会全 502。
        修：./scripts/gw-join.sh --overwrite
-       验：docker exec gw wget -qO- http://cred-broker:8787/healthz
+       验：docker exec gw wget -qO- http://cred-broker:80/healthz
 EOF
   fi
-  if ! docker exec gw wget -qO- -T 5 "http://cred-broker:8787/healthz" >/dev/null 2>&1; then
-    echo "   ⚠️  gw 容器打不到 cred-broker:8787（公网域名会 502）：检查容器是否在跑、compose 的 gw_default 网络是否接上"
+  if ! docker exec gw wget -qO- -T 5 "http://cred-broker:80/healthz" >/dev/null 2>&1; then
+    echo "   ⚠️  gw 容器打不到 cred-broker:80（公网域名会 502）：检查容器是否在跑、compose 的 gw_default 网络是否接上"
   fi
 else
   cat <<'EOF'

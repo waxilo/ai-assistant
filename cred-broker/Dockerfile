@@ -1,4 +1,4 @@
-# 单进程、单职责：一个 HTTP 接口，监听 8787。没有后台任务、没有静态站点。
+# 单进程、单职责：一个 HTTP 接口，监听 80（compose 里用 PORT=80 + 非特权 sysctl 落地）。没有后台任务、没有静态站点。
 #
 # 构建上下文 = 本项目目录（docker-compose.yml 里 context: .）。
 # 镜像里只需要依赖与 src/：db/schema.mysql.sql、test/、scripts/ 都是宿主机侧的东西，
@@ -21,7 +21,7 @@ COPY src/ ./src/
 # 不 chown：代码与依赖归 root 只读，进程（node 用户）写不到自己的二进制里去。
 # 运行时唯一需要写的地方是 MySQL。
 USER node
-EXPOSE 8787
+EXPOSE 80
 
 # 不用 docker --init / tini：src/server.js 自己装了 SIGTERM 处理
 # （先停接单、等在途请求收尾再关连接池），node 作为 PID 1 收到 docker stop 就走这条路。

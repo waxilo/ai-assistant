@@ -71,7 +71,7 @@ DB_PASSWORD=$(password 24)
 LEASE_MS=180000
 FAIL_COOLDOWN_MS=300000
 APP_BIND_ADDR=127.0.0.1
-APP_PORT=8789
+APP_PORT=7003
 EOF
   chmod 600 .env
 else
@@ -133,7 +133,7 @@ cat <<EOF
   npm install                # 只装 mysql2（测试要在宿主机上连库跑）
   npm test                   # 对 cred_broker_test 跑全套断言
   ./scripts/deploy.sh        # 测试闸门 → 构建 → 起容器 → 探活
-  open http://127.0.0.1:${APP_PORT:-8789}/v1/health
+  open http://127.0.0.1:${APP_PORT:-7003}/v1/health
   ./scripts/gw-join.sh       # 一次性：让公网域名按 Host 转进本容器
 
 数据已由本机 MySQL 独占（云上 Worker 与 D1 已删除，见 README「数据搬迁（已完成）」）。
