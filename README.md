@@ -9,10 +9,12 @@ AI 桌面助手相关项目集合（迁移自 TraeWorkAssistant 与 workbuddy-as
 | [traework-assistant](./traework-assistant) | Trae Work Assistant（原 TraeWorkAssistant） |
 | [workbuddy-assistant](./workbuddy-assistant) | WorkBuddy Assistant |
 | [qoder-assistant](./qoder-assistant) | Qoder Assistant（多账号签到、token 自动续签、应用内自动更新） |
-| [cred-broker](./cred-broker) | 账号凭证池 + 续签闸（Cloudflare Worker + D1） |
+| [cred-broker](./cred-broker) | 账号凭证池 + 续签闸（本机 Docker 容器 + 共享 MySQL） |
 
-前三个子项目基于 Tauri + React + Rust；cred-broker 是部署在 Cloudflare Workers 上的
-服务端，跨机器共用同一批账号凭证，保证同一时刻只有一台机器在续签。
+前三个子项目基于 Tauri + React + Rust；cred-broker 是它们共用的服务端，跨机器共用同一批
+账号凭证，保证同一时刻只有一台机器在续签。它原本部署在 Cloudflare Workers + D1，现已迁到
+本机容器：数据已导入、公网域名由 `gw` 转进容器应答，Cloudflare 侧的 Worker 与 D1 库都已删除
+（详见该目录 README）。
 
 ## 应用发布（GitHub Actions）
 

@@ -1,4 +1,10 @@
 node_modules/
-.wrangler/
 .DS_Store
 *.log
+
+# 本机自托管的凭证与导出数据：一次都不该进版本库
+# .env 里是共享库的账号密码；.d1-export/ 里是**整池 access/refresh token 的明文**
+.env
+.env.*
+!.env.example
+.d1-export/

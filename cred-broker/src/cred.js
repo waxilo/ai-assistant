@@ -71,7 +71,8 @@ function ms(v) {
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
 }
 
-/** D1 的 `meta.changes`：只有它等于 1 才算「这一条语句真的改到了那一行」 */
+/** 条件更新上报的匹配行数：只有它等于 1 才算「这一条语句真的改到了那一行」。
+ *  D1 给的是 `meta.changes`；MySQL 侧由 src/db.js 开 FOUND_ROWS 保持同一形态。 */
 function changes(res) {
   return Number(res?.meta?.changes ?? res?.changes ?? 0);
 }
@@ -170,7 +171,7 @@ export function normalizeItems(list) {
 /**
  * 从落库的 payload 里取条目。
  *
- * **出口与入口共用同一套规范化**（`normalizeItems`）：D1 里的 `payload` 是不透明 JSON，
+ * **出口与入口共用同一套规范化**（`normalizeItems`）：落库的 `payload` 是不透明 JSON，
  * 历史行是在「区域还不进池」的年代写下的，读时再规范化一遍，老条目就能在**读的那一刻**
  * 把区域按 key 前缀补回来 —— 不必等下一次提交，也不必写迁移脚本。
  */

@@ -1,7 +1,9 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { handle, normalizeItem, normalizeItems, MAX_ITEMS } from "../src/cred.js";
-import { createEnv } from "./d1-shim.js";
+import { createEnv, closeEnv } from "./mysql-env.js";
+
+after(() => closeEnv());   // 连接池不关，进程会挂在退出流程上
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -39,7 +41,7 @@ async function newPool(env, items, actor = "mac-mini") {
 
 // ── 健康检查 ───────────────────────────────────────────────────────────────
 
-test("health 返回闸参数，供客户端核对与自身常量是否一致", async () => {
+test("health 暴露闸参数与服务器时间（给运维核对部署；三个客户端都不读它）", async () => {
   const env = createEnv();
   const r = await call(env, "GET", "/v1/health");
   assert.equal(r.status, 200);
@@ -394,10 +396,11 @@ test("事件表记下了创建 / 取件 / 抢闸 / 提交 / 解绑，且与业�
   });
   await call(env, "DELETE", `/v1/pool/${uuid}`, { actor: "mac-mini" });
 
-  const kinds = env.DB.raw
+  const { results } = await env.DB
     .prepare("SELECT kind FROM pool_events WHERE uuid = ? ORDER BY id")
-    .all(uuid)
-    .map((r) => r.kind);
+    .bind(uuid)
+    .all();
+  const kinds = results.map((r) => r.kind);
   assert.ok(kinds.includes("created"));
   assert.ok(kinds.includes("leased"));
   assert.ok(kinds.includes("committed"));
@@ -502,4 +505,53 @@ test("email 跟着池走一个来回（别的机器收养时就有，不必自�
   const r = await call(env, "GET", `/v1/pool/${uuid}`);
   assert.equal(r.status, 200);
   assert.equal(r.data.items[0].email, "a@b.c");
+});
+
+// ── 引擎语义：这几条是「迁到 MySQL 之后才可能错」的地方，D1 时代不存在 ──────
+
+test("适配层：匹配到但值没变的 UPDATE 仍报 changes=1（靠 mysql2 的 FOUND_ROWS 标志）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+
+  // 写一个与当前值完全相同的 lease_owner：SQLite/D1 报 1（它数的是 WHERE 匹配到的行），
+  // MySQL 默认报 0（它数的是真正改变值的行）。本项目所有关键判定都是 changes === 1，
+  // 少那个标志的后果是「闸已经写给这台机器了，它却被告知没抢到」。
+  const r = await env.DB.prepare("UPDATE pools SET lease_owner = ? WHERE uuid = ?")
+    .bind("m1", uuid)
+    .run();
+  assert.equal(r.meta.changes, 1);
+});
+
+test("同一台机器在租约到期后能重新拿到自己的闸（值相同也不能判成没抢到）", async () => {
+  const env = createEnv({ LEASE_MS: "1" });
+  const uuid = await newPool(env, [item("a")]);
+  assert.equal((await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" })).data.granted, true);
+  await sleep(5);
+  const r = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  assert.equal(r.data.granted, true);
+});
+
+test("整池 200 条真实长度的 token 原样往返（payload 必须是 LONGTEXT，TEXT 的 64KB 装不下）", async () => {
+  const env = createEnv();
+  const many = Array.from({ length: MAX_ITEMS }, (_, i) =>
+    item(`k${i}`, { access_token: "at".repeat(300), refresh_token: "rt".repeat(300) })
+  );
+  const created = await call(env, "POST", "/v1/pool", { body: { items: many } });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.count, MAX_ITEMS);
+
+  const got = await call(env, "GET", `/v1/pool/${created.data.uuid}`);
+  assert.equal(got.data.items.length, MAX_ITEMS);
+  assert.equal(got.data.items[MAX_ITEMS - 1].access_token, "at".repeat(300));
+});
+
+test("uuid 与 key 按字节比较：换大小写不等于同一个键（与 D1/SQLite 一致）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  // 库级排序规则若写成默认的 *_ci，这一条会读回整池 —— 身份锚点被悄悄放宽，
+  // 而表现为「某个客户端读到了一份它本不该看到的凭证」。
+  const r = await call(env, "GET", `/v1/pool/${uuid.toUpperCase()}`);
+  assert.equal(r.status, 404);
+  assert.equal(r.data.error, "gone");
 });

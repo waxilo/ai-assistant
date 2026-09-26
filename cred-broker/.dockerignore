@@ -1,0 +1,25 @@
+# 构建上下文瘦身：运行时只需要 package*.json 与 src/，其余全部排除。
+# 每条都写出来是因为「一次都没进过镜像」需要的是清单，不是运气。
+.git
+.gitignore
+**/node_modules
+.DS_Store
+*.log
+
+# 密钥与线上数据导出：本项目存的就是一整池别人的凭证，
+# .env 里那个库密码能让任何人把整池 token 读走。
+# `.d1-export/` 是当年从云上导池时落明文 dump 的目录；模式留着，因为它防的是
+# 「下一次有人手工导出一池 token 明文，顺手被 docker build 卷进镜像」。
+**/.env
+**/.env.*
+!**/.env.example
+.d1-export/
+
+# 表结构、测试、运维脚本、文档 —— 都不属于镜像
+db/
+test/
+scripts/
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore

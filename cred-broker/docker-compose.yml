@@ -1,0 +1,54 @@
+# 本机自托管：一个容器只提供 /v1/* 接口，数据库是共享容器 ../../mysql-server。
+#
+#   ../../mysql-server/scripts/start.sh   # 先把数据库起起来
+#   ./scripts/db-init.sh                  # 一次性：建库建用户 + 建表 + 生成 .env
+#   ./scripts/deploy.sh                   # 跑测试 → 构建 → 起容器 → 探活
+#   ./scripts/gw-join.sh                  # 一次性：让公网域名按 Host 转进本容器
+#
+# 本项目按约定留在 ai-assistant 仓库内（三个客户端应用与它同仓），所以共享服务的相对路径
+# 比 notify-hub 多一层：数据库是 ../../mysql-server，网关是 ../../gw。脚本里的默认值已按此写死。
+#
+# 公网入口走共享网关 ../../gw（cloudflared 已带 *.sloan.dpdns.org 通配，由网关上的 nginx
+# 按 Host 分发）：./scripts/gw-join.sh 把 cred-broker.sloan.dpdns.org 指到 cred-broker:8787。
+# 应用自己不开公网端口，也不做 TLS。
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cred-broker:latest
+    container_name: cred-broker
+    restart: unless-stopped
+    env_file: .env
+    # 只绑 127.0.0.1，且只发布一个端口：80/443 归 ../../gw（公网域名实际由它应答），
+    # 8787 归 writing-assistant、8788 归 notify-hub，这里用 8789 是为了本机直连调试不撞车；
+    # 网关注入的是容器名:8787，不经过这个映射。
+    ports:
+      - "${APP_BIND_ADDR:-127.0.0.1}:${APP_PORT:-8789}:8787"
+    healthcheck:
+      # /healthz 会真的 SELECT 1（接口活着但连不上库要能被看出来）。
+      # 不用 /v1/health：那个接口按设计只回闸参数、不碰数据库，库挂了它照样 200。
+      # 用 node 而不是 wget/curl：alpine 运行时镜像里只有 node。
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      # 共享 MySQL 的网络：库里的主机名就是 `mysql`。
+      # 声明为 external —— 本项目不拥有这两个网络，也就不会在 down 时把别人的摘掉。
+      - mysql-server_default
+      # 共享公网网关的网络：让它的 nginx 能以 cred-broker:8787 打到本容器。
+      - gw_default
+
+networks:
+  mysql-server_default:
+    external: true
+  gw_default:
+    external: true
