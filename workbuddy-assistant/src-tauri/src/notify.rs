@@ -390,7 +390,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn smoke_real_webhook_delivery() {
-        let hook = "https://notify-hub-worker.sloan.dpdns.org/hook/z9sm8jfJNpWwfWsfGW1xlRiFV8t-t6WD";
+        let hook = "http://127.0.0.1:7002/hook/z9sm8jfJNpWwfWsfGW1xlRiFV8t-t6WD";
         let out = send(hook, "【测试】通知链路自检")
             .await
             .unwrap_or_else(|e| panic!("webhook 发送失败: {e}"));

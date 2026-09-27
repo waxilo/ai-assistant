@@ -43,8 +43,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// 管家地址。**编译期常量**，不是配置项：改地址 = 改代码 + 重新构建。
-pub const BASE: &str = "https://cred-broker.sloan.dpdns.org";
+/// 管家地址：cred-broker 容器在本机发布的回环端口。域名是网关的事，客户端不认，
+/// 所以网关加第二个 zone 这里也不用动；离开本机即打不通，这是刻意的。
+/// **编译期常量**，不是配置项：改地址 = 改代码 + 重新构建。
+pub const BASE: &str = "http://127.0.0.1:7003";
 
 /// 距上次同步超过这么久才会再问一次管家。
 ///
