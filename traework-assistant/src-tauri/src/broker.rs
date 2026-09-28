@@ -26,11 +26,15 @@
 //! POST /lease  抢闸（抢到的人**同时拿到那一刻的整池**，别自己再 GET 一次）
 //!        ↓     把池并进本地 → 本机执行需要做的续签
 //! PUT  /       提交整池（CAS，版本 +1，顺便归还闸）
-//!        ↓ 失败
+//!        ↓ 真失败（网络坏 / 服务端临时拒）
 //! POST /abort  释放闸 + 记一段冷却，让所有机器都停手
 //! ```
 //!
 //! 抢闸带回的池内容**必须**用它去签：本地那份 refresh token 可能早就被别的机器换掉了。
+//!
+//! ⚠️ **只有「真失败」才 abort**。`needs_login`（这条链绑的是别的设备身份，本机签不动）不拖停
+//! 整池，只记一条日志：一个这样的账号能把两台机器的整池同步每天一起冻住，连本轮已经采纳好的
+//! 新票也一并提交不上去（2026-09-27/28 连续两天 08:00 就是这样，云端版本从 09-26 起没动过）。
 //!
 //! ## 落盘只有 uuid 一项
 //!
@@ -254,7 +258,12 @@ pub struct SyncReport {
     pub deferred: bool,
     pub merged: usize,
     pub refreshed: usize,
+    /// **本轮打不通**的失败（网络、响应看不懂、或服务端临时拒），会把整池拖进冷静期
     pub failed: usize,
+    /// **本机签不动**的账号数（`needs_login`：链绑的是别的设备身份）。
+    /// 它们不拖停整池，只是这个账号自己得靠桌面端自续或重新登录。
+    #[serde(default)]
+    pub blocked: usize,
     pub version: Option<i64>,
     pub message: String,
 }
@@ -297,7 +306,12 @@ pub fn to_item(account: &Account) -> PoolItem {
         phone: account.phone.clone().unwrap_or_default(),
         access_token: account.token.clone(),
         refresh_token: account.refresh_token.clone().unwrap_or_default(),
-        expires_at: account.expires_at,
+        // 落**票自己声明的**到期时间：`account.expires_at` 经常是空的（浏览器登录、跨机采纳
+        // 都不填它），留空上传等于让接收方失去判新旧的唯一依据 —— 见 `renew::token_expiry_ms`。
+        expires_at: account
+            .expires_at
+            .map(crate::renew::norm_ms)
+            .or_else(|| crate::renew::token_expiry_ms(&account.token)),
         rt_expires_at: account.refresh_expires_at,
         updated_at: Some(chrono::Utc::now().timestamp_millis()),
     }
@@ -322,7 +336,7 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
         host: None,
-        expires_at: item.expires_at,
+        expires_at: item_expiry(item),
         refresh_expires_at: item.rt_expires_at,
         device_id: None,
         machine_id: None,
@@ -331,11 +345,26 @@ pub fn account_from_item(item: &PoolItem) -> Account {
     }
 }
 
+/// 池里那一条**自己声明的**到期时间（毫秒）：`expires_at` 字段优先，空的就去解票里的 `exp`。
+///
+/// 必须两个来源都看：老池子里 `expires_at` 全是 `null`（`to_item` 以前上传的就是那个空字段），
+/// 只看字段会让「云端那张还能用的票」永远判不成更新 —— 2026-09-28 就是这个把已过期的本地票
+/// 留下了、把还能签到 11:05 的云端票丢掉了。
+fn item_expiry(item: &PoolItem) -> Option<i64> {
+    item.expires_at
+        .map(crate::renew::norm_ms)
+        .or_else(|| crate::renew::token_expiry_ms(&item.access_token))
+}
+
 /// 把池里那一条采纳到本地账号上。返回是否真的改动了。
 ///
-/// 判据是 **`expires_at` 更晚**：续签之后 access token 的有效期必然往后推，所以「更晚」
-/// 等价于「更新的一次轮换」。反过来（池里那条更旧）绝不能覆盖 —— 那正是
-/// 「先到的旧副本把新凭证盖回去」的来源。
+/// 判据是**到期时间更晚**（[`item_expiry`]：字段或票里的 `exp`），续签之后 access token 的
+/// 有效期必然往后推，所以「更晚」等价于「更新的一次轮换」。反过来（池里那条更旧）绝不能覆盖
+/// —— 那正是「先到的旧副本把新凭证盖回去」的来源。
+///
+/// 两侧到期时间**都**读不出来时，只有两张票都是读得出 `iat` 的 JWT 才敢换（见
+/// [`crate::renew::newer_by_iat`]）：不透明 token「长得不一样」不构成更新的理由，
+/// 来历不明的那份不许盖掉本地凭证。
 ///
 /// 不满足「更新」时仍会补本地缺的字段（老账号没有 refresh token、没有手机号），
 /// 因为那是从「不知道」变成「知道」，不存在覆盖新值的风险。
@@ -345,10 +374,12 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
         // 空 / 纯空白 token 一律忽略：采纳它等于把账号弄成登录不上
         return false;
     }
-    let newer = match (item.expires_at, account.expires_at) {
+    let newer = match (item_expiry(item), crate::renew::expiry_ms(account)) {
         (Some(p), Some(l)) => p > l,
         (Some(_), None) => true,
-        _ => false,
+        // 本地知道到期、池里那条不知道：不动本地（不知道 ≠ 更晚）
+        (None, Some(_)) => false,
+        (None, None) => crate::renew::newer_by_iat(&item.access_token, &account.token),
     };
     if !newer {
         let mut touched = false;
@@ -359,9 +390,11 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
         // 「补空字段」也算改动：从「不知道」变成「知道」是信息增加，不是覆盖。
         // 但两侧都是 `None` 时**不算** —— 那只是把 `None` 赋给 `None`，
         // 报成改动会让调用方平白多落一次盘，同步提示里也多报一个「并入 N 个」。
-        if account.expires_at.is_none() && item.expires_at.is_some() {
-            account.expires_at = item.expires_at;
-            touched = true;
+        if account.expires_at.is_none() {
+            if let Some(e) = item_expiry(item) {
+                account.expires_at = Some(e);
+                touched = true;
+            }
         }
         if account.refresh_expires_at.is_none() && item.rt_expires_at.is_some() {
             account.refresh_expires_at = item.rt_expires_at;
@@ -379,7 +412,7 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
     if !item.refresh_token.trim().is_empty() {
         account.refresh_token = Some(item.refresh_token.clone());
     }
-    account.expires_at = item.expires_at.or(account.expires_at);
+    account.expires_at = item_expiry(item).or(account.expires_at);
     account.refresh_expires_at = item.rt_expires_at.or(account.refresh_expires_at);
     if account.phone.is_none() && !item.phone.trim().is_empty() {
         account.phone = Some(item.phone.clone());
@@ -739,6 +772,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: None,
             message: "本机未绑定凭证池".to_string(),
         });
@@ -753,6 +787,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: rt.version,
             message: "距上次同步不到两分钟，这次跳过".to_string(),
         });
@@ -795,6 +830,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: rt.version,
             message,
         });
@@ -814,31 +850,54 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     let mut pool = union_pool(&lease.items, &accounts);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
+    let mut blocked = 0usize;
     for acct in accounts.iter_mut() {
+        // ⓐ 桌面端 TraeWork 自己续到的新票：**无条件先收**。
+        //     它离线、零请求、零风险，所以不该被绑在「进续签窗口才试」上 —— 旧写法让本机
+        //     桌面端 10-11 才到期的新票，一直等到本地那张过期才采纳（2026-09-28 实测：
+        //     桌面端早就换过票了，assistant 手里还是三天前的旧票）。
+        //     这也是「导入自桌面端的票 assistant 自己签不动（20403）」唯一的日常续签通路。
+        if let Some(out) = crate::renew::adopt_local_session(dir, acct) {
+            refreshed += 1;
+            write_back(&mut pool, acct);
+            crate::journal::append(
+                dir,
+                "broker_sync",
+                &format!("已同步桌面端自续的新票：{}（{}）", acct.name, out.message),
+            );
+            continue;
+        }
+        // ⓑ OAuth 续签：仍要「手里有 refresh token」且「进了续签窗口」才打接口
         if acct.refresh_token.is_none() || !crate::renew::needs_renew(acct, now) {
             continue;
         }
         let out = crate::renew::renew(dir, acct).await;
         if out.renewed {
             refreshed += 1;
-            // 把新的凭证写回池里那一份（保持并集：池里别的条目原样带回去）
-            if let Some(slot) = pool.iter_mut().find(|i| i.key.trim() == item_key_of(acct)) {
-                *slot = to_item(acct);
-            } else {
-                pool.push(to_item(acct));
-            }
+            write_back(&mut pool, acct);
+        } else if out.deferred {
+            // 这条链本机桌面端还续得动：整池这轮不动它，也不算失败
+            continue;
         } else {
-            failed += 1;
             crate::journal::append(
                 dir,
                 "broker_sync",
                 &format!("整池续签失败：{}（{}）", acct.name, out.message),
             );
+            // 失败分性质：`needs_login` 是**这台机器签不动这条链**（设备身份不对），
+            // 重试一百次也是这个结论，跟本轮同步对不对没关系；其余才是真失败。
+            match fail_kind(out.needs_login) {
+                FailKindOut::Blocked => blocked += 1,
+                FailKindOut::Transient => failed += 1,
+            }
         }
     }
     accounts::save_accounts(dir, &accounts).map_err(|e| e.to_string())?;
 
-    // ③ 有失败就 abort（记冷却，让所有机器都停手），没有才提交
+    // ③ 有**真失败**才 abort（记冷却，让所有机器都停手）；签不动的账号不拖停整池。
+    //    旧写法是 `failed > 0` 就 abort：一个「链绑在桌面端」的号能让两台机器的整池同步
+    //    每天一起进冷静期，而且本轮已经采纳好的新票也一并**提交不上去**
+    //    （2026-09-27/28 连续两天 08:00 都是这样，云端版本从 09-26 起就没动过）。
     if failed > 0 {
         let note = format!("{failed} 个账号续签失败");
         let _ = request(
@@ -854,6 +913,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged,
             refreshed,
             failed,
+            blocked,
             version: Some(version),
             message: format!("{refreshed} 个账号续签成功、{failed} 个失败；已暂停整池续签一会儿"),
         });
@@ -891,9 +951,41 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         merged,
         refreshed,
         failed: 0,
+        blocked,
         version: next_version,
-        message: format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）"),
+        message: if blocked > 0 {
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）；另有 {blocked} 个签不动，靠桌面端自续或重新登录")
+        } else {
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）")
+        },
     })
+}
+
+/// 把本机这一条的新凭证写回池里对应的那一份（保持并集：别的条目原样带回去）。
+fn write_back(pool: &mut Vec<PoolItem>, acct: &Account) {
+    if let Some(slot) = pool.iter_mut().find(|i| i.key.trim() == item_key_of(acct)) {
+        *slot = to_item(acct);
+    } else {
+        pool.push(to_item(acct));
+    }
+}
+
+/// 一次续签失败的性质（决定要不要把整池拖进冷静期）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum FailKindOut {
+    /// 本机签不动这条链（`needs_login`）：重试多少次都是同一结论，**不拖停整池**
+    Blocked,
+    /// 真失败（网络、响应看不懂、服务端临时拒）：整池停一轮，别每台机器都拿坏状态去提交
+    Transient,
+}
+
+/// 纯函数，只为把「什么失败才该拖停整池」这条规则钉住 —— 见 [`FailKindOut`]。
+fn fail_kind(needs_login: bool) -> FailKindOut {
+    if needs_login {
+        FailKindOut::Blocked
+    } else {
+        FailKindOut::Transient
+    }
 }
 
 #[cfg(test)]
@@ -932,6 +1024,30 @@ mod tests {
         }
     }
 
+    /// 毫秒量级的真实时间戳：`item_expiry` 会按秒/毫秒归一，测试里用真实量级才不会假通过。
+    const T: i64 = 1_800_000_000_000;
+
+    fn jwt_expiring_in(secs: i64) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let exp = T / 1000 + secs;
+        let body =
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"data":{{"id":"1"}},"iat":{exp},"exp":{exp}}}"#).as_bytes());
+        format!("eyJhbGciOiJSUzI1NiJ9.{body}.sig")
+    }
+
+    /// 老池子里 `expires_at` 全是 `null`（旧版客户端上传的就是那个空字段）：
+    /// 这时票里的 `exp` 是唯一能判新旧的依据，只看字段会让那张还能用的票永远输掉。
+    #[test]
+    fn reads_expiry_from_the_ticket_when_the_field_is_empty() {
+        let mut a = acct("n", Some("138"), "local");
+        a.expires_at = Some(T - 1);
+        let token = jwt_expiring_in(3600);
+        assert!(adopt(&mut a, &item("138", &token, None)), "池里那条更晚到期");
+        assert_eq!(a.token, token);
+        assert_eq!(a.expires_at, Some(T / 1000 * 1000 + 3600_000));
+    }
+
     // ── 身份锚点 ────────────────────────────────────────────────────────
 
     #[test]
@@ -951,11 +1067,11 @@ mod tests {
     #[test]
     fn adopts_the_newer_rotation() {
         let mut a = acct("n", Some("138"), "old");
-        a.expires_at = Some(1_000);
-        assert!(adopt(&mut a, &item("138", "new", Some(2_000))));
+        a.expires_at = Some(T);
+        assert!(adopt(&mut a, &item("138", "new", Some(T + 1_000))));
         assert_eq!(a.token, "new");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-new"));
-        assert_eq!(a.expires_at, Some(2_000));
+        assert_eq!(a.expires_at, Some(T + 1_000));
     }
 
     #[test]
@@ -1220,5 +1336,61 @@ mod tests {
         assert_eq!(parsed.key, "k");
         assert_eq!(parsed.access_token, "");
         assert_eq!(parsed.expires_at, None);
+    }
+
+    // ── 采纳判据：看票自己声明的到期时间，不看那个经常为空的字段 ──────
+    //
+    // `jwt` 造的是能读出 `iat`/`exp` 的假票，与 `renew::tests` 里同一套路。
+    fn jwt(iat: i64, exp: i64) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let body = URL_SAFE_NO_PAD.encode(format!(r#"{{"iat":{iat},"exp":{exp}}}"#).as_bytes());
+        format!("eyJhbGciOiJSUzI1NiJ9.{body}.sig")
+    }
+
+    /// 回归（2026-09-28「池里那张还能用的票被当成不更新丢掉」）：两侧 `expires_at` 都是空的
+    /// —— 老池子里那字段就是 `null`（`to_item` 以前上传的正是这个空字段），本机账号也从没填过。
+    /// 只看字段 → 判不成更新 → 本机抱着已过期的票一路签到 401，而云端那张还能签。
+    #[test]
+    fn adopts_by_jwt_expiry_when_the_expires_at_field_is_empty() {
+        let mut a = acct("n", Some("138"), &jwt(1_000, 2_000));
+        assert_eq!(a.expires_at, None, "账号侧字段是空的（真实库里就这样）");
+        let cloud = item("138", &jwt(3_000, 4_000), None);
+        assert!(adopt(&mut a, &cloud), "两侧字段都空，也要按票里的 `exp` 认更新");
+        assert_eq!(a.token, jwt(3_000, 4_000));
+        assert_eq!(a.expires_at, Some(4_000_000), "采纳后到期时间按毫秒补上");
+    }
+
+    /// 反向约束：都不透明、又都没有到期字段时，**不许**拿「长得不一样」当更新的理由。
+    /// （`renew::is_newer` 那条退化分支是给本机桌面端同步用的；跨机覆盖必须严格，
+    /// 否则一份来历不明的旧副本就能盖掉本机刚签好的凭证。）
+    #[test]
+    fn opaque_tokens_never_overwrite_by_mere_difference() {
+        let mut a = acct("n", Some("138"), "local-opaque");
+        a.refresh_token = Some("rt-local".into());
+        a.expires_at = None;
+        let mut cloud = item("138", "cloud-opaque", None);
+        cloud.refresh_token = "rt-cloud".into();
+        assert!(!adopt(&mut a, &cloud));
+        assert_eq!(a.token, "local-opaque", "不透明票不许互相盖");
+    }
+
+    /// 上传时替空字段补上票自己声明的到期时间 —— 上面那条回归的源头就在这里：
+    /// 本机不补、上传的就是 `null`，接收方连判新旧的依据都没有。
+    #[test]
+    fn to_item_derives_expiry_from_the_jwt_when_the_field_is_empty() {
+        let mut a = acct("n", Some("138"), &jwt(1_000, 2_000));
+        assert_eq!(a.expires_at, None);
+        assert_eq!(to_item(&a).expires_at, Some(2_000_000));
+        // 字段有值时以字段为准，且秒级要归一成毫秒
+        a.expires_at = Some(3_000);
+        assert_eq!(to_item(&a).expires_at, Some(3_000_000));
+    }
+
+    /// 「本机签不动这条链」不拖停整池，只有真失败才 abort（见 [`fail_kind`] 用点）。
+    #[test]
+    fn only_real_failures_pause_the_pool() {
+        assert_eq!(fail_kind(true), FailKindOut::Blocked);
+        assert_eq!(fail_kind(false), FailKindOut::Transient);
     }
 }

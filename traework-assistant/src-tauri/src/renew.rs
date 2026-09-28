@@ -29,15 +29,26 @@
 //! 2. `DeviceProof` 用**签发时那把私钥**签 —— 见 [`crate::devicekey`]（这就是为什么
 //!    密钥对必须落盘：早期每次进程启动现生成一把，于是签发的 token 一律续不了）。
 //!
-//! ⚠️ **已经丢过密钥的账号续不了**：服务端会回 `20403`，此时只能重新登录一次
-//! （重新登录会绑定新的持久化密钥，之后就一直能续）。这条错误会被明确翻译成
-//! 「需重新登录」，而不是含糊的失败。
+//! ⚠️ **谁是那台设备，决定这一枪打不打得中**。本机同时可能存在好几套设备身份：
+//! assistant 自己的 `device.json`，以及**每个 TraeWork 安装各一把** —— 桌面端登录时注册的
+//! `DeviceID` 是数字 id（本机 `1687098020335299`），公钥也是它自己的（落盘在同一个
+//! `storage.json` 的 `iCubeAuthInfo://icube-dc:<DeviceID>` 里，见
+//! [`crate::trae_auth::local_desktop_devices`]）。所以续签按 [`candidates`] 的顺序把本机
+//! 所有身份挨个试一遍，只有 `20403` 才换下一把 —— 两台机器一起 20403 不是「密钥丢了」，
+//! 是当时还只会拿 `device.json` 签。
+//!
+//! 只剩两种真救不了的情况：链是**旧版 assistant 那把没落盘的临时密钥**签的（2026-09-14 之前
+//! 登录的一批，密钥随进程没了），或服务端那条 refresh token 已失效（`20404`）。
+//! 这两种会被明确翻译成「需重新登录」，而不是含糊的失败。
 //!
 //! ## 第二条路：本机登录态同步
 //!
-//! 对「同时登录在本机 TraeWork 里」的账号，还有一条**不需要密钥**的续签路：
-//! TraeWork 自己会续签并把新 token 写回 `storage.json`，我们只要在它更新后**同步过来**即可
-//! （比签发时间 `iat`，晚者胜）。所以策略是：先同步本机登录态，再走 OAuth 续签。
+//! 对「同时登录在本机 TraeWork 里」的账号，还有一条**零请求**的路：TraeWork 自己会续签并
+//! 把新 token 写回 `storage.json`，我们只要在它更新后**同步过来**即可（比签发时间 `iat`，
+//! 晚者胜）。它不等价于第一条路的备份 —— 桌面端换到新票也可能不落盘（2026-09-28 实测：
+//! SOLO 09:37 换票成功却报 `UserInfoNotMatchError`，票被丢掉、旧 refresh token 已作废），
+//! 所以两条路都要走。策略是先同步本机登录态，再走 OAuth 续签；但**桌面端自己还续得动的时候
+//! 不抢**（一条链只能续一次，抢了的代价见上面那个例子）。
 //!
 //! ## 什么时候续（全自动 —— 界面上**没有任何**手动按钮）
 //!
@@ -109,21 +120,43 @@ pub struct RenewOutcome {
     pub expires_at: Option<i64>,
     /// 该账号是否需要重新登录才能自动续签
     pub needs_login: bool,
+    /// 本轮**故意不动**：这条链本机桌面端还续得动，我们等它换完再同步。
+    /// 它既不是成功也不是失败，所以不记日志、不进冷却、也不算整池失败。
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 // ---------------------------------------------------------------------------
 // 到期时间判定（纯函数，便于单测）
 // ---------------------------------------------------------------------------
 
-/// token 到期时间（毫秒）：先读 JWT 载荷里的 `exp`（秒），再退回账号上的 `expires_at`。
-///
-/// `expires_at` 在不同来源里单位不一致（浏览器登录给毫秒、本机登录态给秒），
-/// 这里统一按「小于 1e12 视为秒」归一化。
-pub fn expiry_ms(account: &Account) -> Option<i64> {
-    if let Some(v) = token::payload(&account.token).and_then(|p| p.get("exp").and_then(Value::as_i64)) {
-        return Some(if v < 1_000_000_000_000 { v * 1000 } else { v });
+/// 时间戳归一：服务端各处混发秒与毫秒，小于 1e12 一律当秒。
+pub fn norm_ms(v: i64) -> i64 {
+    if v < 1_000_000_000_000 {
+        v * 1000
+    } else {
+        v
     }
-    account.expires_at.map(|v| if v < 1_000_000_000_000 { v * 1000 } else { v })
+}
+
+/// token **自己声明**的到期时间（JWT `exp`，毫秒）；不是 JWT 就读不出来。
+///
+/// 这是唯一可信的到期来源：`account.expires_at` 这个字段经常是空的（浏览器登录换来的票、
+/// 从池里采纳的票都不填它），而凭证的真实寿命就写在票里。以前凡拿 `expires_at` 判新旧的地方
+/// 都会被这些空值带错 —— 2026-09-28「池里那张还能用的票被当成不更新丢掉」就是这么来的。
+pub fn token_expiry_ms(token: &str) -> Option<i64> {
+    token::payload(token)
+        .and_then(|p| p.get("exp").and_then(Value::as_i64))
+        .map(norm_ms)
+}
+
+/// token 到期时间（毫秒）：先读 JWT 载荷里的 `exp`（秒），再退回账号上的 `expires_at`。
+pub fn expiry_ms(account: &Account) -> Option<i64> {
+    token_expiry_ms(&account.token).or_else(|| account.expires_at.map(norm_ms))
+}
+
+fn iat(token: &str) -> Option<i64> {
+    token::payload(token).and_then(|p| p.get("iat").and_then(Value::as_i64))
 }
 
 /// 是否到了该续签的窗口（已过期也算）。
@@ -142,12 +175,19 @@ pub fn needs_renew(account: &Account, now_ms: i64) -> bool {
 /// 候选 token 是否比当前**更新**（按 JWT `iat`，晚签发者胜）。
 /// 比较 `iat` 而不是 `exp`：两者同向，但 `iat` 不受客户端时钟/时区写法影响。
 pub fn is_newer(candidate: &str, current: &str) -> bool {
-    let at = |t: &str| token::payload(t).and_then(|p| p.get("iat").and_then(Value::as_i64));
-    match (at(candidate), at(current)) {
+    match (iat(candidate), iat(current)) {
         (Some(c), Some(cur)) => c > cur,
         // 拿不到 iat 时，退化为「token 不同就算更新」——但要保证不是空串
         _ => !candidate.trim().is_empty() && candidate != current,
     }
+}
+
+/// 严格版：两边都必须是读得出 `iat` 的 JWT，且候选签发更晚。
+///
+/// 与 [`is_newer`] 的差别就是那条退化分支。这一条要拿去决定**要不要用云端副本盖掉本地凭证**，
+/// 所以「两个不透明 token 长得不一样」不能算更新 —— 来历不明的那份不许赢。
+pub fn newer_by_iat(candidate: &str, current: &str) -> bool {
+    matches!((iat(candidate), iat(current)), (Some(c), Some(cur)) if c > cur)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +248,10 @@ pub async fn renew_if_needed(dir: &Path, account: &mut Account) -> Option<RenewO
         return None;
     }
     let out = renew(dir, account).await;
+    if out.deferred {
+        // 交给桌面端：既不记日志也不进冷却 —— 它每轮都该重新看一眼（桌面端可能就是下一轮换的）
+        return None;
+    }
     if out.renewed {
         clear_attempt(&account.id);
     } else if out.needs_login {
@@ -232,7 +276,25 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
         return out;
     }
 
-    // ② 再试 OAuth 续签
+    // ② 本机桌面端还轮得到它自己续 —— **那就先别抢**。
+    //     `RefreshToken` 是一次性的：谁先打谁把对方的那条链作废。桌面端账号（用户日常在用的
+    //     Trae IDE）一旦被这里续掉，它手里存的 refresh token 当场失效，等它那张票到期就只能
+    //     重新登录 —— 那正是 `用户696006185260` 这次死掉的样子。所以只在桌面端**已经续不动**
+    //     （本机没有它的登录态 / 它那张票已经过期）时，才动用它的密钥替它续。
+    if desktop_can_self_renew(account, chrono::Utc::now().timestamp_millis()) {
+        return RenewOutcome {
+            id: account.id.clone(),
+            name: account.name.clone(),
+            renewed: false,
+            source: None,
+            message: "这个账号本机桌面端还登录着、票也没到期，续签交给它（它换完新票会被本机同步接住）—— 不打接口，免得把桌面端那条链顶掉。".into(),
+            expires_at: expiry_ms(account),
+            needs_login: false,
+            deferred: true,
+        };
+    }
+
+    // ③ 再试 OAuth 续签
     let Some(refresh_token) = account
         .refresh_token
         .clone()
@@ -246,6 +308,7 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
             message: "该账号没有 refresh token，无法自动续签 —— 请重新登录该账号。".into(),
             expires_at: expiry_ms(account),
             needs_login: true,
+            deferred: false,
         };
     };
 
@@ -264,6 +327,7 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
                 ),
                 expires_at: exp,
                 needs_login: false,
+                deferred: false,
             }
         }
         Err(e) => {
@@ -275,21 +339,52 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
                 source: None,
                 message: if needs_login {
                     format!(
-                        "服务端拒绝续签（{e}）—— 该 token 绑定的设备密钥已不在本机，\
-                         需重新登录一次；此后即可自动续签。"
+                        "续签被服务端拒绝（{e}）：本机每一套设备身份（assistant 的 device.json \
+                         加上本机各套桌面端密钥）都被判定不匹配，或那条 refresh token 已失效。\
+                         出路两条：在这个账号还登录着的桌面端 TraeWork 里让它自续一次（本机同步会接住），\
+                         或重新登录一次。"
                     )
                 } else {
                     format!("续签失败：{e}")
                 },
                 expires_at: expiry_ms(account),
                 needs_login,
+                deferred: false,
             }
         }
     }
 }
 
+/// 本机桌面端**自己还续得上**这个账号：它登录着、手里有 refresh token、票还没过期。
+///
+/// 判据见 [`renew`] 的第②步 —— 一条链只能续一次，谁续谁把另一边的 refresh token 顶掉。
+fn desktop_can_self_renew(account: &Account, now_ms: i64) -> bool {
+    let uid = match account.user_id.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => u,
+        _ => return false,
+    };
+    let Some(local) = crate::trae_auth::find_local_session_by_uid(uid) else {
+        return false;
+    };
+    desktop_is_live(
+        local.refresh_token.as_deref(),
+        token_expiry_ms(&local.token).or_else(|| local.expires_at.map(norm_ms)),
+        now_ms,
+    )
+}
+
+/// 纯函数版判据。到期时间**读不出来时算「还活着」**：宁可多等桌面端一轮，
+/// 也不能凭「不知道」就把一条在用的链顶掉（那正是这次要把账号弄死的做法）。
+fn desktop_is_live(refresh_token: Option<&str>, expiry_ms: Option<i64>, now_ms: i64) -> bool {
+    refresh_token.map(str::trim).is_some_and(|s| !s.is_empty())
+        && expiry_ms.map_or(true, |e| e > now_ms)
+}
+
 /// 本机 TraeWork 登录态里是否有这个账号**更新的** token；有就采纳并落盘。
-fn adopt_local_session(dir: &Path, account: &mut Account) -> Option<RenewOutcome> {
+///
+/// `pub` 是给 `broker::sync` 用的：桌面端自续与新票落盘这两件事**不该绑在续签窗口上**
+/// （见 `broker::sync` 第①步）。
+pub fn adopt_local_session(dir: &Path, account: &mut Account) -> Option<RenewOutcome> {
     let uid = account.user_id.clone().filter(|s| !s.trim().is_empty())?;
     let local = crate::trae_auth::find_local_session_by_uid(&uid)?;
     if !is_newer(&local.token, &account.token) {
@@ -325,35 +420,101 @@ fn adopt_local_session(dir: &Path, account: &mut Account) -> Option<RenewOutcome
         ),
         expires_at: exp,
         needs_login: false,
+        deferred: false,
     })
 }
 
 /// 用 `RefreshToken` 换新 token（`ExchangeToken` + `DeviceProof`）。成功后就地更新账号字段。
+///
+/// 一次打不定能成：服务端只认**签发那条票的设备身份**，而本机同时可能存在好几套
+/// （每个 TraeWork 安装一把自己的密钥 + assistant 自己的 `device.json`）。所以按
+/// [`candidates`] 的顺序逐个试，只有 `20403`（=「这把钥匙不对」）才继续往下试，
+/// 其余错误直接停 —— 重试同一把钥匙没有意义。
 async fn exchange_by_refresh_token(
     dir: &Path,
     account: &mut Account,
     refresh_token: &str,
 ) -> Result<(), RenewError> {
+    let host = oauth::normalize_api_host(account.host.as_deref().unwrap_or_default());
+    let mut mismatch: Option<RenewError> = None;
+    for c in candidates(dir, account) {
+        match exchange_once(&host, account, refresh_token, &c).await {
+            Ok(()) => {
+                // 记住这把真的签动了：下次直接是它（`adopt_local_session` 之后可能被覆盖回
+                // `telemetry.devDeviceId`，所以覆盖不到也只是多试一轮，不影响正确性）
+                account.device_id = Some(c.device_id.clone());
+                return Ok(());
+            }
+            Err(e) if e.wrong_device => mismatch = mismatch.or(Some(e)),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(mismatch.unwrap_or_else(|| RenewError::other("本机没有任何可用的设备身份".into())))
+}
+
+/// 一套候选的设备身份：`DeviceInfo` 的 `DeviceID` / `MachineID` / `DevicePublicKey` + 签 `DeviceProof` 的私钥。
+struct Candidate {
+    device_id: String,
+    machine_id: String,
+    public_key_pem: String,
+    private_key_pem: String,
+}
+
+/// 候选设备身份，**优先桌面端**（现网绝大多数票是桌面端签的，assistant 自己那把排最后）。
+fn candidates(dir: &Path, account: &Account) -> Vec<Candidate> {
+    let uid = account
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let fallback_machine = account
+        .machine_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| crate::trae_auth::local_device_identity().1)
+        .unwrap_or_default();
+
+    let mut out: Vec<Candidate> = crate::trae_auth::local_desktop_devices(uid)
+        .into_iter()
+        .map(|d| Candidate {
+            device_id: d.device_id,
+            machine_id: d.machine_id.unwrap_or_else(|| fallback_machine.clone()),
+            public_key_pem: d.public_key_pem,
+            private_key_pem: d.private_key_pem,
+        })
+        .collect();
+
     let dev = devicekey::load_or_create(
         dir,
         crate::trae_auth::local_device_identity().0,
         crate::trae_auth::local_device_identity().1,
     );
+    out.push(Candidate {
+        device_id: dev.device_id.clone(),
+        machine_id: dev.machine_id.clone(),
+        public_key_pem: dev.public_key_pem.clone(),
+        private_key_pem: dev.private_key_pem.clone(),
+    });
 
-    let host = oauth::normalize_api_host(account.host.as_deref().unwrap_or_default());
-    // DeviceID 必须是**签发时**那个（账号里存着）；没有记录时用本机身份兜底，
-    // 但那种情况下服务端大概率仍是 20403 —— 错误会被翻译成「需重新登录」。
-    let device_id = account
-        .device_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| dev.device_id.clone());
-    let machine_id = account
-        .machine_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| dev.machine_id.clone());
+    out.retain(|c| !c.device_id.trim().is_empty() && !c.private_key_pem.trim().is_empty());
+    for i in (1..out.len()).rev() {
+        if out[..i]
+            .iter()
+            .any(|p| p.device_id == out[i].device_id && p.public_key_pem == out[i].public_key_pem)
+        {
+            out.remove(i);
+        }
+    }
+    out
+}
 
+/// 用一套身份打一次 `ExchangeToken`。
+async fn exchange_once(
+    host: &str,
+    account: &mut Account,
+    refresh_token: &str,
+    c: &Candidate,
+) -> Result<(), RenewError> {
     let path = oauth::EXCHANGE_TOKEN_PATH;
     let ts = chrono::Utc::now().timestamp();
     let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -362,7 +523,7 @@ async fn exchange_by_refresh_token(
         "POST {path} {} {refresh_token} {ts} {nonce}",
         oauth::CLIENT_ID_SOLO
     );
-    let signature = devicekey::sign_der_base64(&dev.private_key_pem, message.as_bytes())
+    let signature = devicekey::sign_der_base64(&c.private_key_pem, message.as_bytes())
         .map_err(RenewError::other)?;
 
     let body = serde_json::json!({
@@ -370,8 +531,8 @@ async fn exchange_by_refresh_token(
         "ClientSecret": "",
         "RefreshToken": refresh_token,
         "DeviceInfo": {
-            "DeviceID": device_id,
-            "MachineID": machine_id,
+            "DeviceID": c.device_id,
+            "MachineID": c.machine_id,
             "PlatformCode": "SOLO_PC",
             "DeviceType": "PC",
             "DeviceName": device_name(),
@@ -380,7 +541,7 @@ async fn exchange_by_refresh_token(
             "DeviceCPU": "",
             "OSInfo": "",
             "OSVersion": "",
-            "DevicePublicKey": dev.public_key_pem,
+            "DevicePublicKey": c.public_key_pem,
             "ClientVersion": env!("CARGO_PKG_VERSION"),
         },
         "DeviceProof": { "Signature": signature, "Timestamp": ts, "Nonce": nonce },
@@ -409,14 +570,7 @@ async fn exchange_by_refresh_token(
     {
         let code = err.get("Code").and_then(Value::as_str).unwrap_or("");
         let msg = err.get("Message").and_then(Value::as_str).unwrap_or("");
-        return Err(RenewError::server(
-            code,
-            msg,
-            matches!(
-                code,
-                code::DEVICE_MISMATCH | code::PROOF_REQUIRED | code::BAD_REFRESH_TOKEN
-            ),
-        ));
+        return Err(RenewError::server(code, msg));
     }
 
     let result = v.get("Result").ok_or_else(|| {
@@ -439,21 +593,27 @@ async fn exchange_by_refresh_token(
     Ok(())
 }
 
-/// 续签错误。`needs_login` 表示「必须重新登录」而不是「临时失败」。
+/// 续签错误。`needs_login` 表示「必须重新登录」而不是「临时失败」；
+/// `wrong_device` 只表示「这把钥匙不对」，换下一把候选接着试。
 #[derive(Debug)]
 struct RenewError {
     text: String,
     needs_login: bool,
+    wrong_device: bool,
 }
 
 impl RenewError {
     fn other(text: String) -> RenewError {
-        RenewError { text, needs_login: false }
+        RenewError { text, needs_login: false, wrong_device: false }
     }
-    fn server(code: &str, msg: &str, needs_login: bool) -> RenewError {
+    fn server(code: &str, msg: &str) -> RenewError {
         RenewError {
             text: format!("code={code} {msg}"),
-            needs_login,
+            needs_login: matches!(
+                code,
+                code::DEVICE_MISMATCH | code::PROOF_REQUIRED | code::BAD_REFRESH_TOKEN
+            ),
+            wrong_device: code == code::DEVICE_MISMATCH,
         }
     }
 }
@@ -642,6 +802,27 @@ mod tests {
         assert!(!is_newer("", "opaque-old"));
     }
 
+    /// 严格版（跨机覆盖用的那条）：**没有**上面那条退化分支 —— 读不出 `iat` 就不算更新。
+    #[test]
+    fn newer_by_iat_refuses_opaque_tokens() {
+        assert!(newer_by_iat(&jwt(2_000, 3_000), &jwt(1_000, 2_000)));
+        assert!(!newer_by_iat(&jwt(1_000, 2_000), &jwt(2_000, 3_000)));
+        assert!(!newer_by_iat("opaque-new", "opaque-old"));
+        assert!(!newer_by_iat(&jwt(2_000, 3_000), "opaque-old"));
+    }
+
+    /// 到期时间的首选来源必须是票自己（`exp`），字段只是兜底，且秒/毫秒要归一。
+    #[test]
+    fn token_expiry_prefers_jwt_and_normalizes_units() {
+        assert_eq!(token_expiry_ms(&jwt(1_000, 2_000)), Some(2_000_000));
+        assert_eq!(token_expiry_ms("opaque"), None);
+        assert_eq!(norm_ms(2_000), 2_000_000);
+        assert_eq!(norm_ms(2_000_000_000_000), 2_000_000_000_000);
+        // 票读不出来时退回字段
+        let a = acc("opaque", Some(1_790_601_750));
+        assert_eq!(expiry_ms(&a), Some(1_790_601_750_000));
+    }
+
     /// 冷却分档：临时失败只冷一个巡检周期，注定失败才冷 6 小时。
     /// 纯函数，捏时间点即可 —— 「到底该冷多久」由 `renew_if_needed` 按 `needs_login` 选。
     #[test]
@@ -672,6 +853,93 @@ mod tests {
         ));
         // 时钟不可能倒退，但真倒退了也不能算「已过期」（saturating 到 0 ⇒ 仍在冷却）
         assert!(within_cooldown(failed_at, RETRY_COOLDOWN, failed_at));
+    }
+
+    /// 只有 `20403` 是「这把钥匙不对」→ 换下一把候选接着试；`20404`（refresh token 已失效）
+    /// 换钥匙没有意义，必须立刻停手，别对同一条死链连打三枪。
+    #[test]
+    fn only_device_mismatch_moves_to_the_next_identity() {
+        assert!(RenewError::server(code::DEVICE_MISMATCH, "Token device not match.").wrong_device);
+        assert!(!RenewError::server(code::BAD_REFRESH_TOKEN, "invalid").wrong_device);
+        assert!(!RenewError::server(code::PROOF_REQUIRED, "required").wrong_device);
+        assert!(!RenewError::other("请求失败".into()).wrong_device);
+        for c in [
+            code::DEVICE_MISMATCH,
+            code::BAD_REFRESH_TOKEN,
+            code::PROOF_REQUIRED,
+        ] {
+            assert!(RenewError::server(c, "").needs_login, "{c} 该报成需重登");
+        }
+        assert!(!RenewError::server("500", "busy").needs_login);
+    }
+
+    /// 候选身份必须去重、不能有空钥匙，且本机兜底那套（`device.json`）排最后 ——
+    /// 桌面端签发的票占多数，先试它对，少打几次必然被拒的请求。
+    #[test]
+    fn candidates_are_unique_and_end_with_the_assistant_identity() {
+        let dir = std::env::temp_dir().join("twa_renew_candidates");
+        let _ = std::fs::create_dir_all(&dir);
+        let a = acc(&jwt(1_000, 2_000), None);
+        let list = candidates(&dir, &a);
+        assert!(!list.is_empty());
+        assert!(list
+            .iter()
+            .all(|c| !c.device_id.trim().is_empty() && !c.private_key_pem.trim().is_empty()));
+        for (i, x) in list.iter().enumerate() {
+            for y in &list[i + 1..] {
+                assert!(
+                    !(x.device_id == y.device_id && x.public_key_pem == y.public_key_pem),
+                    "候选重复：{}",
+                    x.device_id
+                );
+            }
+        }
+        let own = devicekey::load_or_create(&dir, None, None);
+        assert_eq!(list.last().unwrap().device_id, own.device_id);
+    }
+
+    /// 只列「本机有哪几套设备身份、按什么顺序试」，**不打任何网络请求**、不打印私钥。
+    /// `cargo test --lib -- --ignored --nocapture print_renew_candidates`
+    #[test]
+    #[ignore]
+    fn print_renew_candidates() {
+        let dir = match std::env::var("TWA_DATA_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => dirs::home_dir()
+                .map(|h| h.join("Library/Application Support/cn.traework.assistant"))
+                .expect("无法定位数据目录"),
+        };
+        for account in accounts::load_accounts(&dir) {
+            println!("=== {} (uid={:?})", account.name, account.user_id);
+            for (i, c) in candidates(&dir, &account).iter().enumerate() {
+                println!(
+                    "  #{} DeviceID={} 公钥sha={}",
+                    i + 1,
+                    c.device_id,
+                    &format!("{:x}", sha256(c.public_key_pem.as_bytes()))[..12]
+                );
+            }
+        }
+    }
+
+    fn sha256(bytes: &[u8]) -> impl std::fmt::LowerHex {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize()
+    }
+
+    /// 「抢不抢桌面端那条链」的判据：没 RT / 票已过期才轮到本机替它续；读不出到期算「还活着」。
+    #[test]
+    fn leaves_the_chain_alone_while_the_desktop_can_still_renew() {
+        let now = 1_790_601_750_000i64;
+        assert!(desktop_is_live(Some("rt"), Some(now + 1), now));
+        // 到期时间未知 = 宁可等，不误顶（把在用的链续掉就是这次的事故本身）
+        assert!(desktop_is_live(Some("rt"), None, now));
+        // 票已过期 / 手里没有 refresh token = 桌面端续不动了，该我们上
+        assert!(!desktop_is_live(Some("rt"), Some(now - 1), now));
+        assert!(!desktop_is_live(Some("   "), Some(now + 1), now));
+        assert!(!desktop_is_live(None, Some(now + 1), now));
     }
 
     /// 真机探针：对真实账号打一次续签，打印服务端结论。

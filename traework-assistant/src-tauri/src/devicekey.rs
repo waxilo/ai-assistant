@@ -8,7 +8,8 @@
 //! 1. `DeviceInfo.DeviceID` 与签发时一致（否则 `20403 Token device not match`，
 //!    连 `DeviceProof` 都不要求你提供）；
 //! 2. `DeviceProof.Signature` 用**签发时那对密钥的私钥**签名 —— 换一把钥匙同样回 `20403`
-//!    （2026-09-14 实测：拿着官方客户端自己落盘的私钥去续签它自己的 token 也是 20403）。
+//!    （本机可能同时有好几套身份：assistant 这把 + 每个 TraeWork 安装各自一把，
+//!    续签时挨个试，见 [`crate::renew`] 的 `candidates`）。
 //!
 //! 早期实现每次进程启动**现生成**一把公钥（`oauth.rs` 里那个 `OnceLock`），只用于换 token、
 //! 用完即弃 —— 于是签发的 token **永远无法续签**。这里把密钥对和设备号落到磁盘，

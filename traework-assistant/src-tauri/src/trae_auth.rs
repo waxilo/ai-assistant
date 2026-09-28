@@ -31,6 +31,10 @@ use std::path::{Path, PathBuf};
 
 /// storage.json 里凭证的键
 const AUTH_KEY: &str = "iCubeAuthInfo://icube.cloudide";
+/// 桌面端**签发时那套设备身份**的键前缀，冒号后面就是 `DeviceInfo.DeviceID`（数字 id）。
+/// 值解密后是 `{privateKeyPEM, publicKeyPEM}` —— 与 `main.js` 里 `DevicePublicKey` 同一个键对
+/// （2026-09-28 逐字节核对过本机 SOLO 的日志）。
+const DEVICE_KEY_PREFIX: &str = "iCubeAuthInfo://icube-dc:";
 /// mac 密钥常量（逆向得到，技能包同源）
 const URE: [u8; 64] = [
     82, 9, 106, 213, 48, 54, 165, 56, 191, 64, 163, 158, 129, 243, 215, 251, 124, 227, 57,
@@ -277,6 +281,76 @@ pub fn find_local_session_by_uid(uid: &str) -> Option<TraeLocalAccount> {
     discover_local_accounts()
         .into_iter()
         .find(|a| a.user_id.as_deref() == Some(uid))
+}
+
+/// 本机某个 TraeWork 安装**换票时用的设备身份**（`DeviceInfo` 的三件套 + 私钥）。
+#[derive(Clone, Debug)]
+pub struct DesktopDevice {
+    /// `icube-dc:` 键名里的数字 id —— 服务端认的是它，不是 `telemetry.devDeviceId`
+    pub device_id: String,
+    pub machine_id: Option<String>,
+    pub public_key_pem: String,
+    pub private_key_pem: String,
+}
+
+/// 逐个读出本机所有 TraeWork 的 `storage.json`（已解析成 JSON，读不动的跳过）。
+fn storages() -> Vec<Value> {
+    storage_paths()
+        .into_iter()
+        .filter_map(|d| std::fs::read_to_string(d.join("storage.json")).ok())
+        .filter_map(|t| serde_json::from_str::<Value>(&t).ok())
+        .collect()
+}
+
+/// 某个 `storage.json` 当前登录态的 uid。
+fn uid_in(json: &Value) -> Option<String> {
+    let dec = decrypt_auth_blob(json.get(AUTH_KEY)?.as_str()?).ok()?;
+    str_at(&serde_json::from_str::<Value>(&dec).ok()?, "userId")
+}
+
+fn desktop_device_in(json: &Value) -> Option<DesktopDevice> {
+    let (key, blob) = json
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.starts_with(DEVICE_KEY_PREFIX))?;
+    let device_id = key.rsplit(':').next().filter(|s| !s.is_empty())?;
+    let dec = decrypt_auth_blob(blob.as_str()?).ok()?;
+    let pair: Value = serde_json::from_str(&dec).ok()?;
+    let private_key_pem = str_at(&pair, "privateKeyPEM")?;
+    let public_key_pem = str_at(&pair, "publicKeyPEM")?;
+    Some(DesktopDevice {
+        device_id: device_id.to_string(),
+        machine_id: str_at(json, "telemetry.machineId"),
+        public_key_pem,
+        private_key_pem,
+    })
+}
+
+/// 本机所有桌面身份，**持有这个 uid 的那个排最前**（它最可能是签这个账号票的那把钥匙）。
+///
+/// 用途见 [`crate::renew`]：桌面端签发的票只认它自己那套设备身份，assistant 拿
+/// `device.json` 去签必回 `20403`，所以续签要能把这把钥匙也摆上候选。
+pub fn local_desktop_devices(uid: Option<&str>) -> Vec<DesktopDevice> {
+    let mut hit: Vec<DesktopDevice> = Vec::new();
+    let mut rest: Vec<DesktopDevice> = Vec::new();
+    for json in storages() {
+        let Some(dev) = desktop_device_in(&json) else {
+            continue;
+        };
+        let seen = |list: &Vec<DesktopDevice>| {
+            list.iter()
+                .any(|d| d.device_id == dev.device_id && d.public_key_pem == dev.public_key_pem)
+        };
+        if uid.is_some() && uid_in(&json).as_deref() == uid {
+            if !seen(&hit) {
+                hit.push(dev);
+            }
+        } else if !seen(&rest) {
+            rest.push(dev);
+        }
+    }
+    hit.extend(rest);
+    hit
 }
 
 #[cfg(test)]
