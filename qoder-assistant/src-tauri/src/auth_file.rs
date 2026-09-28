@@ -583,8 +583,21 @@ pub(crate) fn write_back(creds: &Credentials, json: &Value) -> Result<(), String
 ///
 /// 只改 token / refreshToken 及两者有效期四项，其余字段（`user` 等）原样保留。
 /// 读不到凭据（那个版本没登录）时静默返回 Ok —— 写回是尽力而为，失败不该影响续签本身。
+///
+/// ⚠️ `prev_token` 是**这次被换掉的那枚旧 access token**，写回前用它核对身份：
+/// 登录文件里记的还是它，才说明「这个文件就是刚才那个账号的登录态」。
+/// 少了这道核对会出两种事故：
+///
+/// - **一台机器两个区域池 / 界面里多账号**：给 A 续签换回来的 token 被写进 B 的登录文件，
+///   B 的桌面端第二天带着 A 的票去请求；
+/// - **桌面端自己已经续过一轮**：它文件里那条链比我们的新，写回去等于把别人手里
+///   还能用的凭证换成我们手里这枚已经过时的 —— 症状是 IDE 突然要重新登录。
+///
+/// 两种都返回 Err 并**一个字节都不写**。跳过写回不影响续签本身：界面上那条链照常有效，
+/// 而桌面端更新的那一轮会被 `commands::adopt_file_sessions` 反过来接住。
 pub(crate) fn apply_refresh(
     region: Region,
+    prev_token: &str,
     token: &str,
     refresh_token: Option<&str>,
     expires_at: Option<i64>,
@@ -593,7 +606,17 @@ pub(crate) fn apply_refresh(
     let Ok(creds) = read_credentials(region) else {
         return Ok(());
     };
-    let mut json = creds.json.clone();
+    let json = creds.json.clone();
+    let on_file = str_at(&json, &["token"])
+        .or_else(|| str_at(&json, &["accessToken"]))
+        .or_else(|| str_at(&json, &["access_token"]));
+    if !same_token_on_file(&on_file, prev_token) {
+        return Err(format!(
+            "{} 的登录文件里记的不是本次被换掉的那枚 token，已跳过写回（不覆盖别人的登录态）",
+            region.label()
+        ));
+    }
+    let mut json = json;
     json["token"] = Value::String(token.to_string());
     match refresh_token {
         Some(rt) => json["refreshToken"] = Value::String(rt.to_string()),
@@ -602,6 +625,18 @@ pub(crate) fn apply_refresh(
     set_expiry(&mut json, "expiresAt", expires_at);
     set_expiry(&mut json, "refreshTokenExpiresAt", rt_expires_at);
     write_back(&creds, &json)
+}
+
+/// 文件里的 token 与「本次换出去的旧 token」是否同一枚。
+///
+/// 只在**两边都读得到值**时才比对；文件里没有 token 字段算核对不上（那是我们认不出的
+/// 文件形态，别往里写）。旧 token 为空则是调用方的 bug，同样不写。
+fn same_token_on_file(on_file: &Option<String>, prev_token: &str) -> bool {
+    let prev = prev_token.trim();
+    if prev.is_empty() {
+        return false;
+    }
+    on_file.as_deref() == Some(prev)
 }
 
 /// 回写一个有效期字段，**保持原文的写法**。
@@ -889,6 +924,21 @@ mod tests {
         for account in &scan.accounts {
             assert!(Region::ALL.contains(&account.region));
         }
+    }
+
+    /// 写回前的认人核对：文件里记的还是「本次被换掉的那枚」才允许写。
+    #[test]
+    fn write_back_only_when_the_file_still_holds_the_token_we_rotated() {
+        let prev = Some("prev-token".to_string());
+        assert!(same_token_on_file(&prev, "prev-token"));
+        // 两边的空白都忽略：文件里的值读出来就 trim（`str_at`），调用方那枚也该容得下
+        assert!(same_token_on_file(&prev, " prev-token "));
+        assert!(!same_token_on_file(&prev, "someone-elses-token"));
+        // 文件里没有 token 字段 = 认不出的文件形态，不写
+        assert!(!same_token_on_file(&None, "prev-token"));
+        // 调用方给的旧票为空是 bug，同样不写
+        assert!(!same_token_on_file(&prev, ""));
+        assert!(!same_token_on_file(&None, ""));
     }
 
     /// 本机冒烟：`cargo test -- --ignored --nocapture`。

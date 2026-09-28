@@ -11,6 +11,7 @@ import {
   signState,
   expiryInfo,
   expiryCountdown,
+  needsRelogin,
   type SignState,
 } from "../common";
 import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, useCredits } from "../credits";
@@ -249,7 +250,15 @@ export function AccountsPage({
                     )}
                   </td>
                   <td className="ac-cell-expiry col-secondary">
-                    {tok.text === "—" ? (
+                    {needsRelogin(a.rt_expires_at) ? (
+                      // 链死了：显示时间只会让人以为「等它自动续上就好」，而它已经续不动了
+                      <span
+                        className="ac-expiry expired"
+                        title="refresh token 已过有效期，自动续签换不出新凭证，只能重新登录这个账号"
+                      >
+                        需重新登录
+                      </span>
+                    ) : tok.text === "—" ? (
                       <span className="muted">—</span>
                     ) : (
                       <span className={"ac-expiry" + (tok.expired ? " expired" : "")}>

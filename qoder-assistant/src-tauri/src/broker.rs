@@ -283,6 +283,13 @@ pub struct SyncReport {
     pub merged: usize,
     pub refreshed: usize,
     pub failed: usize,
+    /// 失败里**重试也没用**的个数（refresh token 已死，只能重新登录）。
+    ///
+    /// 单独计数是为了不把它们算进 [`failed`](SyncReport::failed)：`failed > 0` 会触发
+    /// `/abort` 让**所有机器**一起冷却，一个已经换不出票的账号因此能把整池里
+    /// 那些还能救的账号一起拖到过期。
+    #[serde(default)]
+    pub blocked: usize,
     pub version: Option<i64>,
     pub message: String,
 }
@@ -897,6 +904,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: None,
             message: "本区域未绑定凭证池".to_string(),
         });
@@ -911,6 +919,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: rt.version,
             message: "距上次同步不到两分钟，这次跳过".to_string(),
         });
@@ -953,6 +962,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: rt.version,
             message,
         });
@@ -986,6 +996,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     let mut pool = union_pool(&cloud, &local);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
+    let mut blocked = 0usize;
     for acct in accounts.iter_mut().filter(|a| a.region == region) {
         if acct.refresh_token.is_none()
             || !crate::refresh::should_refresh(acct.expires_at, now)
@@ -1005,6 +1016,16 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
                     pool.push(to_item(acct));
                 }
             }
+            Err(e) if e.dead => {
+                // 死链单独一档：**不**算进 failed，因此不会触发 /abort。
+                // 整池因为一个已经换不出票的账号进入冷却，等于让别的账号陪它一起过期 ——
+                // 而它们本来还能续。这条链只能靠重新登录复活，跳过它是最不负责任也最负责的做法。
+                blocked += 1;
+                crate::scheduler::log_event(
+                    dir,
+                    &format!("这条链已死，跳过它（不拖停整池）：{}（{e}）", acct.name),
+                );
+            }
             Err(e) => {
                 failed += 1;
                 crate::scheduler::log_event(
@@ -1016,7 +1037,8 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     }
     accounts::save_accounts(dir, &accounts).map_err(|e| e.to_string())?;
 
-    // ③ 有失败就 abort（记冷却，让所有机器都停手），没有才提交
+    // ③ 有**临时**失败才 abort（记冷却，让所有机器都停手），没有才提交。
+    //    死链（`blocked`）不进这个条件：它们重试无用，冷却只会把还能救的账号一起拖过期。
     if failed > 0 {
         let note = format!("{failed} 个账号续签失败");
         let _ = request(
@@ -1026,14 +1048,22 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
         )
         .await;
         note_error(region, format!("{note}，已让管家进入冷静期"));
+        let tail = if blocked > 0 {
+            format!("（另有 {blocked} 个是票已失效、重试没用的）")
+        } else {
+            String::new()
+        };
         return Ok(SyncReport {
             changed: merged > 0 || refreshed > 0,
             deferred: false,
             merged,
             refreshed,
             failed,
+            blocked,
             version: Some(version),
-            message: format!("{refreshed} 个账号续签成功、{failed} 个失败；已暂停整池续签一会儿"),
+            message: format!(
+                "{refreshed} 个账号续签成功、{failed} 个失败；已暂停整池续签一会儿{tail}"
+            ),
         });
     }
 
@@ -1069,8 +1099,13 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
         merged,
         refreshed,
         failed: 0,
+        blocked,
         version: next_version,
-        message: format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）"),
+        message: if blocked > 0 {
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个，{blocked} 个已死掉、需要重新登录）")
+        } else {
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）")
+        },
     })
 }
 

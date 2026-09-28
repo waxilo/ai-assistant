@@ -25,11 +25,47 @@
 //!
 //! 设计取舍：续签是「尽力而为」的旁路——失败仅影响本次续签（大概率是 refresh token 已过期），
 //! 由调用方决定如何呈现；成功后由调用方决定是否原子写回 `auth.v1.dat`（见 `auth_file::apply_refresh`）。
+//!
+//! ⚠️ 但「失败」有两种，只有一种该重试：接口打不通是暂时的，而**服务端明确拒了这份
+//! refresh token**（顶层 `reason: "expired"` / `"rejected"`）是怎么重试都同一结论的死链。
+//! 整池同步必须把它们分开，见 [`RefreshError::dead`] 与 `crate::broker::sync`。
 
 use crate::timeutil::token_expiry;
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
+
+/// 一次续签失败：文字给人看，[`dead`](RefreshError::dead) 给程序做决定。
+#[derive(Debug, Clone)]
+pub struct RefreshError {
+    pub text: String,
+    /// 这条链是否已经**死透** —— 见模块头那条分隔。
+    ///
+    /// `true` 只在「请求发出去了、服务端认得我们并明确拒了这份 refresh token」时成立。
+    /// 网络失败、返回体看不懂都算 `false`：那些确实值得再来一次。
+    pub dead: bool,
+}
+
+impl RefreshError {
+    pub(crate) fn transient(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            dead: false,
+        }
+    }
+    pub(crate) fn dead(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            dead: true,
+        }
+    }
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
 
 /// 一次成功续签的产物。
 #[derive(Serialize, Clone, Debug)]
@@ -57,19 +93,66 @@ pub const REFRESH_THRESHOLD_MS: i64 = 48 * 60 * 60 * 1000;
 const COSY_CLIENT_TYPE: &str = "10";
 
 /// 是否「值得」续签：未知有效期不动（无从判断），已过期或剩余不足 48 小时则续。
+///
+/// ⚠️ 本项目的 access token 是**不透明串**（`dt-…`，不是 JWT），到期时间只能来自
+/// `expires_at` 这一个字段 —— 没有「从票里读出来」这条路（traework 那边有，它的票是 JWT）。
+/// 所以这里的兜底办法是**换一个事实来源**：续签响应每次都会带回新的 `expires_at`，
+/// 只要有一条路径把它收下（[`crate::commands::refresh_account_in_place`]、授权、导入、
+/// 采纳登录文件的 [`crate::commands::adopt_file_sessions`]），这个字段就不会空。
+/// 而**空着的账号等于「永远不会被自动续」**：`should_refresh(None)` 恒 `false`，
+/// 界面上不会有任何报错 —— 它只是安静地过期。
 pub fn should_refresh(expires_at: Option<i64>, now_ms: i64) -> bool {
     matches!(expires_at, Some(e) if e - now_ms < REFRESH_THRESHOLD_MS)
 }
 
+/// 这条链的**续签能力**是否已经过期（`rt_expires_at` 归一到毫秒后与 now 比）。
+///
+/// 不知道就返回 `false` —— 没有证据就别放弃这条链。而已经知道它过期了还去打接口，
+/// 只会换回一次明确的拒绝，并把「本机在签」的闸白白占一轮。
+pub fn rt_is_expired(rt_expires_at: Option<i64>, now_ms: i64) -> bool {
+    norm_rt_ms(rt_expires_at)
+        .map(|ms| ms <= now_ms)
+        .unwrap_or(false)
+}
+
+/// `rt_expires_at` 归一成毫秒（历史数据里秒级写法也存过）；不知道就 `None`。
+///
+/// 单独给出来是因为调用点除了「过没过期」还要**把那个时间说给人听**，
+/// 而重新解析一遍会出现两套归一规则。
+pub fn norm_rt_ms(rt_expires_at: Option<i64>) -> Option<i64> {
+    let v = rt_expires_at?;
+    crate::timeutil::norm_ts(Some(&serde_json::Value::from(v)))
+}
+
+/// 顶层 `reason` 里「这张票没了」的几种说法。命中任一才判死链。
+///
+/// 为什么不只认 `expired`：`rejected` 同样是服务端对这张票的表态，而漏判的代价是
+/// **一个坏账号反复把整池拖进冷却**（见 `crate::broker::sync`）。
+/// 反过来，把 `transient` 这类也算成死链，代价是一条还能救的链被我们放弃 ——
+/// 所以判据宁窄勿宽：认不出来的 reason 一律当「值得再试」。
+const DEAD_REASONS: &[&str] = &["expired", "rejected", "invalid_grant", "revoked"];
+
+/// 业务失败分级：`reason` 命中 [`DEAD_REASONS`] 才算死链。
+fn dead_by_reason(reason: &str) -> bool {
+    let r = reason.trim().to_lowercase();
+    DEAD_REASONS.iter().any(|k| r == *k)
+}
+
 /// 续签响应解析：Qoder 返回**平铺**的 token 对（不套 `code/data`）。
-fn parse_response(v: &Value, now_ms: i64) -> Result<Refreshed, String> {
+fn parse_response(v: &Value, now_ms: i64) -> Result<Refreshed, RefreshError> {
     // 顶层 reason，业务失败统一在这（expired / rejected / transient…）
     if let Some(reason) = v.get("reason").and_then(Value::as_str) {
-        return Err(format!("续签失败：{reason}"));
+        let text = format!("续签失败：{reason}");
+        return Err(if dead_by_reason(reason) {
+            RefreshError::dead(text)
+        } else {
+            RefreshError::transient(text)
+        });
     }
     let token = str_of(v, &["token", "device_token", "accessToken", "access_token"]);
     if token.is_empty() {
-        return Err("续签响应缺少 token".to_string());
+        // 答复看不懂 ≠ 票没了：留着下一轮再试
+        return Err(RefreshError::transient("续签响应缺少 token"));
     }
     let expires_at = token_expiry(
         v,
@@ -110,12 +193,12 @@ pub async fn refresh(
     region: crate::region::Region,
     token: &str,
     refresh_token: &str,
-) -> Result<Refreshed, String> {
+) -> Result<Refreshed, RefreshError> {
     let url = format!("{}/api/v1/deviceToken/refresh", region.openapi_base());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|e| format!("初始化 HTTP 客户端失败：{e}"))?;
+        .map_err(|e| RefreshError::transient(format!("初始化 HTTP 客户端失败：{e}")))?;
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::ACCEPT,
@@ -132,15 +215,19 @@ pub async fn refresh(
         .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
         .await
-        .map_err(|e| format!("请求续签接口失败：{e}"))?;
+        .map_err(|e| RefreshError::transient(format!("请求续签接口失败：{e}")))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|_| format!("续签接口返回非 JSON（HTTP {status}）"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| {
+        RefreshError::transient(format!("续签接口返回非 JSON（HTTP {status}）"))
+    })?;
     match parse_response(&v, chrono::Utc::now().timestamp_millis()) {
         Ok(r) => Ok(r),
-        // HTTP 非 2xx 且无 reason → 包一层状态码，便于调用方判断
-        Err(e) if !status.is_success() => Err(format!("{e}（HTTP {status}）")),
+        // HTTP 非 2xx 且无 reason → 包一层状态码，便于调用方判断；死链标记要保住
+        Err(e) if !status.is_success() => Err(RefreshError {
+            text: format!("{}（HTTP {status}）", e.text),
+            dead: e.dead,
+        }),
         Err(e) => Err(e),
     }
 }
@@ -195,9 +282,37 @@ mod tests {
     #[test]
     fn reports_business_reason_and_missing_token() {
         let e = parse_response(&serde_json::json!({"reason": "expired"}), 0).unwrap_err();
-        assert!(e.contains("expired"), "{e}");
+        assert!(e.text.contains("expired"), "{e}");
         assert!(parse_response(&serde_json::json!({}), 0).is_err());
         assert!(parse_response(&serde_json::json!({"code": 0}), 0).is_err());
+    }
+
+    #[test]
+    fn only_an_explicit_refusal_counts_as_a_dead_chain() {
+        // 服务端点名这张票没了 → 死链；其余失败（哪怕带 reason）都还值得再试一次
+        for reason in ["expired", "rejected", "invalid_grant", "REVOKED"] {
+            let e = parse_response(&serde_json::json!({"reason": reason}), 0).unwrap_err();
+            assert!(e.dead, "{reason} 应判死链");
+        }
+        for reason in ["transient", "rate_limited", "maintenance"] {
+            let e = parse_response(&serde_json::json!({"reason": reason}), 0).unwrap_err();
+            assert!(!e.dead, "{reason} 不该判死链");
+        }
+        // 答复看不懂（缺 token）同样是「再来一次」，不是死刑
+        assert!(!parse_response(&serde_json::json!({}), 0)
+            .unwrap_err()
+            .dead);
+    }
+
+    #[test]
+    fn an_expired_refresh_token_is_never_worth_a_request() {
+        let now = 1_700_000_000_000;
+        assert!(rt_is_expired(Some(now - 1), now));
+        assert!(rt_is_expired(Some(now), now));
+        assert!(rt_is_expired(Some(1_700_000_000 - 1), now)); // 秒级也要归一后比较
+        assert!(!rt_is_expired(Some(now + 1), now));
+        // 不知道就不放弃这条链 —— 没有证据就别替服务端做决定
+        assert!(!rt_is_expired(None, now));
     }
 
     /// 真实接口冒烟：用本机 auth.v1.dat 里的 refresh token 换一次新凭证。

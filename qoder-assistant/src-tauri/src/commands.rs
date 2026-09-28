@@ -88,6 +88,29 @@ pub struct AutoRefreshReport {
     pub refreshed: Vec<String>,
     /// 需要续签但失败的（账号名 + 原因）
     pub failed: Vec<String>,
+    /// 失败里**重试也没用**的那些（refresh token 已被服务端判死，只能重新登录）。
+    ///
+    /// 单列出来不是为了换个措辞，而是因为整池同步对这两类的处理**相反**：
+    /// 临时失败要冷却重试，死链要跳过放行 —— 混在一起会让一个坏账号反复把整池拖进冷却。
+    #[serde(default)]
+    pub dead: Vec<String>,
+    /// 本轮从**桌面端登录文件**接过来的账号名（没打任何接口，见 [`adopt_file_sessions`]）。
+    ///
+    /// 单列是因为它和 `refreshed` 的差别值得让人看见：前者说明「桌面端自己续过、我们只是
+    /// 跟上」，后者说明「我们替它去打了一次接口」。
+    #[serde(default)]
+    pub adopted: Vec<String>,
+}
+
+/// 毫秒时间戳 → 给人看的本地时间。
+fn fmt_expiry(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "未知".to_string())
 }
 
 /// 就地做一次本地续签（拿 refresh token 换新的一对 token）。
@@ -99,12 +122,27 @@ pub struct AutoRefreshReport {
 /// 两个 token 的过期时间**都要收下来**：refresh token 那条是「这条续签链还能活多久」
 /// 的判据，而只有它能换来新的 access token —— 漏掉它，界面上的「剩余有效期」就只剩
 /// 一个看起来还很新、实际已经换不出东西的数字。
-pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<(), String> {
+pub(crate) async fn refresh_account_in_place(
+    account: &mut Account,
+) -> Result<(), refresh::RefreshError> {
     let rt = account
         .refresh_token
         .clone()
-        .ok_or_else(|| "没有 refresh token，无法续签".to_string())?;
+        .ok_or_else(|| refresh::RefreshError::transient("没有 refresh token，无法续签"))?;
+    // 已知的死链不必去打接口：结果注定是同一个拒绝，却会白占一轮「本机在签」的闸，
+    // 并把界面上「续签失败」的口径污染成「再试一次就好」。
+    let now = chrono::Utc::now().timestamp_millis();
+    if refresh::rt_is_expired(account.rt_expires_at, now) {
+        let dead_at = refresh::norm_rt_ms(account.rt_expires_at).unwrap_or(now);
+        return Err(refresh::RefreshError::dead(format!(
+            "refresh token 已于 {} 过期，这个账号需要重新登录",
+            fmt_expiry(dead_at)
+        )));
+    }
     let r = refresh::refresh(account.region, &account.token, &rt).await?;
+    // 写回登录文件要认人：那枚**换出去**的旧 token 就是「这个登录文件确实是我们刚签的那个
+    // 账号」的证据。先存下来，下面传给 apply_refresh 做核对。
+    let prev_token = account.token.clone();
     account.token = r.token.clone();
     let next_rt = r.refresh_token.clone();
     if let Some(nrt) = &next_rt {
@@ -112,15 +150,99 @@ pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<()
     }
     account.expires_at = r.expires_at.or(account.expires_at);
     account.rt_expires_at = r.rt_expires_at.or(account.rt_expires_at);
-    // 续签成功 → 同窗口原子写回 auth.v1.dat（尽力而为，失败只读模式静默）
+    // 续签成功 → 同窗口原子写回 auth.v1.dat（尽力而为；核对不上本人就跳过，见它的文档）
     let _ = crate::auth_file::apply_refresh(
         account.region,
+        &prev_token,
         &r.token,
         next_rt.as_deref(),
         r.expires_at,
         r.rt_expires_at,
     );
     Ok(())
+}
+
+/// 采纳**桌面端已经换好的那一轮**：把 `auth.v1.dat` 里的凭证并回本地账号。
+///
+/// 纯函数，`files` 由调用方从 [`crate::auth_file::discover_local_accounts`] 取。
+/// 返回被采纳的账号名。
+///
+/// 这条路径是**离线**的：不打任何接口，所以既不会顶掉别人的链，也不受「这条链还活着吗」
+/// 的限制 —— 桌面端每次登录/续签都会把新的一对 token 写进它自己的文件，我们只是把
+/// 它已经换好的结果接过来。对「本地那份 refresh token 已经过期、又没法重新登录」的账号，
+/// 这是唯一一条能自动复活的路。
+///
+/// 三条门槛，缺一不可：
+///
+/// 1. **认得出是同一个人**（同区域内 token 相同，或手机号/邮箱任一对上）——
+///    两套部署各有一份登录文件，而一个文件只代表**当前**那一个账号；
+///    认错了人就是把 A 的票塞进 B 的记录里，症状与 `apply_refresh` 那道核对同一种事故；
+/// 2. **文件里带 refresh token** —— 只有一张快过期的 access token 不算救活，
+///    下一轮照样续不动，白白让界面显示「刚刚更新过」；
+/// 3. **文件里那条链确实更新**（access token 的到期时间更晚；本地那份的到期时间
+///    都不知道时，只要文件知道就算更新）—— 反向比较会在桌面端用着我们写的旧值时，
+///    把我们刚签回来的新票覆盖掉。
+pub(crate) fn adopt_file_sessions(
+    accounts: &mut [Account],
+    files: &[crate::auth_file::LocalAccount],
+) -> Vec<String> {
+    let mut adopted = Vec::new();
+    for f in files {
+        let Some(file_rt) = f.refresh_token.as_deref().filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let Some(a) = accounts.iter_mut().find(|a| same_person_in_file(a, f)) else {
+            continue;
+        };
+        // 「文件那条更新」：两边到期时间都比，本地不知道时只要文件知道就算更新
+        // （那个本地账号从此有了到期时间，界面上不再是沉默账号）。
+        let newer = match (f.expires_at, a.expires_at) {
+            (Some(fe), Some(ae)) => fe > ae,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if !newer {
+            continue;
+        }
+        a.token = f.token.clone();
+        a.refresh_token = Some(file_rt.to_string());
+        a.expires_at = f.expires_at;
+        // 两个到期时间都**直接赋值**，不是 `or`：它们描述的是被换掉的那条旧链，
+        // 留着就是留着一条已经作废的判据 —— 比如旧链的 refresh token 早已过期，
+        // 采纳后它会让下一个调用点立刻把这个账号又判成死链（见 `refresh::rt_is_expired`）。
+        a.rt_expires_at = f.rt_expires_at;
+        // 顺手补身份（**只补空，绝不覆盖**，与 [`fill_identity_if_missing`] 同一条规矩）：
+        // 登录文件知道这个人是谁，而我们认人、以及池里的 key 都指着这两样。
+        // 这次是按 token 认出来的，下次 token 一轮换就只剩它们兜底了。
+        if a.phone.is_none() {
+            a.phone = f.phone.clone().filter(|s| !s.trim().is_empty());
+        }
+        if a.email.is_none() {
+            a.email = f.email.clone().filter(|s| !s.trim().is_empty());
+        }
+        if a.name.trim().is_empty() {
+            if let Some(n) = f.nickname.as_deref().filter(|s| !s.trim().is_empty()) {
+                a.name = n.to_string();
+            }
+        }
+        adopted.push(a.name.clone());
+    }
+    adopted
+}
+
+/// 本地记录与登录文件是否是同一个账号（判据与 [`merge_import`] 一致）。
+fn same_person_in_file(a: &Account, f: &crate::auth_file::LocalAccount) -> bool {
+    let eq = |l: &Option<String>, r: &Option<String>| {
+        let (Some(l), Some(r)) = (l, r) else {
+            return false;
+        };
+        let (l, r) = (l.trim(), r.trim());
+        !l.is_empty() && !r.is_empty() && l.eq_ignore_ascii_case(r)
+    };
+    a.region == f.region
+        && (a.token.trim() == f.token.trim()
+            || eq(&a.phone, &f.phone)
+            || eq(&a.email, &f.email))
 }
 
 /// 阈值内自动续签。返回值 `Ok(true)` = **账号字段有更新，调用方需要落盘**。
@@ -130,7 +252,7 @@ pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<()
 /// 「谁先签谁把别人踢下线」正是这么来的，所以这条分岔不能省。
 /// 判据按**账号自己的区域**算：两套部署各绑各的池，国际版绑了不代表国内版账号
 /// 也要停掉本地续签。
-pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, String> {
+pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, refresh::RefreshError> {
     if crate::broker::bound_in(account.region) {
         return Ok(false);
     }
@@ -239,9 +361,28 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
     }
 
     let mut accounts = accounts::load_accounts(&dir);
+    // 先接住桌面端已经换好的那一轮（离线、零风险，见 [`adopt_file_sessions`]）。
+    // 顺序很重要：本地那份可能整条链都已被桌面端换掉、只剩一枚过期的 refresh token，
+    // 先看文件就不必先打一次注定被拒的接口，也不会把还能救的账号报成「需要重新登录」。
+    //
+    // 但**只在真有需要时才去读登录文件**：那要动用系统钥匙串，而在没做过「导入本机账号」
+    // 的机器上，第一次读可能弹一次授权框 —— 一轮什么都不缺的后台自检不该弹这个。
+    let now = chrono::Utc::now().timestamp_millis();
+    let needs_a_look = accounts.iter().any(|a| {
+        a.refresh_token.is_none()
+            || refresh::rt_is_expired(a.rt_expires_at, now)
+            || refresh::should_refresh(a.expires_at, now)
+    });
+    let adopted = if needs_a_look {
+        let files = crate::auth_file::discover_local_accounts().accounts;
+        adopt_file_sessions(&mut accounts, &files)
+    } else {
+        Vec::new()
+    };
+    let mut changed = !adopted.is_empty();
     let mut refreshed = Vec::new();
     let mut failed = Vec::new();
-    let mut changed = false;
+    let mut dead = Vec::new();
     // 上一个账号是否真的产生过出站请求：用来决定本账号前要不要让一拍。
     // 两个条件同时成立才等（上次发过 + 这次也要发），缺一个等待就纯属拖延
     let mut sent = false;
@@ -259,16 +400,27 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
             }
             Ok(false) => {}
             Err(e) => {
-                // 走到这里说明请求已经发出去了（只是失败），流量一样算数
+                // 失败按性质分家：死链要单独报（见 [`AutoRefreshReport::dead`]）。
+                // 「请求是否真发出去」不在这里区分 —— 多让一拍无害，少一层分支值得。
                 sent = true;
-                failed.push(format!("{}：{e}", acct.name));
+                let line = format!("{}：{e}", acct.name);
+                if e.dead {
+                    dead.push(line);
+                } else {
+                    failed.push(line);
+                }
             }
         }
     }
     if changed {
         accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     }
-    Ok(AutoRefreshReport { refreshed, failed })
+    Ok(AutoRefreshReport {
+        refreshed,
+        failed,
+        dead,
+        adopted,
+    })
 }
 
 /// 一条导入项：来自「导入本机账号」或「登录新账号」。
@@ -599,6 +751,138 @@ mod import_tests {
         let raw = serde_json::json!({ "token": "t" });
         let it: ImportItem = serde_json::from_value(raw).unwrap();
         assert_eq!(it.region, Region::Global);
+    }
+
+    // ── 采纳桌面端登录文件 ────────────────────────────────────────────────
+    // 认人的判据与上面几条同源（同区域 + token/手机号/邮箱任一相同），所以放在一起测。
+
+    fn file_in(
+        region: Region,
+        token: &str,
+        phone: Option<&str>,
+        expires_at: Option<i64>,
+        rt: Option<&str>,
+    ) -> crate::auth_file::LocalAccount {
+        crate::auth_file::LocalAccount {
+            token: token.into(),
+            refresh_token: rt.map(str::to_string),
+            region,
+            source: "test".into(),
+            uid: None,
+            nickname: None,
+            phone: phone.map(str::to_string),
+            email: None,
+            expires_at,
+            rt_expires_at: Some(expires_at.unwrap_or(0) + 86_400_000),
+            is_current: true,
+            file: "auth.v1.dat".into(),
+        }
+    }
+
+    fn file(token: &str, phone: Option<&str>, expires_at: Option<i64>) -> crate::auth_file::LocalAccount {
+        file_in(Region::Global, token, phone, expires_at, Some("rt-file"))
+    }
+
+    /// 「无法重登」时唯一能自动复活这条链的路径：本地票已死、桌面端自己换过一轮。
+    #[test]
+    fn adopts_the_desktop_rotation_even_when_our_own_chain_is_dead() {
+        let now = 1_790_000_000_000;
+        let mut a = acct("waxiloao", Some("138"), "old-token");
+        a.refresh_token = Some("rt-dead".into());
+        a.expires_at = Some(now - 1);
+        a.rt_expires_at = Some(now - 1_000); // 我们这条链已经换不出东西了
+        let mut accs = vec![a];
+        let adopted = adopt_file_sessions(&mut accs, &[file("new-token", Some("138"), Some(now + 600_000))]);
+        assert_eq!(adopted, vec!["waxiloao".to_string()]);
+        assert_eq!(accs[0].token, "new-token");
+        assert_eq!(accs[0].refresh_token.as_deref(), Some("rt-file"));
+        assert_eq!(accs[0].expires_at, Some(now + 600_000));
+        // 采纳之后再判「链死了吗」就该是活的 —— 这正是它要先于续签跑的理由
+        assert!(!refresh::rt_is_expired(accs[0].rt_expires_at, now));
+    }
+
+    /// 采纳来的链不能继承旧链的到期判据：文件没写 refresh token 到期时间时，
+    /// 若留着本地那条早已作废的旧值，这个账号在下一个调用点又会被判成死链。
+    #[test]
+    fn a_rescued_chain_does_not_inherit_the_dead_refresh_expiry() {
+        let now = 1_790_000_000_000;
+        let mut a = acct("a", Some("138"), "old-token");
+        a.refresh_token = Some("rt-old".into());
+        a.expires_at = Some(now - 1);
+        a.rt_expires_at = Some(now - 1_000); // 旧链：已经换不出票
+        let mut accs = vec![a];
+        let mut f = file("new-token", Some("138"), Some(now + 600_000));
+        f.rt_expires_at = None; // 文件只说了 access token 的到期
+        assert_eq!(adopt_file_sessions(&mut accs, &[f]), vec!["a".to_string()]);
+        assert_eq!(accs[0].rt_expires_at, None, "旧判据必须清掉而不是留着");
+        assert!(!refresh::rt_is_expired(accs[0].rt_expires_at, now));
+    }
+
+    #[test]
+    fn adoption_never_replaces_a_newer_chain_with_an_older_one() {
+        let mut a = acct("a", Some("138"), "our-token");
+        a.refresh_token = Some("rt-ours".into());
+        a.expires_at = Some(2_000);
+        let mut accs = vec![a];
+        // 文件里那条更早：说明桌面端拿的是我们写回去的旧值，倒着采纳会把刚签的票换掉
+        assert!(adopt_file_sessions(&mut accs, &[file("file-token", Some("138"), Some(1_000))]).is_empty());
+        assert_eq!(accs[0].token, "our-token");
+        // 认不出的人（手机号/邮箱/token 都对不上）不采纳 —— 一个文件只代表一个当前账号
+        assert!(adopt_file_sessions(&mut accs, &[file("file-token", Some("999"), Some(3_000))]).is_empty());
+        // 跨区域不认人：同一个手机号在两套部署里是两个账号（与 `merge_import` 同一条规矩）
+        let other = file_in(Region::Cn, "file-token", Some("138"), Some(3_000), Some("rt-file"));
+        assert!(adopt_file_sessions(&mut accs, &[other]).is_empty());
+        assert_eq!(accs[0].token, "our-token", "三种情况都该一个字都不动");
+    }
+
+    #[test]
+    fn a_file_without_a_refresh_token_is_not_a_rescue() {
+        let mut accs = vec![acct("a", Some("138"), "t")];
+        let no_rt = file_in(Region::Global, "file-token", Some("138"), Some(9_000), None);
+        assert!(adopt_file_sessions(&mut accs, &[no_rt]).is_empty());
+        assert_eq!(accs[0].token, "t");
+    }
+
+    /// 本地到期时间空着的「沉默账号」：文件知道就该采纳，它从此才有到期时间、
+    /// 也才会被续签判定看见（见 `refresh::should_refresh` 的注释）。
+    #[test]
+    fn a_silent_account_gets_its_expiry_from_the_file() {
+        let mut a = acct("a", Some("138"), "t");
+        a.expires_at = None;
+        let mut accs = vec![a];
+        assert_eq!(
+            adopt_file_sessions(&mut accs, &[file("file-token", Some("138"), Some(5_000))]),
+            vec!["a".to_string()]
+        );
+        assert_eq!(accs[0].expires_at, Some(5_000));
+    }
+
+    /// 采纳时顺手补身份（只补空），但不许覆盖已有的：这次是按 token 认出来的人，
+    /// 下次 token 一轮换，认人就只剩手机号/邮箱这两样了。
+    #[test]
+    fn adoption_fills_a_missing_identity_but_never_overwrites_one() {
+        // 这次只能按 token 认（本地没手机号），文件里那三样就都该补进来
+        let mut accs = vec![acct("", None, "same-token")];
+        let mut f = file("same-token", None, Some(9_000));
+        f.phone = Some("138-0000".into());
+        f.email = Some("a@b.c".into());
+        f.nickname = Some("文件里的昵称".into());
+        assert_eq!(adopt_file_sessions(&mut accs, &[f]), vec!["文件里的昵称".to_string()]);
+        assert_eq!(accs[0].phone.as_deref(), Some("138-0000"));
+        assert_eq!(accs[0].email.as_deref(), Some("a@b.c"));
+        assert_eq!(accs[0].name, "文件里的昵称");
+
+        // 本地已有的一个都不许被顶掉：文件里那份可能是别处旧值（换个手机号登录过、改过昵称）
+        let mut a = acct("我", Some("139"), "other-token");
+        a.email = Some("me@x.y".into());
+        let mut accs = vec![a];
+        let mut f = file("other-token", Some("138-0000"), Some(9_000));
+        f.email = Some("old@x.y".into());
+        f.nickname = Some("别的名字".into());
+        assert_eq!(adopt_file_sessions(&mut accs, &[f]), vec!["我".to_string()]);
+        assert_eq!(accs[0].phone.as_deref(), Some("139"));
+        assert_eq!(accs[0].email.as_deref(), Some("me@x.y"));
+        assert_eq!(accs[0].name, "我");
     }
 }
 

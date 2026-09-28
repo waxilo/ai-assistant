@@ -489,6 +489,21 @@ fn maybe_auto_refresh(app: &AppHandle, dir: &Path) {
             for f in &report.failed {
                 log_event(dir, &format!("自动续签失败：{f}"));
             }
+            // 死链要说成死链：混在「自动续签失败」里，看日志的人会以为再等一轮就好了，
+            // 于是一路等到这个账号彻底过期（而它其实只能靠重新登录复活）。
+            for d in &report.dead {
+                log_event(dir, &format!("自动续签放弃（这条链已死，要重新登录才能自动续）：{d}"));
+            }
+            // 接住桌面端那一轮同样要留痕：它解释了「这个账号今天没打接口怎么就续上了」
+            if !report.adopted.is_empty() {
+                log_event(
+                    dir,
+                    &format!(
+                        "已采纳桌面端登录文件里更新的凭证：{}",
+                        report.adopted.join("、")
+                    ),
+                );
+            }
         }
         Err(e) => log_event(dir, &format!("自动续签异常：{e}")),
     }
