@@ -255,6 +255,10 @@ pub struct SyncReport {
     pub merged: usize,
     pub refreshed: usize,
     pub failed: usize,
+    /// 本机**签不动**的条数（票已失效，重试也是同一结论）。它不算 `failed`，
+    /// 因为它不该让整池进冷却 —— 见 `sync` 里那条分支。
+    #[serde(default)]
+    pub blocked: usize,
     pub version: Option<i64>,
     pub message: String,
 }
@@ -297,10 +301,25 @@ pub fn to_item(account: &Account) -> PoolItem {
         phone: account.phone.clone().unwrap_or_default(),
         access_token: account.token.clone(),
         refresh_token: account.refresh_token.clone().unwrap_or_default(),
-        expires_at: account.expires_at,
+        // 上传**推得出的**到期，而不是本地那个可能为空白的字段：`expires_at: null`
+        // 到了别的机器上就是「永不续签」，而真实寿命一直写在这张票里。
+        expires_at: acct_expiry(account),
         rt_expires_at: account.rt_expires_at,
         updated_at: Some(chrono::Utc::now().timestamp_millis()),
     }
+}
+
+/// 本账号的到期时间：字段优先，空了就从票里的 JWT `exp` 折算（见 `refresh::expiry_ms`）。
+fn acct_expiry(account: &Account) -> Option<i64> {
+    crate::refresh::expiry_ms(account.expires_at, &account.token)
+}
+
+/// 池里那一条的到期时间，判据同 [`acct_expiry`]。
+///
+/// 别的机器（或更早版本的我们）上传的条目可能是 `"expires_at": null`，
+/// 而票是完整的 —— 那种 null 不是「永不过期」，也不是「已过期」，只是**没带上**。
+fn item_expiry(item: &PoolItem) -> Option<i64> {
+    crate::refresh::expiry_ms(item.expires_at, &item.access_token)
 }
 
 /// 池里的一条 → 本机新账号（本地还没有这个 key 时用）
@@ -334,6 +353,10 @@ pub fn account_from_item(item: &PoolItem) -> Account {
 /// 等价于「更新的一次轮换」。反过来（池里那条更旧）绝不能覆盖 —— 那正是
 /// 「先到的旧副本把新凭证盖回去」的来源。
 ///
+/// 两边都走 [`acct_expiry`] / [`item_expiry`]（字段空了就从票里读），因为
+/// 「字段是 null」在这套数据里太常见了，而它既不代表永不过期也不代表最旧：
+/// 2026-09-28 那次「池里还能用的票被当成不更新丢掉」就是这么来的。
+///
 /// 不满足「更新」时仍会补本地缺的字段（老账号没有 refresh token、没有手机号），
 /// 因为那是从「不知道」变成「知道」，不存在覆盖新值的风险。
 pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
@@ -342,7 +365,7 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
         // 空 / 纯空白 token 一律忽略：采纳它等于把账号弄成登录不上
         return false;
     }
-    let newer = match (item.expires_at, account.expires_at) {
+    let newer = match (item_expiry(item), acct_expiry(account)) {
         (Some(p), Some(l)) => p > l,
         (Some(_), None) => true,
         _ => false,
@@ -376,7 +399,10 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
     if !item.refresh_token.trim().is_empty() {
         account.refresh_token = Some(item.refresh_token.clone());
     }
-    account.expires_at = item.expires_at.or(account.expires_at);
+    account.expires_at = item
+        .expires_at
+        .or_else(|| item_expiry(item))
+        .or(account.expires_at);
     account.rt_expires_at = item.rt_expires_at.or(account.rt_expires_at);
     if account.phone.is_none() && !item.phone.trim().is_empty() {
         account.phone = Some(item.phone.clone());
@@ -732,6 +758,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: None,
             message: "本机未绑定凭证池".to_string(),
         });
@@ -746,6 +773,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: rt.version,
             message: "距上次同步不到两分钟，这次跳过".to_string(),
         });
@@ -788,6 +816,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged: 0,
             refreshed: 0,
             failed: 0,
+            blocked: 0,
             version: rt.version,
             message,
         });
@@ -807,9 +836,10 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     let mut pool = union_pool(&lease.items, &accounts);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
+    let mut blocked = 0usize;
     for acct in accounts.iter_mut() {
         if acct.refresh_token.is_none()
-            || !crate::refresh::should_refresh(acct.expires_at, now)
+            || !crate::refresh::refresh_due(acct.expires_at, &acct.token, now)
         {
             continue;
         }
@@ -822,6 +852,16 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
                 } else {
                     pool.push(to_item(acct));
                 }
+            }
+            // 这条链本机续不动了（票已失效 / 需要重登）。它**不该拖停整池**：
+            // 重试一千次也是同一句答复，而冷却是按整池算的 —— 一个等着重登的账号
+            // 会把别的还能救的账号一起挡在续签窗口外，最后表现成「一池集体过期」。
+            Err(e) if e.dead => {
+                blocked += 1;
+                crate::scheduler::log_event(
+                    dir,
+                    &format!("这条链已死，跳过它（不拖停整池）：{}（{e}）", acct.name),
+                );
             }
             Err(e) => {
                 failed += 1;
@@ -850,8 +890,16 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             merged,
             refreshed,
             failed,
+            blocked,
             version: Some(version),
-            message: format!("{refreshed} 个账号续签成功、{failed} 个失败；已暂停整池续签一会儿"),
+            message: format!(
+                "{refreshed} 个账号续签成功、{failed} 个失败；已暂停整池续签一会儿{}",
+                if blocked > 0 {
+                    format!("（另有 {blocked} 个是票已失效、重试没用的）")
+                } else {
+                    String::new()
+                }
+            ),
         });
     }
 
@@ -887,8 +935,13 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         merged,
         refreshed,
         failed: 0,
+        blocked,
         version: next_version,
-        message: format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）"),
+        message: if blocked > 0 {
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个；{blocked} 个已死掉、需要重新登录）")
+        } else {
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）")
+        },
     })
 }
 
@@ -1008,6 +1061,41 @@ mod tests {
         assert!(!adopt(&mut a, &blank));
         assert_eq!(a.token, "keep");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-keep"));
+    }
+
+    /// 两侧字段都是 null、票却读得出到期时，**必须**比出个新旧。
+    ///
+    /// 以前云端那条 `expires_at: null` 一律判成「不更新」，本机就永远收养不到别的机器
+    /// 换到的新链；而上传的那一份又带着 null 下去，下一台机器同样读不出到期。
+    #[test]
+    fn null_expiry_rows_are_still_compared_by_the_ticket() {
+        let jwt = signed_jwt_with_exp(1_800_000_000);
+        let mut a = acct("n", Some("138"), &jwt);
+        a.refresh_token = Some("rt-local".into());
+        let mut cloud = item("138", &signed_jwt_with_exp(1_800_003_600), None);
+        cloud.expires_at = None;
+        assert!(adopt(&mut a, &cloud), "两边字段都空，也要按票里的 exp 判新旧");
+        assert!(a.token.starts_with("eyJ"), "采纳的是云端那张票");
+        // 采纳之后本地必须有一个**能拿来判下次续签**的到期时间，不能还是 null
+        assert_eq!(a.expires_at, Some(1_800_003_600_000));
+        // 上传时同理：票读得出到期就不该交 null 上去
+        let mut blank = acct("m", Some("139"), &signed_jwt_with_exp(1_800_007_200));
+        blank.expires_at = None;
+        assert_eq!(to_item(&blank).expires_at, Some(1_800_007_200_000));
+    }
+
+    /// 拼一张本项目真实形态的票（三段式 JWT，载荷里 `exp` 是**秒**）。
+    fn signed_jwt_with_exp(exp: i64) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let payload = format!(r#"{{"iss":"https://www.workbuddy.cn","exp":{exp}}}"#);
+        let b64 = STANDARD
+            .encode(payload)
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string();
+        format!("eyJhbGciOiJSUzI1NiJ9.{b64}.sig")
     }
 
     // ── 并集 ────────────────────────────────────────────────────────────

@@ -256,6 +256,13 @@ export function expiryInfo(
   return { text, expired };
 }
 
+/// 「这条凭证还能不能自己续上」——refresh token 的有效期一过，续签就再也换不出新票，
+/// 这个账号只能重新登录。判据与后端 `refresh::rt_is_expired` 同源（正好到点也算过期）。
+/// null（不知道）不算死：后端同样不拿未知当坏消息，界面别比它更急。
+export function needsRelogin(rtExpiresAt?: number | null): boolean {
+  return rtExpiresAt != null && rtExpiresAt <= Date.now();
+}
+
 /// 积分过期倒计时：毫秒时间戳 → 「还有 N 天后过期」，看起来更直观。
 /// 已过期的返回「已过期」并标 expired。null/非法返回「—」。
 export function expiryCountdown(

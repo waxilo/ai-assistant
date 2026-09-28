@@ -388,6 +388,11 @@ fn maybe_auto_refresh(app: &AppHandle, dir: &Path) {
             for f in &report.failed {
                 log_event(dir, &format!("自动续签失败：{f}"));
             }
+            // 分开记是因为**人的动作不同**：失败等下一轮自动重试，死链只能重登一次。
+            // 混在一句「续签失败」里，用户会等一个永远不会来的好转。
+            for d in &report.dead {
+                log_event(dir, &format!("自动续签放弃（这条链已死，要重新登录才能自动续）：{d}"));
+            }
         }
         Err(e) => log_event(dir, &format!("自动续签异常：{e}")),
     }

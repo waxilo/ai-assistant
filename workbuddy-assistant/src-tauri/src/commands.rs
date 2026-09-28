@@ -93,6 +93,23 @@ pub struct AutoRefreshReport {
     pub refreshed: Vec<String>,
     /// 需要续签但失败的（账号名 + 原因）
     pub failed: Vec<String>,
+    /// 试过了、但服务端明确说这张票没了的（账号名 + 原因）：**重试不会变好，只有重登会**。
+    ///
+    /// 它和 `failed` 必须分开：调度线程对「有失败」是要报异常、进冷却的，
+    /// 而一条早就死透的链反复触发冷却，会把整池里那些**本来还能救**的账号一起拖到过期。
+    #[serde(default)]
+    pub dead: Vec<String>,
+}
+
+/// 毫秒时间戳 → 「2026-09-28 10:20」（本地时区）；越界写成「未知」。
+fn fmt_expiry(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| {
+            chrono::DateTime::<chrono::Local>::from(t)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "未知".to_string())
 }
 
 /// 就地做一次本地续签（拿 refresh token 换新的一对 token）。
@@ -104,11 +121,24 @@ pub struct AutoRefreshReport {
 /// 两个 token 的过期时间**都要收下来**：refresh token 那条是「这条续签链还能活多久」
 /// 的判据，而只有它能换来新的 access token —— 漏掉它，界面上的「剩余有效期」就只剩
 /// 一个看起来还很新、实际已经换不出东西的数字。
-pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<(), String> {
+///
+/// 返回 [`refresh::RefreshError`]：`dead` 那一种（服务端明确拒了这张票 / 我们明知这张票
+/// 过期了）重试多少次都是同一结论，整池同步要靠它把「一个坏账号」和「一次网络抖动」分开。
+pub(crate) async fn refresh_account_in_place(
+    account: &mut Account,
+) -> Result<(), refresh::RefreshError> {
     let rt = account
         .refresh_token
         .clone()
-        .ok_or_else(|| "没有 refresh token，无法续签".to_string())?;
+        .ok_or_else(|| refresh::RefreshError::transient("没有 refresh token，无法续签"))?;
+    // 已知这条链过期，就别去打那一下：白要一次服务端答复，还会让整池多一轮失败
+    let now = chrono::Utc::now().timestamp_millis();
+    if refresh::rt_is_expired(account.rt_expires_at, now) {
+        return Err(refresh::RefreshError::dead(format!(
+            "refresh token 已于 {} 过期，这个账号需要重新登录",
+            fmt_expiry(refresh::norm_ms(account.rt_expires_at.unwrap_or(0)))
+        )));
+    }
     let host = account_host(account);
     let r = refresh::refresh(&host, &account.token, &rt).await?;
     account.token = r.token;
@@ -125,7 +155,7 @@ pub(crate) async fn refresh_account_in_place(account: &mut Account) -> Result<()
 /// 绑了凭证池时**恒为「没动」**：整池的续签统一由 [`sync_pool_if_bound`] 拿着闸做。
 /// 这里若退回本地续签，几台机器会同时打官方接口、各自换一条新链 ——
 /// 「谁先签谁把别人踢下线」正是这么来的，所以这条分岔不能省。
-pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, String> {
+pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, refresh::RefreshError> {
     if crate::broker::bound() {
         return Ok(false);
     }
@@ -133,7 +163,7 @@ pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, St
         return Ok(false);
     }
     let now = chrono::Utc::now().timestamp_millis();
-    if !refresh::should_refresh(account.expires_at, now) {
+    if !refresh::refresh_due(account.expires_at, &account.token, now) {
         return Ok(false);
     }
     refresh_account_in_place(account).await?;
@@ -164,7 +194,11 @@ pub(crate) async fn sync_pool_if_bound(dir: &Path) {
 /// 一次后台自检就要凭空多花十几秒。
 fn will_refresh(account: &Account) -> bool {
     account.refresh_token.is_some()
-        && refresh::should_refresh(account.expires_at, chrono::Utc::now().timestamp_millis())
+        && refresh::refresh_due(
+            account.expires_at,
+            &account.token,
+            chrono::Utc::now().timestamp_millis(),
+        )
 }
 
 /// 自动续签全部账号（调度线程 / 启动自检调用）。
@@ -179,6 +213,7 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
     let mut accounts = accounts::load_accounts(&dir);
     let mut refreshed = Vec::new();
     let mut failed = Vec::new();
+    let mut dead = Vec::new();
     let mut changed = false;
     // 上一个账号是否真的产生过出站请求：用来决定本账号前要不要让一拍。
     // 两个条件同时成立才等（上次发过 + 这次也要发），缺一个等待就纯属拖延
@@ -199,14 +234,23 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
             Err(e) => {
                 // 走到这里说明请求已经发出去了（只是失败），流量一样算数
                 sent = true;
-                failed.push(format!("{}：{e}", acct.name));
+                let line = format!("{}：{}", acct.name, e.text);
+                if e.dead {
+                    dead.push(line);
+                } else {
+                    failed.push(line);
+                }
             }
         }
     }
     if changed {
         accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     }
-    Ok(AutoRefreshReport { refreshed, failed })
+    Ok(AutoRefreshReport {
+        refreshed,
+        failed,
+        dead,
+    })
 }
 
 /// 一条导入项：来自「导入本机账号」或「登录新账号」。
