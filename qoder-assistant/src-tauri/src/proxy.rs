@@ -519,13 +519,35 @@ fn serve(stream: TcpStream, tls: Arc<rustls::ServerConfig>, app: tauri::AppHandl
         return;
     }
     if !looks_like_tls(&stream) {
-        handle_conn(stream, app);
+        handle_conn(stream, app, None);
         return;
     }
-    match rustls::ServerConnection::new(tls) {
-        Ok(conn) => handle_conn(rustls::StreamOwned::new(conn, stream), app),
-        Err(e) => eprintln!("[proxy] TLS 会话建立失败：{e}"),
+    match handshake_and_sni(stream, tls) {
+        Ok((stream, sni)) => handle_conn(stream, app, sni),
+        Err(e) => eprintln!("[proxy] {e}"),
     }
+}
+
+/// 握手 + 取 SNI。抽成独立函数**是为了能被测**：`serve` 要一个 `AppHandle`，
+/// 单测造不出来，而这几行正是国际版上游选择的唯一依据（[`upstream_host`]）。
+///
+/// 握手必须**显式走完**再读 SNI：`server_name()` 只有读过 ClientHello 才有值，
+/// 顺序写反（先读再握）会永远拿到 `None` —— 表现是静默回落到 `infer_base`，
+/// 选举到 api3 的机器全部打到 api2 上。顺带的好处是握手失败在这里就返回，
+/// 不会带着一个「半开」的连接进 [`handle_conn`] 去读请求。
+fn handshake_and_sni(
+    stream: TcpStream,
+    tls: Arc<rustls::ServerConfig>,
+) -> Result<(rustls::StreamOwned<rustls::ServerConnection, TcpStream>, Option<String>), String> {
+    let conn = rustls::ServerConnection::new(tls).map_err(|e| format!("TLS 会话建立失败：{e}"))?;
+    let mut stream = rustls::StreamOwned::new(conn, stream);
+    // 客户端连上就走、或中间有防火墙 —— 够不上「故障」，但得留个脚印
+    stream
+        .conn
+        .complete_io(&mut stream.sock)
+        .map_err(|e| format!("TLS 握手未完成：{e}"))?;
+    let sni = stream.conn.server_name().map(str::to_string);
+    Ok((stream, sni))
 }
 
 /// 探测首字节是不是 TLS 握手（`0x16` = handshake record）。
@@ -673,6 +695,20 @@ fn hop_by_hop(name: &str) -> bool {
     .any(|h| name.eq_ignore_ascii_case(h))
 }
 
+/// 转发循环的落点：请求头 `name` 该不该照抄给上游？
+///
+/// `credentials_replaced` = 本轮凭据**被我们换过**（重签 COSY / 换成裸 token）：
+/// - **换过** ⇒ 客户端原来的 `Cosy-*` 必须挡掉。重签时新四件套已显式写过，不挡
+///   就成了两个同名头（上游取先到的旧值 = 没换）；换成裸 token 时它们是孤儿头。
+/// - **没换**（原样透传）⇒ 一个都不许挡。COSY 是「Authorization + Cosy-User /
+///   Cosy-Key / Cosy-Date」**一套四件**，少任何一个上游都回
+///   `{"code":"101","message":"Signature invalid"}`（客户端弹「请求验证失败」卡片）。
+///   2026-09-29 实测事故：这里曾无条件挡掉 `Cosy-*`，而 Keep 路径只补回了
+///   Authorization —— 一次本可安全原样透传的对话被打成 101。
+fn forwarded_header(name: &str, credentials_replaced: bool) -> bool {
+    !hop_by_hop(name) && !(credentials_replaced && cosy::is_cosy_header(name))
+}
+
 /// 客户端的 `Authorization` 是不是**账号凭证**（`Bearer <token>`）？
 ///
 /// 不是 ⇒ 当作**不可改写的凭证**原样透传。判据写死在这里、只此一处：
@@ -720,20 +756,28 @@ enum AuthPlan {
 ///
 /// # 规则（两类凭证、两种路径，别混）
 ///
-/// ⚠️ **走到这里的一切都已经不是 COSY**：`Bearer COSY.…` 由调用方在本函数**之前**
-/// 用 [`crate::cosy::rebuild`] 重签，签成了根本不会进来。进来只说明重签没成
-/// （取不到 uid、body 非 UTF-8…），此时 `Keep` 正是想要的答案 ——
-/// 宁可原样透传，也不能发一个半改的请求出去。
+/// ⚠️ **没签成的 COSY 也会走进来**：`Bearer COSY.…` 先由调用方用
+/// [`crate::cosy::rebuild`] 重签，但重签会失败（取不到 uid、body 非 UTF-8…），
+/// 那些请求就落到这里。它们的答案是 **`Keep`** —— 宁可原样透传，也不能发一个
+/// 半改的请求出去。这条只能由本函数自己守住：`is_bearer_credential` 只看
+/// `bearer ` 前缀，**认不出 COSY 与 `dt-` 的区别**，会把它当成可换的 Bearer
+/// 走到 `Swap` —— 把客户端封好的凭据覆盖成裸 token，2026-09-19 实测的下场是
+/// 上游回 101、客户端连模型清单都拉不到、整个起不来。
 ///
 /// 剩下的两类：
 /// - **推理路径**（`/model/v1/chat/completions`，OpenAI 风格）：客户端带该账号的
-///   `Bearer <token>` ⇒ 换号，扣费才落到选中的账号上。
+///   `Bearer dt-…` ⇒ 换号，扣费才落到选中的账号上。
 /// - 任何路径上的 `Signature …` 等非 Bearer 凭证：一律原样透传（它们覆盖
 ///   method/path/body，我们只搬运不改写，所以照样成立）。
 /// - 客户端没带凭证：补扣费账号的 —— 上游不认匿名请求（`/api/v1/userinfo` 这类也靠它）。
 ///
 /// 判据是**两个条件的合取**：`is_inference` 与「是不是 Bearer」。
 fn auth_plan(is_inference: bool, authorization: Option<&str>) -> AuthPlan {
+    // COSY 形态永不换：重签失败时它只能原样透传（见上面那段）。判据本体在
+    // [`crate::cosy::is_cosy_authorization`]，与重签路径同一个口径。
+    if authorization.is_some_and(cosy::is_cosy_authorization) {
+        return AuthPlan::Keep;
+    }
     match authorization {
         // 非推理路径：无论 Bearer 还是 Signature，都不碰
         Some(_) if !is_inference => AuthPlan::Keep,
@@ -885,6 +929,46 @@ fn clip(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// 上游选谁：**由客户端握手里的 SNI 决定**（国际版的 TLS 重定向专门保留了它，
+/// 见 `region::Takeover::HostRedirect`）。
+///
+/// - 族内 SNI（`api*.qoder.sh` / `api*.qoder.com.cn`）→ 就用它。这是国际版**唯一**
+///   正确的来源：客户端每天按选举换域，写死一个上游就会「今天能用、明天 404」。
+/// - 没有 SNI（明文调试分支、国内版的 env 覆盖连的是 IP，而 SNI 不带 IP）→
+///   回落 [`Region::infer_base`]。国内版的正常路径走的就是这一支。
+/// - SNI 是回环地址：同上按回落处理（某些运行时会照着 host 给 IP 也带上 servername）。
+/// - SNI 是族外的域 → `Err`，**不猜也不转发**：那不是我们的注入发来的，拿这种域去
+///   拼上游等于把本机变成一个能转发到任意域的开放代理。
+///
+/// 返回的形态是 `https://<host>`（与 [`Region::infer_base`] 同形，直接喂 [`upstream_url`]）。
+fn upstream_host(region: Region, sni: Option<&str>) -> Result<String, String> {
+    let Some(sni) = sni.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(region.infer_base().to_string());
+    };
+    if crate::region::is_model_gateway_host(sni) {
+        return Ok(format!("https://{sni}"));
+    }
+    if matches!(sni, "127.0.0.1" | "localhost" | "::1") {
+        return Ok(region.infer_base().to_string());
+    }
+    Err(sni.to_string())
+}
+
+/// 「客户端今天连的是哪个上游」每个取值只记一次。
+///
+/// 按请求记会把调试日志刷满（一次对话几十个请求）；而「选举把域换掉了」恰恰是排查
+/// 接管失效时第一个要看的量 —— 所以按**取值去重**，换一个域留一条。
+fn note_upstream_once(dir: &Path, host: &str) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let first = SEEN
+        .lock()
+        .map(|mut s| s.insert(host.to_string()))
+        .unwrap_or(false);
+    if first {
+        let _ = stealth::debug_append(dir, "proxy_upstream", &format!("本轮上游：{host}"));
+    }
+}
+
 /// 处理一条已建立的连接。
 ///
 /// 泛型化（而不是写死 `TcpStream`）是为了同时容纳两种承载：端点覆盖强制 https，
@@ -893,7 +977,9 @@ fn clip(s: &str, max: usize) -> String {
 ///
 /// 套接字层面的设置（阻塞模式 / 读写超时）必须在**包装成 TLS 之前**做完：
 /// `StreamOwned` 上没有 `set_read_timeout`，见 `configure_conn` 的文档。
-fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
+///
+/// `sni` 来自 TLS 握手（明文分支为 `None`），决定转发到哪个上游 —— 见 [`upstream_host`]。
+fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option<String>) {
     // 数据目录：选账号 / 写接管日志都要用；取不到直接 500，不再读请求
     let Ok(dir) = commands::try_data_dir(&app) else {
         respond(&mut stream, 500, "text/plain", b"internal error", &[]);
@@ -967,10 +1053,25 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let settings = accounts::load_settings(&dir);
-    // 转发目标由**接管区域**唯一决定（国际版 `api2-v2.qoder.sh` / 国内版
-    // `gateway.qoder.com.cn`）。这里曾经读 `settings.default_base_url` —— 那是个
-    // 既没人能改、内容还是模板残留的字段，已随区域模型一起删掉。
-    let host = settings.takeover_region.infer_base().to_string();
+    // 转发目标：优先按握手里的 SNI（国际版的选举会换域），拿不到才回落到区域默认。
+    // 这里曾经读 `settings.default_base_url` —— 那是个既没人能改、内容还是模板残留的
+    // 字段，已随区域模型一起删掉。
+    let region = settings.takeover_region;
+    let host = match upstream_host(region, sni.as_deref()) {
+        Ok(h) => h,
+        Err(other) => {
+            // 族外的 SNI：来的不是我们的注入（或客户端新版换了域）。**不猜、不转发**，
+            // 如实回 421 —— 猜错的代价是把请求发到用户没打算去的地方。
+            let _ = stealth::debug_append(
+                &dir,
+                "proxy_bad_sni",
+                &format!("握手 SNI 不在模型网关族内，回 421：{other}"),
+            );
+            respond(&mut stream, 421, "text/plain", b"unexpected sni", &[]);
+            return;
+        }
+    };
+    note_upstream_once(&dir, &host);
     let bare = normalize_target(&req.target);
     let path = bare;
     let is_chat = is_inference_path(bare);
@@ -994,10 +1095,79 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             respond(&mut stream, 503, "text/plain", b"no account available", &[]);
             return;
         };
-        if ban.is_empty() && (is_chat || is_chat_generation(&bare)) {
-            // 对客通知：界面上最该有的一条 —— 「这轮对话扣的是哪个账号」。
-            // 去重口径见 `should_announce_session`。
-            if should_announce_session(&account, model.as_deref()) {
+
+        // 鉴权头形态要**先拿出来**：下面的「这个账号接不接得下这单」判据用它
+        // （只有 `Bearer COSY.…` 才需要重签，而重签要签名身份）。
+        let auth_in = header_value(&req, "authorization")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        // COSY 签名身份（uid + 名字 + 该账号的 dt- token）。**在闭包外先取一次**：
+        // 下面两处都要用 —— 重签发往上的请求、以及拉「免费模型集」。
+        // 它只在账号第一次被路由到时才联网（拿 uid 并落盘），平时是纯本地的一次字段读。
+        //
+        // 取 uid 打的是 [`Region::identity_base`]，**不是**转发目标（`host`）：国际版的
+        // uid 只在 openapi 上，而网关族里没有这条路径 —— 指错的表现是「换号签名永远
+        // 做不成」而界面只说「接管已开启」。
+        let cosy_id = tauri::async_runtime::block_on(accounts::cosy_identity(
+            &dir,
+            &account,
+            &CLIENT,
+            region.identity_base(),
+        ));
+
+        // 选中的账号**接不接得下这单**：聊天类 COSY 请求必须重签才谈得上换号，
+        // 而重签要先拿到签名身份；拿不到（uid 没缓存、现问也问不到 = 登录态已死
+        // 或网络不通）⇒ 这个账号签不出请求，本轮扣费落不到它头上。
+        // 有备选就换人 —— 没有这一步，表现是「接管开着、扣费却静默没生效」。
+        // 没有备选就**留在原位**原样透传（见下面 Keep 的注释）——绝不能把它 ban 掉：
+        // 下一轮 `choose_account` 会因候选为空返回 `None`，反代只能给客户端回 503，
+        // 对话直接起不来 —— 比「这次不换号」糟得多。
+        let resign_needed = (is_chat || is_chat_generation(&bare))
+            && auth_in.as_deref().is_some_and(cosy::is_cosy_authorization);
+        let can_resign = cosy_id.is_some();
+        if resign_needed && !can_resign {
+            let mut tried = ban.clone();
+            tried.push(account.id.clone());
+            let can_switch = ban.len() + 1 < FAILOVER_MAX_TRIES
+                && has_spare_candidate(
+                    &accounts::load_accounts(&dir),
+                    region,
+                    &settings.billing_account_ids,
+                    &tried,
+                );
+            if can_switch {
+                ban = tried;
+                stealth::debug_append(
+                    &dir,
+                    "proxy_skip",
+                    &format!(
+                        "账号「{}」签不出请求（取不到签名身份 uid），本轮换下一个候选",
+                        account.name
+                    ),
+                );
+                continue;
+            }
+            // 试尽：这轮只能原样透传（扣的是客户端自己登录的账号）。对客说一句实话，
+            // 同时它也是界面上**没有**出现「本次对话由账号 X 提供」那一条的解释。
+            stealth::journal_append(
+                &dir,
+                "failover",
+                &format!(
+                    "账号「{}」签不出请求（登录态已失效，或取身份时网络不通），已无更多候选：本轮未换号、原样透传",
+                    account.name
+                ),
+            );
+        }
+
+        // 走到这里 = 这一轮**确定要发给上游**。对客通知「这轮对话扣的是哪个账号」
+        // 必须是可当场核验的事实：签不出请求的那一轮上面已经换人或已如实说明，
+        // 这里报出的名字才是真正服务这次请求的账号。
+        if is_chat || is_chat_generation(&bare) {
+            if !(resign_needed && !can_resign)
+                && should_announce_session(&account, model.as_deref())
+            {
                 stealth::journal_append(
                     &dir,
                     "session_start",
@@ -1021,16 +1191,6 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             );
         }
 
-        // COSY 签名身份（uid + 名字 + 该账号的 dt- token）。**在闭包外先取一次**：
-        // 下面两处都要用 —— 重签发往上的请求、以及拉「免费模型集」。
-        // 它只在账号第一次被路由到时才联网（拿 uid 并落盘），平时是纯本地的一次字段读。
-        let cosy_id = tauri::async_runtime::block_on(accounts::cosy_identity(
-            &dir,
-            &account,
-            &CLIENT,
-            &host,
-        ));
-
         // 透传
         let upstream = tauri::async_runtime::block_on(async {
             let mut r = CLIENT.request(
@@ -1045,7 +1205,7 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             // | 路径 | 客户端发什么 | 我们该做什么 |
             // |---|---|---|
             // | 推理 `/model/v1/chat/completions` | `Bearer COSY.…`（或旧的 `Bearer <access token>`） | **换成选中扣费账号的凭证**（这就是接管） |
-            // | 目录/策略 `/algo/*`（模型清单、data policy） | WASM 按「机器 + 账号」现场生成的凭证 | 按这张表**应当**原样带走 —— 见下面 ⓪ 的「待办」 |
+            // | 目录/策略 `/algo/*`（模型清单、data policy…） | 实测同样是 `Bearer COSY.…`（与对话一套凭据） | **同样重签**（cosy.rs 就是为这类业务接口写的）；「一个字不能动」只对 `Signature …` 那类请求签名成立 |
             //
             // 曾经这里是「只要不是 Bearer 就透传」—— 于是 `/algo/*` 的 Bearer 也被换成
             // 扣费账号的 token。后果不是「换号没生效」，是客户端**整个起不来**：网关回
@@ -1054,10 +1214,7 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             //
             // 所以判据必须**同时**看两件事：是不是 Bearer、是不是推理路径。
             // 规则本体在 [`auth_plan`]（纯函数，有回归测试）；下面只负责执行与留痕。
-            let auth_in = header_value(&req, "authorization")
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string);
+            // `auth_in` 在循环体开头已取出（「接不接得下这单」的判据也要用它）。
 
             // ⓪ Qoder 的**真实**认证形态：`Bearer COSY.…`。
             //
@@ -1069,13 +1226,13 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
             // 重签失败（不是 COSY / 取不到 uid / body 非 UTF-8）一律回落到下面的
             // `auth_plan`：宁可原样透传，也绝不发一个半改的请求。
             //
-            // ⚠️ **待办（上面那张表目前对这一条不成立）**：这里的判据只看凭证形态、
-            // 不看路径，所以 `/algo/*` 的 COSY 也会被重签。实测接管开着时客户端的
-            // `modelCatalogFetch` 有 6×403 / 9×200（调试日志 `proxy_auth` 里逐条可查），
-            // 与那张表「/algo 一个字都不能动」的结论对不上，嫌疑就在这一步。
-            // 要收敛只需给下面的 filter 加一个 `is_chat &&`。
-            // 界面那份模型清单**不依赖**客户端这条请求（`models::load` 自己签自己拉），
-            // 所以那样改不会让接管页变空。
+            // ⚠️ **这里曾记着一条「待办」**：`/algo/*` 的 COSY 也会被重签，而当时实测
+            // `modelCatalogFetch` 有 6×403，怀疑该按路径收敛（「给 filter 加 `is_chat &&`」）。
+            // **那个方向是错的，别再走**：对话入口 `agent_chat_generation` 就在 `/algo` 下
+            // 且 `is_chat == false`，加上它 = 对话永不换号、接管整个失效。重签不是 403 的
+            // 成因 —— 同一形态的 403（`/business/finish`）在 2026-09-29 被证明是 Keep
+            // 路径丢 `Cosy-*` 所致（见下面转发循环）。若再见到 `/algo` 403，先看
+            // `proxy_auth` 那一行是不是「原样透传」。
             let cosy_rebuilt = match auth_in
                 .as_deref()
                 .filter(|v| cosy::is_cosy_authorization(v))
@@ -1094,7 +1251,9 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
                 }
             };
 
-            let auth_action = match cosy_rebuilt {
+            // 凭据是否**被我们换过**（重签 / 换成裸 token 都算）。决定下面拷贝循环里
+            // `Cosy-*` 的处置 —— 换过要挡掉旧的那套，没换（原样透传）一个都不许挡。
+            let (auth_action, credentials_replaced) = match cosy_rebuilt {
                 Some(reb) => {
                     // 四个头必须**同时**替换：只换 Authorization，上游仍会拿旧的
                     // Cosy-Key/Cosy-Date 去校验，等于没换。
@@ -1103,19 +1262,19 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
                         .header("cosy-user", reb.user.as_str())
                         .header("cosy-key", reb.key.as_str())
                         .header("cosy-date", reb.date.as_str());
-                    "已重签 COSY（换成扣费账号）"
+                    ("已重签 COSY（换成扣费账号）", true)
                 }
                 None => match auth_plan(is_chat, auth_in.as_deref()) {
                     AuthPlan::Swap => {
                         r = r.bearer_auth(&account.token);
-                        "已换成扣费账号"
+                        ("已换成扣费账号", true)
                     }
                     AuthPlan::Keep => {
                         r = r.header("authorization", auth_in.as_deref().unwrap_or_default());
                         if is_chat {
-                            "原样透传（签名类凭证）"
+                            ("原样透传（签名类凭证）", false)
                         } else {
-                            "原样透传（非推理路径）"
+                            ("原样透传（非推理路径）", false)
                         }
                     }
                 },
@@ -1148,10 +1307,12 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
                 );
             }
             for (k, v) in &req.headers {
-                // `hop_by_hop` 已经滤掉 `authorization`；`Cosy-*` 也必须滤掉 ——
-                // 重签时已显式写过新值，再复制一遍就成了**两个同名头**，
-                // 上游取哪个由实现决定（多半取先到的那个 = 旧的），等于没换。
-                if !hop_by_hop(k) && !cosy::is_cosy_header(k) {
+                // 该不该照抄由 [`forwarded_header`] 说了算（纯函数，有回归测试）。
+                // 要命的那个别名在它身上：**原样透传时 `Cosy-*` 一个都不能丢** ——
+                // 2026-09-29 实测事故就是这里曾无条件滤掉它们、而 Keep 路径只补回了
+                // Authorization，上游拿到「一半 COSY」直接回 101（客户端弹
+                // 「请求验证失败」）。
+                if forwarded_header(k, credentials_replaced) {
                     r = r.header(k.as_str(), v.as_str());
                 }
             }
@@ -1216,8 +1377,20 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
                     let note = cooldown_note(set_cooldown(&account.id, model_name, until_ms, source));
                     // 粘滞不必解绑：冷却表已保证该「账号 × 模型」在有效期内不会被选中；
                     // 而粘滞按「会话 × 模型」分开记，这次冷却不会牵连同会话的其它模型。
-                    if ban.len() + 1 < FAILOVER_MAX_TRIES {
-                        ban.push(account.id.clone());
+                    // 「还有没有下一个」必须**先问清楚**：把候选 ban 空后，下一轮
+                    // `choose_account` 只会返回 None，反代就得给客户端回 503 ——
+                    // 宁可这轮把 429 原样透传（下面那条路），也不能让对话起不来。
+                    let mut tried = ban.clone();
+                    tried.push(account.id.clone());
+                    if ban.len() + 1 < FAILOVER_MAX_TRIES
+                        && has_spare_candidate(
+                            &accounts::load_accounts(&dir),
+                            region,
+                            &settings.billing_account_ids,
+                            &tried,
+                        )
+                    {
+                        ban = tried;
                         stealth::journal_append(
                             &dir,
                             "failover",
@@ -1322,8 +1495,9 @@ fn normalize_target(target: &str) -> &str {
 // 这里曾有 `upstream_path()`，作用是给裸 `/chat/completions` 补上 `/v2` 前缀
 // （CodeBuddy 时代的 APISIX 网关不吃裸路径，会 302 到官网、CLI 报 `Empty stream`）。
 //
-// 在 Qoder 上这条改写**已被证伪，必须去掉**（2026-09-19 未鉴权探测国际版网关
-// `api2-v2.qoder.sh`，401 = 路由存在、404 = 不存在）：
+// 在 Qoder 上这条改写**已被证伪，必须去掉**（2026-09-19 未鉴权探测当时的国际版网关
+// `api2-v2.qoder.sh`，401 = 路由存在、404 = 不存在。该域如今只剩旧的
+// `/model/v1/chat/completions`，现役网关是 `api2/api3.qoder.sh` 那一族 —— 见 `region`）：
 //
 //   POST /model/v1/chat/completions  → 401   ← 客户端真正在用的路径
 //   POST /v2/chat/completions        → 404   ← 旧改写指向的地方，**根本不存在**
@@ -1420,7 +1594,9 @@ pub async fn free_models(
         .find(|a| !a.token.is_empty());
     let identity = match &account {
         Some(a) => {
-            accounts::cosy_identity(&dir, a, &crate::http::api_client_direct(), region.infer_base())
+            // uid 查询打的是 [`Region::identity_base`]（国际版在 openapi、国内版与业务同域），
+            // 与转发目标 `infer_base` 是两件事 —— 见 [`crate::region`]。
+            accounts::cosy_identity(&dir, a, &crate::http::api_client_direct(), region.identity_base())
                 .await
         }
         None => None,
@@ -1743,6 +1919,28 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
     }
 }
 
+/// 除 `tried` 之外，还有没有可换的候选账号？（纯函数，便于单测）
+///
+/// 判据与 [`choose_account`] 的候选集**逐句对齐**：先按区域过滤，再取勾选的
+/// 扣费备选（未勾选 = 全部）。入参是**已读好的**账号表 —— 它被调用在路由热路径上，
+/// 不能顺手读盘，更不能有网络副作用（`choose_account` 会顺手补积分、续签、
+/// 写粘滞，绝不能拿它来「试算」）。
+///
+/// 为什么必须问这一句：把一个候选 ban 到空，下一轮 `choose_account` 会返回
+/// `None`，反代只能给客户端回 503 —— 对话直接起不来；而**留在原位原样透传**，
+/// 对话是通的。所以「换下一个」的前提永远是「真的有下一个」。
+fn has_spare_candidate(
+    all: &[crate::accounts::Account],
+    region: Region,
+    selected: &[String],
+    tried: &[String],
+) -> bool {
+    let in_region: Vec<_> = all.iter().filter(|a| a.region == region).cloned().collect();
+    billing_candidates(&in_region, selected)
+        .iter()
+        .any(|a| !tried.iter().any(|t| t == &a.id))
+}
+
 /// 选出一个该用的账号。
 ///
 /// `model` 是本轮请求要用的模型：限流冷却（和因此产生的粘滞）都是按
@@ -2022,6 +2220,76 @@ mod tests {
         // 客户端没带凭证：补扣费账号的（上游不认匿名请求）
         assert_eq!(auth_plan(true, None), AuthPlan::Swap);
         assert_eq!(auth_plan(false, None), AuthPlan::Swap);
+        // ⚠️ COSY 形态**任何路径**都不换：它是「重签没成」才进来的（能签成的在上面
+        // 就被 cosy::rebuild 接走了），覆盖成裸 token 就是 2026-09-19 的 101 事故。
+        // `is_bearer_credential` 认不出 COSY 与 dt-，所以这条必须在这里明写。
+        assert_eq!(auth_plan(true, Some("Bearer COSY.eyJhIjoxfQ.deadbeef")), AuthPlan::Keep);
+        assert_eq!(auth_plan(true, Some("bearer COSY.eyJhIjoxfQ.deadbeef")), AuthPlan::Keep);
+        assert_eq!(auth_plan(false, Some("Bearer COSY.eyJhIjoxfQ.deadbeef")), AuthPlan::Keep);
+    }
+
+    /// 转发循环的头处置：**原样透传时 `Cosy-*` 一个都不能丢**。
+    ///
+    /// 2026-09-29 实测事故的回归测试：这里曾无条件滤掉 `Cosy-*`，而 Keep 路径
+    /// 只补回了 Authorization —— 上游收到「一半 COSY」，SSE 首条事件就是
+    /// `{"code":"101","message":"Signature invalid"}`，客户端弹「请求验证失败」。
+    /// 反向也要守住：凭据被换过（重签/换裸 token）时旧的 `Cosy-*` 必须滤掉，
+    /// 否则要么两个同名头、要么是配在别人凭据旁边的孤儿头。
+    #[test]
+    fn passthrough_keeps_cosy_headers_while_replaced_credentials_drop_them() {
+        for h in ["Cosy-User", "cosy-key", "COSY-DATE"] {
+            assert!(forwarded_header(h, false), "{h}：原样透传时必须照抄");
+            assert!(!forwarded_header(h, true), "{h}：换过凭据时必须滤掉");
+        }
+        // 无关请求头两种情形都照抄；hop-by-hop 的（含 authorization）两种情形都不带
+        assert!(forwarded_header("content-type", false));
+        assert!(forwarded_header("content-type", true));
+        assert!(forwarded_header("cosy-machineid", false), "机器标识不属于被换的凭据");
+        assert!(!forwarded_header("authorization", false));
+        assert!(!forwarded_header("authorization", true));
+        assert!(!forwarded_header("host", true));
+    }
+
+    /// 「还有没有下一个」：判据必须与 `choose_account` 的候选集一致，
+    /// 否则会出现「以为有备选 → ban 空 → choose_account 返回 None → 给客户端回 503」。
+    #[test]
+    fn spare_candidate_detection_mirrors_choose_account() {
+        let mk = |id: &str, region: Region| crate::accounts::Account {
+            region,
+            id: id.into(),
+            name: id.into(),
+            phone: None,
+            email: None,
+            token: "tok".into(),
+            refresh_token: None,
+            expires_at: None,
+            rt_expires_at: None,
+            created_at: String::new(),
+            checked_today: None,
+            cosy_uid: None,
+            last: None,
+        };
+        let all = vec![
+            mk("g1", Region::Global),
+            mk("g2", Region::Global),
+            mk("c1", Region::Cn),
+        ];
+        let tried = |ids: &[&str]| -> Vec<String> { ids.iter().map(|s| s.to_string()).collect() };
+        // 未勾选 = 全部可用：试过 g1 还有 g2（同区的 c1 不算数，跨区 token 在对面网关无效）
+        assert!(has_spare_candidate(&all, Region::Global, &[], &tried(&["g1"])));
+        // 全域都试过了 → 没有备选
+        assert!(!has_spare_candidate(&all, Region::Global, &[], &tried(&["g1", "g2"])));
+        // 勾选只认勾了的那几个：勾了 g1，试过 g1 = 没有备选（g2 未勾选不参战）
+        assert!(!has_spare_candidate(
+            &all,
+            Region::Global,
+            &tried(&["g1"]),
+            &tried(&["g1"])
+        ));
+        // 勾选的 id 全不存在（账号删光）→ 与 choose_account 一样退回全区
+        assert!(has_spare_candidate(&all, Region::Global, &tried(&["zzz"]), &tried(&["g1"])));
+        // 跨区域的账号不在候选里
+        assert!(!has_spare_candidate(&all, Region::Cn, &[], &tried(&["c1"])));
     }
 
     #[test]
@@ -2030,6 +2298,164 @@ mod tests {
             upstream_url("https://copilot.tencent.com/", "/chat/completions"),
             "https://copilot.tencent.com/chat/completions"
         );
+    }
+
+    /// 上游选谁：族内 SNI 说了算（国际版），没有 SNI 才回落区域默认（国内版）。
+    ///
+    /// 这条守的是国际版的**核心假设**：客户端按选举在 api1/api2/api3/api6 之间换域，
+    /// 注入段只改 TCP 目标、把 `servername` 原样留给反代 —— 反代认不出来就会
+    /// 静默回落到 `infer_base`（api2），于是「今天能用、明天全 404」。
+    #[test]
+    fn upstream_follows_the_sni_and_falls_back_without_one() {
+        // 族内 SNI：就用它（选举到哪就跟到哪）
+        for (sni, want) in [
+            ("api3.qoder.sh", "https://api3.qoder.sh"),
+            ("api1.qoder.sh", "https://api1.qoder.sh"),
+            ("api2-v2.qoder.sh", "https://api2-v2.qoder.sh"),
+            ("api6.qoder.com.cn", "https://api6.qoder.com.cn"),
+        ] {
+            assert_eq!(
+                upstream_host(Region::Global, Some(sni)).unwrap(),
+                want,
+                "国际版要跟着 SNI 走"
+            );
+            // 国内版收到族内 SNI 也照走：那不是 CN 客户端发得出来的（它连的是 IP），
+            // 只可能是切换区域时的残留 —— 转发比乱猜好，日志里看得见
+            assert_eq!(upstream_host(Region::Cn, Some(sni)).unwrap(), want);
+        }
+        // 没有 SNI（明文调试、国内版连 IP）：回落区域默认
+        assert_eq!(
+            upstream_host(Region::Global, None).unwrap(),
+            Region::Global.infer_base()
+        );
+        assert_eq!(
+            upstream_host(Region::Cn, None).unwrap(),
+            Region::Cn.infer_base()
+        );
+        assert_eq!(
+            upstream_host(Region::Cn, Some("")).unwrap(),
+            Region::Cn.infer_base(),
+            "空 SNI 等同没有"
+        );
+        // 回环地址当 SNI（有的运行时会照 host 填）：按「没有」处理，别去连 localhost
+        for local in ["127.0.0.1", "localhost", "::1"] {
+            assert_eq!(
+                upstream_host(Region::Cn, Some(local)).unwrap(),
+                Region::Cn.infer_base(),
+                "{local}"
+            );
+        }
+        // 族外的域：**拒绝**，不猜也不转发 —— 否则本机就成了能转发到任意域的开放代理
+        for foreign in [
+            "center.qoder.sh",
+            "openapi.qoder.sh",
+            "qoder.com",
+            "api3.qoder.sh.evil.com",
+            "example.com",
+        ] {
+            assert_eq!(
+                upstream_host(Region::Global, Some(foreign)).unwrap_err(),
+                foreign,
+                "{foreign} 必须原样报出来（排查时要知道对端发的到底是什么）"
+            );
+        }
+    }
+
+    /// SNI 只有**真握手之后**才读得到 —— 这条用真实 TLS 握手钉住
+    /// [`handshake_and_sni`] 的用法（先 `complete_io`、再 `server_name`）。
+    ///
+    /// 顺序写反的表现不是报错，而是所有国际版请求静默回落到 `infer_base`：
+    /// 「接管开着、一个请求都到不了选举出来的那个域」。客户端那一侧同款做法
+    /// （TCP 目标是 127.0.0.1、servername 是原域）也在这里一并演练。
+    #[test]
+    fn sni_survives_a_real_handshake_when_only_the_tcp_target_moved() {
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        #[derive(Debug)]
+        struct TrustAnything;
+        impl ServerCertVerifier for TrustAnything {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("qa-sni-{}", uuid::Uuid::new_v4()));
+        let cfg = certs::ensure(&dir)
+            .and_then(|c| certs::server_config(&c))
+            .expect("自签证书应能装配");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // 服务端：走的就是 `serve` 用的那个函数
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            configure_conn(&stream).unwrap();
+            handshake_and_sni(stream, cfg).unwrap().1
+        });
+
+        // 客户端：TCP 目标已改成 127.0.0.1（注入段干的），servername 仍是选举出来的域
+        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TrustAnything))
+        .with_no_client_auth();
+        let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut client = rustls::StreamOwned::new(
+            rustls::ClientConnection::new(
+                Arc::new(client_cfg),
+                ServerName::try_from("api3.qoder.sh").unwrap(),
+            )
+            .unwrap(),
+            sock,
+        );
+        client.conn.complete_io(&mut client.sock).unwrap();
+
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen.as_deref(),
+            Some("api3.qoder.sh"),
+            "握手之后必须读得到 SNI —— 读不到就只能回落 infer_base"
+        );
+        assert_eq!(
+            upstream_host(Region::Global, seen.as_deref()).unwrap(),
+            "https://api3.qoder.sh"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

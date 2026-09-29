@@ -431,7 +431,7 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
 /// 而那时能导进来的只有国际版账号。
 ///
 /// 旧版这里还有个 `host`，会被写进 `Account.base_url`。那条路已经删掉了：
-/// 授权域（`qoder.com`）≠ 模型网关（`api2-v2.qoder.sh`），一个恒错的字段没人该读。
+/// 授权域（`qoder.com`）≠ 模型网关（国际版 `api2.qoder.sh`），一个恒错的字段没人该读。
 #[derive(serde::Deserialize)]
 pub struct ImportItem {
     #[serde(default)]
@@ -1546,18 +1546,12 @@ struct TakeoverTopology {
 
 /// 租约里查不到失败原因时的**就地诊断**。
 ///
-/// 有两类失败发生在 [`crate::stealth::install`] **写租约之前**，因此租约的
-/// `last_error` 里必然什么都读不到：客户端找不到（产物路径解析不出来）、以及该区域
-/// 根本不支持端点覆盖。它们恰恰是最常见的两种 —— 于是界面只能端出那句
-/// 「检查端口是否被占用、客户端是否装在 /Applications」，而这两句在 Windows 上
-/// 都是错的（那里的客户端装在 `%LOCALAPPDATA%\Programs`，端口也从没被占）。
+/// 有一类失败发生在 [`crate::stealth::install`] **写租约之前**，因此租约的
+/// `last_error` 里必然什么都读不到：客户端找不到（产物路径解析不出来）。
+/// 它恰恰是最常见的一种 —— 于是界面只能端出那句「检查端口是否被占用、客户端是否
+/// 装在 /Applications」，而这两句在 Windows 上都是错的（那里的客户端装在
+/// `%LOCALAPPDATA%\Programs`，端口也从没被占）。
 fn diagnose_enable_failure(region: Region) -> Option<String> {
-    if region.endpoint_env_key().is_none() {
-        return Some(format!(
-            "{}的端点覆盖尚未支持：该区域的客户端不读这个键。",
-            region.label()
-        ));
-    }
     if crate::patch::worker_path(region).is_none() {
         return Some(format!(
             "找不到{}客户端的 worker 产物：请确认官方客户端已安装在 {}。",
@@ -1635,9 +1629,9 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                 // 「App 管理」未授权，而自签应用**永远不会弹授权框**（系统只往 tccd
                 // 记一条拒绝）。原样端出去，用户才知道该开哪个开关。
                 //
-                // 租约只覆盖「注入那一步失败」；**客户端找不到 / 区域不支持**发生在
-                // 写租约之前 —— 那里什么都不会留下，所以补一遍就地诊断（见
-                // [`diagnose_enable_failure`]），别让这两类也端出那句误导的兜底。
+                // 租约只覆盖「注入那一步失败」；**客户端找不到**发生在写租约之前
+                // —— 那里什么都不会留下，所以补一遍就地诊断（见
+                // [`diagnose_enable_failure`]），别让这一类也端出那句误导的兜底。
                 let cause = crate::stealth::last_error(&dir)
                     .or_else(|| diagnose_enable_failure(next.takeover_region));
                 // 端点没装上（端口被占 / 客户端没装 / 未授权）→ 连设置一起退回去。
@@ -2127,11 +2121,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 国际版没有端点键：要直说「尚未支持」，而不是误报成「客户端没装」。
+    /// 国际版也要走同一条诊断路：以前它在这里被「端点覆盖尚未支持」短路掉，
+    /// 现在两个区域都可能失败在「客户端找不到」上 —— 诊断得说清**找过哪里**。
     #[test]
-    fn a_region_without_an_endpoint_key_is_diagnosed_as_unsupported() {
-        let msg = diagnose_enable_failure(Region::Global).expect("Global 必须给出诊断");
-        assert!(msg.contains("尚未支持"), "{msg}");
+    fn the_global_region_is_diagnosed_with_its_own_install_paths() {
+        let base = std::env::temp_dir().join("qoder-diagnose-missing-global-client");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let msg = crate::patch::with_sdk_root(&base, || {
+            diagnose_enable_failure(Region::Global).expect("空 SDK 根下必须给出诊断")
+        });
+        assert!(msg.contains(Region::Global.label()), "{msg}");
+        assert!(msg.contains(&Region::Global.install_hint()), "{msg}");
+        assert!(!msg.contains("尚未支持"), "国际版不再是「不支持」了：{msg}");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

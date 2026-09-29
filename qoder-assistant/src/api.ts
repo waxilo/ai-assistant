@@ -181,7 +181,8 @@ export const revealDebugLog = () => invoke<void>("reveal_debug_log");
  * 所以点一次「刷新」不会把界面刷成空的。
  *
  * `region` 省略时用设置里的接管目标区域。它必须能显式传：模型目录与落盘快照
- * 都是**按区域**的（国际版在 `api3.qoder.sh`，国内版在 `gateway.qoder.com.cn`），
+ * 都是**按区域**的（宿主取该区域的 `infer_base` —— 国内版 `gateway.qoder.com.cn`、
+ * 国际版走默认推理域 `api2.qoder.sh`），
  * 接管页要能在还没保存设置之前就预览目标区域的模型清单。
  */
 export const freeModels = (refresh: boolean, region?: string) =>

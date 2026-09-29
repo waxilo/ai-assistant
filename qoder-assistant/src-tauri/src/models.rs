@@ -47,8 +47,9 @@
 //! 顺带两条实测结论，省得下次再试：
 //! - 客户端发的 `?Encode=1` **可以去掉**。签名只覆盖剥掉 query 的 path，所以去掉它
 //!   签名照样有效，而上游就不加密响应体了（带 `Encode=1` 也是 200，但这里没必要）。
-//! - 宿主取 [`Region::infer_base`]（CLI 日志里 `endpointType:"infer"` 的那个域），
-//!   **不是**早先猜的 `api3.qoder.sh`。
+//! - 宿主取 [`Region::infer_base`]（国际版 = 客户端的**默认**推理域 `api2.qoder.sh`；
+//!   选举之后客户端会换成 api1/api3/api6…，但这一层是**直连**、不经过接管，
+//!   用默认域即可 —— 它同样服务 `/algo/api/v2/model/list`，2026-09-29 未鉴权探测过）。
 //!
 //! # 与路由的契约
 //!
@@ -1080,7 +1081,8 @@ mod tests {
                 continue;
             };
             let client = crate::http::api_client_direct();
-            let gateway = region.infer_base();
+            // uid 在 openapi 上（国际版），目录在 infer 上 —— 两件事，别混
+            let gateway = region.identity_base();
             let Some(id) =
                 crate::accounts::cosy_identity(&accounts_dir, &acc, &client, gateway).await
             else {

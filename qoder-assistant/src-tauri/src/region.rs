@@ -17,8 +17,8 @@
 //! |---|---|---|
 //! | `productId` | `qoder` | `qoder-cn` |
 //! | 登录 / 授权 | `https://qoder.com` | `https://qoder.cn` |
-//! | OpenAPI（额度 / 活动权益 / 用户） | `https://openapi.qoder.sh` | `https://openapi.qoder.com.cn` |
-//! | 模型网关（接管转发目标 **与** 模型目录） | `https://api2-v2.qoder.sh` | `https://gateway.qoder.com.cn` |
+//! | OpenAPI（额度 / 活动权益 / 用户 / COSY uid） | `https://openapi.qoder.sh` | `https://openapi.qoder.com.cn` |
+//! | 模型网关（接管转发目标 **与** 模型目录） | `https://api2.qoder.sh`（选举后 `api3`） | `https://gateway.qoder.com.cn` |
 //! | CLI 配置目录 | `~/.qoder` | `~/.qoder-cn` |
 //! | 桌面端数据目录 | `com.qoder.app.stable` | `com.qodercn.app.stable` |
 //! | macOS 应用 | `/Applications/Qoder.app` | `/Applications/Qoder CN.app` |
@@ -32,7 +32,14 @@
 //!   `CFBundleURLSchemes`）；
 //! - **真机 CLI 日志**：`~/.qoder-cn/logs/runs/*/qodercli.log` 里实测出现的
 //!   `https://gateway.qoder.com.cn/api/v2/model/list`、`https://openapi.qoder.com.cn/api/v1/userinfo`
-//!   —— 国内版的模型目录确实不在 `api3` 上，而在 `gateway`。
+//!   —— 国内版的模型目录确实不在 `api3` 上，而在 `gateway`；
+//! - **国际版的网关族**（2026-09-29 实测）：客户端选举缓存
+//!   `~/.qoder/.cache/endpoint-cache.json` 给出 `inference=api3.qoder.sh`、
+//!   `security=api2.qoder.sh`、`fast=api6.qoder.com.cn`；未鉴权路由探测
+//!   `https://api2|api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`
+//!   与 `/algo/api/v2/model/list` 都有路由（SSE 回 200 内嵌 403 `Signature invalid`），
+//!   而 `api2-v2.qoder.sh` 对这两条新路径**已经是 404**（只剩旧的
+//!   `/model/v1/chat/completions`）—— 所以 `infer_base` 不再取它。
 //!
 //! # 两件事**不随区域变**
 //!
@@ -41,19 +48,112 @@
 //!    `null`，官方自己就不用自定义 scheme 回调。这同时是 `oauth` 那条「不要照抄官方
 //!    `redirect_uri`」结论的官方旁证。
 //!
-//! # 不猜的部分
+//! # 接管：两条路，别把参数互相借
 //!
-//! 国内版的 `authRedirectUris` 是 `null`、`cliEnvironmentPrefix` 是 `QODERCN`，
-//! 键名由 `${prefix}${name}` 拼出来。`QODERCN_SERVER_ENDPOINT` 已**实测生效**
-//! （客户端运行日志的 `[config-service] baseUrl` 变成了我们给的值），所以
-//! [`Region::endpoint_env_key`] 对国内版返回它；国际版走的是只覆盖 center 的另一个键，
-//! 推理端点还得靠代答 `/api/v3/service/region/endpoints`，因此**返回 `None` 显式表示
-//! 不支持** —— 而不是猜一个键名，把接管做成「看着开着、其实空转」。
+//! 国内版的 `cliEnvironmentPrefix` 是 `QODERCN`，端点键名由 `${prefix}${name}` 拼出来，
+//! `QODERCN_SERVER_ENDPOINT` 已**实测生效**（客户端运行日志的 `[config-service] baseUrl`
+//! 变成了我们给的值）—— 它覆盖**全部 purpose**，所以一份 env 键就够了。
+//!
+//! 国际版没有可用的键：`QODER_SERVER_ENDPOINT` 的读取者在国际版构建里恒不生效
+//! （`if(!Ja) return`），`QODER_CENTER_ENDPOINT` 只覆盖 center。所以国际版改走
+//! **TLS 目标重定向**：注入段把模型网关族（[`is_model_gateway_host`]）的连接目标
+//! 改写成 `127.0.0.1:<port>` 并保留 SNI，反代按 SNI 选上游 —— 见 [`Region::takeover`]。
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// 智能接管在**客户端侧**怎么把流量引到本机反代 —— 见 [`Region::takeover`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Takeover {
+    /// 国内版：写 `process.env[<键>] = https://127.0.0.1:<port>`，客户端自己把
+    /// **全部 purpose** 的地址换成它。
+    ///
+    /// # 键名在产物里没有字面量，只能顺着 `Rr=` 回溯
+    ///
+    /// 客户端读端点的唯一入口是：
+    ///
+    /// ```text
+    /// function v7a(){ if(!Ja) return; let A = process.env[aue]; let e = M7a(A); … }
+    /// function yg(A){ return v7a() ?? A }      // 有覆盖就用覆盖，没有才退回默认
+    /// ```
+    ///
+    /// 其中 `aue = Rr("SERVER_ENDPOINT")`、`Rr(name) = ${前缀}${name}`，前缀由区域
+    /// 常量决定（国内版构建里 `Mo = "cn" == (eTs="cn")` 恒真，`"QODERCN_"` 被折叠进
+    /// 产物）。**所以直接 grep `QODERCN_SERVER_ENDPOINT` 是 0 命中**（踩过这个坑），
+    /// 要顺着 `Rr(` 与 `Uer=` 回溯才拿得到真实键名。
+    ///
+    /// # 覆盖值的形态（实测确认）
+    ///
+    /// `M7a()` 只做 `new URL(v).origin` 校验，所以：
+    ///
+    /// - **必须 https**（没有 `http:` 分支）；
+    /// - 路径必须为空或 `/`，不能带查询串 / 散列 / 用户名；
+    /// - **端口可以带** —— origin 含端口，`https://127.0.0.1:8789` 合法，
+    ///   不必占 443、不需要管理员。反代因此必须自己终止 TLS，见 [`crate::certs`]。
+    ///
+    /// 实测（`QODERCN_SERVER_ENDPOINT=https://127.0.0.1:9999` 手工起 worker）：
+    /// 客户端日志 `[config-service] baseUrl` 立刻由 `'(SDK default, …)'` 变成该值。
+    EndpointEnv(&'static str),
+    /// 国际版：**没有**可覆盖的键（`v7a()` 那句 `if(!Ja) return` 让它在国际版构建里
+    /// 恒不生效，`QODER_CENTER_ENDPOINT` 只覆盖 center），所以改在 `tls.connect` 里
+    /// 把模型网关族的连接目标改写成 `127.0.0.1:<port>`。
+    ///
+    /// # 为什么不是「覆盖 center + 代答选举」
+    ///
+    /// 那条路要在反代里区分 center 与推理两类流量，而它们的路径**是重叠的**
+    /// （`/api/v2/service/pro/*` 两边都在用），且改写后 Host/SNI 全变成 127.0.0.1，
+    /// 没有可靠判据 —— 判错的代价是打断用户的对话。
+    ///
+    /// # 为什么保留 SNI
+    ///
+    /// 选举会把推理域在 `api1/api2/api3/api6…` 之间换，写死一个上游就会
+    /// 「今天能用、明天 404」。所以注入段**只改 TCP 目标、保留 `servername`**，
+    /// 反代握手后读 SNI 选上游（[`is_model_gateway_host`] 限定族）。
+    /// center / openapi **不重定向**：它们是业务面（选举、策略、tracking），
+    /// 官方直连即可，也避免把非推理流量卷进换号签名。
+    HostRedirect,
+}
+
+/// 网关族规则的**唯一来源**：反代（[`is_model_gateway_host`]，手判、不引正则依赖）
+/// 与注入段（`patch::render` 把它原样嵌成客户端里的 `new RegExp(...)`）都取这一份。
+///
+/// 分成两处手写就会出现「注入改了、反代不认」：客户端连上来、反代却回落到
+/// `infer_base`，于是选举到 api3 的机器全部打到 api2 上 —— 表现是接管静默失效，
+/// 不像报错那样容易发现。
+pub const MODEL_GATEWAY_HOST_REGEX: &str = "^api[0-9a-z-]*\\.qoder\\.(sh|com\\.cn)$";
+
+/// 国际版模型网关族：`api*.qoder.sh` 与 `api*.qoder.com.cn`。
+///
+/// 不含 `center.qoder.sh` / `openapi.qoder.sh` / `gateway.qoder.com.cn`（国内版的网关，
+/// 国际版客户端不会连它）；也不接受任何其它域 —— 反代只按这个族决定「要不要拿 SNI
+/// 当上游」，多认一个域就等于把本机变成一个转发器。
+///
+/// 规则**逐字**在 [`MODEL_GATEWAY_HOST_REGEX`] 里，反代与注入段（客户端侧）
+/// 都从那里取，别在任一侧另写一份 —— 也**别在这里另立判法**：这条手判必须与那条
+/// 正则逐字等价，宽一格窄一格都是一样的故障（注入改了、反代不认，或反过来）。
+///
+/// 它曾按「域后缀结尾」判，于是 `api3.qoder.sh.qoder.sh` 这类**多标签**主机被放进来
+/// （正则从不接受），也就是反代比注入段宽 —— 族外的 SNI 本该一律 421 拒掉。
+pub fn is_model_gateway_host(host: &str) -> bool {
+    let Some(rest) = host.strip_prefix("api") else {
+        return false;
+    };
+    // 剥掉 `api` 与两个合法后缀，剩下的必须是**单个不含点的标签**（对应正则里的
+    // `[0-9a-z-]*`，它的字符类里没有 `.`）—— 空标签合法（`api.qoder.sh`）。
+    // `api3.qoder.sh.evil.com` 在这里就因为后缀对不上而落选；`api3.qoder.sh.qoder.sh`
+    // 则是因为剩下的标签里含点。两种漏网形态各有一例回归用例（见 tests）。
+    let label = rest
+        .strip_suffix(".qoder.sh")
+        .or_else(|| rest.strip_suffix(".qoder.com.cn"));
+    let Some(label) = label else {
+        return false;
+    };
+    label
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 /// Qoder 的部署区域。新增区域只需往这里加一个变体 + 补全下面四组常量。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -121,16 +221,32 @@ impl Region {
     /// 模型网关：接管反代把 CLI 的对话请求转发到它，**模型目录也在同一个域**
     /// （`GET {infer_base}/algo/api/v2/model/list`，见 `models` 模块头）。
     ///
-    /// 国际版取的是 CLI `gtn()` 的 `prod` 分支（`api2-v2`，与桌面端 asar 里那个
-    /// `api2.qoder.sh` 不是同一个 —— 实测能用的是前者，接管线一直用它）；
-    /// 国内版两边都是 `gateway.qoder.com.cn`。
+    /// 国际版取**客户端自己的默认推理域** `api2.qoder.sh`（`qgd()` 的 prod 默认；
+    /// 选举之后实际跑的是 `api3.qoder.sh`）。这里曾经写 `api2-v2.qoder.sh` —— 那是
+    /// 只服务旧 `/model/v1/chat/completions` 的老网关，**对客户端现在用的
+    /// `/algo/api/v2/...` 两条路径都已经是 404**（2026-09-29 未鉴权探测）。
     ///
-    /// 这里曾经另有一个 `catalog_base()`（国际版写成 `api3.qoder.sh`）—— 那是早先
-    /// 一次没验证过的猜测。国内版实测目录就在本函数的域上（`models` 模块头），
-    /// 国际版走同一条代码路径；留两个常量只会让「哪一天对不上」变成两个答案。
+    /// 接管生效时这个值只是**兜底**：反代优先按客户端握手里的 SNI 选上游
+    /// （选举会把域换成 api1/api3/api6…），只有拿不到 SNI 才回落到这里。
     pub fn infer_base(self) -> &'static str {
         match self {
-            Region::Global => "https://api2-v2.qoder.sh",
+            Region::Global => "https://api2.qoder.sh",
+            Region::Cn => "https://gateway.qoder.com.cn",
+        }
+    }
+
+    /// COSY 身份查询的基址：`GET {identity_base}/api/v3/user/status`（见 [`crate::cosy`]）。
+    ///
+    /// 两个区域**不在一起**，别顺手统一：
+    /// - 国内版与业务同域（`gateway.qoder.com.cn`，本机 `cosy_uid` 就是这么补齐的）；
+    /// - 国际版只在 OpenAPI 上 —— 官方客户端自己打的就是
+    ///   `https://openapi.qoder.sh/api/v3/user/status`（`~/.qoder/logs` 里 510 条，
+    ///   200 OK），而 `api3.qoder.sh` / `api2-v2.qoder.sh` 上这条路径都是 404。
+    ///   查询基址指错的表现是「uid 永远补不上 ⇒ 换号签名永远做不成」，
+    ///   界面却只显示「接管已开启」。
+    pub fn identity_base(self) -> &'static str {
+        match self {
+            Region::Global => "https://openapi.qoder.sh",
             Region::Cn => "https://gateway.qoder.com.cn",
         }
     }
@@ -230,48 +346,11 @@ impl Region {
 
     // ------------------------------------------------------------------ 智能接管
 
-    /// 智能接管要写进客户端的**端点环境变量键**；该区域不支持时返回 None。
-    ///
-    /// # 键名在产物里没有字面量，只能顺着 `Rr=` 回溯
-    ///
-    /// 客户端读端点的唯一入口是：
-    ///
-    /// ```text
-    /// function v7a(){ if(!Ja) return; let A = process.env[aue]; let e = M7a(A); … }
-    /// function yg(A){ return v7a() ?? A }      // 有覆盖就用覆盖，没有才退回默认
-    /// ```
-    ///
-    /// 其中 `aue = Rr("SERVER_ENDPOINT")`、`Rr(name) = ${前缀}${name}`，前缀由区域
-    /// 常量决定（国内版构建里 `Mo = "cn" == (eTs="cn")` 恒真，`"QODERCN_"` 被折叠进
-    /// 产物）。**所以直接 grep `QODERCN_SERVER_ENDPOINT` 是 0 命中**（踩过这个坑），
-    /// 要顺着 `Rr(` 与 `Uer=` 回溯才拿得到真实键名。
-    ///
-    /// # 两个区域的开关是相反的，所以这里必须分叉
-    ///
-    /// `v7a()` 开头那句 `if(!Ja) return` 说明**它只在一个区域的构建里生效**：
-    /// `Ja` 在国内版里恒真、国际版里恒假 —— 国际版读的是 `U7a()`
-    /// （`QODER_CENTER_ENDPOINT`），而它**只覆盖 center**：推理端点还得靠代答
-    /// `/api/v3/service/region/endpoints` 的选举结果。
-    ///
-    /// 于是国际版这里返回 `None`，让上层明确报「尚未支持」——
-    /// 而不是写一段**看起来生效、实际没人读**的注入。那正是这块历史踩过的坑：
-    /// 配置写成功、界面显示已开启、端口在听，而对话一直直连官方。
-    ///
-    /// # 覆盖值的形态（实测确认）
-    ///
-    /// `M7a()` 只做 `new URL(v).origin` 校验，所以：
-    ///
-    /// - **必须 https**（没有 `http:` 分支）；
-    /// - 路径必须为空或 `/`，不能带查询串 / 散列 / 用户名；
-    /// - **端口可以带** —— origin 含端口，`https://127.0.0.1:8789` 合法，
-    ///   不必占 443、不需要管理员。反代因此必须自己终止 TLS，见 [`crate::certs`]。
-    ///
-    /// 实测（`QODERCN_SERVER_ENDPOINT=https://127.0.0.1:9999` 手工起 worker）：
-    /// 客户端日志 `[config-service] baseUrl` 立刻由 `'(SDK default, …)'` 变成该值。
-    pub fn endpoint_env_key(self) -> Option<&'static str> {
+    /// 智能接管在**客户端侧**的落点。两个区域走的是两条不同的路，别把参数互相借。
+    pub fn takeover(self) -> Takeover {
         match self {
-            Region::Cn => Some("QODERCN_SERVER_ENDPOINT"),
-            Region::Global => None,
+            Region::Cn => Takeover::EndpointEnv("QODERCN_SERVER_ENDPOINT"),
+            Region::Global => Takeover::HostRedirect,
         }
     }
 
@@ -473,9 +552,18 @@ mod tests {
         assert_eq!(Region::Global.openapi_base(), "https://openapi.qoder.sh");
         assert_eq!(Region::Cn.openapi_base(), "https://openapi.qoder.com.cn");
         assert_eq!(Region::Cn.infer_base(), "https://gateway.qoder.com.cn");
-        assert_eq!(Region::Global.infer_base(), "https://api2-v2.qoder.sh");
+        assert_eq!(Region::Global.infer_base(), "https://api2.qoder.sh");
         // 国际版的推理网关（模型目录也在它上面）与 openapi 不是同一个域，别顺手统一
         assert_ne!(Region::Global.infer_base(), Region::Global.openapi_base());
+        // COSY 身份查询（uid）与推理**不在一个域**上：国际版的 uid 只在 openapi 上
+        // （客户端日志实测 `openapi.qoder.sh/api/v3/user/status` 200），指到网关会 404。
+        assert_eq!(
+            Region::Global.identity_base(),
+            "https://openapi.qoder.sh"
+        );
+        assert_eq!(Region::Cn.identity_base(), "https://gateway.qoder.com.cn");
+        // 国内版恰好与业务同域（本机 cosy_uid 就是这么补齐的）；国际版不同域，见上
+        assert_eq!(Region::Cn.identity_base(), Region::Cn.infer_base());
     }
 
     /// 本地目录：CLI 目录与桌面端数据目录都必须按区域分开。
@@ -535,20 +623,78 @@ mod tests {
         assert_eq!(Region::default(), Region::Global);
     }
 
-    /// 接管的端点键**只有国内版有**：`v7a()` 的 `if(!Ja) return` 让它在国际版构建里
-    /// 恒不生效，国际版覆盖的是别的键、且只覆盖 center。所以国际版必须返回 None
-    /// —— 上层据此明确报「尚未支持」，而不是写一段没人读的注入。
+    /// 接管落点：国内版是 env 键、国际版是 TLS 重定向 —— 两条路，别把参数互相借。
+    ///
+    /// 国际版**没有**可用的键：`QODER_SERVER_ENDPOINT` 的读取者在国际版构建里恒不生效
+    /// （`if(!Ja) return`），覆盖键只覆盖 center。所以它不能退成 `EndpointEnv`，
+    /// 否则等于写一段没人读的注入、界面却显示「接管已开启」。
     #[test]
-    fn endpoint_env_key_exists_only_where_it_is_actually_read() {
-        assert_eq!(Region::Cn.endpoint_env_key(), Some("QODERCN_SERVER_ENDPOINT"));
-        assert_eq!(Region::Global.endpoint_env_key(), None);
-        // 键名前缀与区域一一对应，别把两边的键搞混（读错区域 = 覆盖静默失效）
-        for (r, key) in [
-            (Region::Cn, Region::Cn.endpoint_env_key().unwrap()),
-            (Region::Global, "QODER_CENTER_ENDPOINT"),
+    fn takeover_route_is_the_one_each_client_actually_reads() {
+        assert_eq!(
+            Region::Cn.takeover(),
+            Takeover::EndpointEnv("QODERCN_SERVER_ENDPOINT")
+        );
+        assert_eq!(Region::Global.takeover(), Takeover::HostRedirect);
+        // 键名前缀与区域一一对应（产物里 `Rr(name) = ${前缀}${name}`）：读错区域的键
+        // 不会报错，只会让覆盖静默失效
+        match Region::Cn.takeover() {
+            Takeover::EndpointEnv(key) => assert!(key.starts_with("QODERCN_"), "{key}"),
+            other => panic!("国内版应走 env 覆盖，实际 {other:?}"),
+        }
+        assert!(
+            !matches!(Region::Global.takeover(), Takeover::EndpointEnv(_)),
+            "国际版不能退回 env 覆盖"
+        );
+    }
+
+    /// 只有模型网关族允许被重定向 —— 反代按这条规则决定「要不要拿 SNI 当上游」，
+    /// 多认一个域就等于把本机变成一个开放转发器。
+    ///
+    /// ⚠️ 与 `patch::render` 里嵌入的 JS 正则（`^api[0-9a-z-]*\.qoder\.(sh|com\.cn)$`）
+    /// 同一条规则：两处的用例表必须一致，否则会出现「注入改了、反代不认」的静默失效。
+    #[test]
+    fn only_the_model_gateway_family_may_be_redirected() {
+        for ok in [
+            "api.qoder.sh",
+            "api1.qoder.sh",
+            "api2.qoder.sh",
+            "api3.qoder.sh",
+            "api2-v2.qoder.sh",
+            "api.qoder.com.cn",
+            "api6.qoder.com.cn",
         ] {
-            let want = if r == Region::Cn { "QODERCN_" } else { "QODER_" };
-            assert!(key.starts_with(want), "{key} 的前缀应与 {} 对应", r.label());
+            assert!(is_model_gateway_host(ok), "{ok} 应在网关族内");
+        }
+        for no in [
+            // 业务面（选举 / 策略 / 用户 / 国内版网关）——官方直连，不进接管
+            "center.qoder.sh",
+            "openapi.qoder.sh",
+            "openapi.qoder.com.cn",
+            "gateway.qoder.com.cn",
+            "qoder.sh",
+            "qoder.com",
+            "www.qoder.com",
+            // 「域是后缀、真实域在别处」的漏网形态
+            "api3.qoder.sh.evil.com",
+            "api.qoder.shx",
+            "api3.qoder.com.cn.evil.com",
+            // 「先在结尾凑出合法后缀、真正的主机名在中间」：只按后缀结尾判会放进来，
+            // 而注入段那条正则从不接受（它的字符类里没有点）—— 反代宽一格 = 421 形同虚设
+            "api3.qoder.sh.qoder.sh",
+            "api3.qoder.com.cn.qoder.com.cn",
+            // 族内主机名不允许大写 / 下划线
+            "API3.qoder.sh",
+            "api_3.qoder.sh",
+            // 别的产品域
+            "apiv2.qoder.cn",
+            // 空串 / 本机名这类杂音
+            "",
+            "127.0.0.1",
+            "localhost",
+            "api",
+            "api.",
+        ] {
+            assert!(!is_model_gateway_host(no), "{no} 不该被当成网关族");
         }
     }
 

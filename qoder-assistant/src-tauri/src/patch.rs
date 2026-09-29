@@ -31,30 +31,43 @@
 //! 所以上面第 1 节里「客户端 SDK 起推理进程时 env 由桌面端构造」仍然成立，落点仍然
 //! 只能是产物文件本身；变的只是「改动何时被读到」：**下一次对话**，无需重启。
 //!
-//! # 注入段做两件事
+//! # 注入段：每个区域走它自己那条路（[`Region::takeover`]）
 //!
-//! 1. `process.env.QODERCN_SERVER_ENDPOINT = <本机反代>`。
-//!    客户端读端点的唯一入口是 `v7a(){ ... process.env[aue] ... }`，
-//!    其中 `aue = Rr("SERVER_ENDPOINT")`、`Rr(name) = ${prefix}${name}`、
-//!    CN 构建的前缀硬编码为 `QODERCN_` —— 所以键名在源码里**没有字面量**，
-//!    只能顺着 `Rr=` 回溯。已用真实进程实测：该键一写进 env，
-//!    客户端日志的 `[config-service] baseUrl` 立刻变成该值。
+//! **国内版**：`process.env.QODERCN_SERVER_ENDPOINT = <本机反代>`。
+//! 客户端读端点的唯一入口是 `v7a(){ ... process.env[aue] ... }`，
+//! 其中 `aue = Rr("SERVER_ENDPOINT")`、`Rr(name) = ${prefix}${name}`、
+//! CN 构建的前缀硬编码为 `QODERCN_` —— 所以键名在源码里**没有字面量**，
+//! 只能顺着 `Rr=` 回溯。已用真实进程实测：该键一写进 env，
+//! 客户端日志的 `[config-service] baseUrl` 立刻变成该值。
 //!
-//! 2. 把本机 CA 注入 `node:tls`，**只对回环地址的连接**。端点被客户端强制成
-//!    https（`M7a()` 只接受 `https:` origin），所以反代终止 TLS 后必须让客户端
-//!    认这张自签证书 —— 走注入而不是改系统信任库，因此不需要管理员。
+//! **国际版**：没有可读的键（`v7a()` 那句 `if(!Ja) return` 在国际版构建里恒不生效），
+//! 所以注入段改在 `tls.connect` 里把**模型网关族**
+//! （`api*.qoder.sh` / `api*.qoder.com.cn`，与 [`crate::region::is_model_gateway_host`]
+//! 同一条规则）的连接目标改写成 `127.0.0.1:<port>`，并**保留 SNI** ——
+//! 反代握手后按 SNI 选上游。业务面（center / openapi）不在族内，原样直连。
+//!
+//! 判「是不是族内连接」要**连 `servername` 一起测**，不能只看 host：httpdns 模式
+//! （对话请求全走这条）下，客户端自建的 resolved-ip Agent 会把 `hostname` 换成
+//! 解析出的 IP、只把域名留在 `servername` 里 —— 2026-09-29 真机踩过「接管全绿、
+//! 对话零条」，就是只测 host 漏掉了这一整类连接。两个字段任一命中就改写；
+//! 改写时 servername 已有值就原样保留，域名那半边才是给反代的 SNI。
+//!
+//! **两条路都要**把本机 CA 注入 `node:tls`，**只对回环地址的连接**：
+//! 端点被客户端强制成 https（`M7a()` 只接受 `https:` origin），所以反代终止 TLS
+//! 后必须让客户端认这张自签证书 —— 走注入而不是改系统信任库，因此不需要管理员。
 //!
 //! # 官方更新会覆盖它
 //!
-//! 每次启用与心跳都会比对文件头指纹：不是我们的注入段就重新打一遍
-//! （先把当前这份官方原版存成备份）。摘除是**精确剥离**，不依赖备份回滚 ——
-//! 备份只作额外保险，避免「用旧版客户端覆盖掉用户刚更新到的新版」。
-//!
-//! ⚠️ 国际版目前**不支持**：它的 `v7a()` 恒不生效（`if(!Ja) return`，
-//! 而 `Ja` 在 CN 构建里才是 true），端点覆盖走的是只覆盖 center 的另一个键，
-//! 推理端点还需要代答 `/api/v3/service/region/endpoints` —— 见 `region::endpoint_env_key`。
+//! 每次启用与心跳都会比对文件头：不是我们的注入段就重新打一遍
+//! （先把当前这份官方原版存成备份）。**比对的不只是 url/CA，还包括注入体指纹**
+//! （标记行里的 `js=`）—— 只比前两者的话，改了本文件注入段代码、而 url/CA 没变时，
+//! 盘上的旧注入会被当成「已是最新」，心跳永远不重写（2026-09-29 实遇：dev 重编译
+//! 出带新判据的构建，产物里却还是旧注入）。旧格式 marker 没有 `js=` → 自动判过时
+//! → 下一次心跳重写（升级自愈，不用手动关开接管）。
+//! 摘除是**精确剥离**，不依赖备份回滚 —— 备份只作额外保险，避免「用旧版客户端
+//! 覆盖掉用户刚更新到的新版」。
 
-use crate::region::Region;
+use crate::region::{Region, Takeover};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs;
@@ -85,6 +98,9 @@ pub struct Marker {
     pub url: String,
     /// 注入的 CA 指纹（sha256 前 16 位十六进制），用于判断 CA 换过没有
     pub ca: String,
+    /// 注入体指纹。是后加的字段：旧格式 marker 解析出来是 `None`，
+    /// [`is_current`] 会因此判它过时、下一次心跳重写（升级自愈）。
+    pub js: Option<String>,
 }
 
 /// 解析 worker 产物的**全部候选路径**：每个 SDK 根 × [`CANDIDATES`]，
@@ -175,10 +191,23 @@ fn backup_path(worker: &Path) -> PathBuf {
     worker.with_file_name(format!("{name}.qoderassistant-orig"))
 }
 
-fn ca_fingerprint(ca_pem: &str) -> String {
+fn fingerprint16(text: &str) -> String {
     let mut h = Sha256::new();
-    h.update(ca_pem.as_bytes());
+    h.update(text.as_bytes());
     hex(&h.finalize())[..16].to_string()
+}
+
+fn ca_fingerprint(ca_pem: &str) -> String {
+    fingerprint16(ca_pem)
+}
+
+/// 注入体（标记行之后那段 JS）的指纹。
+///
+/// 它是「装着的是不是**这一版**注入代码」的判据：指到它，改 `render_js` 的产出
+/// 就会让旧注入立刻变成「过时」，心跳重写 —— 不能只比 url/CA，那两个在改代码时
+/// 不会变（2026-09-29 实遇：dev 重编译后新判据写不进产物）。
+fn body_fingerprint(js: &str) -> String {
+    fingerprint16(js)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -205,7 +234,11 @@ pub fn parse_marker(head: &str) -> Option<Marker> {
     let line = head.lines().next()?;
     let url = field(line, "url=")?;
     let ca = field(line, "ca=")?;
-    Some(Marker { url, ca })
+    Some(Marker {
+        url,
+        ca,
+        js: field(line, "js="),
+    })
 }
 
 /// 从标记行里取 `key=value`（值到空格或行尾为止）
@@ -221,9 +254,21 @@ fn field(line: &str, key: &str) -> Option<String> {
     }
 }
 
-/// 已注入（且端点/CA 与给定值一致）时返回 true。
-pub fn is_current(worker: &Path, url: &str, ca_pem: &str) -> bool {
-    matches!(read_marker(worker), Some(m) if m.url == url && m.ca == ca_fingerprint(ca_pem))
+/// 已注入（且端点 / CA / **注入体**都与当前构建一致）时返回 true。
+///
+/// 注入体也要比：只比 url/CA 的话，改了注入段代码的构建会把「装着旧注入」误判成
+/// 最新 —— 心跳永远跳过重写，界面上全绿、客户端跑的还是旧代码。旧格式 marker
+/// 没有 `js=` 字段 → 判不一致 → 下一次心跳升级重写。
+pub fn is_current(worker: &Path, region: Region, url: &str, ca_pem: &str) -> bool {
+    let Some(m) = read_marker(worker) else {
+        return false;
+    };
+    m.url == url
+        && m.ca == ca_fingerprint(ca_pem)
+        && matches!(
+            (m.js.as_deref(), render_js(region, url, ca_pem)),
+            (Some(js), Ok(expected)) if js == body_fingerprint(&expected)
+        )
 }
 
 /// 剥掉注入段，得到官方原文。没注入过就原样返回。
@@ -242,40 +287,99 @@ fn strip(raw: &str) -> &str {
     }
 }
 
-/// 生成注入段。
+/// 从 `https://host[:port]` 里取端口。
+///
+/// 国际版的重定向要往 `tls.connect` 的 `port` 选项里填**数字**（那里不认 URL），
+/// 所以这里把端点 URL 拆一次；缺端口按 https 默认 443。
+fn port_of(url: &str) -> Result<u16, String> {
+    let hostport = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    match hostport.rsplit_once(':') {
+        Some((_, p)) => p
+            .parse::<u16>()
+            .map_err(|_| format!("端点 URL 里的端口不是数字：{url}")),
+        None => Ok(443),
+    }
+}
+
+/// 生成注入段 = 标记行 + 注入体（[`render_js`]）。
+///
+/// 标记行里的 `js=` 是注入体指纹，算的是**除标记行之外**的部分 —— 指纹不能写进
+/// 自己覆盖的范围里（自指），所以先渲染本体、再拼标记行。
+fn render(region: Region, url: &str, ca_pem: &str) -> Result<String, String> {
+    let js = render_js(region, url, ca_pem)?;
+    Ok(format!(
+        "{} url={} ca={} js={} */\n{js}",
+        MARK_BEGIN,
+        url,
+        ca_fingerprint(ca_pem),
+        body_fingerprint(&js)
+    ))
+}
+
+/// 注入体本身（标记行之后那段 JS）。
 ///
 /// 所有插进 JS 的字符串都用 `{:?}`（Rust 字符串字面量）渲染，避免手写转义 ——
 /// 这段代码一旦语法出错，客户端会**整个起不来**，不是「接管不生效」那么轻。
-fn render(region: Region, url: &str, ca_pem: &str) -> Result<String, String> {
-    let key = region
-        .endpoint_env_key()
-        .ok_or_else(|| format!("{} 的端点覆盖尚未支持", region.label()))?;
+fn render_js(region: Region, url: &str, ca_pem: &str) -> Result<String, String> {
     let ca_lines = ca_pem
         .lines()
         .map(|l| format!("{l:?}"))
         .collect::<Vec<_>>()
         .join(",");
-    let mut s = String::with_capacity(ca_pem.len() + 2048);
-    s.push_str(&format!(
-        "{} url={} ca={} */\n",
-        MARK_BEGIN,
-        url,
-        ca_fingerprint(ca_pem)
-    ));
+    let mut s = String::with_capacity(ca_pem.len() + 3072);
     s.push_str("import{createRequire as __qaReq}from\"node:module\";\n");
-    s.push_str(&format!(
-        "process.env[{:?}]={:?};\n",
-        key, url
-    ));
+    // 区域差异只有一处：怎么把流量引到本机。CA 注入两条路共用。
+    let redirect_port = match region.takeover() {
+        Takeover::EndpointEnv(key) => {
+            s.push_str(&format!("process.env[{key:?}]={url:?};\n"));
+            None
+        }
+        Takeover::HostRedirect => Some(port_of(url)?),
+    };
     s.push_str("try{const __qaTls=__qaReq(import.meta.url)(\"node:tls\");");
     s.push_str(&format!("const __qaCa=[{ca_lines}].join(\"\\n\");"));
     s.push_str("const __qaLocal=h=>h===\"127.0.0.1\"||h===\"localhost\"||h===\"::1\";");
-    s.push_str("const __qaHost=o=>String((o&&(o.host??o.servername))??\"\");");
+    s.push_str("const __qaHost=o=>String((o&&(o.host??o.hostname??o.servername))??\"\");");
+    if let Some(port) = redirect_port {
+        // 族规则取自 [`crate::region::MODEL_GATEWAY_HOST_REGEX`]（唯一来源）：
+        // 反代认哪个族，客户端就只改哪个族的目标
+        s.push_str(&format!(
+            "const __qaGw=new RegExp({:?});",
+            crate::region::MODEL_GATEWAY_HOST_REGEX
+        ));
+        s.push_str("const __qaSni=o=>String((o&&o.servername)??\"\");");
+        s.push_str(&format!("const __qaPort={port};"));
+    }
     s.push_str("const __qaConnect=__qaTls.connect;");
+    s.push_str("__qaTls.connect=function(...a){try{const o=a[0];if(o&&typeof o===\"object\"){");
+    if redirect_port.is_some() {
+        // 只动**族内**的连接：族外的域（center / openapi）一个字段都不碰 ——
+        // 连 servername 也不设，Node 本来就会拿 host 当 SNI，替它设一遍只是多一个
+        // 「给 IP 塞 servername」的机会（Node 对 IP 的 SNI 另有一套判断）。
+        // 保留 servername 的理由见 [`crate::region::Takeover::HostRedirect`]：
+        // 选举会把推理域在 api1/api2/api3/api6… 之间换，写死一个上游就会「明天 404」。
+        // `host` 与 `hostname` 都改：Node 的不同连接路径读的是其中一个，
+        // 而两个都写只影响「连哪儿」，不影响 SNI。`socket` 在时跳过（那时 host/port 不生效）。
+        // **族判据要连 servername 一起测**：httpdns 的 resolved-ip 路线里 host 是
+        // 解析出的 IP，族名只留在 servername（见模块头注释）；只测 host 会整类漏掉。
+        // `__qaGw.test(h)` 里的 `.test(` 不能省成 `__qaGw(h)`：`new RegExp` 出来的是
+        // 正则对象，**不是函数**，当函数调用会在运行时抛 `TypeError` —— 而它会被包裹层
+        // 自己的 `catch{}` 吞掉，表现是「注入装好了、界面显示生效中，实际一个连接都没改」。
+        s.push_str(
+            "if(!o.socket){const __qaH=__qaHost(o);if(__qaGw.test(__qaH)||__qaGw.test(__qaSni(o))){\
+             if(o.servername===undefined)o.servername=__qaH;\
+             o.host=\"127.0.0.1\";o.hostname=\"127.0.0.1\";o.port=__qaPort}}",
+        );
+    }
     s.push_str(
-        "__qaTls.connect=function(...a){try{const o=a[0];if(o&&typeof o===\"object\"\
-         &&__qaLocal(__qaHost(o))){if(o.ca===undefined)o.ca=__qaCa;o.rejectUnauthorized=!1}}\
-         catch{}return __qaConnect.apply(this,a)};",
+        "if(__qaLocal(__qaHost(o))){if(o.ca===undefined)o.ca=__qaCa;\
+         o.rejectUnauthorized=!1}}}catch{}return __qaConnect.apply(this,a)};",
     );
     s.push_str("const __qaCsc=__qaTls.createSecureContext;");
     s.push_str(
@@ -451,7 +555,7 @@ fn write_hint(what: &str, path: &Path, e: &std::io::Error) -> String {
 ///
 /// 返回「是否真的写过盘」（`false` = 已经是最新的，跳过）。
 pub fn install_at(worker: &Path, region: Region, url: &str, ca_pem: &str) -> Result<bool, String> {
-    if is_current(worker, url, ca_pem) {
+    if is_current(worker, region, url, ca_pem) {
         return Ok(false);
     }
     let raw = fs::read_to_string(worker)
@@ -787,7 +891,9 @@ mod tests {
         let s = fs::read_to_string(&p).unwrap();
         assert_eq!(s.matches(MARK_BEGIN).count(), 1, "注入段不能叠加：{s:.200}");
         assert_eq!(s.matches("https://127.0.0.1:9999").count() > 0, true);
-        assert!(!s.contains("8789"));
+        // 旧端点不能残留。判据写成完整 URL 而不是裸 `"8789"`：标记行里的
+        // js 指纹是十六进制，有极小概率自然含 "8789" —— 裸串断言会偶发假失败。
+        assert!(!s.contains("127.0.0.1:8789"));
         assert_eq!(read_marker(&p).unwrap().url, "https://127.0.0.1:9999");
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
@@ -796,9 +902,9 @@ mod tests {
     fn marker_records_the_ca_so_a_rotated_ca_triggers_a_rewrite() {
         let p = tmp_worker();
         install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
-        assert!(is_current(&p, "https://127.0.0.1:8789", FAKE_CA));
+        assert!(is_current(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA));
         let other_ca = FAKE_CA.replace("AAAA", "ZZZZ");
-        assert!(!is_current(&p, "https://127.0.0.1:8789", &other_ca));
+        assert!(!is_current(&p, Region::Cn, "https://127.0.0.1:8789", &other_ca));
         assert!(install_at(&p, Region::Cn, "https://127.0.0.1:8789", &other_ca).unwrap());
         assert_eq!(read_marker(&p).unwrap().ca, ca_fingerprint(&other_ca));
         let _ = fs::remove_dir_all(p.parent().unwrap());
@@ -843,38 +949,357 @@ mod tests {
         let m = parse_marker(&body).expect("应能解析");
         assert_eq!(m.url, "https://127.0.0.1:8789");
         assert_eq!(m.ca, ca_fingerprint(FAKE_CA));
+        // 注入体指纹必须是**本体**的哈希（标记行之外），且渲染是确定性的
+        let js = render_js(Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+        let fp = body_fingerprint(&js);
+        assert_eq!(m.js.as_deref(), Some(fp.as_str()), "js= 指纹要对得上注入体");
+        assert!(!js.contains(MARK_BEGIN), "指纹不能含标记行（自指）：{js:.80}");
         // 未经注入的文件头解析不出来
         assert!(parse_marker(ORIGINAL).is_none());
     }
 
+    /// 改了注入段代码（url/CA 都没变）也要触发重写 —— marker 里的 `js=` 指纹
+    /// 与当前构建对不上就该重写。2026-09-29 真机：dev 重编译出带新判据的构建、
+    /// 产物里却还是旧注入，就是缺这个判据（快速重建时租约没过期，心跳直接跳过）。
+    #[test]
+    fn a_changed_injection_body_forces_a_rewrite() {
+        let p = tmp_worker();
+        install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+        assert!(is_current(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA));
+
+        // 模拟「上一版构建注入的产物」：把标记行里的 js= 指纹改成过时的
+        let s = fs::read_to_string(&p).unwrap();
+        let (line, rest) = s.split_once('\n').unwrap();
+        let stale_line = match line.split_once(" js=") {
+            Some((head, tail)) => format!("{head} js=0000000000000000{}", &tail[16..]),
+            None => panic!("标记行里应当有 js=：{line}"),
+        };
+        fs::write(&p, format!("{stale_line}\n{rest}")).unwrap();
+
+        assert!(!is_current(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA));
+        assert!(
+            install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap(),
+            "指纹对不上必须重写"
+        );
+        assert!(is_current(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA));
+        let after = fs::read_to_string(&p).unwrap();
+        assert_eq!(after.matches(MARK_BEGIN).count(), 1, "重写不能叠出两段注入");
+        assert!(after.ends_with(ORIGINAL), "重写后官方原文仍要原样接在注入段之后");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 旧格式（没有 `js=` 的）marker：判为过时 → 下一次 install 升级重写。
+    /// 这条是「改了注入代码的构建第一次上线」真正会走的升级路径。
+    #[test]
+    fn an_old_format_marker_without_js_is_healed_by_the_next_install() {
+        let p = tmp_worker();
+        let js = render_js(Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+        fs::write(
+            &p,
+            format!(
+                "{MARK_BEGIN} url=https://127.0.0.1:8789 ca={} */\n{js}",
+                ca_fingerprint(FAKE_CA)
+            ),
+        )
+        .unwrap();
+        assert!(read_marker(&p).unwrap().js.is_none(), "旧格式应解析出 None");
+        assert!(!is_current(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA));
+
+        assert!(install_at(&p, Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap());
+        let fp = body_fingerprint(&js);
+        assert_eq!(read_marker(&p).unwrap().js.as_deref(), Some(fp.as_str()));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
     /// 插入的 JS 必须是**语法合法**的：字符串字面量成对、没有裸的换行。
     /// （一段语法错误的注入会让客户端整个起不来，比接管不生效严重得多。）
+    /// 两个区域的渲染结果都要过这一关 —— 国际版那段分支是后加的，更容易出错。
     #[test]
     fn rendered_js_is_syntactically_sane() {
-        let body = render(Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
-        assert_eq!(
-            body.matches('"').count() % 2,
-            0,
-            "双引号必须成对：\n{body}"
-        );
-        assert!(body.contains("import{createRequire as __qaReq}from\"node:module\";"));
-        assert!(body.contains("-----BEGIN CERTIFICATE-----"));
-        assert!(body.contains("-----END CERTIFICATE-----"));
-        assert!(body.trim_end().ends_with(MARK_END));
-        // 每个字符串字面量里都不能出现裸换行
-        for line in body.lines().filter(|l| l.contains("__qaCa=")) {
-            assert!(!line.is_empty());
+        for region in Region::ALL {
+            let body = render(region, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+            let tag = region.label();
+            assert_eq!(
+                body.matches('"').count() % 2,
+                0,
+                "[{tag}] 双引号必须成对：\n{body}"
+            );
+            assert!(body.contains("import{createRequire as __qaReq}from\"node:module\";"));
+            assert!(body.contains("-----BEGIN CERTIFICATE-----"));
+            assert!(body.contains("-----END CERTIFICATE-----"));
+            assert!(body.trim_end().ends_with(MARK_END), "[{tag}]");
+            // 每个字符串字面量里都不能出现裸换行
+            for line in body.lines().filter(|l| l.contains("__qaCa=")) {
+                assert!(!line.is_empty(), "[{tag}]");
+            }
+            // 端点 URL 只能以字符串字面量出现（裸着写进 JS，URL 里的 `//` 会变成注释）。
+            // 标记行自己就写着 `url=…`，但它在 `/* */` 里，排除掉。
+            for line in body.lines().filter(|l| !l.starts_with(MARK_BEGIN)) {
+                assert!(
+                    !line.contains("=https://"),
+                    "[{tag}] 端点必须渲染成字符串字面量：{line}"
+                );
+            }
         }
     }
 
-    /// 国际版没有可用的端点键 —— 必须明确报错，而不是写一段无效注入
+    /// 国际版的注入段：**改连接目标、保留 SNI**，且绝不写 env 键
+    /// （国际版构建里那个键没人读，写了等于没写，界面却会显示「接管已开启」）。
     #[test]
-    fn global_region_is_rejected_with_a_clear_message() {
+    fn global_injection_redirects_the_gateway_family_and_keeps_sni() {
+        let body = render(Region::Global, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+        // 端口必须是**数字**：tls.connect 的 port 选项不认 URL
+        assert!(body.contains("const __qaPort=8789;"), "{body}");
+        // 族规则与反代同源（同一个常量渲染出来），否则「注入改了、反代不认」
+        assert!(
+            body.contains(&format!(
+                "new RegExp({:?})",
+                crate::region::MODEL_GATEWAY_HOST_REGEX
+            )),
+            "族规则必须取自 region::MODEL_GATEWAY_HOST_REGEX：{body}"
+        );
+        // 只改 host/hostname/port，**不动 servername**（拿不到时才补上原 host）——
+        // 反代按 SNI 选上游
+        assert!(body.contains("if(o.servername===undefined)o.servername=__qaH"), "{body}");
+        assert!(body.contains("o.host=\"127.0.0.1\""), "{body}");
+        assert!(body.contains("o.hostname=\"127.0.0.1\""), "{body}");
+        assert!(body.contains("o.port=__qaPort"), "{body}");
+        // 族外（center / openapi）一个字段都不能碰：判据在改写**之前**取。
+        // `.test(` 单独钉住：正则对象不可调用，`__qaGw(h)` 会抛 TypeError，
+        // 而外层 catch 会把它吞成「静默不生效」。
+        // servername 也必须进判据：httpdns 的 resolved-ip 路线只有它带着域名
+        // （host 是解析出的 IP）—— 只测 host 会把整类对话连接漏掉。
+        assert!(
+            body.contains(
+                "const __qaH=__qaHost(o);if(__qaGw.test(__qaH)||__qaGw.test(__qaSni(o))){"
+            ),
+            "族判据必须在改 host 之前算、走 RegExp.test，且连 servername 一起测：{body}"
+        );
+        assert!(
+            body.contains("const __qaSni=o=>String((o&&o.servername)??\"\");"),
+            "servername 的取值助手要能读到：{body}"
+        );
+        // 国际版没有可读的端点键：不许出现 env 赋值
+        assert!(
+            !body.contains("process.env["),
+            "国际版不能退回 env 覆盖（那个键在国际版构建里恒不生效）：{body}"
+        );
+        // CA 注入两条路共用：重定向之后连接落在回环上，CA 才跟着注入
+        assert!(body.contains("__qaLocal(__qaHost(o))"), "{body}");
+        assert!(body.contains("-----BEGIN CERTIFICATE-----"), "{body}");
+    }
+
+    /// 国内版反过来：只写 env 键，**不碰** TLS 目标（它的端点覆盖本来就让客户端
+    /// 自己连 127.0.0.1，去改目标只会多一份没用的注入面）。
+    #[test]
+    fn cn_injection_stays_env_only() {
+        let body = render(Region::Cn, "https://127.0.0.1:8789", FAKE_CA).unwrap();
+        assert!(
+            body.contains("process.env[\"QODERCN_SERVER_ENDPOINT\"]=\"https://127.0.0.1:8789\";"),
+            "{body}"
+        );
+        assert!(!body.contains("__qaGw"), "国内版不该带网关族规则：{body}");
+        assert!(!body.contains("__qaSni"), "国内版不该带 SNI 判据：{body}");
+        assert!(!body.contains("__qaPort"), "国内版不该带重定向端口：{body}");
+    }
+
+    /// 端点 URL 拆端口：缺端口按 https 默认 443，非数字要报错而不是静默取 0。
+    #[test]
+    fn redirect_port_is_parsed_from_the_endpoint_url() {
+        assert_eq!(port_of("https://127.0.0.1:8789").unwrap(), 8789);
+        assert_eq!(port_of("https://127.0.0.1").unwrap(), 443);
+        assert_eq!(port_of("https://127.0.0.1:8789/").unwrap(), 8789);
+        assert!(port_of("https://127.0.0.1:very").is_err());
+    }
+
+    /// 国际版也要能注入 / 摘除 / 还原 —— 走的是与国内版同一套落盘路径。
+    #[test]
+    fn global_inject_uninstall_round_trips_byte_for_byte() {
         let p = tmp_worker();
-        let err = install_at(&p, Region::Global, "https://127.0.0.1:8789", FAKE_CA).unwrap_err();
-        assert!(err.contains("尚未支持"), "{err}");
-        assert_eq!(fs::read_to_string(&p).unwrap(), ORIGINAL, "失败不能改文件");
+        assert!(install_at(&p, Region::Global, "https://127.0.0.1:8789", FAKE_CA).unwrap());
+        let injected = fs::read_to_string(&p).unwrap();
+        assert!(injected.starts_with(MARK_BEGIN));
+        assert!(injected.ends_with(ORIGINAL), "原文必须原样接在注入段之后");
+        assert_eq!(read_marker(&p).unwrap().url, "https://127.0.0.1:8789");
+
+        assert!(uninstall_at(&p).unwrap());
+        assert_eq!(fs::read_to_string(&p).unwrap(), ORIGINAL, "还原必须逐字节一致");
         let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    // ── 行为验证：渲染结果交给 node **真跑一遍** ─────────────────────────
+    //
+    // 字符串断言测的是「我们写了什么」，测不出「跑起来会怎样」：注入段语法合法、
+    // `node --check` 也过，仍可能一执行就抛。实测踩过这个坑 —— `__qaGw(h)` 把
+    // 正则对象当函数调，抛出的 `TypeError` 被包裹层自己的 `catch{}` 吞掉，
+    // 表现是「界面显示生效中、实际一个连接都没改」，纯静态检查一个都发现不了。
+    //
+    // 下面这套把注入段挂进一个真 node 进程，读回它**实际**改了哪些字段。
+    // 需要本机的 node（不在 crate 依赖里）：缺席时打印一行跳过，不算失败。
+
+    /// node 侧观测脚本：逐例调用 `tls.connect`，把**调用后**的选项对象打回来。
+    ///
+    /// `lookup` 被桩掉是有意的：族外的域（center / openapi）必须原样直连，
+    /// 而测试不许碰网 —— 桩让「没被改写」这一例在尝试解析域名时就报错结束，
+    /// 观测到的字段仍是改写与否的直接证据。族内的例子会被改写成本机回环端口
+    /// （由 Rust 侧真实监听），连接落在我们的监听器上，同样不出网。
+    ///
+    /// `resolved-ip` 两例模拟 httpdns 路线的建连形态（host 已是解析出的 IP、
+    /// 域名在 `servername`）：不涉及 DNS；未改写的反例用回环网段里的 `127.0.0.2`，
+    /// 即使真的发起连接也是瞬时拒绝，同样不出网。
+    const HARNESS: &str = r#"
+import tls from "node:tls";
+import { pathToFileURL } from "node:url";
+await import(pathToFileURL(process.env.QA_INJECT).href);
+const port = Number(process.env.QA_PORT);
+const dns = (_h, _o, cb) => cb(new Error("qa: 测试不许碰网"));
+const cases = [
+  ["family-sh", { host: "api3.qoder.sh", port: 443 }],
+  ["family-cn", { host: "api6.qoder.com.cn", port: 443 }],
+  ["hostname-form", { hostname: "api2.qoder.sh", port: 443 }],
+  ["resolved-ip", { host: "8.212.20.107", servername: "api3.qoder.sh", port: 443 }],
+  ["resolved-ip-foreign-sni", { host: "127.0.0.2", servername: "example.com", port: 443 }],
+  ["foreign-center", { host: "center.qoder.sh", port: 443 }],
+  ["foreign-openapi", { host: "openapi.qoder.sh", port: 443 }],
+  ["suffix-attack", { host: "api3.qoder.sh.evil.com", port: 443 }],
+  ["double-tail", { host: "api3.qoder.sh.qoder.sh", port: 443 }],
+  ["loopback", { host: "127.0.0.1", port }],
+  ["localhost", { host: "localhost", port }],
+];
+for (const [label, opts] of cases) {
+  const o = { ...opts, lookup: dns };
+  const s = tls.connect(o);
+  s.on("error", () => {});
+  s.destroy();
+  console.log(`QA ${label} host=${o.host} hostname=${o.hostname} port=${o.port} servername=${o.servername} ca=${o.ca ? "yes" : "no"} reject=${o.rejectUnauthorized}`);
+}
+if (process.env.QA_ENV_KEY) {
+  console.log(`QA env-key value=${process.env[process.env.QA_ENV_KEY]}`);
+}
+"#;
+
+    /// 从 node 的观测输出里取一行（按 `QA <例名>` 前缀），取不到直接把全部输出摊开。
+    fn qa_line(out: &str, label: &str) -> String {
+        let prefix = format!("QA {label} ");
+        out.lines()
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("node 没给出「{label}」这一行：\n{out}"))
+            .to_string()
+    }
+
+    /// 渲染一份注入 → 交给 node 执行 → 返回（回环监听端口, 观测输出）。
+    /// node 缺席返回 None。
+    fn observe_injection_with_node(region: Region) -> Option<(u16, String)> {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            println!("本机没有 node，跳过注入段的真机行为验证");
+            return None;
+        }
+        // 真监听一个回环端口：重定向之后的连接要有真实落点，观测才不是自说自话
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑回环端口");
+        let port = listener.local_addr().unwrap().port();
+
+        let dir = std::env::temp_dir().join(format!("qa-inject-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let inject = dir.join("inject.mjs");
+        fs::write(
+            &inject,
+            render(region, &format!("https://127.0.0.1:{port}"), FAKE_CA).unwrap(),
+        )
+        .unwrap();
+        let harness = dir.join("observe.mjs");
+        fs::write(&harness, HARNESS).unwrap();
+
+        let out = std::process::Command::new("node")
+            .arg(&harness)
+            .env("QA_INJECT", &inject)
+            .env("QA_PORT", port.to_string())
+            .env(
+                "QA_ENV_KEY",
+                match region.takeover() {
+                    Takeover::EndpointEnv(key) => key,
+                    Takeover::HostRedirect => "",
+                },
+            )
+            .output()
+            .expect("node 应能跑起来");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "node 退出非零：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some((port, String::from_utf8_lossy(&out.stdout).to_string()))
+    }
+
+    /// 国际版注入段的真实行为：族内改到本机（**SNI 保留**）、族外一个字段不碰。
+    #[test]
+    fn the_global_injection_actually_rewrites_connections() {
+        let Some((port, out)) = observe_injection_with_node(Region::Global) else {
+            return;
+        };
+        let cases = [
+            // 族内：目标与端口都改到本机，servername 原样留给反代选上游；
+            // 落地在回环上，CA 注入跟着生效（否则客户端认不出自签证书）
+            ("family-sh", format!("QA family-sh host=127.0.0.1 hostname=127.0.0.1 port={port} servername=api3.qoder.sh ca=yes reject=false")),
+            ("family-cn", format!("QA family-cn host=127.0.0.1 hostname=127.0.0.1 port={port} servername=api6.qoder.com.cn ca=yes reject=false")),
+            // 只给 hostname 的调用形态：两条都要认（Node 的不同路径读的是其中一个）
+            ("hostname-form", format!("QA hostname-form host=127.0.0.1 hostname=127.0.0.1 port={port} servername=api2.qoder.sh ca=yes reject=false")),
+            // httpdns 的 resolved-ip 形态：host 已是解析出的 IP，域名只在 servername 里。
+            // 这类连接必须照样改写，且 servername 原样保留给反代选上游 ——
+            // 之前只测 host，整个对话流量都从这里漏出去
+            ("resolved-ip", format!("QA resolved-ip host=127.0.0.1 hostname=127.0.0.1 port={port} servername=api3.qoder.sh ca=yes reject=false")),
+            // 反向：host 是 IP、servername 族外 —— 一个字段都不能动
+            // （`127.0.0.2` 在回环网段内，即使真的发起连接也是瞬时拒绝，不出网）
+            ("resolved-ip-foreign-sni", "QA resolved-ip-foreign-sni host=127.0.0.2 hostname=undefined port=443 servername=example.com ca=no reject=undefined".into()),
+            // 族外（业务面）：一个字段都不能动 —— 改写一旦漏出去就是「账号页也走反代」
+            ("foreign-center", "QA foreign-center host=center.qoder.sh hostname=undefined port=443 servername=undefined ca=no reject=undefined".into()),
+            ("foreign-openapi", "QA foreign-openapi host=openapi.qoder.sh hostname=undefined port=443 servername=undefined ca=no reject=undefined".into()),
+            // 后缀攻击：`api3.qoder.sh.evil.com` 不在族内（族规则是整串锚定的）
+            ("suffix-attack", "QA suffix-attack host=api3.qoder.sh.evil.com hostname=undefined port=443 servername=undefined ca=no reject=undefined".into()),
+            // 「先在结尾凑出合法后缀」也不在族内：标签里不允许有点。这一例与
+            // `region::is_model_gateway_host` 的同一例配对 —— 两侧判定必须一致
+            ("double-tail", "QA double-tail host=api3.qoder.sh.qoder.sh hostname=undefined port=443 servername=undefined ca=no reject=undefined".into()),
+            // 回环直连（反代自己再连、或客户端本来就写 127.0.0.1 的调用）
+            ("loopback", format!("QA loopback host=127.0.0.1 hostname=undefined port={port} servername=undefined ca=yes reject=false")),
+            ("localhost", format!("QA localhost host=localhost hostname=undefined port={port} servername=undefined ca=yes reject=false")),
+        ];
+        for (label, want) in cases {
+            assert_eq!(qa_line(&out, label), want, "node 实际观测：\n{out}");
+        }
+    }
+
+    /// 国内版注入段的真实行为：写 env 键、**不碰**连接目标、回环照样注 CA。
+    #[test]
+    fn the_cn_injection_actually_sets_the_endpoint_key() {
+        let Some((port, out)) = observe_injection_with_node(Region::Cn) else {
+            return;
+        };
+        assert_eq!(
+            qa_line(&out, "env-key"),
+            format!("QA env-key value=https://127.0.0.1:{port}"),
+            "node 实际观测：\n{out}"
+        );
+        // 国内版靠 env 键让客户端自己连回环，去改 TLS 目标只是多一份没用的注入面
+        assert_eq!(
+            qa_line(&out, "family-sh"),
+            "QA family-sh host=api3.qoder.sh hostname=undefined port=443 servername=undefined ca=no reject=undefined",
+            "node 实际观测：\n{out}"
+        );
+        // 国内版不改 TLS：resolved-ip 形态（host=IP、servername=域名）同样一个字段都不碰
+        assert_eq!(
+            qa_line(&out, "resolved-ip"),
+            "QA resolved-ip host=8.212.20.107 hostname=undefined port=443 servername=api3.qoder.sh ca=no reject=undefined",
+            "node 实际观测：\n{out}"
+        );
+        assert_eq!(
+            qa_line(&out, "loopback"),
+            format!("QA loopback host=127.0.0.1 hostname=undefined port={port} servername=undefined ca=yes reject=false"),
+            "node 实际观测：\n{out}"
+        );
     }
 
     // ── 真机探针（默认 ignored：依赖这台机器上真的装了客户端） ─────────────

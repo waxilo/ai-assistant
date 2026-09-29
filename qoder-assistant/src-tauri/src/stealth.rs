@@ -14,8 +14,9 @@
 //! 两套部署各有自己的客户端与 SDK 目录，所以本模块的**每一个入口都必须带区域**：
 //! 装错那一份的后果不是报错，而是「界面显示接管已开启、实际一个请求都没被接管」。
 //! 租约也把区域记下来 —— 卸载 / 清扫时手里只有租约，而「该动哪一份产物」正是它决定的。
-//! 国际版目前**不支持**端点覆盖（[`Region::endpoint_env_key`] 对它返回 `None`，
-//! [`install`] 直接报错而不是静默空转）。
+//! 两个区域都支持，但**引流的落点不同**：国内版写 env 键（客户端自己换端点）、
+//! 国际版改 TLS 连接目标（见 [`Region::takeover`]）—— 注入段由 [`crate::patch`]
+//! 按区域各自渲染，本模块只负责装卸与租约。
 //!
 //! # 能装不是本事，「保证一定能卸」才是
 //!
@@ -34,7 +35,7 @@
 //! 这样「一键恢复」清掉的是真残留，不会把正在工作的接管误伤掉。
 //! 它同样是**逐区域**问的：两个区域各可能留一份，一个是工作中的、另一个是残留。
 
-use crate::region::Region;
+use crate::region::{Region, Takeover};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -425,8 +426,10 @@ pub fn current_endpoint(region: Region) -> Option<String> {
 /// 见 [`crate::patch::install_everywhere`]），并落下租约。
 ///
 /// 幂等：已装着、且区域与端口都一致 → 只续一次心跳，不重复写 33MB 的产物文件。
-/// 但**每次都复查一遍注入是否还在**：官方更新会把整个文件换掉，那样注入就没了，
-/// 而心跳（每 5s）正是发现这件事最自然的时机 —— 复查只读文件头 4KB。
+/// 但**每次都复查一遍注入是否还在、是不是这一版**：官方更新会把整个文件换掉，
+/// 而本应用的构建改了注入段代码（url/CA 不变）时盘上那份也已过时 ——
+/// 判据是文件头标记里的注入体指纹（`js=`），心跳（每 5s）正是发现这两件事
+/// 最自然的时机，复查只读文件头 4KB。换新构建后无需手动关开接管。
 ///
 /// 区域不一致时**先按旧租约卸干净**再装新的：换区域等于换一个客户端接管，
 /// 旧客户端上的注入必须一起摘掉，否则它会一直指向本机端口，而我们已不为它服务。
@@ -435,12 +438,6 @@ pub fn current_endpoint(region: Region) -> Option<String> {
 /// 认得出它。证书随注入一起写进产物，见 [`crate::patch`]。
 pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Result<(), String> {
     let url = url_for_port(port);
-    if region.endpoint_env_key().is_none() {
-        return Err(format!(
-            "{}的端点覆盖尚未支持（该区域的客户端不读这个键），已跳过。",
-            region.label()
-        ));
-    }
     if crate::patch::worker_paths(region).is_empty() {
         return Err(format!(
             "找不到{}客户端的 worker 产物，无法接管：请确认官方客户端已安装在 {}。",
@@ -514,16 +511,22 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
             region.label()
         ),
     );
-    // 落点路径 / env 键名 / 端点值只在排查时有用，端到界面上既占地方又答非所问 ——
+    // 落点路径 / 引流方式 / 端点值只在排查时有用，端到界面上既占地方又答非所问 ——
     // 它们进调试日志。上面那条 reset 刚清过文件，所以这是新一轮的第一条细节。
+    let how = match region.takeover() {
+        Takeover::EndpointEnv(key) => format!("env.{key}={url}"),
+        Takeover::HostRedirect => format!(
+            "{url}：把模型网关族（api*.qoder.sh / api*.qoder.com.cn）的连接目标改写过去、\
+             保留 SNI 供反代选上游"
+        ),
+    };
     debug_append(
         data_dir,
         "install_target",
         &format!(
-            "端点已注入 {} 份产物副本：{}（env.{}={url}），并注入了本机 CA 以信任本地 TLS",
+            "端点已注入 {} 份产物副本：{}（{how}），并注入了本机 CA 以信任本地 TLS",
             installed.len(),
-            joined_paths(&installed),
-            region.endpoint_env_key().unwrap_or("")
+            joined_paths(&installed)
         ),
     );
     Ok(())
@@ -685,9 +688,7 @@ pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
             format!("注入还在 {target}，但心跳已停 —— 本应用的反代可能已退出，请点「停止接管」清理。")
         }
         (true, false, _) => {
-            if region.endpoint_env_key().is_none() {
-                format!("{label}的端点覆盖尚未支持：该区域客户端不读这个键。切到国内版再开启接管。")
-            } else if let Some(err) = lease
+            if let Some(err) = lease
                 .as_ref()
                 .filter(|l| l.region == region)
                 .and_then(|l| l.last_error.as_deref())
@@ -1049,18 +1050,25 @@ mod tests {
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }
 
-    /// 国际版没有可用的端点键：必须明确拒绝，而不是写一段没人读的注入
-    /// （那正是这块历史踩过的坑：写成功、显示已开启、请求全直连官方）
+    /// 国际版**不再被拒**：没有可读的 env 键，但注入段改的是 TLS 连接目标
+    /// （见 [`Region::takeover`]）—— 所以它必须真的改到文件，而不是写一段没人读的注入
+    /// （写成功、显示已开启、请求全直连官方，正是这块历史踩过的坑）。
     #[test]
-    fn global_region_is_refused_instead_of_silently_injected() {
+    fn global_region_is_injected_through_the_redirect_path() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            let err = install(Region::Global, &data, default_port(&data), CA).unwrap_err();
-            assert!(err.contains("尚未支持"), "{err}");
+            install(Region::Global, &data, default_port(&data), CA).unwrap();
+            let injected = fs::read_to_string(official_file(&sdk, Region::Global)).unwrap();
+            assert_ne!(injected, OFFICIAL, "国际版的产物必须被真的改到");
+            assert!(injected.contains("__qaGw"), "走的是 TLS 目标重定向那条路：{injected:.200}");
+            assert!(
+                !injected.contains("process.env["),
+                "国际版构建里那个 env 键恒不生效，不许写"
+            );
             assert_eq!(
-                fs::read_to_string(official_file(&sdk, Region::Global)).unwrap(),
+                fs::read_to_string(official_file(&sdk, Region::Cn)).unwrap(),
                 OFFICIAL,
-                "失败不能改文件"
+                "装国际版不能顺手动国内版那份"
             );
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
@@ -1173,10 +1181,13 @@ mod tests {
             let off = status(Region::Cn, &data);
             assert!(!off.installed, "{}", off.note);
 
-            // 国际版：如实说「不支持」，而不是给一个永远不生效的开关
+            // 国际版也走同一套状态：装上就如实说「生效中」，落点也是它自己那份产物
+            install(Region::Global, &data, default_port(&data), CA).unwrap();
             let g = status(Region::Global, &data);
-            assert!(!g.installed);
-            assert!(g.note.contains("尚未支持"), "{}", g.note);
+            assert!(g.installed && g.alive && g.region == Region::Global);
+            assert!(g.note.contains("生效中"), "{}", g.note);
+            // 换区域接管是**搬家**：装国际版时国内版那份注入要被摘掉（见 install 的区域切换）
+            assert!(!status(Region::Cn, &data).installed);
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }

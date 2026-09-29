@@ -104,7 +104,8 @@ pub struct Account {
     //   ① **只写不读** —— 转发实际读的是 `settings.default_base_url`（见 `proxy.rs`），
     //      这个字段除了导入时被写一次之外没有任何消费方；
     //   ② **写进去的值还是错的** —— 登录新账号那条路把它写成授权域（`qoder.com`，登录页），
-    //      而转发目标是模型网关（`api2-v2.qoder.sh`）。一个既没人读、内容又不对的字段，
+    //      而转发目标是模型网关（国际版 `api2.qoder.sh`、国内版 `gateway.qoder.com.cn`）。
+    //      一个既没人读、内容又不对的字段，
     //      留着只会让人以为「账号可以各自配端点」。
     // Qoder 只有一套域，唯一可改的那一处是 `Settings::default_base_url`（带迁移）。
     #[serde(default)]
