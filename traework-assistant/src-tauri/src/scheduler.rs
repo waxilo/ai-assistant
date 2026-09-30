@@ -162,7 +162,7 @@ pub fn spawn(app: tauri::AppHandle) {
 fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
     let settings = accounts::load_settings(dir);
     // 绑了凭证池：先整池同步一轮再读账号，闸带回来的才是最新凭证（本地可能已被别的机器换掉）
-    tauri::async_runtime::block_on(crate::commands::sync_pool_if_bound(dir));
+    tauri::async_runtime::block_on(crate::commands::sync_pool_if_bound(dir, true));
     // 账号列表里已无「启用」概念：所有账号一律参与定时签到。
     let mut pending: Vec<Account> = accounts::load_accounts(dir);
     if pending.is_empty() {

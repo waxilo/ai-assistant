@@ -732,7 +732,7 @@ async fn choose_account(
 ) -> Option<accounts::Account> {
     let settings = accounts::load_settings(dir);
     // 绑了凭证池：先整池同步一轮再读账号，闸带回来的才是最新凭证（本地可能已被别的机器换掉）
-    crate::commands::sync_pool_if_bound(dir).await;
+    crate::commands::sync_pool_if_bound(dir, false).await;
     let mut all = accounts::load_accounts(dir);
     if all.is_empty() {
         return None;

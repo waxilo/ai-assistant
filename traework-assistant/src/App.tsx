@@ -169,7 +169,22 @@ export default function App() {
     [confirmReq]
   );
 
-  /** 拉取每个账号的签到状态与积分（每个账号一次请求，属于重活，故只在必要时调用） */
+  /** 重拉凭证池绑定状态（上传 / 绑定 / 解绑 / 同步后都调用，让那一栏跟上后端） */
+  const refreshBroker = useCallback(async () => {
+    try {
+      setBrokerStatus(await brokerState());
+    } catch {
+      /* 状态拉取失败不打扰用户：下一次动作会再拉 */
+    }
+  }, []);
+
+  /**
+   * 拉取每个账号的签到状态与积分（每个账号一次请求，属于重活，故只在必要时调用）。
+   *
+   * 后端这一趟会顺带做「整池同步 + 按需续签」（见 `commands::checkin_status`），
+   * 所以结束时要重拉凭证池状态 —— 否则「上次同步 / 出错」那行横幅停在旧值上，
+   * 用户点了刷新却看不到它到底去没去云端。
+   */
   const refreshStatus = useCallback(async () => {
     setStatusText("查询中…");
     try {
@@ -179,7 +194,8 @@ export default function App() {
     } catch (e) {
       setStatusText("查询失败: " + e);
     }
-  }, []);
+    void refreshBroker();
+  }, [refreshBroker]);
 
   const reloadAccounts = useCallback(async () => setAccounts(await listAccounts()), []);
 
@@ -352,15 +368,6 @@ export default function App() {
     },
     [refreshStatus]
   );
-
-  /** 重拉凭证池绑定状态（上传 / 绑定 / 解绑 / 同步后都调用，让那一栏跟上后端） */
-  const refreshBroker = useCallback(async () => {
-    try {
-      setBrokerStatus(await brokerState());
-    } catch {
-      /* 状态拉取失败不打扰用户：下一次动作会再拉 */
-    }
-  }, []);
 
   /**
    * 把本机这一批账号整体上传到凭证管家：管家颁发一串 uuid 并当场绑定。

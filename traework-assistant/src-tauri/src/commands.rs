@@ -33,14 +33,29 @@ fn settings(app: &tauri::AppHandle) -> Settings {
 /// 而闸带回来的才是最新凭证（本地那份可能早被别的机器换掉了）。
 /// 先读后同步 = 整轮都在用已作废的 token，症状是「绑定之后签到反而全失败」。
 ///
-/// 未绑定、距上次同步不到两分钟、闸在别的机器手里，都是**常态**，静默返回；
-/// 真出错也只写进 `broker::status().error`。它挂在签到 / 刷新 / 接管路由这些主流程上，
-/// 不该因为管家不可达就把主流程拦住 —— 本地凭证本来就还能用。
-pub(crate) async fn sync_pool_if_bound(dir: &Path) {
+/// `force = true` 给**用户主动的动作**（刷新状态 / 签到 / 补资料 / 定时签到）：
+/// 绕过两分钟节流，并把结果落进签到日志 —— 旧写法把结果 `let _ =` 吞了，
+/// 「刷新了但根本没去云端拿」就成了查无实据的沉默症状（2026-09-30 实测：
+/// 打开账号页的 checkin_status 先吃掉同步配额，紧接着点签到被节流跳过，
+/// 本地拿着过期票报鉴权失败，界面上一个字都没有）。
+/// `force = false` 是反代热路径：照旧静默 —— 未绑定、被节流、闸在别的机器手里
+/// 都是常态，真出错也只进 `broker::status().error`，不该拦住主流程。
+pub(crate) async fn sync_pool_if_bound(dir: &Path, force: bool) {
     if !broker::bound() {
         return;
     }
-    let _ = broker::sync(dir, false).await;
+    match broker::sync(dir, force).await {
+        Ok(report) => {
+            if force {
+                crate::logs::push("凭证池", true, format!("整池同步：{}", report.message));
+            }
+        }
+        Err(e) => {
+            if force {
+                crate::logs::push("凭证池", false, format!("整池同步失败：{e}"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -59,7 +74,7 @@ pub fn list_accounts(app: tauri::AppHandle) -> Result<Vec<Account>, String> {
 #[tauri::command]
 pub async fn refresh_account_profiles(app: tauri::AppHandle) -> Result<Vec<Account>, String> {
     let dir = try_data_dir(&app)?;
-    sync_pool_if_bound(&dir).await;
+    sync_pool_if_bound(&dir, true).await;
     Ok(crate::profile::sync_profiles(&dir).await)
 }
 
@@ -115,7 +130,7 @@ pub fn discover_local(app: tauri::AppHandle) -> Result<Vec<Account>, String> {
 #[tauri::command]
 pub async fn checkin_one(app: tauri::AppHandle, id: String) -> Result<checkin::CheckinResult, String> {
     let dir = try_data_dir(&app)?;
-    sync_pool_if_bound(&dir).await;
+    sync_pool_if_bound(&dir, true).await;
     let list = accounts::load_accounts(&dir);
     let mut account = list
         .into_iter()
@@ -133,7 +148,7 @@ pub async fn checkin_one(app: tauri::AppHandle, id: String) -> Result<checkin::C
 #[tauri::command]
 pub async fn checkin_all(app: tauri::AppHandle) -> Result<Vec<checkin::CheckinResult>, String> {
     let dir = try_data_dir(&app)?;
-    sync_pool_if_bound(&dir).await;
+    sync_pool_if_bound(&dir, true).await;
     let list = accounts::load_accounts(&dir);
     let mut results = Vec::new();
     for mut account in list {
@@ -157,12 +172,17 @@ pub async fn checkin_all(app: tauri::AppHandle) -> Result<Vec<checkin::CheckinRe
 #[tauri::command]
 pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<checkin::AccountStatus>, String> {
     let dir = try_data_dir(&app)?;
-    sync_pool_if_bound(&dir).await;
+    sync_pool_if_bound(&dir, true).await;
     let mut list = accounts::load_accounts(&dir);
     let mut out = Vec::new();
     let mut dirty = false;
     let client = reqwest::Client::new();
     for account in list.iter_mut() {
+        // ⓪ 未绑池时这是「刷新」唯一一次取新票的机会（绑了池的由上面的整池同步去做）。
+        //    窗口外 / 冷却中 / 绑池都会静默返回 None，不会多打接口。
+        if let Some(rn) = crate::renew::renew_if_needed(&dir, account).await {
+            crate::logs::push(&account.name, rn.renewed, format!("续签：{}", rn.message));
+        }
         // ① 今日是否已签到（签到状态接口）
         let status = checkin::query_status(account).await;
         // ② 账号已有积分（entitlement 用量接口）；拉到就落盘，供界面展示与接管选号
