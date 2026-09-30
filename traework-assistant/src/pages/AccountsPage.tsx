@@ -16,6 +16,7 @@ import {
   IconTrash,
   IconCloud,
   IconUpload,
+  IconSwap,
   IconLink,
   IconUnlink,
   IconList,
@@ -47,6 +48,8 @@ interface Props {
   onBrokerUpload: () => void;
   onBrokerLink: () => void;
   onBrokerUnbind: () => void;
+  /** 手动双向同步：本机新票/新账号推上去，云端新票/新账号拉下来 */
+  onBrokerSync: () => void;
 }
 
 /** 毫秒时间戳 → 人话的「多久之前」。 */
@@ -103,6 +106,7 @@ function PoolBar({
   onUpload,
   onLink,
   onUnbind,
+  onSync,
 }: {
   status: BrokerStatus | null;
   accountCount: number;
@@ -110,6 +114,7 @@ function PoolBar({
   onUpload: () => void;
   onLink: () => void;
   onUnbind: () => void;
+  onSync: () => void;
 }) {
   const uuid = status?.uuid ?? null;
   const bound = Boolean(status?.bound && uuid);
@@ -139,6 +144,15 @@ function PoolBar({
         {bound && uuid ? (
           <>
             <CopyChip uuid={uuid} />
+            <button
+              className="btn small"
+              disabled={busy}
+              onClick={onSync}
+              title="双向同步一轮：云端更新的票与账号拉到本机，本机更新的票与账号回写云端（绕过两分钟节流；闸在别的机器手里会跳过）"
+            >
+              <IconSwap size={13} />
+              同步
+            </button>
             <button
               className="btn small danger"
               disabled={busy}
@@ -286,6 +300,7 @@ function AccountsPage({
   onBrokerUpload,
   onBrokerLink,
   onBrokerUnbind,
+  onBrokerSync,
 }: Props) {
   // 资源包列表弹窗：记录当前打开的是哪个账号；null = 未打开
   const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
@@ -325,6 +340,7 @@ function AccountsPage({
       onUpload={onBrokerUpload}
       onLink={onBrokerLink}
       onUnbind={onBrokerUnbind}
+      onSync={onBrokerSync}
     />
   );
 

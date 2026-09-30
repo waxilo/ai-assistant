@@ -117,6 +117,7 @@ pub fn run() {
             commands::broker_link,
             commands::broker_unbind,
             commands::broker_state,
+            commands::broker_sync_now,
             commands::get_settings,
             // 区域清单（国际版 / 国内版）：界面下拉的唯一来源
             commands::regions,

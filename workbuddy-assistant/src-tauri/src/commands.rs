@@ -707,6 +707,23 @@ pub fn broker_state() -> broker::BrokerStatus {
     broker::status()
 }
 
+/// 手动跑一轮**双向**整池同步：云端新票 / 新账号拉到本机，本机新票 / 新账号回写云端
+/// （`broker::sync` 的 `force = true` 通道，绕过两分钟节流）。
+///
+/// 为什么要这个按钮：自动那轮只在**抢到闸**时跑，而闸可能长时间在别的机器手里
+/// —— 本机刚重新登录拿到新票却推不上去，别的机器就一直领过期票，反之亦然。
+/// 未绑定直接报错：用户点了就是想知道为什么没动，这里没有「静默跳过」的余地。
+#[tauri::command]
+pub async fn broker_sync_now(app: AppHandle) -> Result<broker::SyncReport, String> {
+    let dir = data_dir(&app);
+    if !broker::bound() {
+        return Err("本机未绑定云端凭证池 —— 先「上传本机账号」或「绑定云端凭证池」".into());
+    }
+    let report = broker::sync(&dir, true).await?;
+    crate::scheduler::log_event(&dir, &format!("手动整池同步：{}", report.message));
+    Ok(report)
+}
+
 /// 首选通道：直接读本机 WorkBuddy 写在磁盘上的登录信息文件（auth/*.info）。
 ///
 /// 不需要应用处于运行状态、不需要调试端口，且一次就能拿到 token + 昵称 + 手机号。

@@ -377,13 +377,7 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
         // 空 / 纯空白 token 一律忽略：采纳它等于把账号弄成登录不上
         return false;
     }
-    let newer = match (item_expiry(item), crate::renew::expiry_ms(account)) {
-        (Some(p), Some(l)) => p > l,
-        (Some(_), None) => true,
-        // 本地知道到期、池里那条不知道：不动本地（不知道 ≠ 更晚）
-        (None, Some(_)) => false,
-        (None, None) => crate::renew::newer_by_iat(&item.access_token, &account.token),
-    };
+    let newer = cloud_is_newer(item, account);
     if !newer {
         let mut touched = false;
         if account.refresh_token.is_none() && !item.refresh_token.trim().is_empty() {
@@ -450,6 +444,31 @@ pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
         }
     }
     changed
+}
+
+/// 池里那一条是否**严格新于**本机这一条 —— [`adopt`] 用的判据（云端 → 本地方向）。
+///
+/// 两个方向都只走 [`crate::renew::ticket_is_newer`] 这一套新序判据：各写一套就会出现
+/// 「A 看 B 更新、B 看 A 也更新」，两台机器每轮同步都改一次整池版本、永不收敛。
+fn cloud_is_newer(item: &PoolItem, account: &Account) -> bool {
+    crate::renew::ticket_is_newer(
+        item_expiry(item),
+        &item.access_token,
+        crate::renew::expiry_ms(account),
+        &account.token,
+    )
+}
+
+/// 本机的票是否**严格新于**池里那一份 —— [`cloud_is_newer`] 的反方向，供本地 → 云端回写用。
+///
+/// 来历不明（两侧到期都读不出、又不是可比 JWT）的一律不许覆盖云端。
+fn local_is_newer(account: &Account, item: &PoolItem) -> bool {
+    crate::renew::ticket_is_newer(
+        crate::renew::expiry_ms(account),
+        &account.token,
+        item_expiry(item),
+        &item.access_token,
+    )
 }
 
 /// 提交给管家的整池内容 = **云端那份 ∪ 本机账号**。
@@ -521,7 +540,7 @@ fn actor() -> String {
                     }
                 }
             }
-            if let Ok(o) = std::process::Command::new("hostname").output() {
+            if let Ok(o) = crate::proc::cmd("hostname").output() {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if !s.is_empty() {
                     return s;
@@ -922,6 +941,26 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         });
     }
 
+    // ④ 本地 → 云端方向：把**本机比池里更新**的票回写进池。上面 ⓐ/ⓑ 只回写「本轮签出来的」，
+    //    这一步兜住「早就换过新票、但从没被传上去」的 —— 最典型：绑池期间在本机重新登录了一次
+    //    （accounts.json 里已是新票，云端还停在旧票，别的机器每轮拿到的都是过期票）。
+    //    判据与 `adopt` 镜像（[`local_is_newer`]）：只有严格更新才回写，来历不明的不许覆盖云端。
+    let mut uploaded = 0usize;
+    for acct in accounts.iter() {
+        let key = item_key_of(acct);
+        if key.trim().is_empty() {
+            continue;
+        }
+        let newer = pool
+            .iter()
+            .find(|i| i.key.trim() == key)
+            .is_some_and(|item| local_is_newer(acct, item));
+        if newer {
+            write_back(&mut pool, acct);
+            uploaded += 1;
+        }
+    }
+
     // 提交整池：CAS 由服务端做（`version = ? AND lease_owner = ?`），新版本号就在响应里。
     // **不要再补一次 GET 去问版本** —— 那是热路径上白打的一趟接口。
     let next_version = match request(
@@ -948,8 +987,13 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     };
     note_ok(next_version);
 
+    let upload_note = if uploaded > 0 {
+        format!("，回写 {uploaded} 个更新的本地票")
+    } else {
+        String::new()
+    };
     Ok(SyncReport {
-        changed: merged > 0 || refreshed > 0,
+        changed: merged > 0 || refreshed > 0 || uploaded > 0,
         deferred: false,
         merged,
         refreshed,
@@ -957,9 +1001,9 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         blocked,
         version: next_version,
         message: if blocked > 0 {
-            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）；另有 {blocked} 个签不动，靠桌面端自续或重新登录")
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}）；另有 {blocked} 个签不动，靠桌面端自续或重新登录")
         } else {
-            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）")
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}）")
         },
     })
 }
@@ -1395,5 +1439,82 @@ mod tests {
     fn only_real_failures_pause_the_pool() {
         assert_eq!(fail_kind(true), FailKindOut::Blocked);
         assert_eq!(fail_kind(false), FailKindOut::Transient);
+    }
+
+    // ── 本地 → 云端方向（[`local_is_newer`]，`adopt` 的镜像判据）──────────
+
+    #[test]
+    fn uploads_only_a_strictly_newer_local_ticket() {
+        let mut a = acct("n", Some("138"), "new");
+        a.expires_at = Some(T + 1_000);
+        assert!(local_is_newer(&a, &item("138", "old", Some(T))));
+
+        // 反向：本机更旧绝不能盖云端 —— 那等于把别的机器刚签好的凭证作废，
+        // 两台机器来回盖就是同步永不收敛。
+        a.expires_at = Some(T - 1_000);
+        assert!(!local_is_newer(&a, &item("138", "cloud", Some(T))));
+        // 同一到期时间也不算更新（严格大于），避免两边互相认为对方该被覆盖
+        a.expires_at = Some(T);
+        assert!(!local_is_newer(&a, &item("138", "cloud", Some(T))));
+    }
+
+    /// 单侧读不出到期时间：读得出的算新（与 `adopt` 同一条规则的方向版本）。
+    #[test]
+    fn a_readable_local_expiry_beats_a_pool_entry_with_no_expiry() {
+        let mut a = acct("n", Some("138"), "local");
+        a.expires_at = Some(T);
+        assert!(local_is_newer(&a, &item("138", "cloud", None)));
+        // 反过来「不知道」不等于「更旧」：本机读不出到期就不许盖云端
+        a.expires_at = None;
+        assert!(!local_is_newer(&a, &item("138", "cloud-opaque", None)));
+    }
+
+    /// 两侧 `expires_at` 都空时按票里的 `exp` 判 —— 与 2026-09-28 那条回归同一条病因，
+    /// 只是方向反过来：那时是本机抱着过期票，这里是本机有更新票而云端停在旧票，
+    /// 判不出来就会整池停在过期凭证上。
+    #[test]
+    fn uploads_by_jwt_expiry_when_both_expiry_fields_are_empty() {
+        let a = acct("n", Some("138"), &jwt(3_000, 4_000));
+        assert!(local_is_newer(&a, &item("138", &jwt(1_000, 2_000), None)));
+        assert!(!local_is_newer(&a, &item("138", &jwt(5_000, 6_000), None)));
+    }
+
+    /// 不透明票 + 无到期字段：只「长得不一样」不构成回写的理由。
+    #[test]
+    fn opaque_local_ticket_never_overwrites_the_pool() {
+        let a = acct("n", Some("138"), "local-opaque");
+        assert!(!local_is_newer(&a, &item("138", "cloud-opaque", None)));
+    }
+
+    /// 两个方向必须**互斥**：同一对凭证不能既「该采纳云端」又「该回写云端」，
+    /// 否则两台机器每轮同步都会改一次整池版本，永远收敛不了。
+    #[test]
+    fn the_two_directions_never_both_claim_to_be_newer() {
+        let cases: [(Account, PoolItem); 5] = [
+            (acct("a", Some("1"), "opaque"), item("1", "other", None)),
+            ({
+                let mut a = acct("b", Some("2"), "x");
+                a.expires_at = Some(T);
+                a
+            }, item("2", "y", Some(T + 1))),
+            ({
+                let mut a = acct("c", Some("3"), "x");
+                a.expires_at = Some(T + 1);
+                a
+            }, item("3", "y", Some(T))),
+            (acct("d", Some("4"), &jwt(1_000, 2_000)), item("4", &jwt(3_000, 4_000), None)),
+            (acct("e", Some("5"), &jwt(3_000, 4_000)), item("5", &jwt(1_000, 2_000), None)),
+        ];
+        for (a, cloud) in &cases {
+            // 用的是两条方向判据本身，不是 `adopt` 的返回值（它还会因为「补上空字段」
+            // 返回 true，那不是覆盖，不构成收敛问题）。
+            let to_local = cloud_is_newer(cloud, a);
+            let to_pool = local_is_newer(a, cloud);
+            assert!(
+                !(to_local && to_pool),
+                "「{}」两侧同时认定对方该被覆盖，同步会永不收敛",
+                a.name
+            );
+        }
     }
 }

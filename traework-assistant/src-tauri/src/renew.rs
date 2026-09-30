@@ -190,6 +190,29 @@ pub fn newer_by_iat(candidate: &str, current: &str) -> bool {
     matches!((iat(candidate), iat(current)), (Some(c), Some(cur)) if c > cur)
 }
 
+/// 「谁的票更新」的**唯一**判据：候选（到期时间, token）是否新于在用的那一份。
+///
+/// 两个方向必须共用它 —— 云端 → 本地的采纳（`broker::adopt`）和本地 → 云端的回写
+/// （`broker::local_is_newer`）一旦各写一套，就会出现「A 看 B 更新、B 看 A 也更新」，
+/// 两台机器每轮同步都改一次整池版本，永远收敛不了。
+///
+/// 规则：先比到期时间（都读得出时晚到期者胜）；一侧读不出，读得出的算新
+/// （**「不知道」不等于「更旧」**）；两侧都读不出时，必须是两张都读得出 `iat` 的 JWT
+/// 且候选签发更晚 —— 不透明 token「长得不一样」不构成更新的理由，来历不明的不许赢。
+pub fn ticket_is_newer(
+    cand_expiry: Option<i64>,
+    cand_token: &str,
+    cur_expiry: Option<i64>,
+    cur_token: &str,
+) -> bool {
+    match (cand_expiry, cur_expiry) {
+        (Some(c), Some(cur)) => c > cur,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => newer_by_iat(cand_token, cur_token),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 失败冷却
 // ---------------------------------------------------------------------------

@@ -1304,6 +1304,28 @@ pub fn broker_state(app: AppHandle) -> broker::BrokerStatus {
     broker::status(accounts::load_settings(&dir).takeover_region)
 }
 
+/// 手动跑一轮**双向**整池同步（当前区域）：云端新票 / 新账号拉到本机，
+/// 本机新票 / 新账号回写云端（`broker::sync` 的 `force = true` 通道，绕过两分钟节流）。
+///
+/// 为什么要这个按钮：自动那轮只在**抢到闸**时跑，而闸可能长时间在别的机器手里
+/// —— 本机刚重新登录拿到新票却推不上去，别的机器就一直领过期票，反之亦然。
+/// 未绑定该区域直接报错（`deferred` 那条「本区域未绑定」是给热路径用的，
+/// 用户主动点了就该拿到明确答复）；区域取当前选中的区域，与其余四个命令同源。
+#[tauri::command]
+pub async fn broker_sync_now(app: AppHandle) -> Result<broker::SyncReport, String> {
+    let dir = data_dir(&app);
+    let region = accounts::load_settings(&dir).takeover_region;
+    if !broker::bound_in(region) {
+        return Err(format!(
+            "{} 未绑定云端凭证池 —— 先「上传本机账号」或「绑定云端凭证池」",
+            region.label()
+        ));
+    }
+    let report = broker::sync(&dir, true, region).await?;
+    crate::scheduler::log_event(&dir, &format!("手动整池同步：{}", report.message));
+    Ok(report)
+}
+
 /// 首选通道：直接读本机 Qoder 写在磁盘上的凭据文件（`auth.v1.dat`，OSCrypt 加密）。
 ///
 /// 不需要应用处于运行状态、不需要调试端口，且一次就能拿到 token + 昵称 + 手机号。
@@ -1357,7 +1379,7 @@ pub fn open_app_management() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         const PANE: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AppBundles";
-        std::process::Command::new("open")
+        crate::proc::cmd("open")
             .arg(PANE)
             .spawn()
             .map(|_| ())

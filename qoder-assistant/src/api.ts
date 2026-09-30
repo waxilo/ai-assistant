@@ -11,6 +11,7 @@ import type {
   ImportReport,
   BrokerStatus,
   PoolOp,
+  SyncReport,
   NetReport,
   NetRestoreReport,
   StealthStatus,
@@ -82,9 +83,10 @@ export const openExternal = (url: string) =>
  */
 export const openAppManagement = () => invoke<void>("open_app_management");
 
-// ── 凭证池：四个命令都是**池级**的，都不带账号 id ──────────────────────────
+// ── 凭证池：五个命令都是**池级**的，都不带账号 id ──────────────────────────
 //
 // 一池一个 uuid、池内一把闸，所以这里的动作作用范围是「整台机器」。
+// **每个区域各绑一池**：区域由后端从 `settings.takeover_region` 取，前端不传参数。
 // 续签仍在本机执行：管家只负责存取与发闸（见 src-tauri/src/broker.rs）。
 
 /** 把本机这一批账号整体上传，管家颁发 uuid 并当场绑定 */
@@ -98,6 +100,12 @@ export const brokerUnbind = () => invoke<BrokerStatus>("broker_unbind");
 
 /** 只读状态（绑没绑 / uuid / 版本 / 上次同步）。无副作用，可随时轮询 */
 export const brokerState = () => invoke<BrokerStatus>("broker_state");
+
+/**
+ * 手动跑一轮**双向**整池同步（作用域是当前区域，绕过两分钟节流）：
+ * 云端新票 / 新账号 → 本机，本机新票 / 新账号 → 云端。该区域未绑定时后端直接报错。
+ */
+export const brokerSyncNow = () => invoke<SyncReport>("broker_sync_now");
 
 export const getSettings = () => invoke<Settings>("get_settings");
 

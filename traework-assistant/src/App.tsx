@@ -14,6 +14,7 @@ import {
   brokerUpload,
   brokerLink,
   brokerUnbind,
+  brokerSyncNow,
   BRIEFING_SEALED_EVENT,
 } from "./api";
 import type { AcctStatus, Account, BrokerStatus, Page, Settings } from "./types";
@@ -450,6 +451,31 @@ export default function App() {
     }
   }, [askConfirm, brokerStatus?.uuid, reloadAccounts, showToast]);
 
+  /**
+   * 手动双向同步一轮：云端更新的票/账号拉到本机，本机更新的票/账号回写云端。
+   *
+   * 为什么要有这个按钮：自动那轮只在**抢到闸**时跑，而闸可能长时间在别的机器手里，
+   * 加上两分钟节流 —— 本机刚重新登录拿到新票却推不上去，别的机器就一直领过期票，
+   * 反过来也一样。点一下就是「现在就把两侧对齐」，结果原话 toast 出来。
+   */
+  const runBrokerSync = useCallback(async () => {
+    setBrokerBusy(true);
+    try {
+      const rep = await brokerSyncNow();
+      showToast({
+        // 被跳过（闸在别的机器手里 / 池在冷静期）不是错，但也不能报成同步好了
+        kind: rep.failed > 0 ? "err" : rep.deferred ? "info" : "ok",
+        text: rep.message,
+      });
+      await reloadAccounts();
+      await refreshBroker();
+    } catch (e) {
+      showToast({ kind: "err", text: "同步失败：" + String(e) });
+    } finally {
+      setBrokerBusy(false);
+    }
+  }, [reloadAccounts, refreshBroker, showToast]);
+
   const checkedToday = useMemo(
     () => accounts.filter((a) => statuses[a.id]?.checked_in).length,
     [accounts, statuses]
@@ -632,6 +658,7 @@ export default function App() {
                 onBrokerUpload={() => void runBrokerUpload()}
                 onBrokerLink={() => setBrokerModal({ type: "brokerLink" })}
                 onBrokerUnbind={() => void runBrokerUnbind()}
+                onBrokerSync={() => void runBrokerSync()}
               />
             )}
             {page === "takeover" && (

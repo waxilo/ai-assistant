@@ -191,6 +191,28 @@ export interface PoolOp {
   message: string;
 }
 
+/**
+ * 一轮双向整池同步的结论（点「同步」按钮返回的就是这个）。
+ *
+ * `message` 已经是给人看的话，直接 toast 即可；数字字段留着，
+ * 将来要按「有没有真的改动」分支处理时不用再加一次后端调用。
+ */
+export interface SyncReport {
+  changed: boolean;
+  /** 被跳过（未绑定 / 两分钟内已同步过 / 闸在别的机器手里） */
+  deferred: boolean;
+  /** 云端 → 本地：并入本地的条数（新增账号 + 采纳的新票） */
+  merged: number;
+  /** 本轮续出来的凭证数（含收到本机桌面端自续的新票） */
+  refreshed: number;
+  /** 本轮真失败数（网络 / 服务端临时拒），会把整池拖进冷静期 */
+  failed: number;
+  /** 本机签不动的账号数（链绑在别的设备），不拖停整池 */
+  blocked: number;
+  version: number | null;
+  message: string;
+}
+
 export interface OAuthStart {
   login_id: string;
   verification_uri: string;

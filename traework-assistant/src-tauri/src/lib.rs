@@ -174,11 +174,12 @@ pub fn run() {
             commands::takeover_save_rules,
             commands::takeover_events,
             commands::clear_takeover_events,
-            // 云端凭证池：四个都是池级命令，不带账号 id（一池一 uuid、池内一把闸）
+            // 云端凭证池：五个都是池级命令，不带账号 id（一池一 uuid、池内一把闸）
             commands::broker_upload,
             commands::broker_link,
             commands::broker_unbind,
             commands::broker_state,
+            commands::broker_sync_now,
             // 积分简报：读（日条目现算）+ 清空 + 开启（清历史 → 采基线 → 落起点条目）
             commands::credit_briefing,
             commands::credit_briefing_clear,

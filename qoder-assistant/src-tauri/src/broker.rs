@@ -440,6 +440,30 @@ pub fn account_from_item(item: &PoolItem) -> Account {
     }
 }
 
+/// 池里那一条是否**严格新于**本机这一条 —— [`adopt`] 用的判据（云端 → 本地方向）。
+///
+/// 两个方向必须共用同一套新序判据（这里是对称的两条：[`cloud_is_newer`] / [`local_is_newer`]）：
+/// 各写一套就会出现「A 看 B 更新、B 看 A 也更新」，两台机器每轮同步都改一次整池版本、永不收敛。
+///
+/// 「读不出到期」不等于「更旧」：一侧读得出、另一侧读不出时，读得出的算新；
+/// 两侧都读不出就**谁也不许盖谁**，来历不明的不算更新。
+fn cloud_is_newer(item: &PoolItem, account: &Account) -> bool {
+    match (item.expires_at, account.expires_at) {
+        (Some(p), Some(l)) => p > l,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// 本机这一条是否**严格新于**池里那一份 —— [`cloud_is_newer`] 的反方向，供本地 → 云端回写用。
+fn local_is_newer(account: &Account, item: &PoolItem) -> bool {
+    match (account.expires_at, item.expires_at) {
+        (Some(l), Some(p)) => l > p,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 /// 把池里那一条采纳到本地账号上。返回是否真的改动了。
 ///
 /// 判据是 **`expires_at` 更晚**：续签之后 access token 的有效期必然往后推，所以「更晚」
@@ -454,11 +478,7 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
         // 空 / 纯空白 token 一律忽略：采纳它等于把账号弄成登录不上
         return false;
     }
-    let newer = match (item.expires_at, account.expires_at) {
-        (Some(p), Some(l)) => p > l,
-        (Some(_), None) => true,
-        _ => false,
-    };
+    let newer = cloud_is_newer(item, account);
     if !newer {
         let mut touched = false;
         if account.refresh_token.is_none() && !item.refresh_token.trim().is_empty() {
@@ -644,7 +664,7 @@ fn actor() -> String {
                     }
                 }
             }
-            if let Ok(o) = std::process::Command::new("hostname").output() {
+            if let Ok(o) = crate::proc::cmd("hostname").output() {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if !s.is_empty() {
                     return s;
@@ -1070,6 +1090,31 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
         });
     }
 
+    // ④ 本地 → 云端方向：把**本机比池里更新**的票回写进池。上面只回写「本轮续出来的」，
+    //    这一步兜住「早就换过新票、但从没被传上去」的 —— 最典型：绑池期间在本机重新登录了一次
+    //    （accounts.json 里已是新票，云端还停在旧票，别的机器每轮拿到的都是过期票）。
+    //    同样只碰本区域，判据与云端 → 本地方向对称（[`local_is_newer`]），只有严格更新才回写。
+    let mut uploaded = 0usize;
+    for acct in accounts.iter().filter(|a| a.region == region) {
+        let key = item_key_of(acct);
+        if key.trim().is_empty() {
+            continue;
+        }
+        let newer = pool
+            .iter()
+            .find(|i| normalize_pool_key(&i.key) == key)
+            .is_some_and(|item| local_is_newer(acct, item));
+        if newer {
+            if let Some(slot) = pool
+                .iter_mut()
+                .find(|i| normalize_pool_key(&i.key) == key)
+            {
+                *slot = to_item(acct);
+            }
+            uploaded += 1;
+        }
+    }
+
     // 提交整池：CAS 由服务端做（`version = ? AND lease_owner = ?`），新版本号就在响应里。
     // **不要再补一次 GET 去问版本** —— 那是热路径上白打的一趟接口。
     let next_version = match request(
@@ -1096,8 +1141,13 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     };
     note_ok(region, next_version);
 
+    let upload_note = if uploaded > 0 {
+        format!("，回写 {uploaded} 个更新的本地票")
+    } else {
+        String::new()
+    };
     Ok(SyncReport {
-        changed: merged > 0 || refreshed > 0,
+        changed: merged > 0 || refreshed > 0 || uploaded > 0,
         deferred: false,
         merged,
         refreshed,
@@ -1105,9 +1155,9 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
         blocked,
         version: next_version,
         message: if blocked > 0 {
-            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个，{blocked} 个已死掉、需要重新登录）")
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}，{blocked} 个已死掉、需要重新登录）")
         } else {
-            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个）")
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}）")
         },
     })
 }
@@ -1673,5 +1723,66 @@ mod tests {
         assert_eq!(parsed.access_token, "");
         assert_eq!(parsed.expires_at, None);
         assert_eq!(parsed.email, "", "老云端数据没有 email → 空串，不是解析失败");
+    }
+
+    // ── 本地 → 云端方向（[`local_is_newer`]，`cloud_is_newer` 的反方向）──
+
+    #[test]
+    fn uploads_only_a_strictly_newer_local_ticket() {
+        let mut a = acct("n", Some("138"), "new");
+        a.expires_at = Some(2_000);
+        assert!(local_is_newer(&a, &item("138", "old", Some(1_000))));
+
+        // 反向：本机更旧绝不能盖云端 —— 那等于把别的机器刚续好的凭证作废，
+        // 两台机器来回盖就是同步永不收敛。
+        a.expires_at = Some(1_000);
+        assert!(!local_is_newer(&a, &item("138", "cloud", Some(2_000))));
+        // 同一到期时间也不算更新（严格大于）
+        a.expires_at = Some(2_000);
+        assert!(!local_is_newer(&a, &item("138", "cloud", Some(2_000))));
+    }
+
+    /// 单侧读不出到期：读得出的算新（与云端 → 本地方向同一条规则的方向版本）。
+    #[test]
+    fn a_readable_local_expiry_beats_a_pool_entry_with_no_expiry() {
+        let mut a = acct("n", Some("138"), "local");
+        a.expires_at = Some(1_000);
+        assert!(local_is_newer(&a, &item("138", "cloud", None)));
+        // 反过来「不知道」不等于「更旧」：本机读不出到期就不许盖云端
+        a.expires_at = None;
+        assert!(!local_is_newer(&a, &item("138", "cloud", None)));
+    }
+
+    /// 两个方向必须**互斥**：同一对凭证不能既「该采纳云端」又「该回写云端」，
+    /// 否则两台机器每轮同步都会改一次整池版本，永远收敛不了。
+    /// （用两条方向判据本身，不用 `adopt` 的返回值 —— 它还会因为「补上空字段」返回 true，
+    /// 那不是覆盖，不构成收敛问题。）
+    #[test]
+    fn the_two_directions_never_both_claim_to_be_newer() {
+        let cases: [(Account, PoolItem); 4] = [
+            (acct("a", Some("1"), "opaque"), item("1", "other", None)),
+            ({
+                let mut a = acct("b", Some("2"), "x");
+                a.expires_at = Some(1_000);
+                a
+            }, item("2", "y", Some(2_000))),
+            ({
+                let mut a = acct("c", Some("3"), "x");
+                a.expires_at = Some(2_000);
+                a
+            }, item("3", "y", Some(1_000))),
+            ({
+                let mut a = acct("d", Some("4"), "x");
+                a.expires_at = Some(1_000);
+                a
+            }, item("4", "y", Some(1_000))),
+        ];
+        for (a, cloud) in &cases {
+            assert!(
+                !(cloud_is_newer(cloud, a) && local_is_newer(a, cloud)),
+                "「{}」两侧同时认定对方该被覆盖，同步会永不收敛",
+                a.name
+            );
+        }
     }
 }

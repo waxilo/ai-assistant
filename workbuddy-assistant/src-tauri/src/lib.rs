@@ -90,11 +90,12 @@ pub fn run() {
             commands::oauth_start,
             commands::oauth_poll,
             commands::open_external,
-            // 凭证管家：四个都是池级命令，不带账号 id（一池一 uuid、池内一把闸）
+            // 凭证管家：五个都是池级命令，不带账号 id（一池一 uuid、池内一把闸）
             commands::broker_upload,
             commands::broker_link,
             commands::broker_unbind,
             commands::broker_state,
+            commands::broker_sync_now,
             commands::get_settings,
             commands::save_settings,
             commands::apply_settings,

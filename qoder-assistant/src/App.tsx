@@ -22,6 +22,7 @@ import {
   brokerUpload,
   brokerLink,
   brokerUnbind,
+  brokerSyncNow,
 } from "./api";
 import { accountIdent, accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
 import { bindCredits, seedCredits } from "./credits";
@@ -527,6 +528,31 @@ export default function App() {
     }
   }, [askConfirm, brokerStatus?.uuid, load, showToast, regionOpts, settings?.takeover_region]);
 
+  /**
+   * 手动双向同步一轮**当前区域**那池：云端更新的票/账号拉到本机，
+   * 本机更新的票/账号回写云端。
+   *
+   * 为什么要有这个按钮：自动那轮只在**抢到闸**时跑，而闸可能长时间在别的机器手里，
+   * 加上两分钟节流 —— 本机刚重新登录拿到新票却推不上去，别的机器就一直领过期票，
+   * 反过来也一样。点一下就是「现在就把两侧对齐」，结果原话 toast 出来。
+   */
+  const runBrokerSync = useCallback(async () => {
+    setBrokerBusy(true);
+    try {
+      const rep = await brokerSyncNow();
+      showToast({
+        // 被跳过（闸在别的机器手里 / 池在冷静期）不是错，但也不能报成同步好了
+        kind: rep.failed > 0 ? "err" : rep.deferred ? "info" : "ok",
+        text: rep.message,
+      });
+      await load();
+    } catch (e) {
+      showToast({ kind: "err", text: "同步失败：" + String(e) });
+    } finally {
+      setBrokerBusy(false);
+    }
+  }, [load, showToast]);
+
   const saveSettings = useCallback(async (s: Settings) => {
     // 设置页已改为「改动自动保存」，这里只负责落盘并刷新内存中的 settings，
     // 不再弹成功 toast（每次改动都弹会刷屏）。失败提示由设置页兜底。
@@ -791,6 +817,7 @@ export default function App() {
               onBrokerUpload={() => void runBrokerUpload()}
               onBrokerLink={() => setModal({ type: "brokerLink" })}
               onBrokerUnbind={() => void runBrokerUnbind()}
+              onBrokerSync={() => void runBrokerSync()}
               onCheckinOne={(id) => void runCheckinOne(id)}
               onRemove={(a) => void removeOne(a)}
               onOpenLogs={(id) => {

@@ -24,6 +24,7 @@ import {
   IconUpload,
   IconUser,
   IconRefresh,
+  IconSwap,
 } from "../components/Icons";
 
 /** 账号签到状态 → 状态圆点文案（圆点本身的视觉由 common 的 StatusDot 统一提供） */
@@ -53,6 +54,7 @@ export function AccountsPage({
   onBrokerUpload,
   onBrokerLink,
   onBrokerUnbind,
+  onBrokerSync,
 }: {
   accounts: Account[];
   loading: boolean;
@@ -67,6 +69,8 @@ export function AccountsPage({
   onBrokerUpload: () => void;
   onBrokerLink: () => void;
   onBrokerUnbind: () => void;
+  /** 手动双向同步：本机新票/新账号推上去，云端新票/新账号拉下来 */
+  onBrokerSync: () => void;
 }) {
   // 订阅那个全局积分对象：后台一次采集（整点采样 / 刷新 / 签到）就会换掉它的引用，
   // 本页随之重渲染并显示新读数。hook 必须在任何提前 return 之前调用，所以挂在最上面。
@@ -84,6 +88,7 @@ export function AccountsPage({
       onUpload={onBrokerUpload}
       onLink={onBrokerLink}
       onUnbind={onBrokerUnbind}
+      onSync={onBrokerSync}
     />
   );
 
@@ -370,6 +375,7 @@ function PoolBar({
   onUpload,
   onLink,
   onUnbind,
+  onSync,
 }: {
   status: BrokerStatus | null;
   accountCount: number;
@@ -377,6 +383,7 @@ function PoolBar({
   onUpload: () => void;
   onLink: () => void;
   onUnbind: () => void;
+  onSync: () => void;
 }) {
   const uuid = status?.uuid ?? null;
   const bound = Boolean(status?.bound && uuid);
@@ -406,6 +413,15 @@ function PoolBar({
         {bound && uuid ? (
           <>
             <CopyChip uuid={uuid} />
+            <button
+              className="btn small"
+              disabled={busy}
+              onClick={onSync}
+              title="双向同步一轮：云端更新的票与账号拉到本机，本机更新的票与账号回写云端（绕过两分钟节流；闸在别的机器手里会跳过）"
+            >
+              <IconSwap size={13} />
+              同步
+            </button>
             <button
               className="btn small danger"
               disabled={busy}

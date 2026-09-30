@@ -1136,6 +1136,23 @@ pub fn broker_state() -> broker::BrokerStatus {
     broker::status()
 }
 
+/// 手动跑一轮**双向**整池同步：云端新票并进本机、本机新票回写云端、
+/// 两侧独有的账号互相补齐（`broker::sync` 的 `force = true` 通道，绕过两分钟节流）。
+///
+/// 必须给按钮而不是只靠自动同步：自动那轮只在抢闸时跑，而闸可能长时间在别的机器手里
+/// —— 本机刚重新登录拿到新票却推不上去，别的机器就一直领过期票，反之亦然。
+/// 未绑定直接报错：这里没有「静默跳过」的余地，用户点了就是想知道为什么没动。
+#[tauri::command]
+pub async fn broker_sync_now(app: tauri::AppHandle) -> Result<broker::SyncReport, String> {
+    let dir = try_data_dir(&app)?;
+    if !broker::bound() {
+        return Err("本机未绑定云端凭证池 —— 先「上传本机账号」或「绑定云端凭证池」".into());
+    }
+    let report = broker::sync(&dir, true).await?;
+    crate::logs::push("凭证池", true, format!("手动整池同步：{}", report.message));
+    Ok(report)
+}
+
 // ---------------------------------------------------------------------------
 // 积分简报
 // ---------------------------------------------------------------------------
