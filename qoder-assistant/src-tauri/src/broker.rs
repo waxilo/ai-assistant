@@ -49,10 +49,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// 管家地址：cred-broker 容器在本机发布的回环端口。域名是网关的事，客户端不认，
-/// 所以网关加第二个 zone 这里也不用动；离开本机即打不通，这是刻意的。
+/// 管家地址：cred-broker 的公网入口（共享网关 cloudflared → nginx → 容器:80）。
+/// 容器**不在本机** —— 旧常量 `http://127.0.0.1:7003` 预设「容器与桌面端同机」，
+/// 这个前提 2026-09-30 被实测推翻：没装 Docker 的机器永远打不通，症状是凭证池
+/// 恒显「还没同步过」、过期票没人救。入口公开后 uuid 即一池凭证的完整权限，
+/// 服务端只另有 `x-cred-actor` 审计，没有第二道鉴权 —— 别把它当秘密外发。
 /// **编译期常量**，不是配置项：改地址 = 改代码 + 重新构建。
-pub const BASE: &str = "http://127.0.0.1:7003";
+pub const BASE: &str = "https://cred-broker.sloan.dpdns.org";
 
 /// 距上次同步超过这么久才会再问一次管家。
 ///
