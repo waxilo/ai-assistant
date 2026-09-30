@@ -1,6 +1,6 @@
 [package]
 name = "traework-assistant"
-version = "0.1.30"
+version = "0.1.31"
 description = "TraeWork 多账号签到 + 池化接管的本地助手"
 authors = ["waxilo"]
 edition = "2021"
