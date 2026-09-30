@@ -819,7 +819,7 @@ pub fn reveal_debug_log(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     // `-R` = 在 Finder 里选中该文件（而不是拿某个 App 打开它）
-    std::process::Command::new("open")
+    crate::proc::cmd("open")
         .arg("-R")
         .arg(path)
         .spawn()
@@ -829,7 +829,7 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    std::process::Command::new("explorer")
+    crate::proc::cmd("explorer")
         .arg(format!("/select,{}", path.display()))
         .spawn()
         .map(|_| ())
@@ -839,7 +839,7 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     let dir = path.parent().unwrap_or(path);
-    std::process::Command::new("xdg-open")
+    crate::proc::cmd("xdg-open")
         .arg(dir)
         .spawn()
         .map(|_| ())
@@ -904,7 +904,7 @@ mod tests {
     /// 在临时 SDK 根下铺好两个区域的官方产物，并在该根下执行 f。
     ///
     /// 必须用临时根：真去动 `/Applications` 下那份会把用户装好的客户端改坏。
-    /// 生产路径永远走 `Region::worker_sdk_root()`，`patch::with_sdk_root` 只在测试里生效。
+    /// 生产路径永远走 `Region::worker_sdk_roots()`，`patch::with_sdk_root` 只在测试里生效。
     fn with_client<T>(sdk: &Path, f: impl FnOnce() -> T) -> T {
         for region in Region::ALL {
             crate::patch::plant_worker(sdk, region, OFFICIAL);

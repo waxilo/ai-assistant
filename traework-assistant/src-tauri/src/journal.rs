@@ -122,7 +122,8 @@ fn write_lock() -> &'static Mutex<()> {
 /// 它顺带解决了一个真实问题 —— 拆分**之前**写下的文件里混着几百行 `proxy_path`，
 /// 不过滤的话用户下次打开页面仍旧看到那一片噪音（要等到他下次开启接管才会被清空）。
 ///
-/// [`read_trace`] 刻意**不**过滤：排查时要看的是文件里的真相，而不是我们以为的真相。
+/// 读诊断日志的那个函数（`read_trace`，只在测试里编进来）刻意**不**过滤：
+/// 排查时要看的是文件里的真相，而不是我们以为的真相。
 pub fn read(data_dir: &Path) -> Vec<JournalEvent> {
     read_file(&journal_path(data_dir))
         .into_iter()
@@ -131,6 +132,11 @@ pub fn read(data_dir: &Path) -> Vec<JournalEvent> {
 }
 
 /// 读取**诊断日志**。不上界面 —— 它是排查用的过程记录，量比用户日志大一个量级。
+///
+/// 生产代码里没有调用点：界面上没有「诊断日志」这一栏（这正是当初分流的目的），
+/// 排查时是人工去读 `trace.jsonl` 文件本身。它存在的全部意义是**单测**能断言
+/// 「事件落对了通道」，故只在测试里编进二进制。
+#[cfg(test)]
 pub fn read_trace(data_dir: &Path) -> Vec<JournalEvent> {
     read_file(&trace_path(data_dir))
 }

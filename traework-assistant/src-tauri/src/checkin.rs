@@ -468,17 +468,6 @@ async fn post_ent_usage(client: &reqwest::Client, account: &Account) -> Option<V
     }
 }
 
-/// 抓取账号「已有积分」（best-effort）。⚠️ 会发一次网络请求，调用方负责缓存/TTL。
-pub async fn fetch_ent_usage(account: &Account) -> Option<EntUsage> {
-    let client = reqwest::Client::new();
-    fetch_ent_usage_with(&client, account).await
-}
-
-/// 同 [`fetch_ent_usage`]，但复用外部 `client` 的连接池。
-pub async fn fetch_ent_usage_with(client: &reqwest::Client, account: &Account) -> Option<EntUsage> {
-    post_ent_usage(client, account).await.map(|v| parse_ent_usage(&v))
-}
-
 /// 一次拉取「剩余积分 + 最早过期时间 + **逐包明细**」（同一份 `ide_user_ent_usage` 响应）。
 ///
 /// 积分简报（[`crate::ledger`]）需要的逐包明细就附在同一份响应里，多解析几个字段而已，
@@ -495,13 +484,7 @@ pub struct ResourceView {
     pub earliest_expiry_ms: Option<i64>,
 }
 
-/// 抓取 `ResourceView`（best-effort）。⚠️ 会发一次网络请求。
-pub async fn fetch_resource_view(account: &Account) -> ResourceView {
-    let client = reqwest::Client::new();
-    fetch_resource_view_with(&client, account).await
-}
-
-/// 同 [`fetch_resource_view`]，但复用外部 `client` 的连接池。
+/// 抓取 `ResourceView`（best-effort），复用外部 `client` 的连接池。⚠️ 会发一次网络请求。
 pub async fn fetch_resource_view_with(client: &reqwest::Client, account: &Account) -> ResourceView {
     let Some(v) = post_ent_usage(client, account).await else {
         return ResourceView::default();

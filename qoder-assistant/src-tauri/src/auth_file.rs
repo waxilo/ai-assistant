@@ -85,9 +85,12 @@ const DPAPI_PREFIX: &[u8] = b"DPAPI";
 const KEYCHAIN_TOOL: &str = "/usr/bin/security";
 
 /// macOS 上派生密钥用的 salt（Chromium 的固定值，勿改）
+// 非 macOS 下没人调用，但单测跑在各平台——固定值留着，只压警告。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MAC_SALT: &[u8] = b"saltysalt";
 
 /// macOS 上的 PBKDF2 迭代轮数（Chromium 的固定值，勿改）
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MAC_ROUNDS: u32 = 1003;
 
 /// CBC 段的 IV：**16 个空格**。
@@ -171,6 +174,10 @@ pub(crate) enum Key {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Gcm([u8; 32]),
     /// macOS：钥匙串密码派生的 16 字节密钥，数据是 AES-128-CBC（IV 固定 16 个空格）。
+    ///
+    /// 与 `Gcm` 对称：非 macOS 构建里不会有实例（构造它的 `open_key` 在那个平台不存在），
+    /// 但两个 match 分支都得留着。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Cbc([u8; 16]),
 }
 
@@ -277,7 +284,7 @@ fn derive_gcm_key(profile_dir: &Path) -> Result<[u8; 32], String> {
 #[cfg(target_os = "macos")]
 fn keychain_password(region: Region) -> Result<String, String> {
     let service = region.keychain_service();
-    let out = std::process::Command::new(KEYCHAIN_TOOL)
+    let out = crate::proc::cmd(KEYCHAIN_TOOL)
         .args([
             "find-generic-password",
             "-s",

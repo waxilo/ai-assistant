@@ -25,6 +25,8 @@ pub struct Holder {
 ///
 /// `-F` 输出是「每行一个字段、首字符即字段名」：`p<pid>` 开进程、`c<command>` 给命令名。
 /// 同一进程若有 IPv4/IPv6 两条监听会各出现一次，故按 PID 去重。
+// 非 macOS 下没人调用，但单测跑在各平台——解析规则留着，只压警告。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_lsof_fields(text: &str) -> Vec<Holder> {
     let mut out: Vec<Holder> = Vec::new();
     let mut pid: Option<u32> = None;

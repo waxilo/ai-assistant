@@ -269,23 +269,11 @@ fn merge_pkgs(led: &mut AcctLedger, views: &[PkgView], at: &str) -> bool {
     touched
 }
 
-/// 只记「剩余积分」读数 —— 给**没有逐包明细**的那条路径用（签到：只查一次汇总值）。
-///
-/// 它刻意**不碰** `earliest_expiry_ms`：签到这条路径根本不知道包的过期时间，
-/// 顺手清掉它会让接管路由的排序依据丢一次。
+/// 记录一次**完整**读数（余额 + 最早过期时间）。有逐包明细的路径走 [`observe`]，
+/// 它内部调用的就是这个 —— 这组字段**只有这一条写入路径**。
 ///
 /// `credits` 为 `None`（这一轮没读到）时**整段不动**：读不到 ≠ 余额变成 0，
 /// 保留上一次读数比抹成一个假的 0 有用得多。
-pub fn record_credits(led: &mut AcctLedger, credits: Option<f64>, at: &str) {
-    if credits.is_none() {
-        return;
-    }
-    led.credits = credits;
-    led.credits_at = at.to_string();
-}
-
-/// 记录一次**完整**读数（余额 + 最早过期时间）。有逐包明细的路径走 [`observe`]，
-/// 它内部调用的就是这个 —— 两者是同一组字段的唯二写入点。
 fn record_view(led: &mut AcctLedger, credits: Option<f64>, expiry_ms: Option<i64>, at: &str) {
     if credits.is_none() {
         return;
@@ -371,7 +359,7 @@ pub fn observe(
 
 /// 只关心「逐包明细 + 小时增量」时的简写（内部就是 [`observe`]）。
 ///
-/// 生产代码里没有调用点 —— 余额读数是「积分事实」的来源，任何真实拉取都必须把读到的
+/// 生产代码里没有调用点 —— 余额读数是要展示给界面的，任何真实拉取都必须把读到的
 /// 汇总值一起交上来；只有**测试**会只喂包明细，写成 `observe(..., None, None, at, Mode::Normal)`
 /// 会把「这里没有读数」这个信息藏进一串 `None` 里。
 #[cfg(test)]
@@ -477,34 +465,6 @@ pub fn save_ledger(dir: &Path, led: &Ledger) -> std::io::Result<()> {
     write_atomic(&ledger_file(dir), &body)
 }
 
-/// 投影给界面的「积分事实」：账户管理与简报共用同一份来源（台账）。
-///
-/// 它**不落盘**（落盘的是台账本身），只用于把读数随账号列表一起发给前端 ——
-/// 前端因此不需要知道台账的存在，也不会出现第二份会漂移的副本。
-#[derive(Serialize, Clone, Debug, Default)]
-pub struct CreditFact {
-    /// 剩余积分（`None` = 还没读到过 ⇒ 界面显示「—」）
-    pub credits: Option<f64>,
-    /// 读数时刻（本地时间串），界面上「上次读到」用它
-    pub at: String,
-    /// 最早重置/过期时刻（毫秒）
-    pub earliest_expiry_ms: Option<i64>,
-}
-
-/// 取某个账号的积分事实：台账里**存过读数**才有 (否则返回 `None`，
-/// 由调用方回退到其它展示口径，而不是编一个 0 出来)。
-pub fn fact(led: &Ledger, id: &str) -> Option<CreditFact> {
-    let a = led.accts.get(id)?;
-    if a.credits_at.is_empty() {
-        return None;
-    }
-    Some(CreditFact {
-        credits: a.credits,
-        at: a.credits_at.clone(),
-        earliest_expiry_ms: a.earliest_expiry_ms,
-    })
-}
-
 /// 一次观测的读数（**采集阶段的产物**，还没并进台账）。
 ///
 /// 存在的理由是把「打接口」与「记账」分开：采集要跨 `await`、要几秒到几十秒，
@@ -558,11 +518,6 @@ impl Store {
             // 接口连续失败的账号永远轮不到它，桶会一直涨。
             prune_buckets(&mut led.accts, chrono::Local::now().date_naive());
         })
-    }
-
-    /// 某个账号的积分事实（只投影一条，不把整本台账搬出来）
-    pub fn fact_of(&self, id: &str) -> Option<CreditFact> {
-        self.read(|led| fact(led, id))
     }
 
     fn open(dir: PathBuf) -> Self {
@@ -883,21 +838,48 @@ mod tests {
 
     // ── 积分读数 ──────────────────────────────────────────────
 
-    /// 读数只由 [`record_credits`] / [`observe`] 写，且**没读到就不许覆盖** —— 读不到 ≠ 余额变 0。
+    /// 余额读数只由 [`observe`]（内部 [`record_view`]）写，且**没读到就不许覆盖** ——
+    /// 读不到 ≠ 余额变 0，也 ≠ 包的过期时间消失了。
     #[test]
     fn a_missing_credit_reading_never_overwrites_the_last_one() {
         let mut led = AcctLedger::default();
-        record_credits(&mut led, None, "2026-09-16 10:00:00");
+        observe(
+            &mut led,
+            &[],
+            None,
+            None,
+            "2026-09-16 10:00:00",
+            Mode::Normal,
+        );
         assert_eq!(led.credits, None, "从没读到过就是未知，不能编一个 0");
         assert_eq!(led.credits_at, "");
 
-        record_credits(&mut led, Some(3000.0), "2026-09-16 11:00:00");
+        observe(
+            &mut led,
+            &[],
+            Some(3000.0),
+            Some(1789954208000),
+            "2026-09-16 11:00:00",
+            Mode::Normal,
+        );
         assert_eq!(led.credits, Some(3000.0));
         assert_eq!(led.credits_at, "2026-09-16 11:00:00");
 
-        record_credits(&mut led, None, "2026-09-16 12:00:00");
+        observe(
+            &mut led,
+            &[],
+            None,
+            None,
+            "2026-09-16 12:00:00",
+            Mode::Normal,
+        );
         assert_eq!(led.credits, Some(3000.0));
         assert_eq!(led.credits_at, "2026-09-16 11:00:00");
+        assert_eq!(
+            led.earliest_expiry_ms,
+            Some(1789954208000),
+            "这一轮没读到余额 ⇒ 整组读数原样保留，接管路由还要靠它排序"
+        );
     }
 
     /// 一次带明细的观测要同时做三件事：并包、记桶、记读数。
@@ -928,35 +910,6 @@ mod tests {
         assert_eq!(led.earliest_expiry_ms, Some(1789954208000));
     }
 
-    /// 投影给界面的积分事实：没有读数就是 `None`（界面显示「—」），不编 0。
-    #[test]
-    fn fact_projects_only_what_was_actually_read() {
-        let mut led = Ledger::default();
-        observe(
-            led.accts.entry("a1".into()).or_default(),
-            &[pkg("p", 100.0, 0.0, "d")],
-            None,
-            None,
-            "2026-09-16 10:00:00",
-            Mode::Normal,
-        );
-        assert!(fact(&led, "a1").is_none(), "只有包明细、没有读数 ⇒ 不投影");
-        assert!(fact(&led, "从未见过的账号").is_none());
-
-        observe(
-            led.accts.entry("a1".into()).or_default(),
-            &[pkg("p", 100.0, 10.0, "d")],
-            Some(90.0),
-            Some(1789954208000),
-            "2026-09-16 11:00:00",
-            Mode::Normal,
-        );
-        let f = fact(&led, "a1").unwrap();
-        assert_eq!(f.credits, Some(90.0));
-        assert_eq!(f.at, "2026-09-16 11:00:00");
-        assert_eq!(f.earliest_expiry_ms, Some(1789954208000));
-    }
-
     // ── 唯一的写入口（Store）──────────────────────────────────
 
     /// 一批读数一次入账：内存与落盘都要有 —— 落盘的那份就是内存的快照，不是第二本账。
@@ -985,7 +938,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.fact_of("a2").unwrap().credits, Some(40.0));
+        assert!(store.read(|led| led.accts["a2"].credits == Some(40.0)));
         let on_disk = load_ledger(&dir);
         assert_eq!(on_disk.accts["a2"].used(), 10.0);
         assert_eq!(on_disk.accts["a2"].credits, Some(40.0));

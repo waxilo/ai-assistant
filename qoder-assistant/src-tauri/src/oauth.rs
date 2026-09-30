@@ -70,7 +70,6 @@ use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -524,19 +523,19 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = Command::new("open");
+        let mut c = crate::proc::cmd("open");
         c.arg(u);
         c
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = Command::new("rundll32");
+        let mut c = crate::proc::cmd("rundll32");
         c.arg("url.dll,FileProtocolHandler").arg(u);
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = {
-        let mut c = Command::new("xdg-open");
+        let mut c = crate::proc::cmd("xdg-open");
         c.arg(u);
         c
     };

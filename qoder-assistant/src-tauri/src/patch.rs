@@ -140,14 +140,14 @@ pub fn worker_path(region: Region) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 // 把 SDK 根指向临时目录。没有它，装卸流程的测试就只能对着 `/Applications` 里
-// 真实的客户端跑 —— 那会把用户装好的客户端改坏，所以生产路径**永远**是
-// `Region::worker_sdk_root()`，这里只在 `#[cfg(test)]` 下被写入。
+// 真实的客户端跑 —— 那会把用户装好的客户端改坏，所以生产路径**永远**走
+// `Region::worker_sdk_roots()`，这里只在 `#[cfg(test)]` 下被写入。
 thread_local! {
     /// 测试里的 SDK 根覆盖，**必须是线程局部**。
     ///
     /// 用一个进程级 `Mutex` 会让并行跑的用例互相串台：A 用例刚把根指向自己的临时目录，
     /// B 用例就覆盖成了它的 —— 表现是「注入写进了别人的沙箱」这种查不出原因的随机失败。
-    /// 生产路径从不写这个格子（真值永远来自 [`Region::worker_sdk_root`]），所以线程局部
+    /// 生产路径从不写这个格子（真值永远来自 [`Region::worker_sdk_roots`]），所以线程局部
     /// 不会带来行为差异。
     static SDK_ROOT_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
@@ -1190,7 +1190,7 @@ if (process.env.QA_ENV_KEY) {
     /// 渲染一份注入 → 交给 node 执行 → 返回（回环监听端口, 观测输出）。
     /// node 缺席返回 None。
     fn observe_injection_with_node(region: Region) -> Option<(u16, String)> {
-        if std::process::Command::new("node")
+        if crate::proc::cmd("node")
             .arg("--version")
             .output()
             .is_err()
@@ -1213,7 +1213,7 @@ if (process.env.QA_ENV_KEY) {
         let harness = dir.join("observe.mjs");
         fs::write(&harness, HARNESS).unwrap();
 
-        let out = std::process::Command::new("node")
+        let out = crate::proc::cmd("node")
             .arg(&harness)
             .env("QA_INJECT", &inject)
             .env("QA_PORT", port.to_string())

@@ -134,7 +134,7 @@ fn spawn_machine_identity(region: Region) -> Option<MachineIdentity> {
     let exe = runtime_info_exe()?;
     // 官方 `dZe`：global 部署 `environment = 3`，其它（含国内）为 `0`。
     let env = if region == Region::Global { "3" } else { "0" };
-    let mut child = std::process::Command::new(exe)
+    let mut child = crate::proc::cmd(exe)
         .args([env, "--account-stdin"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -983,7 +983,7 @@ mod tests {
             return;
         };
         // 调用官方同款：environment=3(global) --account-stdin，account 走 stdin
-        let mut child = std::process::Command::new(&exe)
+        let mut child = crate::proc::cmd(&exe)
             .args(["3", "--account-stdin"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

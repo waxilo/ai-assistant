@@ -53,7 +53,6 @@ use serde_json::Value;
 use std::fs;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 /// 会改变 base url 的环境变量。取自在 CLI 产物中实际出现的名字
@@ -460,7 +459,7 @@ fn takeover_issues(data_dir: &Path) -> Vec<NetIssue> {
 }
 
 fn launchctl_getenv(key: &str) -> Option<String> {
-    let out = Command::new("launchctl").args(["getenv", key]).output().ok()?;
+    let out = crate::proc::cmd("launchctl").args(["getenv", key]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -587,7 +586,7 @@ fn clear_launchd() -> Vec<NetStep> {
         if launchctl_getenv(key).is_none() {
             continue;
         }
-        let ok = Command::new("launchctl")
+        let ok = crate::proc::cmd("launchctl")
             .args(["unsetenv", key])
             .status()
             .map(|s| s.success())
@@ -751,19 +750,19 @@ pub fn reveal_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = Command::new("open");
+        let mut c = crate::proc::cmd("open");
         c.arg("-R").arg(&p);
         c
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = Command::new("explorer");
+        let mut c = crate::proc::cmd("explorer");
         c.arg(format!("/select,{}", p.display()));
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = {
-        let mut c = Command::new("xdg-open");
+        let mut c = crate::proc::cmd("xdg-open");
         c.arg(p.parent().unwrap_or(&p));
         c
     };

@@ -317,6 +317,8 @@ impl Region {
     /// 里都没有它（两边分别是 `Qoder` / `Qoder CN`），所以只能按区域钉死。
     ///
     /// 拼错的后果不报错：`security` 找不到条目 → 与「那个版本没登录」长得一模一样。
+    // 只有 macOS 通道读钥匙串，但单测跑在各平台——两个区域各自的服务名留着，只压警告。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn keychain_service(self) -> &'static str {
         match self {
             Region::Global => "Qoder App Safe Storage",
@@ -325,6 +327,7 @@ impl Region {
     }
 
     /// 同上，钥匙串条目的**账号名**（实测 = 服务名去掉 ` Safe Storage` 再加 ` Key`）。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn keychain_account(self) -> &'static str {
         match self {
             Region::Global => "Qoder App Key",
@@ -364,6 +367,8 @@ impl Region {
     }
 
     /// macOS 应用包路径。
+    // 只有 macOS 的安装根用它，但单测跑在各平台——实测路径留着，只压警告。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn macos_app_dir(self) -> &'static str {
         match self {
             Region::Global => "/Applications/Qoder.app",
@@ -460,6 +465,12 @@ impl Region {
 
     /// 主落点：探测顺序里第一个**真的存在**的候选；一个都不在时给第一个 ——
     /// 让「客户端没装」的报错指向最可能的那个路径，而不是一句无从下手的「没装」。
+    ///
+    /// 生产代码里没有调用点：注入是**全量**的（[`crate::patch::worker_paths`] 把存在候选
+    /// 全打一遍，因为「应用此刻执行哪一份」只有它自己知道），报错文案用的是
+    /// [`crate::patch::worker_path`]。它剩下的价值是让单测能一次拿到「那个主落点」来钉
+    /// 路径不变量，故只在测试里编进二进制。
+    #[cfg(test)]
     pub fn worker_sdk_root(self) -> Option<PathBuf> {
         let roots = self.worker_sdk_roots();
         roots
