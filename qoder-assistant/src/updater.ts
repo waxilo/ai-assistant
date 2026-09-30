@@ -146,6 +146,9 @@ export async function checkAndInstall(
     const onEvent = (event: DownloadEvent) => {
       switch (event.event) {
         case "Started":
+          // Started 可能不止一次：Rust 侧下载器换源重下时会重发一遍，
+          // 累计量必须归零（否则会叠出「已下载 18 MB / 9.6 MB」这种倒挂）。
+          downloaded = 0;
           total = event.data.contentLength ?? 0;
           emit();
           break;

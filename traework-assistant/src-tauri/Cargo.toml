@@ -52,3 +52,5 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 panic = "abort"
 codegen-units = 1
 lto = true
+opt-level = "s"
+strip = true
