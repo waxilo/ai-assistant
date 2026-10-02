@@ -321,6 +321,26 @@ export function expiryCountdown(
   return { text: `还有 ${days} 天后过期`, expired: false };
 }
 
+/// 凭证（token）过期倒计时：「N 天后过期」；不足 1 天改报「N 小时后过期」
+/// （自动续签的窗口就在最后一天里，天数粒度看不出它在不在干活）；
+/// 已过期 → 「已过期」。`at` = 原绝对时刻（`MM-DD HH:mm`，悬停展示）；null/非法 → 「—」。
+export function tokenCountdown(
+  ms?: number | null
+): { text: string; expired: boolean; at: string } {
+  const info = expiryInfo(ms);
+  if (info.text === "—") return { text: "—", expired: false, at: "" };
+  const diff = ms! - Date.now();
+  if (diff <= 0) return { text: "已过期", expired: true, at: info.text };
+  return {
+    text:
+      diff >= 86_400_000
+        ? `${Math.ceil(diff / 86_400_000)} 天后过期`
+        : `${Math.ceil(diff / 3_600_000)} 小时后过期`,
+    expired: false,
+    at: info.text,
+  };
+}
+
 /** 资源包到期的三种状态（界面文案由 [`packageExpiry`] 统一给） */
 export type ExpiryTone = "dated" | "never" | "unknown";
 

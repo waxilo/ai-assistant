@@ -9,8 +9,8 @@ import {
   formatCredits,
   packageExpiry,
   signState,
-  expiryInfo,
   expiryCountdown,
+  tokenCountdown,
   needsRelogin,
   type SignState,
 } from "../common";
@@ -199,9 +199,9 @@ export function AccountsPage({
               const bal = creditsOf(book, a.id);
               const low = bal != null && bal < 100;
               const e = expiryCountdown(expiryOf(book, a.id));
-              // 快过期汇总：最早到期（有余量）的资源包还有几天、挂着多少积分
+              // 快过期汇总：最早到期的**未过期**资源包还有几天、挂着多少积分（已过期旧包跳过，见 `soonestExpiry`）
               const soon = soonestExpiry(book, a.id);
-              const tok = expiryInfo(a.expires_at);
+              const tok = tokenCountdown(a.expires_at);
               return (
                 <tr key={a.id}>
                   <td>
@@ -223,17 +223,12 @@ export function AccountsPage({
                   <td className="ac-cell-expiry num">
                     {soon ? (
                       <span
-                        className={
-                          "ac-expiry clk" +
-                          (soon.kind === "dated" && soon.daysUntil < 0 ? " expired" : "")
-                        }
+                        className="ac-expiry clk"
                         title="点开看逐资源包列表；智能接管优先使用到期最早的积分"
                         onClick={() => setPkgAccount(a)}
                       >
                         {soon.kind === "never"
                           ? `不过期 ${formatCredits(soon.remaining)}`
-                          : soon.daysUntil < 0
-                          ? "已过期"
                           : `${soon.daysUntil} 天后过期 ${formatCredits(soon.remaining)}`}
                       </span>
                     ) : e.text === "—" ? (
@@ -266,7 +261,10 @@ export function AccountsPage({
                     ) : tok.text === "—" ? (
                       <span className="muted">—</span>
                     ) : (
-                      <span className={"ac-expiry" + (tok.expired ? " expired" : "")}>
+                      <span
+                        className={"ac-expiry" + (tok.expired ? " expired" : "")}
+                        title={tok.expired ? `已于 ${tok.at} 过期` : `${tok.at} 过期`}
+                      >
                         {tok.text}
                       </span>
                     )}

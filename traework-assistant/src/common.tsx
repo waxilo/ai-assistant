@@ -88,6 +88,29 @@ export function daysUntil(ms: number): number {
   return Math.round((target.getTime() - today.getTime()) / 86_400_000);
 }
 
+/**
+ * 凭证（token）过期倒计时：「N 天后过期」；不足 1 天改报「N 小时后过期」
+ * （自动续签的窗口就在最后一天里，天数粒度看不出它在不在干活）；
+ * 已过期 → 「已过期」。`at` = 原绝对时刻（`MM-DD HH:mm`，悬停展示）；null/非法 → 「—」。
+ */
+export function tokenCountdown(
+  ms?: number | null
+): { text: string; expired: boolean; at: string } {
+  if (ms == null || isNaN(new Date(ms).getTime()))
+    return { text: "—", expired: false, at: "" };
+  const at = stamp(ms);
+  const diff = ms - Date.now();
+  if (diff <= 0) return { text: "已过期", expired: true, at };
+  return {
+    text:
+      diff >= 86_400_000
+        ? `${Math.ceil(diff / 86_400_000)} 天后过期`
+        : `${Math.ceil(diff / 3_600_000)} 小时后过期`,
+    expired: false,
+    at,
+  };
+}
+
 /** 毫秒时间戳 → 人话的「多久之前」。凭证池「上次同步」那句用 */
 export function sinceMs(ms: number): string {
   const min = Math.floor((Date.now() - ms) / 60000);

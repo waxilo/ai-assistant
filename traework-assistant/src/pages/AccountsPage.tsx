@@ -8,7 +8,7 @@ import {
   daysUntil,
   formatCredits,
   maskToken,
-  stamp,
+  tokenCountdown,
 } from "../common";
 import { Dialog } from "../components/Dialog";
 import {
@@ -31,7 +31,7 @@ import {
  *
  * ⚠️ **续签没有任何按钮，也永远不会有**：token 续签由后端后台线程全自动完成
  * （启动即巡、之后每 30 分钟一轮），每次签到之前还会顺手续一次。所以这一页只负责
- * **把续签的结果显示出来** —— 那一列到期时间被推远了，就是它干的活。
+ * **把续签的结果显示出来** —— 那一列倒计时变长了，就是它干的活。
  */
 interface Props {
   accounts: Account[];
@@ -276,16 +276,23 @@ function creditsOf(a: Account, statuses: Record<string, AcctStatus>): Credits {
 }
 
 /**
- * 最早到期的那个资源包还剩多少积分 —— 「N 天后过期」旁边的数量（需求：快到期提示展示
- * 「2 天后过期 322 积分」）。取 `packages` 里 `expiry_ms` 最小的项的 `remaining`；未知或缺数据 → null。
+ * 最早到期的**未过期**资源包 —— 「N 天后过期 X」里那个天数与数量都取它，
+ * 保证「几天后」和「多少积分」说的是同一个包。
+ *
+ * 已到期的旧包不参与：接口在包过期后仍会挂着正余量（服务端还没清），
+ * 拿它当「最早到期」会把这列永远钉在「已过期」，把后面每一批积分的到期都挡住。
+ * `expiry_ms` 为 0（旧快照缺字段）也跳过 —— 0 不是「到期最早」，是「不知道」。
+ * 没有未过期的包 → `null`，调用方退回 `cr.expiry`（全过期时它会指向过去，正是「已过期」的场合）。
  */
-function earliestPkgRemaining(packages: CreditPackage[] | null): number | null {
+function soonestPackage(packages: CreditPackage[] | null): CreditPackage | null {
   if (!packages || packages.length === 0) return null;
+  const now = Date.now();
   let best: CreditPackage | null = null;
   for (const p of packages) {
+    if (p.expiry_ms <= now) continue;
     if (best === null || p.expiry_ms < best.expiry_ms) best = p;
   }
-  return best ? best.remaining : null;
+  return best;
 }
 
 function AccountsPage({
@@ -400,11 +407,21 @@ function AccountsPage({
               {accounts.map((a) => {
                 const st = statuses[a.id];
                 const cr = creditsOf(a, statuses);
-                const days = !cr.unlimited && cr.expiry ? daysUntil(cr.expiry) : null;
+                const soonPkg = soonestPackage(cr.packages);
+                // 快到期提示先看未过期的包（天数与数量成对取自它）；全过期/没包数据时退回
+                // `cr.expiry` —— 全过期时它指向过去，正是「已过期」该出场的时候
+                const days = cr.unlimited
+                  ? null
+                  : soonPkg
+                  ? daysUntil(soonPkg.expiry_ms)
+                  : cr.expiry
+                  ? daysUntil(cr.expiry)
+                  : null;
                 const texp = tokenExpiry(a);
+                const texpCount = texp === null ? null : tokenCountdown(texp);
                 // 剩余不足 24 小时 = 自动续签没能续上；**已过期**只能重新登录（红），
                 // 还没过期但已进窗口是黄 —— 两者要能一眼分开
-                const texpExpired = texp !== null && texp <= Date.now();
+                const texpExpired = texpCount?.expired ?? false;
                 const texpSoon = texp !== null && texp - Date.now() < RENEW_WINDOW_MS;
                 const credCls = days === null ? "" : days < 0 ? " bad" : days <= 3 ? " warn" : "";
                 const texpCls = texpExpired ? " bad" : texpSoon ? " warn" : "";
@@ -426,17 +443,15 @@ function AccountsPage({
                       </span>
                       {/* 积分与过期合在一列：过期时间就是「智能接管先扣谁」的第一排序键，所以直接显示。
                           有 `packages` 时整行可点击，点开逐资源包列表 */}
-                    {!cr.unlimited && cr.expiry ? (
+                    {days !== null ? (
                       <span
                         className={`sub ${credCls}`}
                         title="智能接管优先使用到期最早的积分"
                         onClick={() => setPkgAccount(a)}
                       >
-                        {days !== null && days < 0
+                        {days < 0
                           ? "已过期"
-                          : `${days} 天后过期 ${
-                              earliestPkgRemaining(cr.packages) ?? ""
-                            }`.trim()}
+                          : `${days} 天后过期 ${soonPkg ? soonPkg.remaining : ""}`.trim()}
                       </span>
                     ) : (
                       <span
@@ -463,18 +478,18 @@ function AccountsPage({
                       {/* 自动续签的可见证据：到期时间被推远了就是续上了。没有按钮之后，
                           这一列就是唯一的反馈 —— 所以「未知」必须显式说出来，否则会有一个
                           「永远不续、界面上又看不出来」的沉默账号。 */}
-                      {texp !== null ? (
+                      {texpCount !== null ? (
                         <span
                           className={`sub${texpCls}`}
                           title={
                             texpExpired
-                              ? "token 已过期且自动续签没成功，需要重新登录这个账号"
+                              ? `token 已于 ${texpCount.at} 过期，自动续签没成功，需要重新登录这个账号`
                               : texpSoon
-                              ? "已进入续签窗口，后台会在 30 分钟内续一轮"
-                              : "自动续签会持续推远这个时间"
+                              ? `已进入续签窗口，后台会在 30 分钟内续一轮（${texpCount.at} 到期）`
+                              : `${texpCount.at} 到期；自动续签会持续推远这个时间`
                           }
                         >
-                          {texpExpired ? "已过期" : `${stamp(texp)} 到期`}
+                          {texpCount.text}
                         </span>
                       ) : (
                         <span

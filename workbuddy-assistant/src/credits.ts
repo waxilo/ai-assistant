@@ -78,12 +78,19 @@ export function packagesOf(book: CreditBook, id: string) {
   return book[id]?.packages ?? [];
 }
 
-/** 快过期提示：最早到期（非 null）的资源包，`{daysUntil, remaining}`；没有就返回 `null` */
+/**
+ * 快过期提示：最早到期的**未过期**资源包，`{daysUntil, remaining}`；没有就返回 `null`。
+ *
+ * 已到期的旧包不参与——接口在包过期后仍会挂着正余量（服务端还没清），
+ * 拿它当「最早到期」会让这一列永远停在「已过期」，把后面每一批积分的到期都挡住。
+ * 全都已过期 → `null`，调用方退回 [`expiryOf`]，照旧显示「已过期」。
+ */
 export function soonestExpiry(book: CreditBook, id: string) {
-  const pkgs = packagesOf(book, id).filter((p) => p.expiry_ms != null);
+  const now = Date.now();
+  const pkgs = packagesOf(book, id).filter((p) => p.expiry_ms != null && p.expiry_ms > now);
   if (pkgs.length === 0) return null;
   const p = pkgs[0];
-  return { daysUntil: Math.ceil((p.expiry_ms! - Date.now()) / 86_400_000), remaining: p.remaining };
+  return { daysUntil: Math.ceil((p.expiry_ms! - now) / 86_400_000), remaining: p.remaining };
 }
 
 /**

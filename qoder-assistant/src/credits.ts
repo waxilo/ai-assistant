@@ -90,19 +90,22 @@ export type SoonestExpiry =
   | { kind: "never"; remaining: number };
 
 /**
- * 快过期提示：最早到期（非 null）的资源包。
+ * 快过期提示：最早到期的**未过期**资源包。
  *
  * 排序已由后端定好（有到期日 → 永不过期 → 未知，见 `ledger::project_packages`），
  * 所以这里只需看第一个「有到期日」的包；一个都没有时，再看有没有永不过期的。
- * 全都没有 → `null`，调用方退回「查看资源包」那条提示。
+ * **已到期的旧包不参与**——接口在包过期后仍会挂着正余量（服务端还没清），
+ * 拿它当「最早到期」会让这一列永远停在「已过期」，把后面每一批积分的到期都挡住。
+ * 全都已过期 → `null`，调用方退回 [`expiryOf`]，照旧显示「已过期」。
  */
 export function soonestExpiry(book: CreditBook, id: string): SoonestExpiry | null {
+  const now = Date.now();
   const pkgs = packagesOf(book, id);
-  const dated = pkgs.find((p) => p.expiry_ms != null);
+  const dated = pkgs.find((p) => p.expiry_ms != null && p.expiry_ms > now);
   if (dated) {
     return {
       kind: "dated",
-      daysUntil: Math.ceil((dated.expiry_ms! - Date.now()) / 86_400_000),
+      daysUntil: Math.ceil((dated.expiry_ms! - now) / 86_400_000),
       remaining: dated.remaining,
     };
   }
