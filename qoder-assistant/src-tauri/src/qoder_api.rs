@@ -75,12 +75,12 @@ pub fn client() -> reqwest::Client {
 
 // ---------------------------------------------------------------- 国际版原生设备身份
 
-/// Qoder 国际版活动接口会校验一套由官方 `runtime-info.exe` 原生导出的设备身份
+/// Qoder 国际版活动接口会校验一套由官方 `runtime-info` 原生二进制导出的设备身份
 /// `{machineToken, machineType, machineCode}`：不带时国际版返回的 `campaigns[]` 里
 /// **没有**当天那条每日 `CLAIM_BENEFIT`（界面就报「活动未开」）；带上后才会下发。
-/// 国内版无此校验，一直正常。
+/// 国内版无此校验，一直正常；macOS 上实测**同样**需要这套头。
 ///
-/// 这套身份来源于官方 `runtime-info.exe`（win32 调用 `runtime-info.exe <env> --account-stdin`，
+/// 这套身份来源于官方 `runtime-info`（调用形态 `runtime-info <env> --account-stdin`，
 /// `<env>` 对 global 部署为 `3`，account 从 stdin 传 `{"account": uid}`）。三个值**每次
 /// 运行都会重新生成**，但同一次运行里必然配套 —— 服务端认可的正是「整体、自洽」的身份，
 /// 所以每次取值必须来自**同一次**输出，不可混用历史值。
@@ -94,7 +94,7 @@ struct MachineIdentity {
     machine_code: String,
 }
 
-/// 设备身份缓存：`(身份, 取到时刻)`。只在缓存过期时才重新拉起 `runtime-info.exe`。
+/// 设备身份缓存：`(身份, 取到时刻)`。只在缓存过期时才重新拉起官方二进制。
 static MACHINE_CACHE: OnceLock<Mutex<Option<(MachineIdentity, Instant)>>> = OnceLock::new();
 
 /// 缓存时长。官方约 1 小时，签到节奏一天一次，10 分钟足够且更宽松。
@@ -104,17 +104,42 @@ fn machine_cache() -> &'static Mutex<Option<(MachineIdentity, Instant)>> {
     MACHINE_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// 定位官方 `runtime-info.exe`：`~/.qoder/.bin/<umid-…>/runtime-info.exe`。
+/// 定位官方 `runtime-info` 原生二进制 —— 两套安装形态都要认：
+/// - Windows：`~/.qoder/.bin/<umid-…>/runtime-info.exe`（藏在子目录里）
+/// - macOS / Linux：`~/.qoder/.bin/runtime-info-<os>-<arch>-<hash>`（直接放的裸文件）
+///
+/// 之前只认 Windows 形态，mac 上于是永远「没装官方环境」→ 国际版永远报「活动未开」。
+/// 官方每升一版会留一个新的、旧的还在，多个候选取**修改时间最新**的那个
+/// （身份要跟官方客户端当前用的版本一致，旧版本那份不该拿去用）。
 /// 未安装官方 Qoder（或路径变了）就 `None` —— 此时国际版只能退回「不带头」的旧行为。
-fn runtime_info_exe() -> Option<std::path::PathBuf> {
+fn runtime_info_bin() -> Option<std::path::PathBuf> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok()?;
     let bin = std::path::Path::new(&home).join(".qoder").join(".bin");
-    std::fs::read_dir(bin).ok()?.flatten().find_map(|e| {
-        let p = e.path().join("runtime-info.exe");
-        p.is_file().then_some(p)
-    })
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(bin).ok()?.flatten() {
+        let path = entry.path();
+        let cand = if path.is_dir() {
+            let inner = path.join("runtime-info.exe");
+            inner.is_file().then_some(inner)
+        } else {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            name.starts_with("runtime-info").then_some(path)
+        };
+        let Some(cand) = cand else { continue };
+        let Ok(mtime) = std::fs::metadata(&cand).and_then(|m| m.modified()) else {
+            continue;
+        };
+        let newer = match &best {
+            None => true,
+            Some((t, _)) => mtime > *t,
+        };
+        if newer {
+            best = Some((mtime, cand));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// 官方 `Cosy-MachineId` 的来源：`~/.qoder/installation_id`（实测它和国际版
@@ -129,9 +154,9 @@ fn installation_id() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// 真正拉起 `runtime-info.exe` 一次，返回新鲜整套身份。
+/// 真正拉起官方 `runtime-info` 一次，返回新鲜整套身份。
 fn spawn_machine_identity(region: Region) -> Option<MachineIdentity> {
-    let exe = runtime_info_exe()?;
+    let exe = runtime_info_bin()?;
     // 官方 `dZe`：global 部署 `environment = 3`，其它（含国内）为 `0`。
     let env = if region == Region::Global { "3" } else { "0" };
     let mut child = crate::proc::cmd(exe)
@@ -165,7 +190,8 @@ fn spawn_machine_identity(region: Region) -> Option<MachineIdentity> {
 }
 
 /// 取（并缓存）原生设备身份。**仅国际版**参与：国内版不需要、也不应被这个随机身份打扰。
-/// 官方环境（`runtime-info.exe`）缺失时回 `None`，调用方保持「不带机器头」的旧行为。
+/// 官方环境（`runtime-info` 二进制，两平台形态见 [`runtime_info_bin`]）缺失时回 `None`，
+/// 调用方保持「不带机器头」的旧行为。
 fn machine_identity(region: Region) -> Option<MachineIdentity> {
     if region != Region::Global {
         return None;
@@ -949,12 +975,12 @@ mod tests {
         assert!(parse_campaigns(&serde_json::json!({})).is_none());
     }
 
-    /// 只读实验 2：**用官方 `runtime-info.exe` 现取一整套原生设备身份
+    /// 只读实验 2：**用官方 `runtime-info` 现取一整套原生设备身份
     /// （`machineToken` / `machineType` / `machineCode`），再把 `Cosy-*` 机器头逐个补齐，
     /// 验证国际版活动接口此时是否下发当天可领的每日活动**。
     ///
-    /// 逆向结论（app.asar 0.3.4 `dZe`/`AXe`）：win32 下官方以
-    /// `runtime-info.exe <environment> --account-stdin` 调用，account 从 stdin 传
+    /// 逆向结论（app.asar 0.3.4 `dZe`/`AXe`）：官方以
+    /// `runtime-info <environment> --account-stdin` 调用，account 从 stdin 传
     /// `{"account": uid}`；全局部署 `environment = 3`。输出为一段 JSON，
     /// 官方只取 `{machineToken, machineType, machineCode}`。关键点：这三个值**每次调用
     /// 都重新生成**（并非持久化），所以「同一次运行里三值必然配套」才是可用的资格，
@@ -969,17 +995,9 @@ mod tests {
             println!("本机没有国际版账号，跳过");
             return;
         };
-        // 定位 runtime-info.exe：~/.qoder/.bin/<umid-xxx>/runtime-info.exe
-        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
-        let bin_dir = std::path::Path::new(&home).join(".qoder").join(".bin");
-        let exe = std::fs::read_dir(&bin_dir).ok().and_then(|rd| {
-            rd.flatten().find_map(|e| {
-                let p = e.path().join("runtime-info.exe");
-                p.is_file().then_some(p)
-            })
-        });
-        let Some(exe) = exe else {
-            println!("未找到 runtime-info.exe，跳过");
+        // 定位官方二进制（两平台形态见 `runtime_info_bin`），之后调用走生产同款
+        let Some(exe) = runtime_info_bin() else {
+            println!("未找到 runtime-info 二进制，跳过");
             return;
         };
         // 调用官方同款：environment=3(global) --account-stdin，account 走 stdin
@@ -989,7 +1007,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("无法启动 runtime-info.exe");
+            .expect("无法启动 runtime-info");
         {
             use std::io::Write;
             if let Some(stdin) = child.stdin.as_mut() {
@@ -1015,9 +1033,13 @@ mod tests {
             return;
         }
         // Cosy-MachineId 用本机真实的 installation_id / machine_id 轮流试
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".into());
+        let qoder_dir = std::path::Path::new(&home).join(".qoder");
         let id_candidates = [
-            std::fs::read_to_string(home.clone() + "\\.qoder\\installation_id").ok(),
-            std::fs::read_to_string(home.clone() + "\\.qoder\\.auth\\machine_id").ok(),
+            std::fs::read_to_string(qoder_dir.join("installation_id")).ok(),
+            std::fs::read_to_string(qoder_dir.join(".auth").join("machine_id")).ok(),
         ]
         .into_iter()
         .flatten()
