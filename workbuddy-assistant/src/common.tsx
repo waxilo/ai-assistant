@@ -156,13 +156,14 @@ export function signState(a: Account, busy: boolean): SignState {
   return "pending";
 }
 
-/** 一批签到结果的互斥计数（成功 / 已签 / 失败），避免「已签」被重复算成「成功」 */
+/** 一批签到结果的互斥计数（成功 / 已签 / 活动未开 / 失败），避免「已签」被重复算成「成功」 */
 export function tally(
   items: { success: boolean; already: boolean; inactive: boolean }[]
 ) {
   return {
     ok: items.filter((l) => l.success && !l.already).length,
     already: items.filter((l) => l.already).length,
+    inactive: items.filter((l) => !l.success && !l.already && l.inactive).length,
     fail: items.filter((l) => !l.success && !l.already && !l.inactive).length,
   };
 }

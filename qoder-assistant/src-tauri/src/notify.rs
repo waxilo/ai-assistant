@@ -139,8 +139,8 @@ pub fn trigger_line(actual: &str, plan: &str, base: &str) -> String {
 
 /// 把一批账号的签到结果汇总成一条人类可读的通知正文（品牌前缀由 [`send`] 施加）。
 ///
-/// 全成功时只报数量；有失败时附上前 5 条失败明细（账号名 + 手机号 + 原因），
-/// 因为推送里最有价值的信息就是「哪个账号为什么没签到」。
+/// 全签上时只报数量；有「未签」（活动未开 / 失败）时附上前 5 条未签明细
+///（账号名 + 展示标识 + 原因），因为推送里最有价值的信息就是「哪个账号为什么没签到」。
 pub fn summary_message(views: &[AccountView]) -> String {
     // 通知只关心账号本身（签到结果 / 名称 / 手机号），积分与它无关：
     // 先摊平成账号列表，下面的逻辑与从前完全一致。
@@ -153,24 +153,39 @@ pub fn summary_message(views: &[AccountView]) -> String {
         .iter()
         .filter(|a| matches!(&a.last, Some(r) if r.success && !r.already))
         .count();
-    let failed: Vec<&Account> = accounts
+    // 「活动未开」既不算成功也不算失败，但**必须占一个计数框**：上一版把它从三个
+    // 计数里全部排除，3 个账号只报出 2 个、明细里也没有它 —— 用户根本不知道谁没签上。
+    let inactive = accounts
+        .iter()
+        .filter(|a| matches!(&a.last, Some(r) if !r.success && !r.already && r.inactive))
+        .count();
+    // 四个计数互斥，且加总恒等于总数：成功 + 已签 + 活动未开 + 失败 == total
+    let failed = accounts
         .iter()
         .filter(|a| match &a.last {
             Some(r) => !r.success && !r.already && !r.inactive,
             None => true,
         })
-        .copied()
-        .collect();
+        .count();
 
     let mut s = format!(
-        "签到完成：成功 {ok} / 已签 {already} / 失败 {}（共 {total} 个账号）",
-        failed.len()
+        "签到完成：成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}（共 {total} 个账号）"
     );
-    if !failed.is_empty() {
-        s.push_str("\n失败明细：");
-        for a in failed.iter().take(5) {
+    // 「未签明细」= 活动未开 + 失败（按账号列表顺序）：未开多是窗口/查询问题，
+    // 失败是真错误 —— 都附上各自的原因，用户在推送里就能判断要不要处理
+    let unsigned: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| match &a.last {
+            Some(r) => !r.success && !r.already,
+            None => true,
+        })
+        .copied()
+        .collect();
+    if !unsigned.is_empty() {
+        s.push_str("\n未签明细：");
+        for a in unsigned.iter().take(5) {
             // 展示标识与界面同一套规则（国内版手机号 / 国际版邮箱，见 `Account::identity`）：
-            // 推送里的「谁失败了」与界面上看到的名字必须是同一条
+            // 推送里的「谁没签上」与界面上看到的名字必须是同一条
             let who = match a.identity() {
                 Some(id) => format!("{}（{}）", a.name, id),
                 None => a.name.clone(),
@@ -183,8 +198,8 @@ pub fn summary_message(views: &[AccountView]) -> String {
                 .unwrap_or_else(|| "未执行".to_string());
             s.push_str(&format!("\n· {who}：{why}"));
         }
-        if failed.len() > 5 {
-            s.push_str(&format!("\n…另有 {} 个失败账号", failed.len() - 5));
+        if unsigned.len() > 5 {
+            s.push_str(&format!("\n…另有 {} 个未签账号", unsigned.len() - 5));
         }
     }
     s
@@ -322,9 +337,10 @@ mod tests {
         let m = summary_message(&accounts);
         assert!(m.contains("成功 1"), "{m}");
         assert!(m.contains("已签 1"), "{m}");
+        assert!(m.contains("活动未开 0"), "{m}");
         assert!(m.contains("失败 0"), "{m}");
-        // 全成功/已签不该堆失败明细
-        assert!(!m.contains("失败明细"), "{m}");
+        // 全成功/已签不该堆未签明细
+        assert!(!m.contains("未签明细"), "{m}");
     }
 
     #[test]
@@ -352,10 +368,43 @@ mod tests {
         let m = summary_message(&accounts);
         assert!(m.contains("成功 1"), "{m}");
         assert!(m.contains("失败 2"), "{m}");
-        assert!(m.contains("失败明细"), "{m}");
+        assert!(m.contains("未签明细"), "{m}");
         assert!(m.contains("小号（138****0000）：HTTP 401 (token expired)"), "{m}");
         // last 为 None 的账号算失败，原因写「未执行」
         assert!(m.contains("无记录：未执行"), "{m}");
+    }
+
+    /// 「活动未开」的账号必须出现在计数与明细里 —— 上一版把它从三个计数里全部排除，
+    /// 3 个账号只报出 2 个（真实案例：国际版缺设备头时整批显示活动未开）。
+    #[test]
+    fn inactive_accounts_are_counted_and_listed_as_unsigned() {
+        let mut a = acct(
+            "waxilo",
+            None,
+            Some(rec(false, false, true, "当前没有可领取的活动（每日 10:00 UTC+8 刷新后才会出现）")),
+        );
+        a.account.email = Some("waxilo88@gmail.com".into());
+        let m = summary_message(&[
+            acct("主号", Some("190****9775"), Some(rec(true, false, false, "已领取 100 Credits"))),
+            a,
+        ]);
+        assert!(m.contains("成功 1 / 已签 0 / 活动未开 1 / 失败 0（共 2 个账号）"), "{m}");
+        assert!(m.contains("未签明细"), "{m}");
+        assert!(m.contains("waxilo（waxilo88@gmail.com）：当前没有可领取的活动"), "{m}");
+    }
+
+    /// 四个计数互斥，加总恒等于总数：成功 + 已签 + 活动未开 + 失败 == 账号数
+    #[test]
+    fn buckets_partition_all_accounts() {
+        let accounts = vec![
+            acct("a", Some("1"), Some(rec(true, false, false, "签到成功"))),
+            acct("b", Some("2"), Some(rec(true, true, false, "今日已领取"))),
+            acct("c", Some("3"), Some(rec(false, false, true, "当前没有可领取的活动"))),
+            acct("d", Some("4"), Some(rec(false, false, false, "HTTP 500"))),
+            acct("e", Some("5"), None),
+        ];
+        let m = summary_message(&accounts);
+        assert!(m.contains("成功 1 / 已签 1 / 活动未开 1 / 失败 2（共 5 个账号）"), "{m}");
     }
 
     /// 国际版账号的展示标识是邮箱：手机号为空的失败账号不能再退回「只有名字」，

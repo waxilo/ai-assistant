@@ -126,19 +126,22 @@ pub fn summary_title(ok: usize, already: usize, failed: usize) -> String {
 }
 
 /// 把一次定时签到的计数汇总成一条通知正文（不含标题，品牌前缀由 [`send`] 施加）。
-pub fn summary_message(ok: usize, already: usize, failed: &[String]) -> String {
-    let total = ok + already + failed.len();
+///
+/// `inactive` 是「活动未开」的数量；`unsigned` 是「未签明细」行（活动未开 + 失败，
+/// 按账号顺序）—— 四个计数互斥、加总恒等于账号数：失败数 = 未签总数 − 活动未开数。
+pub fn summary_message(ok: usize, already: usize, inactive: usize, unsigned: &[String]) -> String {
+    let failed = unsigned.len() - inactive;
+    let total = ok + already + unsigned.len();
     let mut s = format!(
-        "成功 {ok} / 已签 {already} / 失败 {}（共 {total} 个账号）",
-        failed.len()
+        "成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}（共 {total} 个账号）"
     );
-    if !failed.is_empty() {
-        s.push_str("\n失败明细：");
-        for f in failed.iter().take(5) {
+    if !unsigned.is_empty() {
+        s.push_str("\n未签明细：");
+        for f in unsigned.iter().take(5) {
             s.push_str(&format!("\n· {f}"));
         }
-        if failed.len() > 5 {
-            s.push_str(&format!("\n…另有 {} 个失败账号", failed.len() - 5));
+        if unsigned.len() > 5 {
+            s.push_str(&format!("\n…另有 {} 个未签账号", unsigned.len() - 5));
         }
     }
     s
@@ -165,7 +168,7 @@ mod tests {
         let url = build_url(
             "https://h/x",
             &branded(&summary_title(1, 0, 0)),
-            &branded(&summary_message(1, 0, &[])),
+            &branded(&summary_message(1, 0, 0, &[])),
         )
         .unwrap();
         let parsed = reqwest::Url::parse(&url).unwrap();
@@ -191,7 +194,7 @@ mod tests {
         ] {
             assert!(!t.contains("TraeWork"), "{t}");
         }
-        assert!(!summary_message(1, 0, &[]).contains("TraeWork"));
+        assert!(!summary_message(1, 0, 0, &[]).contains("TraeWork"));
     }
 
     #[test]
@@ -238,9 +241,19 @@ mod tests {
 
     #[test]
     fn summary_lists_failures() {
-        let m = summary_message(1, 1, &["小号：HTTP 401".to_string()]);
-        assert!(m.contains("成功 1 / 已签 1 / 失败 1（共 3 个账号）"), "{m}");
+        let m = summary_message(1, 1, 0, &["小号：HTTP 401".to_string()]);
+        assert!(m.contains("成功 1 / 已签 1 / 活动未开 0 / 失败 1（共 3 个账号）"), "{m}");
+        assert!(m.contains("未签明细"), "{m}");
         assert!(m.contains("· 小号：HTTP 401"), "{m}");
+    }
+
+    /// 「活动未开」的账号必须出现在计数与明细里 —— 上一版把它整个丢掉，
+    /// 账号总数对不上，「谁没签上」也查不到。
+    #[test]
+    fn inactive_accounts_are_counted_and_listed_as_unsigned() {
+        let m = summary_message(1, 0, 1, &["waxilo：活动未开启".to_string()]);
+        assert!(m.contains("成功 1 / 已签 0 / 活动未开 1 / 失败 0（共 2 个账号）"), "{m}");
+        assert!(m.contains("· waxilo：活动未开启"), "{m}");
     }
 
     /// 本机冒烟：真的往 webhook 发一条（会收到真实推送）。

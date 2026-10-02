@@ -373,12 +373,13 @@ export default function App() {
       // 跨区域那跑返回的是两边的账号，合并规则一样（见 mergeById），另一区域的行也在列表里
       setAccounts((list) => mergeById(list, updated));
       seedCredits(updated);
-      const { ok, already, fail } = tally(
+      const { ok, already, inactive, fail } = tally(
         updated.map((a) => a.last).filter((r): r is NonNullable<typeof r> => r != null)
       );
       showToast({
-        kind: fail > 0 ? "err" : "ok",
-        text: `全部完成：成功 ${ok} / 已签 ${already} / 失败 ${fail}`,
+        // 「活动未开」不是失败但也没签上：toast 用提示色，别报成一片绿
+        kind: fail > 0 ? "err" : inactive > 0 ? "info" : "ok",
+        text: `全部完成：成功 ${ok} / 已签 ${already} / 活动未开 ${inactive} / 失败 ${fail}`,
       });
     } catch (e) {
       showToast({ kind: "err", text: "批量签到异常：" + String(e) });

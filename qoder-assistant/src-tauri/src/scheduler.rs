@@ -715,7 +715,8 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
     let notify_on = settings.notify_enabled && settings.notify_on_schedule;
     match commands::checkin_all_inner(app, true, commands::Scope::AllRegions).await {
         Ok(views) => {
-            // 与 notify 一致：「已签」与「成功」互斥计数（已签的响应 success 也是 true）。
+            // 与 notify 一致：「已签」与「成功」互斥计数（已签的响应 success 也是 true），
+            // «活动未开»与«失败»各占一个计数框 —— 四个互斥、加总恒等于账号数。
             // 视图里的账号那一半就是签到结果，积分读数在这里不参与统计。
             let already = views
                 .iter()
@@ -725,7 +726,23 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
                 .iter()
                 .filter(|v| matches!(&v.account.last, Some(r) if r.success && !r.already))
                 .count();
-            let msg = format!("签到完成：{} 个账号，成功 {ok} / 已签 {already}", views.len());
+            let inactive = views
+                .iter()
+                .filter(|v| {
+                    matches!(&v.account.last, Some(r) if !r.success && !r.already && r.inactive)
+                })
+                .count();
+            let failed = views
+                .iter()
+                .filter(|v| match &v.account.last {
+                    Some(r) => !r.success && !r.already && !r.inactive,
+                    None => true,
+                })
+                .count();
+            let msg = format!(
+                "签到完成：{} 个账号，成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}",
+                views.len()
+            );
             log_event(dir, &msg);
             let _ = app.emit(
                 EVENT,

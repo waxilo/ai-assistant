@@ -230,22 +230,27 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
 
     let mut ok = 0usize;
     let mut already = 0usize;
-    let mut failed: Vec<String> = Vec::new();
+    let mut inactive = 0usize;
+    // 「未签明细」= 活动未开 + 失败（按账号顺序）：未开另占一个计数框，不是失败
+    let mut unsigned: Vec<String> = Vec::new();
     for (name, r) in &done {
         if r.already {
             already += 1;
         } else if r.success {
             ok += 1;
-        } else if !r.inactive {
-            failed.push(format!("{}：{}", name, r.message));
+        } else {
+            if r.inactive {
+                inactive += 1;
+            }
+            unsigned.push(format!("{}：{}", name, r.message));
         }
     }
 
     // webhook 通知：仅配置了地址才发，失败只记日志、不影响签到结果
     let webhook = settings.webhook_url.trim();
     if !webhook.is_empty() {
-        let title = crate::notify::summary_title(ok, already, failed.len());
-        let msg = crate::notify::summary_message(ok, already, &failed);
+        let title = crate::notify::summary_title(ok, already, unsigned.len() - inactive);
+        let msg = crate::notify::summary_message(ok, already, inactive, &unsigned);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let out = match tauri::async_runtime::block_on(crate::notify::send(webhook, &title, &msg)) {
             Ok(r) => r,
