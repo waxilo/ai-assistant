@@ -128,6 +128,21 @@ pub struct Account {
     /// 所以老账号第一次接管会多一次查询、之后走缓存。
     #[serde(default)]
     pub cosy_uid: Option<String>,
+    /// **活性判定**：usage 接口对这张 token 返回 401 的时刻（毫秒，见
+    /// `checkin::apply_liveness`）。
+    ///
+    /// 这是唯一可信的「票已被吊销」证据 —— `expires_at` 只是本地记的账，服务端可以
+    /// 提前作废一张到期时间还在未来的票。`broker::adopt` 的失效抢救规则用它：
+    /// 本机已判死 + 池里那份与本地不同 → 无条件换血，不再比 `expires_at`。
+    /// 续签/采纳成功后清除。
+    #[serde(default)]
+    pub invalidated_at: Option<i64>,
+    /// 续签冷却的截止时刻（毫秒）：死链（`RefreshError::dead`）后冷 6 小时。
+    ///
+    /// **持久化**的失败退避 —— 不落盘的话应用一重启就失忆，死链每轮都去打一个
+    /// 必然被拒的接口。续签成功 / 换到新票时清除。
+    #[serde(default)]
+    pub renew_blocked_until: Option<i64>,
 }
 
 impl Account {
@@ -891,6 +906,8 @@ mod tests {
                 last: None,
                 checked_today: Some(true),
                 cosy_uid: None,
+                invalidated_at: None,
+                renew_blocked_until: None,
             },
             credits: Some(ledger::CreditFact {
                 credits: Some(2957.83),
@@ -1221,6 +1238,8 @@ mod tests {
             last: None,
             checked_today: None,
             cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 

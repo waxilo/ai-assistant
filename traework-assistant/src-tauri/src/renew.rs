@@ -71,8 +71,7 @@ use crate::token;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 到期前多久算「该续签了」。
 pub const RENEW_WINDOW_MS: i64 = 24 * 3600 * 1000;
@@ -190,64 +189,55 @@ pub fn newer_by_iat(candidate: &str, current: &str) -> bool {
     matches!((iat(candidate), iat(current)), (Some(c), Some(cur)) if c > cur)
 }
 
-/// 「谁的票更新」的**唯一**判据：候选（到期时间, token）是否新于在用的那一份。
+/// 「谁的票更新」的**唯一**判据：候选（token, 到期时间）是否新于在用的那一份。
 ///
 /// 两个方向必须共用它 —— 云端 → 本地的采纳（`broker::adopt`）和本地 → 云端的回写
 /// （`broker::local_is_newer`）一旦各写一套，就会出现「A 看 B 更新、B 看 A 也更新」，
 /// 两台机器每轮同步都改一次整池版本，永远收敛不了。
 ///
-/// 规则：先比到期时间（都读得出时晚到期者胜）；一侧读不出，读得出的算新
-/// （**「不知道」不等于「更旧」**）；两侧都读不出时，必须是两张都读得出 `iat` 的 JWT
-/// 且候选签发更晚 —— 不透明 token「长得不一样」不构成更新的理由，来历不明的不许赢。
+/// 规则（2026-10-08 起改为 **iat 优先**）：
+/// 1. 两侧都是读得出 `iat` 的 JWT → **晚签发者胜**。`iat` 是「轮换顺序」的本义；
+///    exp 只是它的投影（受各家 TTL、时钟写法影响），过去拿 exp 当主键的缺陷在于
+///    exp 无法区分「更新的一次轮换」和「一张 exp 声明得更晚、但已被吊销的死票」。
+/// 2. 两侧都读不出 `iat` → 按到期时间比：都读得出时晚到期者胜；一侧读不出，
+///    读得出的算新（**「不知道」不等于「更旧」**）；两侧都读不出 → 不透明 token
+///    「长得不一样」不构成更新的理由，来历不明的不许赢。
 pub fn ticket_is_newer(
     cand_expiry: Option<i64>,
     cand_token: &str,
     cur_expiry: Option<i64>,
     cur_token: &str,
 ) -> bool {
+    match (iat(cand_token), iat(cur_token)) {
+        (Some(c), Some(cur)) => return c > cur,
+        _ => {}
+    }
     match (cand_expiry, cur_expiry) {
         (Some(c), Some(cur)) => c > cur,
         (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => newer_by_iat(cand_token, cur_token),
+        _ => false,
     }
 }
 
 // ---------------------------------------------------------------------------
-// 失败冷却
+// 失败冷却（**持久化**：写在 `Account::renew_blocked_until` 上、随 accounts.json 落盘）
 // ---------------------------------------------------------------------------
 
-/// 失败时间点 + 本次的冷却时长（时长随失败性质变，见 [`mark_attempt`]）。
-fn last_attempt() -> &'static Mutex<std::collections::HashMap<String, (Instant, Duration)>> {
-    static M: OnceLock<Mutex<std::collections::HashMap<String, (Instant, Duration)>>> =
-        OnceLock::new();
-    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+/// 该账号是否仍在续签冷却期内。
+///
+/// 冷却写在账号上并**落盘**：`needs_login`（refresh token 失效 / 设备密钥不在本机 ——
+/// 重试多少次都是同一个结论）冷 6 小时，临时失败冷一个巡检周期。
+/// 旧实现是内存 HashMap，应用一重启就失忆，死链每轮巡检都去打一个必然被拒的接口。
+pub fn renew_blocked(account: &Account, now_ms: i64) -> bool {
+    account.renew_blocked_until.is_some_and(|until| until > now_ms)
 }
 
-fn cooling(id: &str) -> bool {
-    let Ok(mut g) = last_attempt().lock() else {
-        return false;
-    };
-    let now = Instant::now();
-    g.retain(|_, (t, d)| within_cooldown(*t, *d, now));
-    g.get(id).is_some_and(|(t, d)| within_cooldown(*t, *d, now))
-}
-
-/// 是否仍在冷却窗口内。抽成纯函数只为**能在单测里捏时间点**；生产路径传的都是 `Instant::now()`。
-fn within_cooldown(marked_at: Instant, cooldown: Duration, now: Instant) -> bool {
-    now.saturating_duration_since(marked_at) < cooldown
-}
-
-fn mark_attempt(id: &str, cooldown: Duration) {
-    if let Ok(mut g) = last_attempt().lock() {
-        g.insert(id.to_string(), (Instant::now(), cooldown));
-    }
-}
-
-fn clear_attempt(id: &str) {
-    if let Ok(mut g) = last_attempt().lock() {
-        g.remove(id);
-    }
+/// 是否该**尝试**续签：进了续签窗口（或已过期），**或者已被上游判死**。
+///
+/// 「已被判死」必须单列：被吊销的票 exp 可能还在未来，按窗口判断它永远轮不到续 ——
+/// 链若在本机续得动，续签就是它唯一的自救通道（2026-10-08 死锁事故的另一半）。
+pub fn renew_due(account: &Account, now_ms: i64) -> bool {
+    needs_renew(account, now_ms) || account.invalidated_at.is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -264,10 +254,10 @@ pub async fn renew_if_needed(dir: &Path, account: &mut Account) -> Option<RenewO
         return None;
     }
     let now = chrono::Utc::now().timestamp_millis();
-    if !needs_renew(account, now) {
+    if !renew_due(account, now) {
         return None;
     }
-    if cooling(&account.id) {
+    if renew_blocked(account, now) {
         return None;
     }
     let out = renew(dir, account).await;
@@ -275,16 +265,7 @@ pub async fn renew_if_needed(dir: &Path, account: &mut Account) -> Option<RenewO
         // 交给桌面端：既不记日志也不进冷却 —— 它每轮都该重新看一眼（桌面端可能就是下一轮换的）
         return None;
     }
-    if out.renewed {
-        clear_attempt(&account.id);
-    } else if out.needs_login {
-        // 注定失败：冷 6 小时，别每轮都去打一个必然被拒的接口、把日志刷满
-        mark_attempt(&account.id, FAIL_COOLDOWN);
-    } else {
-        // 临时失败：只冷一个巡检周期，下一轮（30 分钟后）就重试 ——
-        // 这正是「自动续签」该有的韧性：网络抖一下不该让 token 就这么过期掉
-        mark_attempt(&account.id, RETRY_COOLDOWN);
-    }
+    // 成功与失败的冷却/清除都在 [`renew`] 里就地生效并落盘，这里不用再补一次写。
     Some(out)
 }
 
@@ -337,6 +318,9 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
 
     match exchange_by_refresh_token(dir, account, &refresh_token).await {
         Ok(()) => {
+            // 新票在手：活性/冷却两个标记自然失效（这张票刚被官方亲自签发，必然活着）
+            account.invalidated_at = None;
+            account.renew_blocked_until = None;
             let _ = accounts::save_accounts(dir, &replace(dir, account));
             let exp = expiry_ms(account);
             RenewOutcome {
@@ -355,6 +339,14 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
         }
         Err(e) => {
             let needs_login = e.needs_login;
+            // 失败退避**随账号落盘**：needs_login（注定失败）冷 6 小时，临时失败冷一个巡检周期。
+            // 值没变就不写 —— 临时失败每 30 分钟都会走到这里，别白落一次盘。
+            let cooldown = if needs_login { FAIL_COOLDOWN } else { RETRY_COOLDOWN };
+            let until = chrono::Utc::now().timestamp_millis() + cooldown.as_millis() as i64;
+            if account.renew_blocked_until != Some(until) {
+                account.renew_blocked_until = Some(until);
+                let _ = accounts::save_accounts(dir, &replace(dir, account));
+            }
             RenewOutcome {
                 id: account.id.clone(),
                 name: account.name.clone(),
@@ -430,6 +422,9 @@ pub fn adopt_local_session(dir: &Path, account: &mut Account) -> Option<RenewOut
     }
     account.expires_at = local.expires_at;
     account.refresh_expires_at = local.refresh_expires_at;
+    // 新票在手：活性/冷却标记一并清掉（可能正是靠「桌面端换的新票」才能救活一条死链）
+    account.invalidated_at = None;
+    account.renew_blocked_until = None;
     let _ = accounts::save_accounts(dir, &replace(dir, account));
     let exp = expiry_ms(account);
     Some(RenewOutcome {
@@ -729,7 +724,7 @@ fn sweep(app: &tauri::AppHandle) {
     };
     let now = chrono::Utc::now().timestamp_millis();
     for mut account in accounts::load_accounts(&dir) {
-        if !needs_renew(&account, now) {
+        if !renew_due(&account, now) {
             continue;
         }
         let Some(out) = tauri::async_runtime::block_on(renew_if_needed(&dir, &mut account)) else {
@@ -777,6 +772,8 @@ mod tests {
             machine_id: None,
             created_at: String::new(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 
@@ -834,6 +831,28 @@ mod tests {
         assert!(!newer_by_iat(&jwt(2_000, 3_000), "opaque-old"));
     }
 
+    /// 判新主键现在是 **iat**（轮换顺序的本义）：exp 相同/死票 exp 更晚都不能翻盘；
+    /// 读不出 iat 的票才退化到按 exp 比。
+    #[test]
+    fn ticket_newness_is_decided_by_iat_first() {
+        // iat 更晚者胜，即便它的 exp 更早（TTL 变短了也是更新的轮换）
+        assert!(ticket_is_newer(Some(1_000), &jwt(9_000, 10_000), Some(2_000), &jwt(1_000, 9_000)));
+        // 两侧都读得出 iat 时，exp 不参与：死票 exp 更晚也赢不了
+        assert!(!ticket_is_newer(
+            Some(9_000),
+            &jwt(1_000, 9_000),
+            Some(1_000),
+            &jwt(2_000, 3_000)
+        ));
+        // 候选读不出 iat（不透明票）：退化到 exp 比较
+        assert!(ticket_is_newer(Some(3_000), "opaque-new", Some(2_000), &jwt(1_000, 9_000)));
+        assert!(!ticket_is_newer(Some(1_000), "opaque-old", Some(2_000), &jwt(1_000, 9_000)));
+        // 候选有 exp、在用票什么都没有：读得出的算新
+        assert!(ticket_is_newer(Some(3_000), "opaque-new", None, "opaque-cur"));
+        // 两侧都没 exp 且都读不出 iat：来历不明的不许赢
+        assert!(!ticket_is_newer(None, "opaque-new", None, "opaque-cur"));
+    }
+
     /// 到期时间的首选来源必须是票自己（`exp`），字段只是兜底，且秒/毫秒要归一。
     #[test]
     fn token_expiry_prefers_jwt_and_normalizes_units() {
@@ -846,36 +865,25 @@ mod tests {
         assert_eq!(expiry_ms(&a), Some(1_790_601_750_000));
     }
 
-    /// 冷却分档：临时失败只冷一个巡检周期，注定失败才冷 6 小时。
-    /// 纯函数，捏时间点即可 —— 「到底该冷多久」由 `renew_if_needed` 按 `needs_login` 选。
+    /// 冷却与「该不该续」的判定：冷却看持久化的 `renew_blocked_until`；
+    /// `renew_due` = 进窗口 **或已被判死**（吊销票的 exp 还在未来也必须试）。
     #[test]
-    fn cooldown_follows_the_failure_kind() {
-        let failed_at = Instant::now();
-        // 临时失败：一分钟后就该允许重试（更别说 30 分钟后那一轮了）
-        assert!(within_cooldown(
-            failed_at,
-            RETRY_COOLDOWN,
-            failed_at + Duration::from_secs(60)
-        ));
-        // 临时失败：满一个巡检周期即解冻
-        assert!(!within_cooldown(
-            failed_at,
-            RETRY_COOLDOWN,
-            failed_at + RETRY_COOLDOWN
-        ));
-        // 注定失败：一小时还在冷却里，六小时后才放行
-        assert!(within_cooldown(
-            failed_at,
-            FAIL_COOLDOWN,
-            failed_at + Duration::from_secs(3600)
-        ));
-        assert!(!within_cooldown(
-            failed_at,
-            FAIL_COOLDOWN,
-            failed_at + FAIL_COOLDOWN
-        ));
-        // 时钟不可能倒退，但真倒退了也不能算「已过期」（saturating 到 0 ⇒ 仍在冷却）
-        assert!(within_cooldown(failed_at, RETRY_COOLDOWN, failed_at));
+    fn renew_due_and_blocked() {
+        let now = 1_000_000i64;
+        // 冷却期内不放行，期满放行
+        let mut a = acc(&jwt(1, 2), None);
+        a.renew_blocked_until = Some(now + 1);
+        assert!(renew_blocked(&a, now));
+        assert!(!renew_blocked(&a, now + 1));
+        // 进窗口 → 该续
+        let exp_ms = 1_790_601_750_000i64;
+        let b = acc(&jwt(1_789_000_000, 1_790_601_750), None);
+        assert!(renew_due(&b, exp_ms - 23 * 3600 * 1000));
+        // 票还早，但已被上游判死 → 同样该续（否则永远轮不到它自救）
+        let mut c = acc(&jwt(1_789_000_000, 1_790_601_750), None);
+        c.invalidated_at = Some(now);
+        assert!(!renew_due(&acc(&jwt(1_789_000_000, 1_790_601_750), None), exp_ms - 25 * 3600 * 1000));
+        assert!(renew_due(&c, exp_ms - 25 * 3600 * 1000));
     }
 
     /// 只有 `20403` 是「这把钥匙不对」→ 换下一把候选接着试；`20404`（refresh token 已失效）

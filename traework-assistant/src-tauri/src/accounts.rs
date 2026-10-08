@@ -38,6 +38,20 @@ pub struct Account {
     /// `#[serde(default)]` 让旧 `accounts.json`（没有该字段）能正常反序列化。
     #[serde(default)]
     pub credit_snapshot: Option<CreditSnapshot>,
+    /// **活性判定**：官方接口对这张 token 返回 401 的时刻（毫秒，见 `checkin::post_ent_usage`）。
+    ///
+    /// 这是唯一可信的「票已被吊销」证据 —— exp 只是票的自我声明，服务端可以提前吊销一张
+    /// exp 还在未来的票（链在别处被轮换 / 桌面端自续），那正是 2026-10-08「本地死票锁死、
+    /// 云端活票永远采纳不进来」事故的根源。`broker::adopt` 的失效抢救规则用它：
+    /// 本机已判死 + 池里那份与本地不同 → 无条件换血，不再比 exp。续签/采纳成功后清除。
+    #[serde(default)]
+    pub invalidated_at: Option<i64>,
+    /// 续签冷却的截止时刻（毫秒）：`needs_login`（注定失败）冷 6 小时，临时失败冷一个巡检周期。
+    ///
+    /// **持久化**的失败退避 —— 旧实现是内存 HashMap，应用一重启就失忆，死链每轮巡检
+    /// 都去打一个必然被拒的接口。续签成功 / 换到新票时清除。
+    #[serde(default)]
+    pub renew_blocked_until: Option<i64>,
 }
 
 /// 账号**已有积分**快照。
@@ -152,6 +166,8 @@ impl From<TraeLocalAccount> for Account {
             machine_id: a.machine_id,
             created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 }
@@ -423,6 +439,8 @@ mod tests {
             machine_id: None,
             created_at: String::new(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         };
         assert!(normalize(&mut a), "空 id/uid/created_at 应判定为有改动");
         assert!(!a.id.trim().is_empty(), "空 id 必须补成 uuid");
@@ -448,6 +466,8 @@ mod tests {
             machine_id: None,
             created_at: "2026-09-14 21:21:50".into(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         };
         assert!(!normalize(&mut a));
         assert_eq!(a.id, "keep-me");

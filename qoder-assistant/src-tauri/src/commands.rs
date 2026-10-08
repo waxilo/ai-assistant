@@ -134,12 +134,25 @@ pub(crate) async fn refresh_account_in_place(
     let now = chrono::Utc::now().timestamp_millis();
     if refresh::rt_is_expired(account.rt_expires_at, now) {
         let dead_at = refresh::norm_rt_ms(account.rt_expires_at).unwrap_or(now);
+        // 死链退避**随账号落盘**（调用方保存）：重试一百次也是同一个结论，
+        // 不落盘的话应用一重启就失忆，死链每轮都去打一个必然被拒的接口。
+        account.renew_blocked_until = Some(now + refresh::DEAD_RENEW_BLOCK_MS);
         return Err(refresh::RefreshError::dead(format!(
             "refresh token 已于 {} 过期，这个账号需要重新登录",
             fmt_expiry(dead_at)
         )));
     }
-    let r = refresh::refresh(account.region, &account.token, &rt).await?;
+    let r = match refresh::refresh(account.region, &account.token, &rt).await {
+        Ok(r) => r,
+        Err(e) => {
+            // 同上：死链才退避（随账号落盘）；临时失败不冷，下一轮重试
+            if e.dead {
+                account.renew_blocked_until =
+                    Some(chrono::Utc::now().timestamp_millis() + refresh::DEAD_RENEW_BLOCK_MS);
+            }
+            return Err(e);
+        }
+    };
     // 写回登录文件要认人：那枚**换出去**的旧 token 就是「这个登录文件确实是我们刚签的那个
     // 账号」的证据。先存下来，下面传给 apply_refresh 做核对。
     let prev_token = account.token.clone();
@@ -150,6 +163,9 @@ pub(crate) async fn refresh_account_in_place(
     }
     account.expires_at = r.expires_at.or(account.expires_at);
     account.rt_expires_at = r.rt_expires_at.or(account.rt_expires_at);
+    // 新票在手：活性/冷却标记自然失效（这张票刚被官方亲自签发，必然活着）
+    account.invalidated_at = None;
+    account.renew_blocked_until = None;
     // 续签成功 → 同窗口原子写回 auth.v1.dat（尽力而为；核对不上本人就跳过，见它的文档）
     let _ = crate::auth_file::apply_refresh(
         account.region,
@@ -211,6 +227,9 @@ pub(crate) fn adopt_file_sessions(
         // 留着就是留着一条已经作废的判据 —— 比如旧链的 refresh token 早已过期，
         // 采纳后它会让下一个调用点立刻把这个账号又判成死链（见 `refresh::rt_is_expired`）。
         a.rt_expires_at = f.rt_expires_at;
+        // 新票在手：活性/冷却标记一并清掉（这条链正是「死链复活」的通道）
+        a.invalidated_at = None;
+        a.renew_blocked_until = None;
         // 顺手补身份（**只补空，绝不覆盖**，与 [`fill_identity_if_missing`] 同一条规矩）：
         // 登录文件知道这个人是谁，而我们认人、以及池里的 key 都指着这两样。
         // 这次是按 token 认出来的，下次 token 一轮换就只剩它们兜底了。
@@ -260,7 +279,12 @@ pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, re
         return Ok(false);
     }
     let now = chrono::Utc::now().timestamp_millis();
-    if !refresh::should_refresh(account.expires_at, now) {
+    // 「该续」= 进了续签窗口，**或已被上游判死**（吊销票的 expires_at 还在未来，
+    // 按窗口判断它永远轮不到续）；冷却中的账号直接放行不做（退避已随账号落盘）。
+    if !refresh::refresh_due(account, now) {
+        return Ok(false);
+    }
+    if refresh::renew_blocked(account, now) {
         return Ok(false);
     }
     refresh_account_in_place(account).await?;
@@ -583,6 +607,8 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     last: None,
                     checked_today: None,
                     cosy_uid: None,
+                    invalidated_at: None,
+                    renew_blocked_until: None,
                 });
                 added += 1;
             }
@@ -613,6 +639,8 @@ mod import_tests {
             created_at: String::new(),
             checked_today: None,
             cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: None,
         }
     }
@@ -1129,8 +1157,11 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
         // [`fill_identity_if_missing`]）。放在这里而不是签到路径：刷新本来就是
         // 「把该对齐的都对齐」的那一次，而签到要多打一个请求、又不一定会被点到。
         let _ = fill_identity_if_missing(&mut accounts[i]).await;
-        // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账
+        // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账。
+        //    顺手把**活性结论**落盘（401 标死 / 读到数据清除，见 `checkin::apply_liveness`）：
+        //    broker::adopt 的失效抢救规则靠它把池里的活票救下来。
         let view = checkin::fetch_resource_view(accounts[i].region, &accounts[i].token).await;
+        checkin::apply_liveness(&mut accounts[i], &view);
         readings.push(ledger::Reading {
             id: accounts[i].id.clone(),
             packages: view.packages,
@@ -1177,6 +1208,8 @@ pub async fn refresh_account_credits(
     // 临期先续签，避免拿着过期 token 把「没积分」误判成「查不到」
     let _ = ensure_fresh_token(&mut accounts[i]).await;
     let view = checkin::fetch_resource_view(accounts[i].region, &accounts[i].token).await;
+    // 活性结论就地生效（401 标死 / 读到数据清除），随下面的保存一起落盘
+    checkin::apply_liveness(&mut accounts[i], &view);
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let reading = ledger::Reading {
         id: accounts[i].id.clone(),
@@ -2292,6 +2325,8 @@ mod tests {
             rt_expires_at: None,
             created_at: String::new(),
             cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: Some(accounts::CheckinRecord {
                 success: true,
                 already: false,

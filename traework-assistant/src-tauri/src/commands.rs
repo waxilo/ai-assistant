@@ -207,11 +207,13 @@ async fn account_status_entry(
     let status = checkin::query_status(account).await;
     // ② 账号已有积分（entitlement 用量接口）；拉到就落盘，供界面展示与接管选号
     let view = checkin::fetch_resource_view_with(client, account).await;
+    // 活性结论就地生效：401 → 标记 `invalidated_at`（broker::adopt 的失效抢救规则靠它），
+    // 成功读到数据 → 清除。随下面的「有变才落盘」一起持久化。
+    let mut changed = checkin::apply_liveness(account, &view);
     // 失败时 `view` 是 Default（credits/unlimited/expiry 全空）—— 必须拦在这一步，
     // 否则会把已有快照整体覆盖成 `None`。unlimited 账号的 credits 恒为 `None`，
     // 所以不能只看 credits，三个字段任一有效即算拿到。
     let got = view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
-    let mut changed = false;
     if got {
         let packages = checkin::to_credit_packages(view.packages.clone());
         let next = accounts::CreditSnapshot::now(
@@ -221,11 +223,12 @@ async fn account_status_entry(
             packages,
         );
         let prev = account.credit_snapshot.as_ref();
-        changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms, p.packages.clone()))
+        let snap_changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms, p.packages.clone()))
             != Some((next.credits, next.unlimited, next.earliest_expiry_ms, next.packages.clone()));
-        if changed {
+        if snap_changed {
             account.credit_snapshot = Some(next);
         }
+        changed |= snap_changed;
     }
     // 拉不到（限流 9074 / 掉线）时沿用上次已知的积分，而不是把已有数字抹成未知
     let snap = account.credit_snapshot.as_ref();
@@ -1241,6 +1244,8 @@ pub(crate) async fn fetch_samples(
         // 否则会把已有快照整体覆盖成 `None`（账号页/简报页的「当前剩余」变「—」）。
         // unlimited 账号的 credits 恒为 `None`，所以不能只看 credits，三个字段任一有效即算拿到。
         if let Some(acct) = list.iter_mut().find(|x| x.id == a.id) {
+            // 活性结论就地生效（401 标死 / 读到数据清除），有变就随本批一起落盘
+            dirty |= checkin::apply_liveness(acct, &view);
             let got =
                 view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
             if got {

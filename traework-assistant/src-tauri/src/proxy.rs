@@ -784,7 +784,8 @@ async fn choose_account(
             })
             .unwrap_or_default();
         if snapshot_stale(acct.credit_snapshot.as_ref()) {
-            let mut snap = crate::checkin::fetch_credit_snapshot(&CLIENT, acct).await;
+            let view = crate::checkin::fetch_resource_view_with(&CLIENT, acct).await;
+            let mut snap = crate::checkin::credit_snapshot_of(&view);
             // 拉不到就保留上次已知的数字（只把 fetched_at 推新，避免每轮狂打接口），
             // 否则一次限流就会把已积累的额度信息抹成「未知」，选号随之失去依据
             if snap.credits.is_none() && !snap.unlimited {
@@ -799,8 +800,11 @@ async fn choose_account(
                 credits: snap.credits,
                 unlimited: snap.unlimited,
             };
-            // 回写持久化快照（含 fetched_at），下次新会话直接读、不必再打接口
+            // 回写持久化快照（含 fetched_at），下次新会话直接读、不必再打接口。
+            // 顺手把**活性结论**落盘：这里是接管热路径上唯一拿账号 token 打官方接口的地方，
+            // 401 只改快照的话，死票要等下一轮状态采集才会被标出来、broker::adopt 才救得了。
             if let Some(a) = all.iter_mut().find(|a| a.id == acct.id) {
+                crate::checkin::apply_liveness(a, &view);
                 a.credit_snapshot = Some(snap);
             }
             need_persist = true;
@@ -2537,6 +2541,8 @@ mod tests {
             machine_id: None,
             created_at: String::new(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 

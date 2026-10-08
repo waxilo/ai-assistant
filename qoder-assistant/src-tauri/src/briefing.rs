@@ -492,6 +492,8 @@ mod tests {
             last: None,
             checked_today: None,
             cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 

@@ -141,6 +141,9 @@ pub struct ResourceView {
     pub earliest_expiry_ms: Option<i64>,
     /// 逐包明细；响应里解析不到任何包时为空
     pub packages: Vec<PkgView>,
+    /// 这一轮官方接口**亲自拒绝了这张票**（HTTP 401）—— 活性证据，
+    /// 供 `checkin::apply_liveness` 回写账号、`broker::adopt` 的失效抢救规则消费。
+    pub auth_rejected: bool,
 }
 
 // 客户端不再由本模块构造：Qoder 的基址与身份头统一归 [`crate::qoder_api`] 持有。
@@ -342,6 +345,7 @@ pub fn parse_view(root: &Value) -> Option<ResourceView> {
         credits,
         earliest_expiry_ms,
         packages,
+        auth_rejected: false,
     })
 }
 
@@ -352,12 +356,22 @@ pub fn parse_view(root: &Value) -> Option<ResourceView> {
 /// 打错域只会稳定 401；`token` 是登录态里的 access token
 /// （来自 auth.v1.dat 的当前账号）。
 pub async fn fetch_usage(region: Region, token: &str) -> ResourceView {
-    let Some(body) =
-        crate::qoder_api::get_json(region, token, USAGE_PATH, &[("product", "app")]).await
-    else {
-        return ResourceView::default();
+    let (body, auth_rejected) = crate::qoder_api::get_json_with_auth_signal(
+        region,
+        token,
+        USAGE_PATH,
+        &[("product", "app")],
+    )
+    .await;
+    let Some(body) = body else {
+        return ResourceView {
+            auth_rejected,
+            ..Default::default()
+        };
     };
-    parse_view(&body).unwrap_or_default()
+    let mut view = parse_view(&body).unwrap_or_default();
+    view.auth_rejected = auth_rejected;
+    view
 }
 
 #[cfg(test)]
@@ -661,6 +675,8 @@ mod tests {
             last: None,
             checked_today: None,
             cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }];
 
         let mut led = crate::ledger::Ledger::default();

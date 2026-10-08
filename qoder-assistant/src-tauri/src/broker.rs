@@ -437,6 +437,8 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         last: None,
         checked_today: None,
         cosy_uid: None,
+        invalidated_at: None,
+        renew_blocked_until: None,
     }
 }
 
@@ -464,11 +466,27 @@ fn local_is_newer(account: &Account, item: &PoolItem) -> bool {
     }
 }
 
+/// 这张本地票**允许回写**云端吗（sync ④ 的守卫）。
+///
+/// 已被官方接口判死（`invalidated_at` 有值）的票绝不进池：`expires_at` 比较分不清
+/// 「更新的轮换」和「到期时间声明得更晚、但已被吊销的死票」，放行会把死票盖在活票上、
+/// 污染所有绑池机器（2026-10-08 事故里最危险的一半）。
+fn write_back_allowed(account: &Account) -> bool {
+    account.invalidated_at.is_none()
+}
+
 /// 把池里那一条采纳到本地账号上。返回是否真的改动了。
 ///
-/// 判据是 **`expires_at` 更晚**：续签之后 access token 的有效期必然往后推，所以「更晚」
-/// 等价于「更新的一次轮换」。反过来（池里那条更旧）绝不能覆盖 —— 那正是
-/// 「先到的旧副本把新凭证盖回去」的来源。
+/// 判据有两层：
+///
+/// 1. **失效抢救**（最高优先级）：本机这张票已被官方接口判死（`invalidated_at` 有值，
+///    见 `checkin::apply_liveness`），而池里那份与本地不同 → **无条件换血**。
+///    这是 2026-10-08「本地死票锁死」事故的主修：`expires_at` 比较分不清「更新的轮换」
+///    和「到期时间声明得更晚、但已被吊销的死票」，死票会永远挡住池里的活票。
+///    池里若是同一张死票，换血无意义，照旧走续签。
+/// 2. 常规新序：**`expires_at` 更晚**。续签之后 access token 的有效期必然往后推，
+///    所以「更晚」等价于「更新的一次轮换」。反过来（池里那条更旧）绝不能覆盖 ——
+///    那正是「先到的旧副本把新凭证盖回去」的来源。
 ///
 /// 不满足「更新」时仍会补本地缺的字段（老账号没有 refresh token、没有手机号），
 /// 因为那是从「不知道」变成「知道」，不存在覆盖新值的风险。
@@ -478,7 +496,10 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
         // 空 / 纯空白 token 一律忽略：采纳它等于把账号弄成登录不上
         return false;
     }
-    let newer = cloud_is_newer(item, account);
+    let differs = item.access_token.trim() != account.token
+        || (!item.refresh_token.trim().is_empty()
+            && item.refresh_token.trim() != account.refresh_token.as_deref().unwrap_or("").trim());
+    let newer = (account.invalidated_at.is_some() && differs) || cloud_is_newer(item, account);
     if !newer {
         let mut touched = false;
         if account.refresh_token.is_none() && !item.refresh_token.trim().is_empty() {
@@ -514,6 +535,9 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
     }
     account.expires_at = item.expires_at.or(account.expires_at);
     account.rt_expires_at = item.rt_expires_at.or(account.rt_expires_at);
+    // 新票在手：本机的活性/冷却标记一并清掉 —— 换血本身就是对死锁的解除
+    account.invalidated_at = None;
+    account.renew_blocked_until = None;
     if account.phone.is_none() && !item.phone.trim().is_empty() {
         account.phone = Some(item.phone.clone());
     }
@@ -1021,9 +1045,14 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     let mut failed = 0usize;
     let mut blocked = 0usize;
     for acct in accounts.iter_mut().filter(|a| a.region == region) {
-        if acct.refresh_token.is_none()
-            || !crate::refresh::should_refresh(acct.expires_at, now)
-        {
+        // 「该续」= 进了续签窗口，**或已被上游判死**（吊销票的 expires_at 还在未来，
+        // 按窗口判断它永远轮不到续，而续签是它唯一的自救通道）。
+        // 冷却中的账号直接算 blocked：退避已随账号落盘，重启也不会失忆。
+        if acct.refresh_token.is_none() || !crate::refresh::refresh_due(acct, now) {
+            continue;
+        }
+        if crate::refresh::renew_blocked(acct, now) {
+            blocked += 1;
             continue;
         }
         match crate::commands::refresh_account_in_place(acct).await {
@@ -1096,6 +1125,10 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     //    同样只碰本区域，判据与云端 → 本地方向对称（[`local_is_newer`]），只有严格更新才回写。
     let mut uploaded = 0usize;
     for acct in accounts.iter().filter(|a| a.region == region) {
+        // **已被上游判死的票绝不回写**（见 [`write_back_allowed`]）
+        if !write_back_allowed(acct) {
+            continue;
+        }
         let key = item_key_of(acct);
         if key.trim().is_empty() {
             continue;
@@ -1194,6 +1227,8 @@ mod tests {
             last: None,
             checked_today: None,
             cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 
@@ -1328,6 +1363,51 @@ mod tests {
         assert_eq!(a.token, "new");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-new"));
         assert_eq!(a.expires_at, Some(2_000));
+    }
+
+    // ── 失效抢救（2026-10-08「本地死票锁死」事故的主修）─────────────────
+
+    /// 本机已被官方判死（invalidated_at）+ 池里那份与本地不同 → **无条件换血**，
+    /// 不再比 expires_at：死票的到期时间声明得更晚时，常规判据会让它永远挡住池里的活票。
+    #[test]
+    fn a_marked_dead_local_token_is_rescued_from_the_pool() {
+        let mut a = acct("n", Some("138"), "dead-local");
+        a.invalidated_at = Some(5_000);
+        // 池里那张 expires_at 更早（别处更早一轮的活票）—— exp 判据会拒绝，活性规则必须放行
+        let it = item("138", "pool-live", Some(1_000));
+        assert!(adopt(&mut a, &it), "失效抢救不受 expires_at 判据约束");
+        assert_eq!(a.token, "pool-live");
+        // 换血成功后活性标记清除
+        assert_eq!(a.invalidated_at, None);
+        assert_eq!(a.renew_blocked_until, None);
+    }
+
+    /// 池里若是**同一张**死票（token 与 refresh token 都相同），换血无意义：
+    /// 常规判据（expires_at 不更晚）也过不了 → 不采纳，照旧走续签自救。
+    #[test]
+    fn the_same_dead_token_in_the_pool_is_not_adopted() {
+        let mut a = acct("n", Some("138"), "dead-local");
+        a.invalidated_at = Some(5_000);
+        a.refresh_token = Some("rt-dead-local".into());
+        a.expires_at = Some(2_000);
+        a.rt_expires_at = Some(2_001);
+        assert!(!adopt(&mut a, &item("138", "dead-local", Some(1_000))));
+        assert_eq!(a.invalidated_at, Some(5_000), "没换血就不清标记");
+    }
+
+    /// 已被判死的本地票**永不回写云端**（sync ④ 的守卫 [`write_back_allowed`]）：
+    /// expires_at 更晚的死票一旦回写，会把活票盖掉、污染所有绑池机器。
+    #[test]
+    fn local_is_newer_refuses_to_overwrite_the_pool_with_a_dead_token() {
+        let mut a = acct("n", Some("138"), "dead-local");
+        a.invalidated_at = Some(5_000);
+        a.expires_at = Some(2_000);
+        let it = item("138", "pool-live", Some(1_000));
+        // 没有守卫时，expires_at 更晚的死票会被判成「本地更新」——守卫是必需的
+        assert!(local_is_newer(&a, &it));
+        assert!(!write_back_allowed(&a), "判死的票不许参与本地→云端回写");
+        a.invalidated_at = None;
+        assert!(write_back_allowed(&a));
     }
 
     #[test]

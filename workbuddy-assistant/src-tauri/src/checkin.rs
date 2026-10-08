@@ -347,6 +347,30 @@ pub struct ResourceView {
     pub earliest_expiry_ms: Option<i64>,
     /// 逐包明细；响应里解析不到任何包时为空
     pub packages: Vec<PkgView>,
+    /// 这一轮官方接口**亲自拒绝了这张票**（HTTP 401）—— 活性证据，
+    /// 供 `apply_liveness` 回写账号、`broker::adopt` 的失效抢救规则消费。
+    pub auth_rejected: bool,
+}
+
+/// 把这一轮的**活性结论**回写到账号上：额度接口 401 → 记 `invalidated_at`；
+/// 成功解析出积分 → 清除。返回是否有变化（调用方把它当落盘的「脏」信号）。
+///
+/// 清除必须以「真的读到积分」为准 —— 网络/解析失败（`auth_rejected == false` 且读不到）
+/// 既不记也不清，「不知道」不下结论。`broker::adopt` 的失效抢救规则消费这个标记：
+/// 本机已判死 + 池里那份与本地不同 → 无条件换血（2026-10-08「本地死票锁死」事故的主修）。
+pub fn apply_liveness(account: &mut Account, view: &ResourceView) -> bool {
+    if view.auth_rejected {
+        if account.invalidated_at.is_none() {
+            account.invalidated_at = Some(chrono::Utc::now().timestamp_millis());
+            return true;
+        }
+        return false;
+    }
+    if view.credits.is_some() && account.invalidated_at.is_some() {
+        account.invalidated_at = None;
+        return true;
+    }
+    false
 }
 
 /// 从 `get-user-resource` 响应里解析每个资源包的**本周期**授予 / 已用。
@@ -460,13 +484,21 @@ pub async fn fetch_resource_view(
     else {
         return ResourceView::default();
     };
+    // HTTP 401 是官方 API 对这张 token 的**亲自拒绝**——「票已被服务端吊销」的唯一可信
+    // 证据（`expires_at` 只是本地记的账，吊销可以发生在它之前）。其余失败（5xx/超时/
+    // 解析）不能据此下「票死了」的结论。
+    let auth_rejected = resp.status() == reqwest::StatusCode::UNAUTHORIZED;
     let Ok(body) = resp.json::<Value>().await else {
-        return ResourceView::default();
+        return ResourceView {
+            auth_rejected,
+            ..Default::default()
+        };
     };
     let mut view = ResourceView {
         credits: sum_credits(&body),
         earliest_expiry_ms: earliest_cycle_end(&body),
         packages: parse_packages(&body),
+        auth_rejected,
     };
     if view.credits.is_none() {
         // 兜底：checkin-status 的累计积分（没有过期时间概念）
@@ -704,6 +736,8 @@ mod tests {
             created_at: String::new(),
             last: None,
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }];
 
         let mut led = crate::ledger::Ledger::default();

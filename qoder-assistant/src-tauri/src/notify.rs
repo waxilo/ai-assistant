@@ -228,6 +228,8 @@ mod tests {
                 created_at: String::new(),
                 checked_today: None,
                 cosy_uid: None,
+                invalidated_at: None,
+                renew_blocked_until: None,
                 last: rec,
             },
             credits: None,

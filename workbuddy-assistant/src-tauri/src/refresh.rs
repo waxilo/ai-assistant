@@ -87,6 +87,17 @@ pub fn should_refresh(expires_at: Option<i64>, now_ms: i64) -> bool {
     matches!(expires_at, Some(e) if e - now_ms < REFRESH_THRESHOLD_MS)
 }
 
+/// 死链（`RefreshError::dead`）后的冷却时长：重试一百次也是同一个结论。
+pub const DEAD_RENEW_BLOCK_MS: i64 = 6 * 3600 * 1000;
+
+/// 该账号是否仍在续签冷却期内。
+///
+/// 冷却写在账号上并**随 accounts.json 落盘**（[`Account::renew_blocked_until`]）——
+/// 不落盘的话应用一重启就失忆，死链每轮都去打一个必然被拒的接口。
+pub fn renew_blocked(acct: &crate::accounts::Account, now_ms: i64) -> bool {
+    acct.renew_blocked_until.is_some_and(|until| until > now_ms)
+}
+
 /// 时间戳归一：各处混发秒与毫秒，小于 1e12 一律当秒。
 pub fn norm_ms(v: i64) -> i64 {
     if v < 1_000_000_000_000 {

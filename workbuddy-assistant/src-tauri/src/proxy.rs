@@ -1593,6 +1593,8 @@ mod tests {
             base_url: None,
             created_at: String::new(),
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: None,
         };
         let all = vec![mk("a"), mk("b"), mk("c")];
@@ -1619,6 +1621,8 @@ mod tests {
             base_url: None,
             created_at: String::new(),
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: None,
         };
         let all = vec![mk("a"), mk("b"), mk("c")];
@@ -2014,6 +2018,8 @@ mod tests {
             base_url: None,
             created_at: String::new(),
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: None,
         };
         stream_response(
@@ -2121,6 +2127,8 @@ mod tests {
             base_url: None,
             created_at: String::new(),
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: None,
         };
         forward_rate_limited(&mut server, &limited, &acct, "mock.host");

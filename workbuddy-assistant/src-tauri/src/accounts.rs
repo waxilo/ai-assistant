@@ -67,6 +67,21 @@ pub struct Account {
     /// 绝不再把昨天的本地缓存或一次本地报错当成确定状态）。
     #[serde(default)]
     pub checked_today: Option<bool>,
+    /// **活性判定**：额度接口对这张 token 返回 401 的时刻（毫秒，见
+    /// `checkin::apply_liveness`）。
+    ///
+    /// 这是唯一可信的「票已被吊销」证据 —— `expires_at` 只是本地记的账，服务端可以
+    /// 提前作废一张到期时间还在未来的票。`broker::adopt` 的失效抢救规则用它：
+    /// 本机已判死 + 池里那份与本地不同 → 无条件换血，不再比 `expires_at`。
+    /// 续签/采纳成功后清除。
+    #[serde(default)]
+    pub invalidated_at: Option<i64>,
+    /// 续签冷却的截止时刻（毫秒）：死链（`RefreshError::dead`）后冷 6 小时。
+    ///
+    /// **持久化**的失败退避 —— 不落盘的话应用一重启就失忆，死链每轮都去打一个
+    /// 必然被拒的接口。续签成功 / 换到新票时清除。
+    #[serde(default)]
+    pub renew_blocked_until: Option<i64>,
 }
 
 /// 发给前端的账号视图 = **账号本身** + 从唯一台账投影出来的积分事实。
@@ -380,6 +395,8 @@ mod tests {
                 created_at: "2026-09-16 09:00:00".into(),
                 last: None,
                 checked_today: Some(true),
+                invalidated_at: None,
+                renew_blocked_until: None,
             },
             credits: Some(ledger::CreditFact {
                 credits: Some(2957.83),

@@ -41,6 +41,27 @@ pub async fn fetch_resource_view(region: Region, token: &str) -> ResourceView {
     crate::usage::fetch_usage(region, token).await
 }
 
+/// 把这一轮的**活性结论**回写到账号上：usage 接口 401 → 记 `invalidated_at`；
+/// 成功解析出额度 → 清除。返回是否有变化（调用方把它当落盘的「脏」信号）。
+///
+/// 清除必须以「真的读到额度」为准 —— 网络/解析失败（`auth_rejected == false` 且读不到）
+/// 既不记也不清，「不知道」不下结论。`broker::adopt` 的失效抢救规则消费这个标记：
+/// 本机已判死 + 池里那份与本地不同 → 无条件换血（2026-10-08「本地死票锁死」事故的主修）。
+pub fn apply_liveness(account: &mut Account, view: &ResourceView) -> bool {
+    if view.auth_rejected {
+        if account.invalidated_at.is_none() {
+            account.invalidated_at = Some(chrono::Utc::now().timestamp_millis());
+            return true;
+        }
+        return false;
+    }
+    if view.credits.is_some() && account.invalidated_at.is_some() {
+        account.invalidated_at = None;
+        return true;
+    }
+    false
+}
+
 /// 只读查询「今天领没领」。
 ///
 /// 判据就是活动自己的 `claimStatus` —— 不再有第二套兜底字段。旧版列了

@@ -223,6 +223,8 @@ mod tests {
                 base_url: None,
                 created_at: String::new(),
                 checked_today: None,
+                invalidated_at: None,
+                renew_blocked_until: None,
                 last: rec,
             },
             credits: None,

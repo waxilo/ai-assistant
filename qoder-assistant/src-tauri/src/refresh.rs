@@ -105,6 +105,25 @@ pub fn should_refresh(expires_at: Option<i64>, now_ms: i64) -> bool {
     matches!(expires_at, Some(e) if e - now_ms < REFRESH_THRESHOLD_MS)
 }
 
+/// **是否该尝试续签**：进了续签窗口，**或已被上游判死**（`invalidated_at` 有值）。
+///
+/// 「已被判死」必须单列：被吊销的票 `expires_at` 可能还在未来，按窗口判断它永远轮不到续，
+/// 而续签是它唯一的自救通道（2026-10-08 traework「本地死票锁死」事故的另一半）。
+pub fn refresh_due(acct: &crate::accounts::Account, now_ms: i64) -> bool {
+    should_refresh(acct.expires_at, now_ms) || acct.invalidated_at.is_some()
+}
+
+/// 死链（`RefreshError::dead`）后的冷却时长：重试一百次也是同一个结论。
+pub const DEAD_RENEW_BLOCK_MS: i64 = 6 * 3600 * 1000;
+
+/// 该账号是否仍在续签冷却期内。
+///
+/// 冷却写在账号上并**随 accounts.json 落盘**（[`Account::renew_blocked_until`]）——
+/// 不落盘的话应用一重启就失忆，死链每轮都去打一个必然被拒的接口。
+pub fn renew_blocked(acct: &crate::accounts::Account, now_ms: i64) -> bool {
+    acct.renew_blocked_until.is_some_and(|until| until > now_ms)
+}
+
 /// 这条链的**续签能力**是否已经过期（`rt_expires_at` 归一到毫秒后与 now 比）。
 ///
 /// 不知道就返回 `false` —— 没有证据就别放弃这条链。而已经知道它过期了还去打接口，

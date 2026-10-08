@@ -441,12 +441,23 @@ pub fn parse_ent_usage(v: &Value) -> EntUsage {
     }
 }
 
-/// 发一次 `ide_user_ent_usage` 请求并返回原始 JSON（best-effort）。
+/// 发一次 `ide_user_ent_usage` 请求（best-effort）。
 ///
 /// 官方判定：响应存在且 `code` 缺省或为 0 才算成功（正常响应里没有 `code` 字段）。
 /// 汇总（[`parse_ent_usage`]）与逐包明细（[`parse_packages`]）都吃这一份 body，
 /// 所以请求只发一次、解析两遍 —— 简报台账不额外打接口。
-async fn post_ent_usage(client: &reqwest::Client, account: &Account) -> Option<Value> {
+///
+/// 返回是**三态**而不是 `Option`：HTTP 401 是官方 API 对这张 token 的**亲自拒绝**，
+/// 是「票已被服务端吊销」的唯一可信证据（exp 只是票的自我声明，吊销可以发生在
+/// exp 之前 —— 2026-10-08 死锁事故的根源）。其余失败（5xx/超时/限流 9074/解析失败）
+/// 一律归入 [`UsageFetch::Other`]，不能据此下「票死了」的结论。
+enum UsageFetch {
+    Ok(Value),
+    AuthRejected,
+    Other,
+}
+
+async fn post_ent_usage(client: &reqwest::Client, account: &Account) -> UsageFetch {
     let host = normalize_host(&host_of(account));
     let (auth_hdr, hdrs) = headers(account, &device_id(account));
     let url = format!("{host}{ENT_USAGE_PATH}");
@@ -460,11 +471,18 @@ async fn post_ent_usage(client: &reqwest::Client, account: &Account) -> Option<V
     for (k, v) in &hdrs {
         req = req.header(k, v);
     }
-    let resp = req.send().await.ok()?;
-    let v = resp.json::<Value>().await.ok()?;
+    let Ok(resp) = req.send().await else {
+        return UsageFetch::Other;
+    };
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return UsageFetch::AuthRejected;
+    }
+    let Ok(v) = resp.json::<Value>().await else {
+        return UsageFetch::Other;
+    };
     match v.get("code").and_then(Value::as_i64) {
-        None | Some(0) => Some(v),
-        Some(_) => None,
+        None | Some(0) => UsageFetch::Ok(v),
+        Some(_) => UsageFetch::Other,
     }
 }
 
@@ -482,20 +500,49 @@ pub struct ResourceView {
     pub unlimited: bool,
     /// 最早过期时间（毫秒）；未知为 `None`
     pub earliest_expiry_ms: Option<i64>,
+    /// 这一轮官方接口**亲自拒绝了这张票**（HTTP 401）—— 活性证据，见 [`apply_liveness`]。
+    pub auth_rejected: bool,
 }
 
 /// 抓取 `ResourceView`（best-effort），复用外部 `client` 的连接池。⚠️ 会发一次网络请求。
 pub async fn fetch_resource_view_with(client: &reqwest::Client, account: &Account) -> ResourceView {
-    let Some(v) = post_ent_usage(client, account).await else {
-        return ResourceView::default();
-    };
-    let u = parse_ent_usage(&v);
-    ResourceView {
-        packages: parse_packages(&v),
-        credits: u.remaining.map(|r| r as f64),
-        unlimited: u.unlimited,
-        earliest_expiry_ms: u.earliest_expiry_ms,
+    match post_ent_usage(client, account).await {
+        UsageFetch::Ok(v) => {
+            let u = parse_ent_usage(&v);
+            ResourceView {
+                packages: parse_packages(&v),
+                credits: u.remaining.map(|r| r as f64),
+                unlimited: u.unlimited,
+                earliest_expiry_ms: u.earliest_expiry_ms,
+                auth_rejected: false,
+            }
+        }
+        UsageFetch::AuthRejected => ResourceView {
+            auth_rejected: true,
+            ..Default::default()
+        },
+        UsageFetch::Other => ResourceView::default(),
     }
+}
+
+/// 把这一轮的**活性结论**回写到账号上：401 → 记 `invalidated_at`；成功读到数据 → 清除。
+///
+/// 返回是否有变化（调用方把它当落盘的「脏」信号）。清除必须以「真的读到数据」为准 ——
+/// 网络/限流失败（`Other`）既不记也不清，「不知道」不下结论。
+pub fn apply_liveness(account: &mut Account, view: &ResourceView) -> bool {
+    if view.auth_rejected {
+        if account.invalidated_at.is_none() {
+            account.invalidated_at = Some(chrono::Utc::now().timestamp_millis());
+            return true;
+        }
+        return false;
+    }
+    let got = view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
+    if got && account.invalidated_at.is_some() {
+        account.invalidated_at = None;
+        return true;
+    }
+    false
 }
 
 /// 逐包解析 `ide_user_ent_usage` 响应 → 台账输入（[`crate::ledger::PkgView`]）。
@@ -578,20 +625,13 @@ pub fn to_credit_packages(packages: Vec<crate::ledger::PkgView>) -> Vec<crate::a
         .collect()
 }
 
-/// 抓取积分快照（best-effort）：**账号已有积分** + 到期时间 + 逐包明细，供界面展示与接管选号。
-///
-/// **失败也要落一个空快照**，否则每次新会话都会重打一次接口。
-/// 调用方若已有快照，应保留原有数值（见 `commands::checkin_status` / `proxy::choose_account`）。
-pub async fn fetch_credit_snapshot(
-    client: &reqwest::Client,
-    account: &Account,
-) -> crate::accounts::CreditSnapshot {
-    let view = fetch_resource_view_with(client, account).await;
+/// 把 `ResourceView` 投影成积分快照（账号页展示 / 接管选号共用同一口径）。
+pub fn credit_snapshot_of(view: &ResourceView) -> crate::accounts::CreditSnapshot {
     crate::accounts::CreditSnapshot::now(
         view.credits.map(|c| c.round() as i64),
         view.unlimited,
         view.earliest_expiry_ms,
-        to_credit_packages(view.packages),
+        to_credit_packages(view.packages.clone()),
     )
 }
 
@@ -806,6 +846,8 @@ mod tests {
             machine_id: Some("mach".into()),
             created_at: String::new(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         };
         assert_eq!(device_id(&acc), "u123");
     }
@@ -826,6 +868,8 @@ mod tests {
             machine_id: Some("mach".into()),
             created_at: String::new(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 
@@ -1025,6 +1069,8 @@ mod real_tests {
             machine_id: a.machine_id.clone(),
             created_at: String::new(),
             credit_snapshot: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 

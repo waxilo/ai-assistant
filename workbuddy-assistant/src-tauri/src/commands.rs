@@ -131,22 +131,38 @@ pub(crate) async fn refresh_account_in_place(
         .refresh_token
         .clone()
         .ok_or_else(|| refresh::RefreshError::transient("没有 refresh token，无法续签"))?;
-    // 已知这条链过期，就别去打那一下：白要一次服务端答复，还会让整池多一轮失败
+    // 已知这条链过期，就别去打那一下：白要一次服务端答复，还会让整池多一轮失败。
+    // 死链退避**随账号落盘**（调用方保存）：不落盘的话应用一重启就失忆，
+    // 死链每轮都去打一个必然被拒的接口。
     let now = chrono::Utc::now().timestamp_millis();
     if refresh::rt_is_expired(account.rt_expires_at, now) {
+        account.renew_blocked_until = Some(now + refresh::DEAD_RENEW_BLOCK_MS);
         return Err(refresh::RefreshError::dead(format!(
             "refresh token 已于 {} 过期，这个账号需要重新登录",
             fmt_expiry(refresh::norm_ms(account.rt_expires_at.unwrap_or(0)))
         )));
     }
     let host = account_host(account);
-    let r = refresh::refresh(&host, &account.token, &rt).await?;
+    let r = match refresh::refresh(&host, &account.token, &rt).await {
+        Ok(r) => r,
+        Err(e) => {
+            // 同上：死链才退避（随账号落盘）；临时失败不冷，下一轮重试
+            if e.dead {
+                account.renew_blocked_until =
+                    Some(chrono::Utc::now().timestamp_millis() + refresh::DEAD_RENEW_BLOCK_MS);
+            }
+            return Err(e);
+        }
+    };
     account.token = r.token;
     if let Some(next_rt) = r.refresh_token {
         account.refresh_token = Some(next_rt);
     }
     account.expires_at = r.expires_at.or(account.expires_at);
     account.rt_expires_at = r.rt_expires_at.or(account.rt_expires_at);
+    // 新票在手：活性/冷却标记自然失效（这张票刚被官方亲自签发，必然活着）
+    account.invalidated_at = None;
+    account.renew_blocked_until = None;
     Ok(())
 }
 
@@ -163,7 +179,15 @@ pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, re
         return Ok(false);
     }
     let now = chrono::Utc::now().timestamp_millis();
-    if !refresh::refresh_due(account.expires_at, &account.token, now) {
+    // 「该续」= 进了续签窗口（[`refresh::refresh_due`]），**或已被上游判死**
+    // （吊销票的到期时间还在未来，按窗口判断它永远轮不到续）；冷却中的账号直接放行不做
+    // （退避已随账号落盘，重启也不会失忆）。
+    if !refresh::refresh_due(account.expires_at, &account.token, now)
+        && account.invalidated_at.is_none()
+    {
+        return Ok(false);
+    }
+    if refresh::renew_blocked(account, now) {
         return Ok(false);
     }
     refresh_account_in_place(account).await?;
@@ -378,6 +402,8 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     last: None,
                     checked_today: None,
+                    invalidated_at: None,
+                    renew_blocked_until: None,
                 });
                 added += 1;
             }
@@ -406,6 +432,8 @@ mod import_tests {
             base_url: None,
             created_at: String::new(),
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
             last: None,
         }
     }
@@ -607,8 +635,11 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
         // 凭证临期的先续签，避免拿着过期 token 把「没积分」误判成「查不到」。
         let _ = ensure_fresh_token(&mut accounts[i]).await;
         let host = account_host(&accounts[i]);
-        // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账
+        // 1) 资源视图：剩余积分 + 最早过期时间 + 逐包明细 —— 一次拉取，全部进台账。
+        //    顺手把**活性结论**落盘（401 标死 / 读到数据清除，见 `checkin::apply_liveness`）：
+        //    broker::adopt 的失效抢救规则靠它把池里的活票救下来。
         let view = checkin::fetch_resource_view(&client, &host, &accounts[i].token).await;
+        checkin::apply_liveness(&mut accounts[i], &view);
         readings.push(ledger::Reading {
             id: accounts[i].id.clone(),
             packages: view.packages,
@@ -653,6 +684,8 @@ pub async fn refresh_account_credits(
     let client = crate::http::api_client();
     let host = account_host(&accounts[i]);
     let view = checkin::fetch_resource_view(&client, &host, &accounts[i].token).await;
+    // 活性结论就地生效（401 标死 / 读到数据清除），随下面的保存一起落盘
+    checkin::apply_liveness(&mut accounts[i], &view);
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let reading = ledger::Reading {
         id: accounts[i].id.clone(),
@@ -1465,6 +1498,8 @@ mod tests {
                 code: None,
             }),
             checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
         }
     }
 

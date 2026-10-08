@@ -250,22 +250,42 @@ pub async fn get_json(
     path: &str,
     query: &[(&str, &str)],
 ) -> Option<Value> {
+    get_json_with_auth_signal(region, token, path, query)
+        .await
+        .0
+}
+
+/// [`get_json`] 的**活性探针版**：把 HTTP 401 单独暴露出来。
+///
+/// 401 是官方 API 对这张 token 的亲自拒绝，是「票已被服务端吊销」的唯一可信证据
+/// （`expires_at` 只是本地记的账，吊销可以发生在它之前 —— 2026-10-08 traework
+/// 「本地死票锁死」事故的根源）。其余失败（5xx/超时/解析）归入 `(None, false)`，
+/// 「不知道」不下结论。
+pub async fn get_json_with_auth_signal(
+    region: Region,
+    token: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> (Option<Value>, bool) {
     let pairs: Vec<(&str, &str)> = query
         .iter()
         .copied()
         .filter(|(_, v)| !v.is_empty())
         .collect();
-    let resp = client()
+    let Ok(resp) = client()
         .get(format!("{}{path}", region.openapi_base()))
         .query(&pairs)
         .bearer_auth(token)
         .send()
         .await
-        .ok()?;
+    else {
+        return (None, false);
+    };
+    let auth_rejected = resp.status() == reqwest::StatusCode::UNAUTHORIZED;
     if !resp.status().is_success() {
-        return None;
+        return (None, auth_rejected);
     }
-    resp.json::<Value>().await.ok()
+    (resp.json::<Value>().await.ok(), false)
 }
 
 /// 从多个候选键里取第一个非空字符串（官方 `el()` 的同款语义）。
