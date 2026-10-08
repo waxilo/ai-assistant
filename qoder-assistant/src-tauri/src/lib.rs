@@ -107,6 +107,7 @@ pub fn run() {
             // 账号只读面：额度读数（剩余积分 / 逐额度包过期）由 refresh_all 采集后落台账，
             // 界面读台账而不单独打只读命令。签到（= 领取活动权益）走上面的 checkin_*。
             commands::refresh_all,
+            commands::refresh_account_credits,
             commands::discover_local_accounts,
             commands::oauth_start,
             commands::oauth_poll,

@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   listAccounts,
   checkinStatus,
+  refreshAccountStatus,
   checkinAll,
   checkinOne,
   removeAccount,
@@ -199,6 +200,24 @@ export default function App() {
   }, [refreshBroker]);
 
   const reloadAccounts = useCallback(async () => setAccounts(await listAccounts()), []);
+
+  /**
+   * 只刷**一个账号**的状态与额度（资源包弹窗的刷新按钮用）。
+   *
+   * 后端走的是与 `refreshStatus` 完全同一套采集（见 `commands::account_status_entry`），
+   * 只是范围收敛到一个账号 —— 弹窗只关心这一个账号的资源包，
+   * 为它跑一遍全量会把每个账号都挨个打一遍接口。成功就把新状态并进表里，
+   * 失败返回错误文本（弹窗里就地展示，不动 statusText 那行全局提示）。
+   */
+  const refreshOneStatus = useCallback(async (id: string): Promise<string | null> => {
+    try {
+      const st = await refreshAccountStatus(id);
+      setStatuses((prev) => ({ ...prev, [st.id]: st }));
+      return null;
+    } catch (e) {
+      return String(e);
+    }
+  }, []);
 
   useEffect(() => {
     getSettings().then(setSettings).catch(() => {});
@@ -656,6 +675,7 @@ export default function App() {
                 busyIds={busy.ids}
                 onCheckinOne={(id) => void runCheckinOne(id)}
                 onRemove={(a) => void removeOne(a)}
+                onRefreshAccountStatus={refreshOneStatus}
                 brokerStatus={brokerStatus}
                 brokerBusy={brokerBusy}
                 onBrokerUpload={() => void runBrokerUpload()}

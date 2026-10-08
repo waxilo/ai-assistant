@@ -139,6 +139,17 @@
   /* 与 .card 组合：卡片负责外观，这里负责横向滚动与裁切内圆角 */
   overflow: hidden auto;
 }
+/* 资源包弹窗顶栏：左侧说明文字（隐藏数 / 刷新失败），右侧「刷新」按钮 */
+.pkg-dialog-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.pkg-dialog-bar .note:empty {
+  display: none;
+}
 .data-table {
   width: 100%;
   border-collapse: collapse;

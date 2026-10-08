@@ -48,6 +48,13 @@ export const checkinAll = (allRegions = false) =>
 export const refreshAll = () => invoke<Account[]>("refresh_all");
 
 /**
+ * 刷新**单个账号**的积分读数（资源包弹窗的刷新按钮用）：
+ * 后端拉一次额度接口进台账，返回该账号的台账投影。
+ */
+export const refreshAccountCredits = (id: string) =>
+  invoke<Account>("refresh_account_credits", { id });
+
+/**
  * 首选通道：读本机 Qoder 凭据文件（`auth.v1.dat`），含昵称与手机号。
  *
  * 返回的不只是账号列表，还有**每个区域各自的读取情况**（见 [`LocalScan`]）——

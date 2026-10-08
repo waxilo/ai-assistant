@@ -630,6 +630,45 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
     Ok(views)
 }
 
+/// 刷新**单个账号**的积分读数：拉一次 `get-user-resource`，结果进台账并返回该账号视图。
+///
+/// 专门为「资源包列表」弹窗的刷新按钮准备：弹窗只关心这一个账号的逐包明细，
+/// 走 [`refresh_all`] 会把全部账号挨个打一遍接口（还带账号间抖动等待），
+/// 为一个账号等一轮既慢又把风控面摊宽。口径与 `refresh_all` 完全一致：
+/// 读数交台账（唯一数据来源）、返回值是台账投影，界面 `seedCredits` 并进去即可。
+#[tauri::command]
+pub async fn refresh_account_credits(
+    app: AppHandle,
+    id: String,
+) -> Result<accounts::AccountView, String> {
+    let dir = data_dir(&app);
+    sync_pool_if_bound(&dir).await;
+    let mut accounts = accounts::load_accounts(&dir);
+    let i = accounts
+        .iter()
+        .position(|a| a.id == id)
+        .ok_or_else(|| format!("账号 {id} 不存在"))?;
+    // 临期先续签，避免拿着过期 token 把「没积分」误判成「查不到」
+    let _ = ensure_fresh_token(&mut accounts[i]).await;
+    let client = crate::http::api_client();
+    let host = account_host(&accounts[i]);
+    let view = checkin::fetch_resource_view(&client, &host, &accounts[i].token).await;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let reading = ledger::Reading {
+        id: accounts[i].id.clone(),
+        packages: view.packages,
+        credits: view.credits,
+        expiry_ms: view.earliest_expiry_ms,
+    };
+    // 台账落盘失败不影响返回值（它只是统计，丢了下次采样会重新累积）
+    if let Err(e) = ledger::store(&dir).apply(std::slice::from_ref(&reading), &now, ledger::Mode::Normal) {
+        crate::scheduler::log_event(&dir, &format!("积分台账落盘失败：{e}"));
+    }
+    let views = accounts::view_accounts(vec![accounts[i].clone()], &dir);
+    accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
+    Ok(views.into_iter().next().expect("one account in, one view out"))
+}
+
 /// 「全部签到」的实际实现：逐账号签到、逐条落库，最后整体保存。
 ///
 /// 抽成独立函数是因为定时调度（`scheduler`）与手动命令共用同一套逻辑——

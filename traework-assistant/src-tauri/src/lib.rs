@@ -159,6 +159,7 @@ pub fn run() {
             commands::checkin_one,
             commands::checkin_all,
             commands::checkin_status,
+            commands::refresh_account_status,
             commands::get_logs,
             commands::clear_logs,
             commands::get_settings,

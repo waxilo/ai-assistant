@@ -20,6 +20,7 @@ import {
   IconLink,
   IconUnlink,
   IconList,
+  IconRefresh,
 } from "../components/Icons";
 
 /**
@@ -41,6 +42,8 @@ interface Props {
   busyIds: Set<string>;
   onCheckinOne: (id: string) => void;
   onRemove: (a: Account) => void;
+  /** 刷新单个账号的状态与额度（资源包弹窗的刷新按钮）；返回错误文本，null = 成功 */
+  onRefreshAccountStatus: (id: string) => Promise<string | null>;
   /** 凭证池状态；null = 还没读到（首屏那一瞬） */
   brokerStatus: BrokerStatus | null;
   /** 上传 / 绑定 / 解绑进行中：三个动作都会打网络，按钮要一起禁用 */
@@ -302,6 +305,7 @@ function AccountsPage({
   busyIds,
   onCheckinOne,
   onRemove,
+  onRefreshAccountStatus,
   brokerStatus,
   brokerBusy,
   onBrokerUpload,
@@ -542,7 +546,7 @@ function AccountsPage({
             </button>
           }
         >
-          <PkgListAccount account={pkgAccount} statuses={statuses} />
+          <PkgListAccount account={pkgAccount} statuses={statuses} onRefresh={onRefreshAccountStatus} />
         </Dialog>
       )}
     </>
@@ -552,42 +556,89 @@ function AccountsPage({
 /**
  * 资源包列表弹窗内容：一个账号的逐额度包（名称 / 剩余积分 / 到期）。
  * `packages` 从实时状态（或快照兜底）取，缺失时给一条空态提示。
+ *
+ * **已过期的包不显示**：接口在包过期后仍会挂着正余量（服务端还没清），
+ * 原样列出只会让人误以为那些分还能用 —— 与 [`soonestPackage`] 是同一条口径。
+ * `expiry_ms <= 0`（旧快照缺字段）的包保留 —— 0 不是「已过期」，是「不知道」。
+ *
+ * 「刷新」就地重拉当前账号的最新状态与额度：走 [`Props.onRefreshAccountStatus`]，
+ * 它与页面顶部的全量刷新是**同一套采集**，只是范围收敛到这一个账号。
  */
 function PkgListAccount({
   account,
   statuses,
+  onRefresh,
 }: {
   account: Account;
   statuses: Record<string, AcctStatus>;
+  onRefresh: (id: string) => Promise<string | null>;
 }) {
+  const [refreshing, setRefreshing] = useState(false);
+  const [err, setErr] = useState("");
   const cr = creditsOf(account, statuses);
-  const packs = cr.packages ?? [];
-  return packs.length === 0 ? (
-    <p className="note" style={{ margin: 0 }}>
-      这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
-    </p>
-  ) : (
-    <div className="table-wrap">
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>资源包</th>
-            <th className="num">剩余</th>
-            <th className="num">到期</th>
-          </tr>
-        </thead>
-        <tbody>
-          {[...packs]
-            .sort((a, b) => a.expiry_ms - b.expiry_ms)
-            .map((p, i) => (
-              <tr key={i}>
-                <td>{p.name || "未命名额度包"}</td>
-                <td className="num">{formatCredits(p.remaining)}</td>
-                <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
+  const all = cr.packages ?? [];
+  const now = Date.now();
+  const packs = all.filter((p) => !(p.expiry_ms > 0 && p.expiry_ms <= now));
+  const hidden = all.length - packs.length;
+
+  const refresh = async () => {
+    setRefreshing(true);
+    setErr("");
+    const e = await onRefresh(account.id);
+    if (e !== null) setErr(e);
+    setRefreshing(false);
+  };
+
+  const note = err
+    ? `刷新失败：${err}`
+    : hidden > 0
+    ? `已隐藏 ${hidden} 个已过期的资源包`
+    : "";
+
+  return (
+    <div>
+      <div className="pkg-dialog-bar">
+        <span className="note" style={{ margin: 0 }}>
+          {note}
+        </span>
+        <button
+          className="btn small"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+          title="拉取当前账号最新的资源包"
+        >
+          <IconRefresh size={13} className={refreshing ? "spin" : ""} />
+          {refreshing ? "刷新中…" : "刷新"}
+        </button>
+      </div>
+      {packs.length === 0 ? (
+        <p className="note" style={{ margin: 0 }}>
+          这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
+        </p>
+      ) : (
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>资源包</th>
+                <th className="num">剩余</th>
+                <th className="num">到期</th>
               </tr>
-            ))}
-        </tbody>
-      </table>
+            </thead>
+            <tbody>
+              {[...packs]
+                .sort((a, b) => a.expiry_ms - b.expiry_ms)
+                .map((p, i) => (
+                  <tr key={i}>
+                    <td>{p.name || "未命名额度包"}</td>
+                    <td className="num">{formatCredits(p.remaining)}</td>
+                    <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

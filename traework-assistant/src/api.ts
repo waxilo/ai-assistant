@@ -30,6 +30,9 @@ export const checkinOne = (id: string) => invoke<CheckinResult>("checkin_one", {
 export const checkinAll = () => invoke<CheckinResult[]>("checkin_all");
 /** 每个账号的签到状态 + **账号已有积分**（后端直接返回结构化数据，前端不再自行解析 JSON） */
 export const checkinStatus = () => invoke<AcctStatus[]>("checkin_status");
+/** 刷新**单个账号**的状态与额度用量（资源包弹窗的刷新按钮用），口径与 `checkin_status` 完全一致 */
+export const refreshAccountStatus = (id: string) =>
+  invoke<AcctStatus>("refresh_account_status", { id });
 export const getSettings = () => invoke<Settings>("get_settings");
 export const saveSettings = (settings: Settings) =>
   invoke<Settings>("save_settings", { settings });

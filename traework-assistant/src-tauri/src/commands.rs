@@ -174,55 +174,96 @@ pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<checkin::Accoun
     let dir = try_data_dir(&app)?;
     sync_pool_if_bound(&dir, true).await;
     let mut list = accounts::load_accounts(&dir);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(list.len());
     let mut dirty = false;
     let client = reqwest::Client::new();
     for account in list.iter_mut() {
-        // ⓪ 未绑池时这是「刷新」唯一一次取新票的机会（绑了池的由上面的整池同步去做）。
-        //    窗口外 / 冷却中 / 绑池都会静默返回 None，不会多打接口。
-        if let Some(rn) = crate::renew::renew_if_needed(&dir, account).await {
-            crate::logs::push(&account.name, rn.renewed, format!("续签：{}", rn.message));
-        }
-        // ① 今日是否已签到（签到状态接口）
-        let status = checkin::query_status(account).await;
-        // ② 账号已有积分（entitlement 用量接口）；拉到就落盘，供界面展示与接管选号
-        let view = checkin::fetch_resource_view_with(&client, account).await;
-        // 失败时 `view` 是 Default（credits/unlimited/expiry 全空）—— 必须拦在这一步，
-        // 否则会把已有快照整体覆盖成 `None`。unlimited 账号的 credits 恒为 `None`，
-        // 所以不能只看 credits，三个字段任一有效即算拿到。
-        let got = view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
-        if got {
-            let packages = checkin::to_credit_packages(view.packages.clone());
-            let next = accounts::CreditSnapshot::now(
-                view.credits.map(|c| c.round() as i64),
-                view.unlimited,
-                view.earliest_expiry_ms,
-                packages,
-            );
-            let prev = account.credit_snapshot.as_ref();
-            let changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms, p.packages.clone()))
-                != Some((next.credits, next.unlimited, next.earliest_expiry_ms, next.packages.clone()));
-            if changed {
-                account.credit_snapshot = Some(next);
-                dirty = true;
-            }
-        }
-        // 拉不到（限流 9074 / 掉线）时沿用上次已知的积分，而不是把已有数字抹成未知
-        let snap = account.credit_snapshot.as_ref();
-        out.push(checkin::AccountStatus {
-            id: account.id.clone(),
-            checked_in: status.as_ref().map(checkin::is_checked_in).unwrap_or(false),
-            message: status.as_ref().map(checkin::message_of).unwrap_or_default(),
-            credits: snap.and_then(|s| s.credits),
-            unlimited: snap.map(|s| s.unlimited).unwrap_or(false),
-            earliest_expiry_ms: snap.and_then(|s| s.earliest_expiry_ms),
-            packages: snap.map(|s| s.packages.clone()).unwrap_or_default(),
-        });
+        let (status, changed) = account_status_entry(&dir, account, &client).await;
+        dirty |= changed;
+        out.push(status);
     }
     if dirty {
         let _ = accounts::save_accounts(&dir, &list);
     }
     Ok(out)
+}
+
+/// 逐账号的采集体：续签 + 签到状态 + 额度用量，快照有变就写回账号并报「脏」。
+///
+/// 从 [`checkin_status`] 里抽出来：资源包弹窗的「刷新」按钮要对**单个账号**做
+/// 一模一样的一轮采集（[`refresh_account_status`]），两份实现必然漂移，所以只留这一份。
+/// 返回 `(该账号的状态快照, 快照是否被更新)`；落盘由调用方统一做（一批只写一次）。
+async fn account_status_entry(
+    dir: &Path,
+    account: &mut Account,
+    client: &reqwest::Client,
+) -> (checkin::AccountStatus, bool) {
+    // ⓪ 未绑池时这是「刷新」唯一一次取新票的机会（绑了池的由调用方的整池同步去做）。
+    //    窗口外 / 冷却中 / 绑池都会静默返回 None，不会多打接口。
+    if let Some(rn) = crate::renew::renew_if_needed(dir, account).await {
+        crate::logs::push(&account.name, rn.renewed, format!("续签：{}", rn.message));
+    }
+    // ① 今日是否已签到（签到状态接口）
+    let status = checkin::query_status(account).await;
+    // ② 账号已有积分（entitlement 用量接口）；拉到就落盘，供界面展示与接管选号
+    let view = checkin::fetch_resource_view_with(client, account).await;
+    // 失败时 `view` 是 Default（credits/unlimited/expiry 全空）—— 必须拦在这一步，
+    // 否则会把已有快照整体覆盖成 `None`。unlimited 账号的 credits 恒为 `None`，
+    // 所以不能只看 credits，三个字段任一有效即算拿到。
+    let got = view.credits.is_some() || view.unlimited || view.earliest_expiry_ms.is_some();
+    let mut changed = false;
+    if got {
+        let packages = checkin::to_credit_packages(view.packages.clone());
+        let next = accounts::CreditSnapshot::now(
+            view.credits.map(|c| c.round() as i64),
+            view.unlimited,
+            view.earliest_expiry_ms,
+            packages,
+        );
+        let prev = account.credit_snapshot.as_ref();
+        changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms, p.packages.clone()))
+            != Some((next.credits, next.unlimited, next.earliest_expiry_ms, next.packages.clone()));
+        if changed {
+            account.credit_snapshot = Some(next);
+        }
+    }
+    // 拉不到（限流 9074 / 掉线）时沿用上次已知的积分，而不是把已有数字抹成未知
+    let snap = account.credit_snapshot.as_ref();
+    let out = checkin::AccountStatus {
+        id: account.id.clone(),
+        checked_in: status.as_ref().map(checkin::is_checked_in).unwrap_or(false),
+        message: status.as_ref().map(checkin::message_of).unwrap_or_default(),
+        credits: snap.and_then(|s| s.credits),
+        unlimited: snap.map(|s| s.unlimited).unwrap_or(false),
+        earliest_expiry_ms: snap.and_then(|s| s.earliest_expiry_ms),
+        packages: snap.map(|s| s.packages.clone()).unwrap_or_default(),
+    };
+    (out, changed)
+}
+
+/// 刷新**单个账号**的签到状态与额度用量（资源包弹窗的刷新按钮用）。
+///
+/// 采集口径与 [`checkin_status`] 完全同一套（见 [`account_status_entry`]），
+/// 只是范围收敛到一个账号：弹窗只关心这一个账号的资源包，
+/// 为它跑一遍全量 `checkin_status` 会把每个账号都挨个打一遍接口。
+#[tauri::command]
+pub async fn refresh_account_status(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<checkin::AccountStatus, String> {
+    let dir = try_data_dir(&app)?;
+    sync_pool_if_bound(&dir, true).await;
+    let mut list = accounts::load_accounts(&dir);
+    let account = list
+        .iter_mut()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("账号 {id} 不存在"))?;
+    let client = reqwest::Client::new();
+    let (status, dirty) = account_status_entry(&dir, account, &client).await;
+    if dirty {
+        let _ = accounts::save_accounts(&dir, &list);
+    }
+    Ok(status)
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,8 @@ import {
   needsRelogin,
   type SignState,
 } from "../common";
-import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, useCredits } from "../credits";
+import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, useCredits, seedCredits } from "../credits";
+import { refreshAccountCredits } from "../api";
 import { Dialog } from "../components/Dialog";
 import {
   IconCloud,
@@ -288,35 +289,84 @@ export function AccountsPage({
 /**
  * 资源包列表弹窗内容：一个账号的逐额度包（名称 / 剩余积分 / 到期）。
  * `packages` 从全局积分对象里取，缺失时给一条空态提示。
+ *
+ * **已过期的包不显示**：接口在包过期后仍会挂着正余量（服务端还没清），
+ * 原样列出只会让人误以为那些分还能用 —— 与 [`soonestExpiry`] 是同一条口径。
+ * `expiry_ms` 未知的包保留（没法判断它过没过期，宁可多显示一行也不悄悄藏掉）。
+ *
+ * 「刷新」就地重拉当前账号的最新读数：后端拉一次进台账，返回的投影
+ * `seedCredits` 并回全局对象，弹窗随订阅自动更新 —— 不需要本地再存一份 state。
  */
 function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>; account: Account }) {
-  const packs = packagesOf(book, account.id) as CreditPackage[];
-  return packs.length === 0 ? (
-    <p className="note" style={{ margin: 0 }}>
-      这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
-    </p>
-  ) : (
-    <div className="table-wrap">
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>资源包</th>
-            <th className="num">剩余</th>
-            <th className="num">到期</th>
-          </tr>
-        </thead>
-        <tbody>
-          {[...packs]
-            .sort((a, b) => (a.expiry_ms ?? Infinity) - (b.expiry_ms ?? Infinity))
-            .map((p, i) => (
-              <tr key={i}>
-                <td>{p.name || "未命名额度包"}</td>
-                <td className="num">{formatCredits(p.remaining)}</td>
-                <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
+  const [refreshing, setRefreshing] = useState(false);
+  const [err, setErr] = useState("");
+  const now = Date.now();
+  const all = packagesOf(book, account.id) as CreditPackage[];
+  const packs = all.filter((p) => p.expiry_ms == null || p.expiry_ms > now);
+  const hidden = all.length - packs.length;
+
+  const refresh = async () => {
+    setRefreshing(true);
+    setErr("");
+    try {
+      seedCredits([await refreshAccountCredits(account.id)]);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const note = err
+    ? `刷新失败：${err}`
+    : hidden > 0
+    ? `已隐藏 ${hidden} 个已过期的资源包`
+    : "";
+
+  return (
+    <div>
+      <div className="pkg-dialog-bar">
+        <span className="note" style={{ margin: 0 }}>
+          {note}
+        </span>
+        <button
+          className="btn small"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+          title="拉取当前账号最新的资源包"
+        >
+          <IconRefresh size={13} className={refreshing ? "spin" : ""} />
+          {refreshing ? "刷新中…" : "刷新"}
+        </button>
+      </div>
+      {packs.length === 0 ? (
+        <p className="note" style={{ margin: 0 }}>
+          这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
+        </p>
+      ) : (
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>资源包</th>
+                <th className="num">剩余</th>
+                <th className="num">到期</th>
               </tr>
-            ))}
-        </tbody>
-      </table>
+            </thead>
+            <tbody>
+              {[...packs]
+                .sort((a, b) => (a.expiry_ms ?? Infinity) - (b.expiry_ms ?? Infinity))
+                .map((p, i) => (
+                  <tr key={i}>
+                    <td>{p.name || "未命名额度包"}</td>
+                    <td className="num">{formatCredits(p.remaining)}</td>
+                    <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

@@ -39,6 +39,13 @@ export const checkinAll = () => invoke<Account[]>("checkin_all");
 /** 一键刷新：不打签到接口，重拉并持久化全部账号的积分快照 / 签到状态 / 积分余量 */
 export const refreshAll = () => invoke<Account[]>("refresh_all");
 
+/**
+ * 刷新**单个账号**的积分读数（资源包弹窗的刷新按钮用）：
+ * 后端拉一次 `get-user-resource` 进台账，返回该账号的台账投影。
+ */
+export const refreshAccountCredits = (id: string) =>
+  invoke<Account>("refresh_account_credits", { id });
+
 /** 首选通道：读本机 WorkBuddy 登录文件（auth/*.info），含昵称与手机号 */
 export const discoverLocalAccounts = () =>
   invoke<LocalAccount[]>("discover_local_accounts");
