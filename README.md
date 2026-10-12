@@ -6,7 +6,7 @@ AI 桌面助手相关项目集合（迁移自 TraeWorkAssistant 与 workbuddy-as
 
 | 目录 | 说明 |
 | ---- | ---- |
-| [traework-assistant](./traework-assistant) | Trae Work Assistant（原 TraeWorkAssistant） |
+| [trae-assistant](./trae-assistant) | Trae Assistant（原 TraeWorkAssistant，只接管 Trae CN） |
 | [workbuddy-assistant](./workbuddy-assistant) | WorkBuddy Assistant |
 | [qoder-assistant](./qoder-assistant) | Qoder Assistant（多账号签到、token 自动续签、应用内自动更新） |
 | [cred-broker](./cred-broker) | 账号凭证池 + 续签闸（本机 Docker 容器 + 共享 MySQL） |
@@ -18,10 +18,11 @@ AI 桌面助手相关项目集合（迁移自 TraeWorkAssistant 与 workbuddy-as
 
 ## 应用发布（GitHub Actions）
 
-traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **macOS（universal 双架构）** 与
+trae-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **macOS（universal 双架构）** 与
 **Windows（NSIS）** 产物，统一发布到本仓库（ai-assistant）的 GitHub Release，应用内更新
-（`@tauri-apps/plugin-updater`）从各自的固定 tag 拉取：TraeWorkAssistant 用
-`releases/download/traework-latest/latest.json`，WorkBuddyAssistant 用
+（`@tauri-apps/plugin-updater`）从各自的固定 tag 拉取：TraeAssistant 用
+`releases/download/traework-latest/latest.json`（通道名是改名前烧进老客户端的，**保持不动**，
+否则已安装的用户再也收不到更新），WorkBuddyAssistant 用
 `releases/download/workbuddy-latest/latest.json`，QoderAssistant 用
 `releases/download/qoder-latest/latest.json`。
 
@@ -32,13 +33,14 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
    `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（本包条目）、
    `package.json`、`package-lock.json` 的**顶层与 `packages[""]` 两处**
    （lock 里每个依赖都有 `version`，**不能 replace_all**，要用带 `"name"` 的上下文一次覆盖相邻两处）
-2. 打 tag 推送：`traework-v0.1.34` / `workbuddy-v0.1.46` / `qoder-v0.1.29`（版本以 tag 为准）
+2. 打 tag 推送：`trae-v0.1.35` / `workbuddy-v0.1.47` / `qoder-v0.1.30`（版本以 tag 为准；
+   Trae 助手改名后前缀由 `traework-v` 换成 `trae-v`，更新通道 `traework-latest` 不变）
 3. CI 构建两个平台 → 由 `scripts/build-latest.mjs` 用 `.sig` 生成 `latest.json`
    （v2 的 `tauri build` 不产 manifest）→ delete+recreate 各自的固定 tag Release
 
 也可在 Actions 页面手动 `workflow_dispatch`（用配置里的版本号）。
 
-各应用用**独立的固定 tag**（`traework-latest` / `workbuddy-latest` / `qoder-latest`）作为更新通道，
+各应用用**独立的固定 tag**（`traework-latest`（TraeAssistant）/ `workbuddy-latest` / `qoder-latest`）作为更新通道，
 版本号各自演进、互不干扰——同一个仓库内不会像共用 `releases/latest` 那样串版本。
 
 ### 版本号规则（重要）
@@ -47,7 +49,7 @@ traework-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **mac
 
 | 应用 | 当前版本 | 版本线起点 |
 |---|---|---|
-| TraeWorkAssistant | `0.1.34` | 0.1.x（自身历史） |
+| TraeAssistant | `0.1.35` | 0.1.x（自身历史，原名 TraeWorkAssistant） |
 | WorkBuddyAssistant | `0.1.46` | 0.1.x（自身历史） |
 | QoderAssistant | `0.1.29` | **从 `0.1.0` 起算** |
 

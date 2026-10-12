@@ -9,7 +9,7 @@
 #   3. 调 ../../gw/scripts/gw-add-host.sh：生成 nginx vhost + 网关内 reload
 #
 # 域名一直是 cred-broker.sloan.dpdns.org（Cloudflare Worker 时代用的同一个），这是刻意的：
-# qoder-assistant / traework-assistant / workbuddy-assistant 三个应用都把它写成
+# qoder-assistant / trae-assistant / workbuddy-assistant 三个应用都把它写成
 # **编译期常量**（src-tauri/src/broker.rs 的 BASE）。换名等于改三处代码 + 重新构建 +
 # 让用户重装 —— 而服务端换引擎本来是可以对客户端完全无感的。
 # DNS 侧零操作：隧道带的是 *.sloan.dpdns.org 通配记录，网关只是多了一个按 Host 转发的 server 块。
