@@ -10,7 +10,9 @@
 //!
 //! 1. **会话粘滞**：带 `x-conversation-id` 的请求复用上次选中的账号 —— 一次对话中途
 //!    换账号会丢上下文，必须粘住。新会话（粘滞过期或首次）才重新选。
-//! 2. **选账号**：谁的「还有余量的资源包」最早过期就用谁——把快过期的积分先消耗掉；
+//! 2. **选账号**：谁的「还有余量的资源包」到期日最早就用谁——把快过期的积分先消耗掉；
+//!    **同一天到期的账号视为并列，选剩余积分多的**（界面上的到期时间本来就是日粒度，
+//!    按毫秒严格比会让「两个都显示 X 天后过期」的账号悄悄选出积分少的那个）；
 //!    查不到过期时间的账号排最后，剩余积分为 0 的账号直接跳过（除非全员为 0）。
 //! 3. **限流无感切换**：免费模型（从网关 `/v2/enterprises/personal/models` 动态拉取
 //!    积分倍率，倍率为 0 即免费；1h 缓存，失败兜底 hy3）触发限流（429）时，把
@@ -358,13 +360,31 @@ fn available_candidates<T: Clone>(candidates: &[T], is_cooling: impl Fn(&T) -> b
     }
 }
 
-/// 路由排序键：最早过期者优先 → 查不到过期时间的靠后 → 剩余积分多者略优先。
+/// 路由排序的第一键：把「到期时刻」压到**本地自然日**（同一天 = 同一档）。
+///
+/// 为什么按自然日而不是按毫秒：界面上的到期时间本来就是日粒度（「X 天后过期」），
+/// 两个同一天到期的账号看上去一模一样。此时若按毫秒严格比，用户会看到
+/// 「两个都显示 2 天后过期，却用了积分更少的那个」，而且想不明白差在哪
+/// （2026-10-12 实测：两个账号差 112 秒，4772.45 那个比 4872.03 先被选中）。
+/// 压到自然日后同一天到期即并列，交给第二键「积分多者优先」定格。
+///
+/// 未知到期时间（`None`）排在所有有到期日的之后：它连「要不要着急」都不知道，
+/// 不该抢在「确定不着急」前面（与账号页的展示口径一致）。
+fn expiry_day(expiry_ms: Option<i64>) -> i64 {
+    use chrono::{Datelike, TimeZone};
+    expiry_ms
+        .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
+        .map_or(i64::MAX, |t| t.date_naive().num_days_from_ce() as i64)
+}
+
+/// 路由排序键：到期的自然日早者优先 → 查不到到期时间的靠后 →
+/// **同一自然日内剩余积分多者优先**。
 ///
 /// 入参直接用台账的 [`ledger::CreditFact`]：路由的排序依据与账户展示的
 /// 「剩余 / 过期时间」是**同一个类型、同一份来源**，不再各立一份画像结构。
 fn score(info: &ledger::CreditFact) -> (i64, i64) {
     (
-        info.earliest_expiry_ms.unwrap_or(i64::MAX),
+        expiry_day(info.earliest_expiry_ms),
         -(info.credits.unwrap_or(0.0) * 100.0) as i64,
     )
 }
@@ -1379,7 +1399,7 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
 ///
 /// 候选集内的优先级从高到低：
 /// 1. **会话粘滞**——一次对话中途换账号会丢上下文；粘滞账号若已被移出候选集/在冷却则视为未命中；
-/// 2. **智能轮换**——快照过期就重新拉，按「最旧积分」挑。
+/// 2. **智能轮换**——快照过期就重新拉，按「到期日最早 → 同日则积分多者优先」挑。
 ///
 /// 会话首次落到某个账号（或被切换到新账号）时写一条 `route_start` 事件。
 /// 单机模式下，选中的账号若触发了续签会就地保存账号列表；绑了池则不会 ——
@@ -1481,13 +1501,14 @@ async fn choose_account(
     if let Some(conv) = conv {
         if sticky_put(conv, model, account.id.clone()) {
             // 该会话第一次走上代理，或被切到了新账号 —— 记一条「开始使用」事件
+            // 不写会话号：那是给日志比对用的内部标识，界面没人看得懂，
+            // 更糟的是它每条都不同 —— 同一个账号服务 N 个会话，会被看成一屏 N 件不同的事。
             stealth::journal_append(
                 dir,
                 "route_start",
                 &format!(
-                    "开始使用账号「{}」服务会话 {}（当前扣费备选 {} 个）",
+                    "开始使用账号「{}」（当前扣费备选 {} 个）",
                     account.name,
-                    &conv.chars().take(8).collect::<String>(),
                     usable.len()
                 ),
             );
@@ -2167,24 +2188,43 @@ mod tests {
         }
     }
 
+    /// 本地时区下某个「年月日 时点」的毫秒时间戳。
+    ///
+    /// 测试数据必须**跨自然日**才不会退化成「同一天」，而「同一天」又是按本地时区
+    /// 算的 —— 所以用本地时区构造，换机器 / 换 CI 时区都不会跑偏。
+    fn local_ms(y: i32, m: u32, d: u32, h: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(y, m, d, h, 0, 0)
+            .single()
+            .expect("本地时间应唯一")
+            .timestamp_millis()
+    }
+
     #[test]
     fn routing_prefers_earliest_expiry_then_most_credits() {
         let ids = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         let infos = vec![
-            credit_fact(Some(2000), Some(100.0)),
-            credit_fact(Some(1000), Some(10.0)), // 最早过期 → 胜出
-            credit_fact(None, Some(99999.0)),    // 未知 → 靠后
-            credit_fact(Some(500), Some(0.0)),   // 积分为 0 → 跳过
+            credit_fact(Some(local_ms(2026, 3, 12, 9)), Some(100.0)),
+            credit_fact(Some(local_ms(2026, 3, 11, 9)), Some(10.0)), // 到期日更早 → 胜出
+            credit_fact(None, Some(99999.0)),                        // 未知 → 靠后
+            credit_fact(Some(local_ms(2026, 3, 10, 9)), Some(0.0)),  // 积分为 0 → 跳过
         ];
         assert_eq!(pick_index(&ids, &infos), Some(1));
 
-        // 过期时间相同 → 剩余积分多者优先
+        // 同一天到期（只差几小时也算「一样」）→ 剩余积分多者优先。
+        // 就是线上那对账号的形状：4772.45 比 4872.03 早到期 112 秒，
+        // 但界面两个都显示「X 天后过期」⇒ 该用积分多的那个。
         let ids2 = vec!["a".into(), "b".into()];
         let infos2 = vec![
-            credit_fact(Some(1000), Some(10.0)),
-            credit_fact(Some(1000), Some(500.0)),
+            credit_fact(Some(local_ms(2026, 3, 10, 15)), Some(4772.45)),
+            credit_fact(Some(local_ms(2026, 3, 10, 21)), Some(4872.03)),
         ];
-        assert_eq!(pick_index(&ids2, &infos2), Some(1));
+        assert_eq!(
+            pick_index(&ids2, &infos2),
+            Some(1),
+            "同一天到期时应按积分多者优先"
+        );
     }
 
     #[test]

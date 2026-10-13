@@ -13,6 +13,7 @@ import type { ConfirmReq, Toast } from "../common";
 import { IconBolt, IconInfo, IconUser } from "../components/Icons";
 import { Row, Toggle } from "../components/SettingsControls";
 import { Dialog } from "../components/Dialog";
+import { displayDetail, groupJournal } from "../journal";
 
 /** 事件类型 → 界面标签与配色 */
 function eventKind(e: JournalEvent): {
@@ -326,22 +327,10 @@ export function TakeoverPage({
     : "开启后对话自动按备选账号分流扣费";
 
   /**
-   * 连续相同（类型 + 内容都一样）的事件聚合为一条，附重复次数。
-   * 事件流是「新的在前」，相邻即时间连续——重启风暴、心跳重复这类刷屏只会占一行。
-   * 不再截断末尾：后端已把日志限定在「一次接管会话」内，整段历史都值得看。
+   * 事件流聚合（逐字相同的刷屏、以及同一账号本次接管服务过的会话数），见 [`groupJournal`]。
+   * 不截断末尾：后端已把日志限定在「一次接管会话」内，整段历史都值得看。
    */
-  const groupedEvents = useMemo(() => {
-    const out: { e: JournalEvent; count: number }[] = [];
-    for (const e of events) {
-      const last = out[out.length - 1];
-      if (last && last.e.event === e.event && last.e.detail === e.detail) {
-        last.count += 1;
-      } else {
-        out.push({ e, count: 1 });
-      }
-    }
-    return out;
-  }, [events]);
+  const rows = useMemo(() => groupJournal(events), [events]);
 
   /** 弹框内按用户名 / 手机号过滤 */
   const filteredAccounts = useMemo(() => {
@@ -459,18 +448,25 @@ export function TakeoverPage({
           </p>
         ) : (
           <ul className="evt-list">
-            {groupedEvents.map(({ e, count }, i) => {
+            {rows.map(({ e, count, account }, i) => {
               const k = eventKind(e);
+              // 正文取最新那条的原文（只抹掉看不懂的会话号）：一眼看得出用的是哪个号、用了几次
               return (
                 <li
                   key={`${e.at_ms}-${i}`}
                   className={`evt evt-${k.cls}`}
-                  title={count > 1 ? `相同事件连续出现 ${count} 次` : undefined}
+                  title={
+                    account && count > 1
+                      ? `账号「${account}」本次接管共服务 ${count} 个会话`
+                      : count > 1
+                      ? `相同事件连续出现 ${count} 次`
+                      : undefined
+                  }
                 >
                   <span className="e-at">{e.at}</span>
                   <span className={`e-tag tag-${k.cls}`}>{k.label}</span>
                   {count > 1 && <span className="e-count">×{count}</span>}
-                  <span className="e-detail">{e.detail}</span>
+                  <span className="e-detail">{displayDetail(e)}</span>
                 </li>
               );
             })}
