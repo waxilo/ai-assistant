@@ -123,6 +123,7 @@ fn fmt_expiry(ms: i64) -> String {
 /// 的判据，而只有它能换来新的 access token —— 漏掉它，界面上的「剩余有效期」就只剩
 /// 一个看起来还很新、实际已经换不出东西的数字。
 pub(crate) async fn refresh_account_in_place(
+    dir: &Path,
     account: &mut Account,
 ) -> Result<(), refresh::RefreshError> {
     let rt = account
@@ -166,15 +167,40 @@ pub(crate) async fn refresh_account_in_place(
     // 新票在手：活性/冷却标记自然失效（这张票刚被官方亲自签发，必然活着）
     account.invalidated_at = None;
     account.renew_blocked_until = None;
-    // 续签成功 → 同窗口原子写回 auth.v1.dat（尽力而为；核对不上本人就跳过，见它的文档）
-    let _ = crate::auth_file::apply_refresh(
+    // 续签成功 → 同窗口原子写回 auth.v1.dat（核对不上本人就跳过，见它的文档）。
+    //
+    // ⚠️ **这里不许静默**。新的一对 token 已经从官方换到手，而桌面端文件里那枚旧的
+    // `refresh_token` 当场作废：写回失败意味着 Qoder 客户端下次启动去签必然被拒，
+    // 用户看到的症状是「客户端要我重新登录」，而账号本身在 assistant 这边完全正常 ——
+    // 两件事看着不像同一个原因。旧写法 `let _ =` 把它彻底吞掉，于是这条永远查不到。
+    // 与「积分台账落盘失败」同一个通道（[`crate::scheduler::log_event`]）。
+    if let Err(e) = crate::auth_file::apply_refresh(
         account.region,
         &prev_token,
         &r.token,
         next_rt.as_deref(),
         r.expires_at,
         r.rt_expires_at,
-    );
+    ) {
+        crate::scheduler::log_event(
+            dir,
+            &format!("续签成功但写回 Qoder 登录文件失败：{}（{e}）", account.name),
+        );
+        // 这条要推出去：新的一对 token 已经换到手，而桌面端文件里那枚旧的**当场作废**。
+        // 助手这边一切正常，用户只在客户端被要求重新登录时才发现 —— 那时已经看不出是
+        // 「写回失败」造成的了。冷却取最短的一档：这类事件本来就极少发生。
+        crate::alerts::notify(
+            dir,
+            &format!("auth-writeback:{}", account.id),
+            crate::alerts::CRITICAL_COOLDOWN_MS,
+            &format!(
+                "账号 {}：续签成功，但没能写回桌面端登录文件（{e}）。\n\
+                 桌面端手里那枚旧的 refresh token 已经作废，它下次自续必然被拒、会要求重新登录；\n\
+                 助手这边的票是新的，接管不受影响。请确认磁盘可写（登录文件用系统钥匙串加过密）。",
+                account.name
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -271,7 +297,13 @@ fn same_person_in_file(a: &Account, f: &crate::auth_file::LocalAccount) -> bool 
 /// 「谁先签谁把别人踢下线」正是这么来的，所以这条分岔不能省。
 /// 判据按**账号自己的区域**算：两套部署各绑各的池，国际版绑了不代表国内版账号
 /// 也要停掉本地续签。
-pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, refresh::RefreshError> {
+///
+/// `dir` 只为失败时的**日志落点**服务（写回登录文件失败要进签到日志，见
+/// [`refresh_account_in_place`]）。它不参与任何判断 —— 别把它当成「可以顺手改账号」的入口。
+pub(crate) async fn ensure_fresh_token(
+    dir: &Path,
+    account: &mut Account,
+) -> Result<bool, refresh::RefreshError> {
     if crate::broker::bound_in(account.region) {
         return Ok(false);
     }
@@ -287,7 +319,7 @@ pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, re
     if refresh::renew_blocked(account, now) {
         return Ok(false);
     }
-    refresh_account_in_place(account).await?;
+    refresh_account_in_place(dir, account).await?;
     Ok(true)
 }
 
@@ -358,7 +390,24 @@ pub(crate) async fn sync_pool_if_bound_in(dir: &Path, region: Region) {
     if !crate::broker::bound_in(region) {
         return;
     }
-    let _ = crate::broker::sync(dir, false, region).await;
+    // 绑池时整池续签**只有这一条路**（本地逐账号续签在绑池分岔里是被取消的）。
+    // 旧写法把结果整个吞掉：这一跳失败等于「本机几十小时没人续签」，而那种沉默刚付过代价。
+    if let Err(e) = crate::broker::sync(dir, false, region).await {
+        crate::scheduler::log_event(
+            dir,
+            &format!("凭证池整池同步失败（{}）：{e}", region.label()),
+        );
+        crate::alerts::notify(
+            dir,
+            &format!("pool-sync:{}", region.key()),
+            crate::alerts::COOLDOWN_MS,
+            &format!(
+                "凭证池同步失败（{}）：{e}\n后果：绑池期间本机这一轮没有续签，池里的票可能静默过期。\
+                 请检查凭证管家是否可达、这台机器的绑定是否还在。",
+                region.label()
+            ),
+        );
+    }
 }
 
 /// 这个账号接下来会真的发出**官方续签请求**吗？
@@ -416,7 +465,7 @@ pub async fn auto_refresh_all(app: &AppHandle) -> Result<AutoRefreshReport, Stri
             // 自动续签是后台静默循环，用户完全看不见它连发——这条路径反而更该有节奏
             crate::http::account_gap().await;
         }
-        match ensure_fresh_token(acct).await {
+        match ensure_fresh_token(&dir, acct).await {
             Ok(true) => {
                 sent = true;
                 refreshed.push(acct.name.clone());
@@ -1069,7 +1118,7 @@ pub async fn checkin_one(app: AppHandle, id: String) -> Result<accounts::Account
     }
     // 临期先续签。
     // 失败不阻断：仍用旧 token 试一次，由签到结果给出明确提示
-    let _ = ensure_fresh_token(&mut accounts[idx]).await;
+    let _ = ensure_fresh_token(&dir, &mut accounts[idx]).await;
     let rec = checkin::do_checkin(&accounts[idx]).await;
     accounts[idx].last = Some(rec.clone());
     let _ = logs::append_log(&dir, logs::log_from_record(&accounts[idx], &rec));
@@ -1152,7 +1201,7 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
             crate::http::account_gap().await;
         }
         // 凭证临期的先续签，避免拿着过期 token 把「没积分」误判成「查不到」。
-        let _ = ensure_fresh_token(&mut accounts[i]).await;
+        let _ = ensure_fresh_token(&dir, &mut accounts[i]).await;
         // 顺手给老账号补身份标识（手机号 / 邮箱，按区域只在缺时打一下，见
         // [`fill_identity_if_missing`]）。放在这里而不是签到路径：刷新本来就是
         // 「把该对齐的都对齐」的那一次，而签到要多打一个请求、又不一定会被点到。
@@ -1206,7 +1255,7 @@ pub async fn refresh_account_credits(
         .position(|a| a.id == id)
         .ok_or_else(|| format!("账号 {id} 不存在"))?;
     // 临期先续签，避免拿着过期 token 把「没积分」误判成「查不到」
-    let _ = ensure_fresh_token(&mut accounts[i]).await;
+    let _ = ensure_fresh_token(&dir, &mut accounts[i]).await;
     let view = checkin::fetch_resource_view(accounts[i].region, &accounts[i].token).await;
     // 活性结论就地生效（401 标死 / 读到数据清除），随下面的保存一起落盘
     checkin::apply_liveness(&mut accounts[i], &view);
@@ -1319,7 +1368,7 @@ pub(crate) async fn checkin_all_inner(
         }
         let i = idx[o];
         // 临期先续签：失败了也不阻断，仍用旧 token 试一次，由签到结果给出明确提示
-        let _ = ensure_fresh_token(&mut accounts[i]).await;
+        let _ = ensure_fresh_token(&dir, &mut accounts[i]).await;
         let rec = checkin::do_checkin(&accounts[i]).await;
         accounts[i].last = Some(rec.clone());
         let _ = logs::append_log(&dir, logs::log_from_record(&accounts[i], &rec));
@@ -1680,6 +1729,21 @@ fn reinstate(region: Region, dir: &std::path::Path, port: u16) {
     }
 }
 
+/// 回滚写盘的结果 → 追加在错误文案后面的一句话（成功时为空串）。
+///
+/// 为什么单列：两处「开启/切换接管失败」的报错都承诺了「设置已回滚」，而回滚本身
+/// 也可能写不进去（磁盘满、权限、正在被另一处保存占用）。吞掉它（旧写法 `let _ =`）
+/// 就等于对用户说了一件没发生的事 —— 而留下的状态正是这个项目最怕的那种：
+/// 开关显示已开启、磁盘上却没有端点，之后每次保存都被拓扑守卫拒掉。
+fn rollback_note(result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => String::new(),
+        Err(e) => format!(
+            "（注意：设置并没有真的回滚成功，开关可能与磁盘不一致，请重试一次。原因：{e}）"
+        ),
+    }
+}
+
 /// 关闭接管撞「写不回官方原样」时的报错。
 ///
 /// 这里**必须**继续拒掉这次保存：注入还在、反代却停了，客户端的对话就全部连向一个
@@ -1734,12 +1798,15 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                 // 事实长期相反，而且此后这一页的每次保存都会被拓扑守卫拒掉 ——
                 // 用户报的「切换账号失败」正是它的下游症状。
                 let _ = crate::stealth::uninstall(next.takeover_region, &dir);
-                let _ = accounts::save_settings(&dir, &old);
+                // ⚠️ 回滚也是一条要报告的路径（修 4）：下面那句「设置已回滚」是**承诺**，
+                // 回滚写盘失败时磁盘上留着的还是「已开启」那一版 —— 开关与事实长期相反，
+                // 而用户以为已经退回原样。所以这句文案必须跟着事实变。
+                let rb = rollback_note(accounts::save_settings(&dir, &old));
                 return Err(match cause {
-                    Some(c) => format!("接管没能开启（设置已回滚）。\n{c}"),
+                    Some(c) => format!("接管没能开启（设置已回滚）。\n{c}{rb}"),
                     None => format!(
                         "无法在 127.0.0.1:{} 上就位接管（设置已回滚）。\
-                         请检查端口是否被占用、以及本应用有没有权限改客户端文件。",
+                         请检查端口是否被占用、以及本应用有没有权限改客户端文件。{rb}",
                         next.proxy_port
                     ),
                 });
@@ -1765,16 +1832,16 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
                 // 且租约只覆盖注入那一步 —— 客户端找不到这类走就地诊断。
                 let cause = crate::stealth::last_error(&dir)
                     .or_else(|| diagnose_enable_failure(next.takeover_region));
-                let _ = accounts::save_settings(&dir, &old);
+                let rb = rollback_note(accounts::save_settings(&dir, &old));
                 let _ = wait_for_takeover(old_region, &dir, old.proxy_port);
                 return Err(match cause {
                     Some(c) => format!(
-                        "无法把接管切换到{}（127.0.0.1:{}），已回滚。\n{c}",
+                        "无法把接管切换到{}（127.0.0.1:{}），已回滚。\n{c}{rb}",
                         next.takeover_region.label(),
                         next.proxy_port
                     ),
                     None => format!(
-                        "无法把接管切换到{}（127.0.0.1:{}），已回滚。",
+                        "无法把接管切换到{}（127.0.0.1:{}），已回滚。{rb}",
                         next.takeover_region.label(),
                         next.proxy_port
                     ),

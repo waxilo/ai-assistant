@@ -419,13 +419,13 @@ export function SettingsPage({
           </span>
           <div>
             <div className="set-card-title">签到与简报通知</div>
-            <div className="set-card-sub">签到结果与积分简报都通过同一个 webhook 推送</div>
+            <div className="set-card-sub">签到结果、积分简报与续签失败告警都通过同一个 webhook 推送</div>
           </div>
         </div>
         <div className="set-group">
           <Row
             title="开启 webhook 通知"
-            desc="关闭后不再推送任何签到通知"
+            desc="关闭后不再推送任何通知，包括续签失败告警"
             ctrl={
               <Toggle
                 checked={notifyOn}

@@ -1,5 +1,6 @@
 mod accel;
 mod accounts;
+mod alerts;
 mod auth_file;
 mod briefing;
 mod broker;

@@ -112,17 +112,18 @@ fn load_config(dir: &Path) -> BrokerConfig {
         .unwrap_or_default()
 }
 
+/// 把绑定关系（uuid）落盘。
+///
+/// ⚠️ 两个决定都反直觉，改这块前先读完：
+/// 1. **序列化失败要报错，不能写 `{}`**。旧的 `unwrap_or_else(|_| "{}")` 看着像兜底，
+///    实际是把**已有的绑定**覆盖成空：下一轮 `load_config` 读回默认值，本机安静地退回
+///    单机运行，而云端那一池还认为这台机器绑着 —— 两台机器各持一把闸。
+/// 2. **原子写**（[`crate::accounts::write_atomic`]）：uuid 等于一池凭证的完整权限，
+///    半截落盘等于这台机器「没绑过池」；权限在建临时文件时一并收到 0600。
 fn save_config(dir: &Path, cfg: &BrokerConfig) -> std::io::Result<()> {
-    let path = dir.join(BROKER_FILE);
-    let text = serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&path, text)?;
-    // uuid 等于一池凭证的完整权限，文件权限收到 0600（与 accounts.json 一致）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let text = serde_json::to_string_pretty(cfg)
+        .map_err(|e| std::io::Error::other(format!("凭证池配置序列化失败：{e}")))?;
+    crate::accounts::write_atomic(&dir.join(BROKER_FILE), &text)
 }
 
 /// 读一份快照（uuid + 运行时状态），**不持锁跨 await**。
@@ -173,11 +174,37 @@ pub fn uuid() -> Option<String> {
     snapshot().0
 }
 
-fn set_uuid(uuid: Option<String>) {
-    mutate(|s| {
+/// 记录 / 清除绑定，并**当场落盘**，返回落盘结果。
+///
+/// 为什么返回值不能丢（修 4）：绑定只写进内存的话，本次运行看起来一切正常 ——
+/// 续签走池、界面显示「已绑定」，可应用一重启 `load_config` 读回默认值，本机安静地
+/// 退回单机运行。此时云端那把闸仍认为这台机器绑着，于是另一台机器永远签不动，
+/// 而本机又开始单机轮换那些一次性 refresh token。旧写法 `let _ = save_config(..)`
+/// 把这条链路唯一的通知机会吞掉了。调用方负责把它说给用户听。
+fn set_uuid(uuid: Option<String>) -> Result<(), String> {
+    let written = mutate(|s| {
         s.cfg.pool_uuid = uuid;
-        let _ = save_config(&s.dir, &s.cfg);
+        save_config(&s.dir, &s.cfg)
     });
+    match written {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(format!(
+            "绑定状态已在本机生效，但没能写入 {}：{e}（重启后会退回改动前的状态）",
+            BROKER_FILE
+        )),
+        None => Err(format!("凭证池状态不可用，{} 没有改动", BROKER_FILE)),
+    }
+}
+
+/// 把一条「本次操作没能持久化」这类补充说明拼到主提示后面；空串就原样返回。
+///
+/// 之所以要有这一小段：三处绑定动作（[`upload`] / [`link`] / [`unbind`]）都得在
+/// **成功**的提示里带上落盘失败的风险，而「成功了，但……」这句话不能各写一遍口径。
+fn append_note(main: String, note: String) -> String {
+    if note.trim().is_empty() {
+        return main;
+    }
+    format!("{main}｜{note}")
 }
 
 fn note_start() {
@@ -626,9 +653,12 @@ struct VersionResp {
 fn on_failure(kind: FailKind, message: String) -> String {
     match kind {
         FailKind::Gone => {
-            set_uuid(None);
-            "云端那一池已经不存在了（可能已被清理），本机已退回单机运行，请重新上传或绑定"
-                .to_string()
+            // 这里连「摘干净」都不保证：落盘失败时磁盘上仍留着那串已经不存在的 uuid，
+            // 重启后会再绑一次、再吃一次 Gone。不致命（自愈），但得让人看见。
+            let note = set_uuid(None).err().unwrap_or_default();
+            format!(
+                "云端那一池已经不存在了（可能已被清理），本机已退回单机运行，请重新上传或绑定。{note}"
+            )
         }
         FailKind::Unreachable => format!("{message}（本次继续用本机凭证）"),
         FailKind::Denied => message,
@@ -674,7 +704,10 @@ pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
     let created: CreateResp = serde_json::from_value(v)
         .map_err(|e| format!("凭证管家返回的建池结果看不懂：{e}"))?;
 
-    set_uuid(Some(created.uuid.clone()));
+    // 建池已经成功、绑定也写进内存了，所以这里**不失败**（失败就把云端那池退回未绑定？
+    // 更糟：云端有池、本机不知道）。但必须把「这份绑定不一定留得住」写进提示 ——
+    // 见 [`set_uuid`]：没落盘成功的话，重启后本机安静地退回单机，而云端那把闸还占着。
+    let bind_note = set_uuid(Some(created.uuid.clone())).err().unwrap_or_default();
     mutate(|s| {
         s.rt.version = Some(created.version);
         s.rt.error = None;
@@ -685,7 +718,10 @@ pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
         uuid: created.uuid,
         account_count: items.len(),
         merged: 0,
-        message: format!("已把本机的 {} 个账号放上云端", items.len()),
+        message: append_note(
+            format!("已把本机的 {} 个账号放上云端", items.len()),
+            bind_note,
+        ),
     })
 }
 
@@ -719,7 +755,8 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
         .unwrap_or_default();
     let version = v.get("version").and_then(|x| x.as_i64());
 
-    set_uuid(Some(uuid.to_string()));
+    // 同 `upload`：本次运行确实绑上了，不该谎报失败；但「能不能留住」必须说清楚。
+    let bind_note = set_uuid(Some(uuid.to_string())).err().unwrap_or_default();
     mutate(|s| {
         s.rt.version = version;
         s.rt.error = None;
@@ -741,7 +778,7 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
         uuid: uuid.to_string(),
         account_count: items.len(),
         merged,
-        message: sync_note,
+        message: append_note(sync_note, bind_note),
     })
 }
 
@@ -785,7 +822,13 @@ pub async fn unbind() -> Result<BrokerStatus, String> {
         accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     }
 
-    set_uuid(None);
+    // 解绑这个动作**只有在落盘之后才算完成**：内存里摘掉 uuid 只影响本次运行，
+    // 磁盘上仍留着它的话，重启会重新绑上同一池，并把刚删掉的云端副本再收养回来 ——
+    // 用户看到的症状是「解绑没生效」，而界面上那一刻确实显示了解绑。
+    set_uuid(None).map_err(|e| {
+        crate::scheduler::log_event(&dir, &format!("凭证池解绑落盘失败：{e}"));
+        e
+    })?;
     mutate(|s| {
         s.rt = Runtime::default();
     });
@@ -880,6 +923,10 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     let mut refreshed = 0usize;
     let mut failed = 0usize;
     let mut blocked = 0usize;
+    // 告警用的明细：绑池时整池由这一轮签，本地逐账号那条路是被取消的 ——
+    // 「谁签不动」只有这里看得见，别把它留给只有翻文件才会看到的事件。
+    let mut dead_lines: Vec<String> = Vec::new();
+    let mut fail_lines: Vec<String> = Vec::new();
     for acct in accounts.iter_mut() {
         // 「该续」= 进了续签窗口，**或已被上游判死**（吊销票的到期时间还在未来，
         // 按窗口判断它永远轮不到续，而续签是它唯一的自救通道）。
@@ -909,6 +956,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             // 会把别的还能救的账号一起挡在续签窗口外，最后表现成「一池集体过期」。
             Err(e) if e.dead => {
                 blocked += 1;
+                dead_lines.push(format!("{}（{e}）", acct.name));
                 crate::scheduler::log_event(
                     dir,
                     &format!("这条链已死，跳过它（不拖停整池）：{}（{e}）", acct.name),
@@ -916,12 +964,41 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             }
             Err(e) => {
                 failed += 1;
+                fail_lines.push(format!("{}（{e}）", acct.name));
                 crate::scheduler::log_event(
                     dir,
                     &format!("整池续签失败：{}（{e}）", acct.name),
                 );
             }
         }
+    }
+    // 冷却 key 与非绑池路径（`scheduler::maybe_auto_refresh`）共用，两条路同时走到也不推两遍。
+    if !dead_lines.is_empty() {
+        crate::alerts::notify(
+            dir,
+            "renew-dead",
+            crate::alerts::DEAD_COOLDOWN_MS,
+            &crate::alerts::batch_message(
+                &format!(
+                    "自动续签：{} 个账号的链已死，只有重新登录能救",
+                    dead_lines.len()
+                ),
+                &dead_lines,
+                "这些账号的票一到期，接管就会一路 401。重新登录对应账号即可恢复自动续签。",
+            ),
+        );
+    }
+    if !fail_lines.is_empty() {
+        crate::alerts::notify(
+            dir,
+            "renew-fail",
+            crate::alerts::COOLDOWN_MS,
+            &crate::alerts::batch_message(
+                &format!("整池续签失败：{} 个账号本轮没续上", fail_lines.len()),
+                &fail_lines,
+                "临时失败下一轮会再试；反复签不动会被判成死链并单独告警。",
+            ),
+        );
     }
     accounts::save_accounts(dir, &accounts).map_err(|e| e.to_string())?;
 

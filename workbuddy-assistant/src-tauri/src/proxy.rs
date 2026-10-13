@@ -1496,7 +1496,29 @@ async fn choose_account(
         if let Some(a) = merged.iter_mut().find(|a| a.id == account.id) {
             *a = account.clone();
         }
-        let _ = accounts::save_accounts(dir, &merged);
+        // ⚠️ **这里不许静默**（修 4）：refresh token 是**一次性**的，接口一返回新票，
+        // 磁盘上那枚旧的就已经在服务端作废了。这次落盘失败不是「晚点再写」——
+        // 应用一重启就会读回那枚死票，症状是过几天「这个账号要重新登录」，
+        // 而原因藏在几周前的一次写盘失败里。走与调度日志同一个通道，便于对照时间线。
+        if let Err(e) = accounts::save_accounts(dir, &merged) {
+            crate::scheduler::log_event(
+                dir.as_path(),
+                &format!("反代续签结果落盘失败：{}（{e}）", account.name),
+            );
+            // 日志只有翻文件的人才看得见，而这里丢的是**一条不可逆的凭证轮换**：
+            // 现在不吭声，过几天这个账号变成「需要重新登录」，没人会把它关联到这次写盘失败。
+            crate::alerts::notify(
+                dir.as_path(),
+                &format!("renew-persist:{}", account.id),
+                crate::alerts::CRITICAL_COOLDOWN_MS,
+                &format!(
+                    "账号 {}：反代上续签成功，但没能写进 accounts.json（{e}）。\n\
+                     那枚旧 refresh token 已在服务端作废：本进程还在用新票，重启后读回来的是废票。\n\
+                     现在能做的：确认磁盘没满、数据目录可写；绑了凭证池的话，下一轮整池同步会把新票传上去。",
+                    account.name
+                ),
+            );
+        }
     }
     if let Some(conv) = conv {
         if sticky_put(conv, model, account.id.clone()) {

@@ -82,7 +82,10 @@ pub async fn sync_profiles(dir: &Path) -> Vec<Account> {
     }
 
     if changed {
-        let _ = accounts::save_accounts(dir, &list);
+        // 这里补的是 `user_id` —— 它是「从本机桌面端接新票」那条路的**认人依据**
+        // （见 [`crate::trae_auth::find_local_session_by_uid`]）。没落盘就等于那条路
+        // 对这个账号永远是空的，而界面不会报任何错。
+        accounts::save_accounts_noisy(dir, &list, "本机登录态身份补齐");
     }
     list
 }

@@ -121,17 +121,19 @@ fn load_config(dir: &Path) -> BrokerConfig {
         .unwrap_or_default()
 }
 
+/// 把绑定关系（uuid）落盘。
+///
+/// ⚠️ 两个决定都反直觉，改这块前先读完：
+/// 1. **序列化失败要报错，不能写 `{}`**。旧的 `unwrap_or_else(|_| "{}")` 看着像兜底，
+///    实际是把**已有的绑定**覆盖成空：下一轮 `load_config` 读回默认值，本机安静地退回
+///    单机运行，而云端那一池还认为这台机器绑着 —— 两台机器各持一把闸。
+/// 2. **原子写 + 0600 都由 [`crate::accounts::write_atomic`] 负责**：`pool_uuid` 就是
+///    一整池凭证的权限，半截落盘等于这台机器「没绑过池」。
 fn save_config(dir: &Path, cfg: &BrokerConfig) -> std::io::Result<()> {
-    let path = dir.join(BROKER_FILE);
-    let text = serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&path, text)?;
-    // uuid 等于一池凭证的完整权限，文件权限收到 0600（与 accounts.json 一致）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let text = serde_json::to_string_pretty(cfg)
+        .map_err(|e| std::io::Error::other(format!("凭证池配置序列化失败：{e}")))?;
+    crate::accounts::write_atomic(&dir.join(BROKER_FILE), &text)
+        .map_err(std::io::Error::other)
 }
 
 /// 读一份快照（uuid + 运行时状态），**不持锁跨 await**。
@@ -173,11 +175,38 @@ pub fn uuid() -> Option<String> {
     snapshot().0
 }
 
-fn set_uuid(uuid: Option<String>) {
-    mutate(|s| {
+/// 记录 / 清除绑定，并**当场落盘**，返回落盘结果。
+///
+/// 为什么返回值不能丢（修 4）：绑定只写进内存的话，本次运行看起来一切正常 ——
+/// 续签走池、界面显示「已绑定」，可应用一重启 `load_config` 读回默认值，本机安静地
+/// 退回单机运行。此时云端那把闸仍认为这台机器绑着，于是另一台机器永远签不动，
+/// 而本机又开始单机轮换那些一次性 refresh token。旧写法 `let _ = save_config(..)`
+/// 把这条链路唯一的通知机会吞掉了。调用方负责把它说给用户听。
+fn set_uuid(uuid: Option<String>) -> Result<(), String> {
+    let written = mutate(|s| {
         s.cfg.pool_uuid = uuid;
-        let _ = save_config(&s.dir, &s.cfg);
+        save_config(&s.dir, &s.cfg)
     });
+    match written {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(format!(
+            "绑定状态已在本机生效，但没能写入 {}：{e}（重启后会退回改动前的状态）",
+            BROKER_FILE
+        )),
+        // 内部状态不可用（`init` 没跑或锁中毒）：连内存都改不了，必须报错
+        None => Err(format!("凭证池状态不可用，{} 没有改动", BROKER_FILE)),
+    }
+}
+
+/// 把一条「本次操作没能持久化」这类补充说明拼到主提示后面；空串就原样返回。
+///
+/// 之所以要有这一小段：三处绑定动作（[`upload`] / [`link`] / [`unbind`]）都得在
+/// **成功**的提示里带上落盘失败的风险，而「成功了，但……」这句话不能各写一遍口径。
+fn append_note(main: String, note: String) -> String {
+    if note.trim().is_empty() {
+        return main;
+    }
+    format!("{main}｜{note}")
 }
 
 fn note_start() {
@@ -635,8 +664,12 @@ struct VersionResp {
 fn on_failure(kind: FailKind, message: String) -> String {
     match kind {
         FailKind::Gone => {
-            set_uuid(None);
-            "云端那一池已经不存在了（可能已被服务端清理或在别处删除），本机已退回单机运行，请重新上传或绑定".to_string()
+            // 这里连「摘干净」都不保证：落盘失败时磁盘上仍留着那串已经不存在的 uuid，
+            // 重启后会再绑一次、再吃一次 Gone。不致命（自愈），但得让人看见。
+            let note = set_uuid(None).err().unwrap_or_default();
+            format!(
+                "云端那一池已经不存在了（可能已被服务端清理或在别处删除），本机已退回单机运行，请重新上传或绑定。{note}"
+            )
         }
         FailKind::Unreachable => format!("{message}（本次继续用本机凭证）"),
         FailKind::Denied => message,
@@ -682,7 +715,10 @@ pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
     let created: CreateResp = serde_json::from_value(v)
         .map_err(|e| format!("凭证管家返回的建池结果看不懂：{e}"))?;
 
-    set_uuid(Some(created.uuid.clone()));
+    // 建池已经成功、绑定也写进内存了，所以这里**不失败**（失败就把云端那池退回未绑定？
+    // 更糟：云端有池、本机不知道）。但必须把「这份绑定不一定留得住」写进提示 ——
+    // 见 [`set_uuid`]：没落盘成功的话，重启后本机安静地退回单机，而云端那把闸还占着。
+    let bind_note = set_uuid(Some(created.uuid.clone())).err().unwrap_or_default();
     mutate(|s| {
         s.rt.version = Some(created.version);
         s.rt.error = None;
@@ -693,7 +729,10 @@ pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
         uuid: created.uuid,
         account_count: items.len(),
         merged: 0,
-        message: format!("已把本机的 {} 个账号放上云端", items.len()),
+        message: append_note(
+            format!("已把本机的 {} 个账号放上云端", items.len()),
+            bind_note,
+        ),
     })
 }
 
@@ -727,7 +766,8 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
         .unwrap_or_default();
     let version = v.get("version").and_then(|x| x.as_i64());
 
-    set_uuid(Some(uuid.to_string()));
+    // 同 `upload`：本次运行确实绑上了，不该谎报失败；但「能不能留住」必须说清楚。
+    let bind_note = set_uuid(Some(uuid.to_string())).err().unwrap_or_default();
     mutate(|s| {
         s.rt.version = version;
         s.rt.error = None;
@@ -749,7 +789,7 @@ pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
         uuid: uuid.to_string(),
         account_count: items.len(),
         merged,
-        message: sync_note,
+        message: append_note(sync_note, bind_note),
     })
 }
 
@@ -790,13 +830,22 @@ pub async fn unbind(dir: &Path) -> Result<BrokerStatus, String> {
             .collect();
         let removed = before - keep.len();
         if removed > 0 {
-            let _ = crate::accounts::save_accounts(dir, &keep);
+            // ⚠️ 「这批凭证已交给云端、本机不再持有」只有**落盘**才算完成：写失败时本机
+            // 磁盘上仍留着与云端相同的 token，而用户以为自己解绑了 —— 之后本机单机续签
+            // 会把云端那条链轮换掉（正是本函数开头要避免的事）。所以这里必须报错。
+            crate::accounts::save_accounts(dir, &keep)
+                .map_err(|e| format!("解绑时清理本机凭证副本失败，绑定保持不变：{e}"))?;
         }
         removed
     } else {
         0
     };
-    set_uuid(None);
+    // 解绑这个动作**只有在落盘之后才算完成**：内存里摘掉 uuid 只影响本次运行，
+    // 磁盘上仍留着它的话，重启会重新绑上同一池，并把刚删掉的云端副本再收养回来。
+    set_uuid(None).map_err(|e| {
+        crate::logs::push("凭证池", false, format!("解绑落盘失败：{e}"));
+        e
+    })?;
     mutate(|s| {
         s.rt = Runtime::default();
     });
@@ -933,6 +982,10 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
                 "broker_sync",
                 &format!("整池续签失败：{}（{}）", acct.name, out.message),
             );
+            // 绑池时的逐账号失败**只有这里看得见**：本地巡检在那条分岔里是被取消的，
+            // 所以告警必须挂在整池这一侧，否则「池里某个账号一路签不动」又是静默的。
+            // 冷却 key 与巡检共用（按账号 id），两条路同时走也不会推两遍。
+            crate::renew::alert_failure(dir, acct, &out);
             // 失败分性质：`needs_login` 是**这台机器签不动这条链**（设备身份不对），
             // 重试一百次也是这个结论，跟本轮同步对不对没关系；其余才是真失败。
             match fail_kind(out.needs_login) {

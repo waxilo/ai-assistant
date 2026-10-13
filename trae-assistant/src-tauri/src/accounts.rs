@@ -308,10 +308,74 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
     list
 }
 
+/// 原子写：先落同名 `.tmp`（`sync_all` 确认进了盘），再 `rename` 覆盖目标。
+///
+/// 凭证类文件**必须**走这条路。`RefreshToken` 是一次性的：续签成功的那一瞬间，
+/// 盘上那份就同时作废了。直写目标文件时若中途崩溃 / 断电，留下的是一截既换不回旧值、
+/// 新值又没落稳的 JSON —— 症状与 `renew.rs` 里那条死链一模一样：只能重新登录。
+/// 原子替换保证「要么还是旧的一份，要么就是新的一份」，不会出现第三种。
+///
+/// `broker.json`（绑池身份）与 `device.json`（签 `DeviceProof` 的那把私钥）同理：
+/// 它们半截丢失分别等于「这台机器没绑池」「这条链的钥匙没了」，都不是重试能救的。
+pub(crate) fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("路径没有文件名：{}", path.display()))?
+        .to_os_string();
+    let mut tmp_name = name;
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // 先 `sync_all` 再 `rename`：顺序反了就只是「名义上原子」—— 内容可能还留在页缓存里，
+    // 崩溃时目标文件已指向一个尚未落稳的 inode。
+    //
+    // 权限在**建临时文件那一刻**就是 0600，而不是 rename 之后再补：后者中间有个窗口，
+    // 新凭证已经落盘、却还是同机其它用户可读的。
+    let opened = || -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+        }
+        #[cfg(not(unix))]
+        std::fs::File::create(&tmp)
+    };
+    let write = || -> std::io::Result<()> {
+        let mut f = opened()?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    };
+    let result = write();
+    // 失败时把半截临时文件扫掉：它带着一份新凭证的副本，留在那儿既脏又是多余的暴露面。
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("写入 {} 失败：{e}", path.display()))
+}
+
 pub fn save_accounts(dir: &Path, accounts: &[Account]) -> Result<(), String> {
-    let p = dir.join(accounts_path());
     let json = serde_json::to_string_pretty(accounts).map_err(|e| e.to_string())?;
-    std::fs::write(&p, json).map_err(|e| e.to_string())
+    write_atomic(&dir.join(accounts_path()), &json)
+}
+
+/// 落盘账号，失败就**当场吼一声**给界面日志 —— 给那些「不值得为写失败中断整条调用」的调用点。
+///
+/// 为什么不能 `let _ =`：这些保存里往往带着**活性结论**（`invalidated_at`）与身份补齐
+/// （`user_id`）。前者决定云端那一池会不会把这张死票救回来，后者是「从本机桌面端接新票」
+/// 那条路的认人依据（见 [`crate::trae_auth::find_local_session_by_uid`]）。
+/// 写失败不致命，但必须让人看得见 —— 否则它的症状要等几周后才以
+/// 「这个账号怎么突然要我重新登录」的形式出现，而那时已经查不到是哪次写盘失败了。
+pub(crate) fn save_accounts_noisy(dir: &Path, accounts: &[Account], scene: &str) {
+    if let Err(e) = save_accounts(dir, accounts) {
+        crate::logs::push("账号数据", false, format!("{scene}：落盘失败（{e}）"));
+    }
 }
 
 /// 读取设置。
@@ -344,9 +408,8 @@ pub fn load_settings(dir: &Path) -> Settings {
 }
 
 pub fn save_settings(dir: &Path, settings: &Settings) -> Result<(), String> {
-    let p = dir.join(settings_path());
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(&p, json).map_err(|e| e.to_string())
+    write_atomic(&dir.join(settings_path()), &json)
 }
 
 #[cfg(test)]
@@ -358,6 +421,48 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::remove_file(dir.join(settings_path()));
         dir
+    }
+
+    /// 凭证文件必须**原子替换**，且失败要吭声。
+    ///
+    /// 这条判据是给 `renew.rs` 那条不可逆的一步兜底的：`RefreshToken` 换出去就收不回来，
+    /// 「以为写好了」和「没写进去」的差别就是这条链的命。
+    #[test]
+    fn write_atomic_replaces_in_place_and_fails_loudly() {
+        let dir = tmp("twa_write_atomic_test");
+        let p = dir.join("atomic_target.json");
+        let _ = std::fs::remove_file(&p);
+        write_atomic(&p, r#"{"v":1}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), r#"{"v":1}"#);
+        assert!(
+            !dir.join("atomic_target.json.tmp").exists(),
+            "不该留下 .tmp 残留"
+        );
+        write_atomic(&p, r#"{"v":2}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), r#"{"v":2}"#, "覆盖写要生效");
+        // 权限：新票不能有一瞬间是「同机任何人可读」的，所以收窄要发生在**建临时文件时**，
+        // 而不是 rename 之后再补 —— 这里直接断言最终文件的模式。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "凭证文件的权限必须收窄到 0600");
+        }
+        // 目标目录不存在必须返回 Err：静默成功等于让调用方以为新票已经落稳了
+        let bad = dir.join("definitely-not-a-dir").join("x.json");
+        assert!(write_atomic(&bad, "{}").is_err(), "写不进去要返回 Err");
+        // 失败不能留下半截临时文件：那是一份没人管的新凭证副本。
+        // 这里要造一个「临时文件写得成、但换名失败」的场景：把目标位置占成**目录**，
+        // `rename` 对已存在的目录目标会失败（EISDIR），于是能干净地验证清理那一步。
+        let blocker = dir.join("blocked_dir");
+        std::fs::create_dir_all(&blocker).unwrap();
+        assert!(write_atomic(&blocker, "{}").is_err(), "目标是目录时必须报错");
+        assert!(
+            !dir.join("blocked_dir.tmp").exists(),
+            "换名失败也要扫掉那份半截临时文件"
+        );
+        let _ = std::fs::remove_dir(&blocker);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 「尾号」必须与前端 `shortLabel` 同算法：取**打码串最后一个星号后可见**的数字。

@@ -114,7 +114,9 @@ fn read_file(dir: &Path) -> Option<DeviceIdentity> {
 
 fn write_file(dir: &Path, id: &DeviceIdentity) -> Result<(), String> {
     let json = serde_json::to_string_pretty(id).map_err(|e| e.to_string())?;
-    std::fs::write(identity_path(dir), json).map_err(|e| e.to_string())
+    // 原子写：这把私钥就是「谁能续这条链」的全部凭据 —— 半截落盘等于钥匙没了，
+    // 而那些链只能重新登录（`renew.rs` 顶部记着早期「密钥根本没落盘」的同一类代价）。
+    crate::accounts::write_atomic(&identity_path(dir), &json)
 }
 
 fn gen_keypair() -> (String, String) {

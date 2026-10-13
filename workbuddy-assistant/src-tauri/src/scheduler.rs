@@ -123,13 +123,17 @@ fn save_state(dir: &Path, st: &ScheduleState) {
     if fs::create_dir_all(dir).is_err() {
         return;
     }
-    let target = state_file(dir);
-    let tmp = dir.join("schedule_state.json.tmp");
     let Ok(json) = serde_json::to_string_pretty(st) else {
         return;
     };
-    if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, &target).is_ok() {
-        accounts::set_private_permissions(&target);
+    // 原子写：这份状态记着「今天几点触发过 / 补跑没有」，半截落盘会被读回成默认值，
+    // 症状是当天漏跑一次签到而界面上没有任何痕迹。权限由 [`write_atomic`] 在建
+    // 临时文件时一并收到 0600，不需要 rename 之后再补一次。
+    //
+    // 失败**必须留痕**（修 4）：定时任务最坏的失败模式就是静默不生效，而这份状态是
+    // 「今天到底跑过没有」的唯一本地证据（见 [`log_event`]）。
+    if let Err(e) = accounts::write_atomic(&state_file(dir), &json) {
+        log_event(dir, &format!("定时任务状态落盘失败：{e}"));
     }
 }
 
@@ -393,8 +397,47 @@ fn maybe_auto_refresh(app: &AppHandle, dir: &Path) {
             for d in &report.dead {
                 log_event(dir, &format!("自动续签放弃（这条链已死，要重新登录才能自动续）：{d}"));
             }
+            // ── 告警：日志是给「会去翻文件的人」看的，推送是给「此刻不在应用前的人」看的。
+            // 两类分开推、各占自己的冷却：死链只有重新登录能救（结论不会自己变，一天一次），
+            // 临时失败下一轮大概率自己就好（六小时一次足够）。
+            if !report.dead.is_empty() {
+                crate::alerts::notify(
+                    dir,
+                    "renew-dead",
+                    crate::alerts::DEAD_COOLDOWN_MS,
+                    &crate::alerts::batch_message(
+                        &format!(
+                            "自动续签：{} 个账号的链已死，只有重新登录能救",
+                            report.dead.len()
+                        ),
+                        &report.dead,
+                        "这些账号的票一到期，接管就会一路 401。重新登录对应账号即可恢复自动续签。",
+                    ),
+                );
+            }
+            if !report.failed.is_empty() {
+                crate::alerts::notify(
+                    dir,
+                    "renew-fail",
+                    crate::alerts::COOLDOWN_MS,
+                    &crate::alerts::batch_message(
+                        &format!("自动续签失败：{} 个账号本轮没续上", report.failed.len()),
+                        &report.failed,
+                        "临时失败会在下一轮扫描（12 小时）重试；反复签不动会被判成死链并单独告警。",
+                    ),
+                );
+            }
         }
-        Err(e) => log_event(dir, &format!("自动续签异常：{e}")),
+        Err(e) => {
+            log_event(dir, &format!("自动续签异常：{e}"));
+            // 整轮异常意味着**一个账号都没续**：比逐账号失败更严重，必须推出去
+            crate::alerts::notify(
+                dir,
+                "renew-run",
+                crate::alerts::COOLDOWN_MS,
+                &format!("自动续签整轮失败，本轮没有任何账号被续签：{e}"),
+            );
+        }
     }
 }
 
@@ -584,9 +627,10 @@ pub(crate) fn log_event(dir: &Path, msg: &str) {
     if fs::create_dir_all(dir).is_err() {
         return;
     }
-    if fs::write(&target, body).is_ok() {
-        accounts::set_private_permissions(&target);
-    }
+    // 原子写：这份日志是「整个截断重写」的（只留最后 200 行），
+    // 直接 `fs::write` 一旦在中途崩溃会把**历史**一起抹掉 —— 排查时正好最需要它。
+    // 日志自己写失败没有别的通道可报，只能放弃（这里 `let _ =` 是有意的）。
+    let _ = accounts::write_atomic(&target, &body);
 }
 
 /// 执行一次「全部签到」并推送结果。

@@ -1,4 +1,4 @@
-use crate::accounts::{set_private_permissions, Account, CheckinRecord};
+use crate::accounts::{Account, CheckinRecord};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,12 +57,9 @@ pub fn load_logs(dir: &Path) -> Vec<CheckinLog> {
 
 fn save_logs(dir: &Path, logs: &[CheckinLog]) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    let target = logs_file(dir);
-    let tmp = dir.join("checkin_logs.json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(logs)?)?;
-    fs::rename(&tmp, &target)?;
-    set_private_permissions(&target);
-    Ok(())
+    // 走 [`write_atomic`]：这份是「整本重写」的（只留最近 MAX_LOGS 条），
+    // 中途崩溃会把历史一起抹掉；另外要 `sync_all`，光 rename 只保证名字不换、不保证内容落盘。
+    crate::accounts::write_atomic(&logs_file(dir), &serde_json::to_string_pretty(logs)?)
 }
 
 /// 追加一条日志；保留最近 MAX_LOGS 条

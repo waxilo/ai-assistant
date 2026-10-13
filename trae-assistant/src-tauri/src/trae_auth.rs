@@ -70,6 +70,12 @@ pub struct TraeLocalAccount {
     pub expires_at: Option<i64>,
     /// refresh token 过期（毫秒）
     pub refresh_expires_at: Option<i64>,
+    /// 这份登录态**最后一次被桌面端写过**的时间（`storage.json` 的 mtime，毫秒）。
+    ///
+    /// 它是「那个桌面端进程最近真的在动」的唯一离线证据：桌面端登录、续签、退出都会回写
+    /// 这个文件，所以 mtime 落在续签窗口内 ≈ 这个窗口里它被打开过。
+    /// 让位判据要用它，见 [`crate::renew::desktop_is_active`]。
+    pub updated_at_ms: Option<i64>,
 }
 
 fn xor_64(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
@@ -219,6 +225,14 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
         machine_id,
         expires_at: num_at(&data, "expiredAt"),
         refresh_expires_at: num_at(&data, "refreshExpiredAt"),
+        updated_at_ms: std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default()
+            }),
     })
 }
 
@@ -286,6 +300,20 @@ pub fn find_local_session_by_uid(uid: &str) -> Option<TraeLocalAccount> {
     discover_local_accounts()
         .into_iter()
         .find(|a| a.user_id.as_deref() == Some(uid))
+}
+
+/// 本机装着这个 uid 的登录态里，**最后一次被桌面端写过**的时间（毫秒，取最大值）。
+///
+/// 为什么要单独取最大值而不是顺着 [`find_local_session_by_uid`] 那一份读：一个机器上可能
+/// 并存好几套 Trae CN 安装，同一个 uid 各存一份 `storage.json`，而 mtime 是**按文件**算的。
+/// 取第一份会把「另一套安装昨天刚被打开」这件事看成「这台机器三个月没动过」——
+/// 那个误判的方向是让 assistant 自己去换票，也就是把桌面端手里那条链顶掉。
+pub fn local_session_last_write_ms(uid: &str) -> Option<i64> {
+    discover_local_accounts()
+        .into_iter()
+        .filter(|a| a.user_id.as_deref() == Some(uid))
+        .filter_map(|a| a.updated_at_ms)
+        .max()
 }
 
 /// 本机某个 Trae CN 安装**换票时用的设备身份**（`DeviceInfo` 的三件套 + 私钥）。

@@ -249,7 +249,13 @@ fn machine_id(region: Region) -> String {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&p, &fresh);
+        // ⚠️ 落盘失败**必须吭声**：这份文件就是本应用的机器身份，没写下去等于
+        // 「本次登录用了一个身份、下次重启换一个」。服务端看到的是同一台机器的
+        // uuid 反复变，而池的「本机在签」闸也按它判定。旧写法 `let _ =` 让它安静地
+        // 每次重启都换一个身份，症状（要重新授权）却离原因很远。
+        if let Err(e) = crate::accounts::write_atomic(&p, &fresh) {
+            eprintln!("机器身份落盘失败（下次启动会换一个新 uuid）：{e}");
+        }
     }
     fresh
 }

@@ -207,7 +207,20 @@ pub(crate) async fn sync_pool_if_bound(dir: &Path) {
     if !crate::broker::bound() {
         return;
     }
-    let _ = crate::broker::sync(dir, false).await;
+    // 绑池时整池续签**只有这一条路**（本地逐账号续签在绑池分岔里是被取消的）。
+    // 旧写法把结果整个吞掉：这一跳失败等于「本机几十小时没人续签」，而那种沉默刚付过代价。
+    if let Err(e) = crate::broker::sync(dir, false).await {
+        crate::scheduler::log_event(dir, &format!("凭证池整池同步失败：{e}"));
+        crate::alerts::notify(
+            dir,
+            "pool-sync",
+            crate::alerts::COOLDOWN_MS,
+            &format!(
+                "凭证池同步失败：{e}\n后果：绑池期间本机这一轮没有续签，池里的票可能静默过期。\
+                 请检查凭证管家是否可达、这台机器的绑定是否还在。"
+            ),
+        );
+    }
 }
 
 /// 这个账号接下来会真的发出**官方续签请求**吗？
@@ -972,6 +985,21 @@ fn normalize_settings(mut settings: Settings) -> Result<Settings, String> {
     Ok(settings)
 }
 
+/// 回滚写盘的结果 → 追加在错误文案后面的一句话（成功时为空串）。
+///
+/// 为什么单列：两处「开启/切换接管失败」的报错都承诺了「已回滚」，而回滚本身
+/// 也可能写不进去（磁盘满、权限、正被另一处保存占用）。吞掉它（旧写法 `let _ =`）
+/// 就等于对用户说了一件没发生的事 —— 留下的状态正是这个项目最怕的那种：
+/// 开关显示已开启、磁盘上却没有端点，之后每次保存都要跟这个假象搏斗。
+fn rollback_note(result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => String::new(),
+        Err(e) => format!(
+            "（注意：设置并没有真的回滚成功，开关可能与磁盘不一致，请重试一次。原因：{e}）"
+        ),
+    }
+}
+
 fn wait_for_takeover(home: &std::path::Path, dir: &std::path::Path, port: u16) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
@@ -1003,10 +1031,13 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
         (false, true) => {
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
             if !wait_for_takeover(&home, &dir, next.proxy_port) {
-                let _ = accounts::save_settings(&dir, &old);
+                // ⚠️ 回滚是一条要报告的路径（修 4）：下面那句「已回滚」是**承诺**，
+                // 回滚写盘失败时磁盘上留着的还是「已开启」那一版 —— 开关与事实长期相反，
+                // 而用户以为已经退回原样。所以这句文案必须跟着事实变。
+                let rb = rollback_note(accounts::save_settings(&dir, &old));
                 let _ = crate::stealth::uninstall(&home, &dir);
                 return Err(format!(
-                    "无法监听 127.0.0.1:{}，接管未开启。请检查端口是否被占用。",
+                    "无法监听 127.0.0.1:{}，接管未开启。请检查端口是否被占用。{rb}",
                     next.proxy_port
                 ));
             }
@@ -1045,12 +1076,15 @@ pub(crate) fn apply_settings_inner(app: &AppHandle, settings: Settings) -> Resul
             }
             accounts::save_settings(&dir, &next).map_err(|e| e.to_string())?;
             if !wait_for_takeover(&home, &dir, next.proxy_port) {
-                let _ = accounts::save_settings(&dir, &old);
+                let rb = rollback_note(accounts::save_settings(&dir, &old));
                 let _ = wait_for_takeover(&home, &dir, old.proxy_port);
                 if was_running {
                     let _ = open_workbuddy();
                 }
-                return Err(format!("无法切换到端口 {}，已回滚原端口。", next.proxy_port));
+                return Err(format!(
+                    "无法切换到端口 {}，已回滚原端口。{rb}",
+                    next.proxy_port
+                ));
             }
             if was_running {
                 open_workbuddy()?;

@@ -2,6 +2,7 @@
 
 mod accel;
 mod accounts;
+mod alerts;
 mod briefing;
 mod broker;
 mod checkin;

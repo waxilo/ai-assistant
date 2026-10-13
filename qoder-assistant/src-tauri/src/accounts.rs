@@ -220,7 +220,7 @@ pub fn load_account_views(dir: &Path) -> Vec<AccountView> {
 /// 是「global + regions」落盘格式里 global 那一半的全部成员。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GlobalSettings {
-    /// 通知总开关（关掉后定时与手动都不推送）
+    /// 通知总开关（关掉后定时与手动都不推送，**续签失败告警也一起静音**）
     #[serde(default)]
     pub notify_enabled: bool,
     /// 通知 webhook 地址，形如 `https://…/hook/<key>`
@@ -405,7 +405,7 @@ pub struct Settings {
     //    读的都是这一张扁平的表；[`load_settings`] 从 store 拼视图时用 `global`
     //    覆盖它们，[`save_settings`] 落盘时再把它们抽回 `global`。
     //    区域切片里序列化出来的这几份是**冗余副本**，读侧一律忽略。
-    /// 通知总开关（关掉后定时与手动都不推送）
+    /// 通知总开关（关掉后定时与手动都不推送，**续签失败告警也一起静音**）
     #[serde(default)]
     pub notify_enabled: bool,
     /// 通知 webhook 地址，形如 `https://…/hook/<key>`
@@ -706,14 +706,56 @@ fn merge_gaps(into: &mut Account, from: &Account) {
     }
 }
 
+/// **原子写**：临时文件 + `sync_all` + `rename`，并且**把错误原样还回去**。
+///
+/// 为什么单独一条路：这条路上落盘的是凭证 —— `accounts.json` 里的 refresh token
+/// 是**一次性**的，换过票之后旧票在服务端就作废了。此时半截落盘等于
+/// 「旧票已死、新票没留下」，这条链只能重新登录；而 `let _ = fs::write(..)`
+/// 会把这件事变成几周后才被发现的沉默事故。
+///
+/// 两点不能反过来：
+/// 1. 先 `sync_all` 再 `rename` —— 顺序反了只是「名义上原子」，崩溃时仍可能
+///    留下一个名字已经换过去、内容却还空着的文件。
+/// 2. 权限在**创建临时文件时**就收到 0600，而不是 rename 之后再补 —— 后者中间
+///    有个窗口：新凭证已经落盘、却还是同机其它用户可读的。
+pub(crate) fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::other(format!("路径没有文件名：{}", path.display()))
+    })?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let opened = || -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+        }
+        #[cfg(not(unix))]
+        fs::File::create(&tmp)
+    };
+    let result = opened().and_then(|mut f| {
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)
+    });
+    // 失败时把半截临时文件扫掉：它带着新凭证的内容，留在那儿既脏又是一份多余副本。
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn save_accounts(dir: &Path, accounts: &[Account]) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    let target = accounts_file(dir);
-    let tmp = dir.join("accounts.json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(accounts)?)?;
-    fs::rename(&tmp, &target)?;
-    set_private_permissions(&target);
-    Ok(())
+    write_atomic(&accounts_file(dir), &serde_json::to_string_pretty(accounts)?)
 }
 
 /// 把某个账号的 [`Account::cosy_uid`] 落盘（幂等：值没变就不写）。
@@ -844,12 +886,7 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
 
 fn write_store(dir: &Path, store: &SettingsStore) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    let target = settings_file(dir);
-    let tmp = dir.join("settings.json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(store)?)?;
-    fs::rename(&tmp, &target)?;
-    set_private_permissions(&target);
-    Ok(())
+    write_atomic(&settings_file(dir), &serde_json::to_string_pretty(store)?)
 }
 
 /// 切换「当前区域」—— 左下角区域选择器改的就是这一个指针。
@@ -1126,12 +1163,12 @@ mod tests {
         v.takeover_region = Region::Global;
         v.schedule_time = "08:00".into();
         v.proxy_enabled = true;
-        save_settings(&dir, &v);
+        save_settings(&dir, &v).unwrap();
 
         set_region(&dir, Region::Cn).unwrap();
         let mut v = load_settings(&dir);
         v.schedule_time = "20:00".into();
-        save_settings(&dir, &v);
+        save_settings(&dir, &v).unwrap();
 
         // 落盘格式确认：嵌套表，两个区域各有切片，顶层指针指向当前区域
         let raw = read_raw(&dir);
@@ -1156,7 +1193,7 @@ mod tests {
         let mut v = Settings::default();
         v.takeover_region = Region::Cn;
         v.notify_webhook = "https://only-global".into();
-        save_settings(&dir, &v);
+        save_settings(&dir, &v).unwrap();
 
         // 篡改 cn 切片里的冗余副本 —— 视图必须无视它
         let mut raw = read_raw(&dir);
@@ -1169,9 +1206,9 @@ mod tests {
         // 反向同样成立：在 cn 视图里改 webhook，切回 global 后拿到的也是新值
         let mut v = s;
         v.notify_webhook = "https://updated".into();
-        save_settings(&dir, &v);
+        save_settings(&dir, &v).unwrap();
         v.takeover_region = Region::Global;
-        save_settings(&dir, &v);
+        save_settings(&dir, &v).unwrap();
         assert_eq!(load_settings(&dir).notify_webhook, "https://updated");
 
         let _ = fs::remove_dir_all(&dir);
@@ -1191,7 +1228,7 @@ mod tests {
 
         let mut v = load_settings(&dir);
         v.takeover_region = Region::Cn;
-        save_settings(&dir, &v);
+        save_settings(&dir, &v).unwrap();
         // ⚠️ 这里必须重新 load 而不是看内存里的 v：另一侧的修正在盘上
         assert_eq!(load_settings(&dir).schedule_time, "10:00", "另一区域的遗留值也要被修掉");
 
@@ -1376,5 +1413,59 @@ mod tests {
         let twice = dedupe_by_credential(once.clone());
         assert_eq!(once.len(), twice.len());
         assert_eq!(once[0].id, twice[0].id);
+    }
+
+    /// [`write_atomic`] 的三条底线：内容完整、原地替换、**失败要响**。
+    ///
+    /// 对应修 4 的起因 —— 凭证文件里 refresh token 是一次性的，
+    /// 「写了个半截」和「写失败但没人知道」叠在一起就等于这条链悄悄死掉。
+    #[test]
+    fn write_atomic_replaces_in_place_and_fails_loudly() {
+        let dir = temp_dir("write_atomic");
+        let target = dir.join("credentials.json");
+
+        write_atomic(&target, r#"{"refresh_token":"rt-1"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            r#"{"refresh_token":"rt-1"}"#
+        );
+        // 原地替换：临时文件必须已经没了，否则下次同名写入会撞上一个残留
+        assert!(!dir.join("credentials.json.tmp").exists(), "临时文件不得残留");
+
+        // 覆盖写：不是追加、不是新 inode 意义上的「留一份旧的」
+        write_atomic(&target, r#"{"refresh_token":"rt-2"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            r#"{"refresh_token":"rt-2"}"#
+        );
+
+        // 父目录不存在 → 必须返回 Err，而不是 `let _ =` 那样吞掉
+        let bad = dir.join("nope").join("credentials.json");
+        assert!(write_atomic(&bad, "{}").is_err(), "写不进去必须报错");
+    }
+
+    /// 凭证落盘的两面：**读写往返无损** + **写不进就返回 Err**。
+    ///
+    /// 后半截才是修 4 的重点 —— refresh token 是一次性的，调用点若用 `let _ =` 吞掉
+    /// 失败，磁盘上留着的就还是那枚已经作废的旧票，几天后表现为「要重新登录」。
+    /// 这里用「数据目录指向一个普通文件」制造失败（真实世界是磁盘满 / 权限不对，
+    /// 但那两者在测试里不可靠），判据一样：`save_accounts` 必须把错误冒出来。
+    #[test]
+    fn save_accounts_roundtrips_and_propagates_a_failed_write() {
+        let dir = temp_dir("save_accounts");
+        let a = mk("a", Region::Global, "主号", Some("138"), "dt");
+        save_accounts(&dir, &[a.clone()]).expect("落盘应该成功");
+
+        let back = load_accounts(&dir);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].token, "dt");
+        assert_eq!(back[0].refresh_token.as_deref(), Some("rt-dt"));
+
+        let blocker = dir.join("not-a-dir");
+        fs::write(&blocker, "").unwrap();
+        assert!(
+            save_accounts(&blocker, &[a]).is_err(),
+            "写不进去必须返回 Err，而不是静默成功"
+        );
     }
 }

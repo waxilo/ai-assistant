@@ -127,7 +127,7 @@ function SettingsPage({
           )}
           <Row
             title="失败通知地址"
-            desc="Webhook 地址（GET 即可）。签到失败时会汇总成一条消息推过去；留空则不通知。"
+            desc="Webhook 地址（GET 即可）。签到结果汇总推一条；续签失败、链已死、新票没落盘这类要人处理的失败会单独告警，同类几小时内只推一次。留空则不通知。"
             ctrl={
               <input
                 className="set-input"

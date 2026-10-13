@@ -812,7 +812,9 @@ async fn choose_account(
         infos.push(info);
     }
     if need_persist {
-        let _ = accounts::save_accounts(dir, &all);
+        // 这一步同时落的是**活性结论**：401 只改内存的话，下一轮 `broker::adopt`
+        // 就看不到「这张票已死」，救不了它。
+        accounts::save_accounts_noisy(dir, &all, "接管热路径的活性/积分回写");
     }
 
     let idx = pick_index(&ids, &infos)?;

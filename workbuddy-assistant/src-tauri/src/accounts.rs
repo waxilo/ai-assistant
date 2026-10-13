@@ -151,7 +151,7 @@ pub struct Settings {
     /// 当天挑定的时刻会写进 `schedule_state.json` 复用，重启不会重新摇。0 = 关闭随机。
     #[serde(default = "default_schedule_window")]
     pub schedule_window_minutes: u32,
-    /// 通知总开关（关掉后定时与手动都不推送）
+    /// 通知总开关（关掉后定时与手动都不推送，**续签失败告警也一起静音**）
     #[serde(default)]
     pub notify_enabled: bool,
     /// 通知 webhook 地址，形如 `https://…/hook/<key>`
@@ -328,14 +328,57 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
     serde_json::from_str(&s).unwrap_or_default()
 }
 
+/// **原子写**：临时文件 + `sync_all` + `rename`，并且**把错误原样还回去**。
+///
+/// 为什么单独一条路（修 4）：这条路上落盘的是凭证 —— `accounts.json` 里的
+/// refresh token 是**一次性**的，换过票之后旧票在服务端就作废了。此时半截落盘等于
+/// 「旧票已死、新票没留下」，这条链只能重新登录；而 `let _ = fs::write(..)`
+/// 会把这件事变成几周后才被发现的沉默事故（症状是「某个账号突然要重新登录」，
+/// 原因藏在几周前的一次写盘失败里）。
+///
+/// 两点不能反过来：
+/// 1. 先 `sync_all` 再 `rename` —— 顺序反了只是「名义上原子」，崩溃时仍可能留下
+///    一个名字已经换过去、内容却还空着的文件。
+/// 2. 权限在**创建临时文件时**就收到 0600，而不是 rename 之后再补 —— 后者中间有个
+///    窗口：新凭证已经落盘、却还是同机其它用户可读的。
+pub(crate) fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other(format!("路径没有文件名：{}", path.display())))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let opened = || -> std::io::Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+        }
+        #[cfg(not(unix))]
+        fs::File::create(&tmp)
+    };
+    let result = opened().and_then(|mut f| {
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)
+    });
+    // 失败时把半截临时文件扫掉：它带着一份新凭证的副本，留在那儿既脏又是多余的暴露面。
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn save_accounts(dir: &Path, accounts: &[Account]) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    let target = accounts_file(dir);
-    let tmp = dir.join("accounts.json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(accounts)?)?;
-    fs::rename(&tmp, &target)?;
-    set_private_permissions(&target);
-    Ok(())
+    write_atomic(&accounts_file(dir), &serde_json::to_string_pretty(accounts)?)
 }
 
 pub fn load_settings(dir: &Path) -> Settings {
@@ -349,12 +392,7 @@ pub fn load_settings(dir: &Path) -> Settings {
 
 pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    let target = settings_file(dir);
-    let tmp = dir.join("settings.json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(settings)?)?;
-    fs::rename(&tmp, &target)?;
-    set_private_permissions(&target);
-    Ok(())
+    write_atomic(&settings_file(dir), &serde_json::to_string_pretty(settings)?)
 }
 
 /// 把账号/设置文件权限设为 0600（仅当前用户可读写）。
@@ -510,5 +548,92 @@ mod tests {
         // 旧版单选字段不再使用：读到也不影响新逻辑（多选列表仍为空 = 全部可用）
         let s: Settings = serde_json::from_str(r#"{"preferred_account_id":"abc"}"#).unwrap();
         assert!(s.billing_account_ids.is_empty());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wb-{tag}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// [`write_atomic`] 的四条底线：内容完整、原地替换、权限收窄、**失败要响并且扫干净**。
+    ///
+    /// 对应修 4 的起因 —— refresh token 是**一次性**的，「写了个半截」和「写失败但没人
+    /// 知道」叠在一起，就等于这条链悄悄死掉，几周后才以「要重新登录」的形式浮出来。
+    #[test]
+    fn write_atomic_replaces_in_place_and_fails_loudly() {
+        let dir = temp_dir("write_atomic");
+        let target = dir.join("credentials.json");
+
+        write_atomic(&target, r#"{"refresh_token":"rt-1"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            r#"{"refresh_token":"rt-1"}"#
+        );
+        assert!(!dir.join("credentials.json.tmp").exists(), "临时文件不得残留");
+
+        write_atomic(&target, r#"{"refresh_token":"rt-2"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            r#"{"refresh_token":"rt-2"}"#,
+            "覆盖写要生效"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "凭证文件必须收窄到 0600，且不能有一瞬间是全局可读的");
+        }
+
+        // 「临时文件写得成、换名失败」的场景：把目标占成目录，rename 会失败（EISDIR）。
+        // 用它验证失败后那份带新凭证的半截文件被扫掉了。
+        let blocker = dir.join("blocked_dir");
+        fs::create_dir_all(&blocker).unwrap();
+        assert!(write_atomic(&blocker, "{}").is_err(), "目标是目录时必须报错");
+        assert!(
+            !dir.join("blocked_dir.tmp").exists(),
+            "换名失败也要扫掉那份半截临时文件"
+        );
+
+        // 父目录不存在同样要报错（真实世界对应磁盘满 / 权限不对，判据一样）
+        let bad = dir.join("nope").join("credentials.json");
+        assert!(write_atomic(&bad, "{}").is_err(), "写不进去必须返回 Err");
+    }
+
+    /// `save_accounts` 必须把写失败**冒给调用方**，而不是静默返回 Ok。
+    ///
+    /// 反代那条续签路径就靠这个返回值决定是否记日志：token 已经轮换，磁盘上却还是旧票，
+    /// 下次重启读回的就是那枚已作废的 refresh token。
+    #[test]
+    fn save_accounts_roundtrips_and_propagates_a_failed_write() {
+        let dir = temp_dir("save_accounts");
+        let a = Account {
+            id: "a1".into(),
+            name: "主号".into(),
+            phone: Some("190****9775".into()),
+            token: "dt-new".into(),
+            refresh_token: Some("rt-new".into()),
+            expires_at: Some(2_000),
+            rt_expires_at: Some(3_000),
+            base_url: None,
+            created_at: "2026-09-16 09:00:00".into(),
+            last: None,
+            checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
+        };
+        save_accounts(&dir, &[a.clone()]).expect("落盘应该成功");
+        let back = load_accounts(&dir);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].refresh_token.as_deref(), Some("rt-new"));
+
+        // 数据目录位置放一个**普通文件**：create_dir_all 必然失败 → Err 要冒出来
+        let blocker = dir.join("not-a-dir");
+        fs::write(&blocker, "").unwrap();
+        assert!(
+            save_accounts(&blocker, &[a]).is_err(),
+            "写不进去必须返回 Err，而不是静默成功"
+        );
     }
 }

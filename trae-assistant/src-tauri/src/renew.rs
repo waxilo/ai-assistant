@@ -47,8 +47,10 @@
 //! 把新 token 写回 `storage.json`，我们只要在它更新后**同步过来**即可（比签发时间 `iat`，
 //! 晚者胜）。它不等价于第一条路的备份 —— 桌面端换到新票也可能不落盘（2026-09-28 实测：
 //! SOLO 09:37 换票成功却报 `UserInfoNotMatchError`，票被丢掉、旧 refresh token 已作废），
-//! 所以两条路都要走。策略是先同步本机登录态，再走 OAuth 续签；但**桌面端自己还续得动的时候
-//! 不抢**（一条链只能续一次，抢了的代价见上面那个例子）。
+//! 所以两条路都要走。策略是先同步本机登录态，再走 OAuth 续签；但**桌面端自己还续得动、
+//! 而且最近真的在动的时候不抢**（一条链只能续一次，抢了的代价见上面那个例子；
+//! 反过来「让」也要有度 —— 只看票没到期就把整窗让给一个从没启动过的桌面端，
+//! 结局是两边一起过期，`用户696006185260` 就是这么死的第二次，判据见 [`desktop_can_self_renew`]）。
 //!
 //! ## 什么时候续（全自动 —— 界面上**没有任何**手动按钮）
 //!
@@ -63,6 +65,10 @@
 //! 2. 每次签到（手动单签 / 一键全签 / 定时签到）之前顺手续一次，见 `commands` 与 `scheduler`；
 //! 3. 失败冷却**分档**：临时失败（网络抖动、服务端繁忙）只冷一个巡检周期、下一轮就重试；
 //!    只有 `needs_login`（refresh token 失效 / 设备密钥丢了 —— 重试多少次都是同一个结论）才冷 6 小时。
+//!
+//! 还有一条**绑了凭证池时**的兜底：本地逐账号续签在那条分岔里是被取消的，接替它的是
+//! [`sweep`] —— 巡检那一跳改为去要一次闸、走 `broker::sync`。少了这一条，「自动续签」在
+//! 绑池的机器上就只剩界面动作 / 定时签到 / 反代流量三个触发点，安静过期的窗口能拉到几十小时。
 
 use crate::accounts::{self, Account};
 use crate::devicekey;
@@ -249,6 +255,7 @@ pub async fn renew_if_needed(dir: &Path, account: &mut Account) -> Option<RenewO
     // 绑了凭证池时本地永不续签：整池的续签统一由 `broker::sync` 拿着闸做。
     // 这里若退回本地续签，几台机器会同时打官方接口、各自换一条新链 ——
     // 「谁先签谁把别人踢下线」正是这么来的，所以这条分岔不能省。
+    // 但**取消要有接替**：绑池时那一跳由 [`sweep`] 去要闸，别把心跳一起省掉了。
     // `renew()` 不加这个判断：`broker::sync` 需要直接调它来续签。
     if crate::broker::bound() {
         return None;
@@ -284,14 +291,18 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
     //     `RefreshToken` 是一次性的：谁先打谁把对方的那条链作废。桌面端账号（用户日常在用的
     //     Trae IDE）一旦被这里续掉，它手里存的 refresh token 当场失效，等它那张票到期就只能
     //     重新登录 —— 那正是 `用户696006185260` 这次死掉的样子。所以只在桌面端**已经续不动**
-    //     （本机没有它的登录态 / 它那张票已经过期）时，才动用它的密钥替它续。
+    //     时，才动用它的密钥替它续。
+    //
+    //     「续不动」有两层（见 [`desktop_can_self_renew`]）：链本身死了（没 RT / 票已过期），
+    //     以及**它根本没在跑**。旧实现只看前者，于是把整个 24 小时窗口让给一个从没被打开过的
+    //     桌面端 —— 两边都不动手，一起过期，那还是同一条链第二次死在同一种沉默上。
     if desktop_can_self_renew(account, chrono::Utc::now().timestamp_millis()) {
         return RenewOutcome {
             id: account.id.clone(),
             name: account.name.clone(),
             renewed: false,
             source: None,
-            message: "这个账号本机桌面端还登录着、票也没到期，续签交给它（它换完新票会被本机同步接住）—— 不打接口，免得把桌面端那条链顶掉。".into(),
+            message: "这个账号本机桌面端最近还在用、票也没到期，续签交给它（它换完新票会被本机同步接住）—— 不打接口，免得把桌面端那条链顶掉。".into(),
             expires_at: expiry_ms(account),
             needs_login: false,
             deferred: true,
@@ -321,7 +332,7 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
             // 新票在手：活性/冷却两个标记自然失效（这张票刚被官方亲自签发，必然活着）
             account.invalidated_at = None;
             account.renew_blocked_until = None;
-            let _ = accounts::save_accounts(dir, &replace(dir, account));
+            persist(dir, account, true);
             let exp = expiry_ms(account);
             RenewOutcome {
                 id: account.id.clone(),
@@ -345,7 +356,7 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
             let until = chrono::Utc::now().timestamp_millis() + cooldown.as_millis() as i64;
             if account.renew_blocked_until != Some(until) {
                 account.renew_blocked_until = Some(until);
-                let _ = accounts::save_accounts(dir, &replace(dir, account));
+                persist(dir, account, false);
             }
             RenewOutcome {
                 id: account.id.clone(),
@@ -370,9 +381,18 @@ pub async fn renew(dir: &Path, account: &mut Account) -> RenewOutcome {
     }
 }
 
-/// 本机桌面端**自己还续得上**这个账号：它登录着、手里有 refresh token、票还没过期。
+/// 本机桌面端**自己还续得上**这个账号：链还活着，**而且它真的在动**。
 ///
-/// 判据见 [`renew`] 的第②步 —— 一条链只能续一次，谁续谁把另一边的 refresh token 顶掉。
+/// 两个条件缺一不可，方向相反的两次事故各由一个来挡：
+///
+/// - 只看「链还活着」→ 把整窗让给一个从没被打开过的桌面端，两边一起过期（`用户696006185260`）；
+/// - 只看「在动」→ 桌面端正开着，但它的 refresh token 早被换掉了，等它到点去签就是必然被拒，
+///   我们这一轮也白等（[`desktop_is_live`] 那条判据）。
+///
+/// 「在动」的证据取**两者之一**：进程此刻在跑（[`desktop_running`]），或它的登录态文件在
+/// 一个续签窗口（[`RENEW_WINDOW_MS`]，24 小时）内被回写过（[`crate::trae_auth::local_session_last_write_ms`]）。
+/// 后者是必需的 —— 巡检 30 分钟一跳，桌面端完全可能在两次巡检之间启动、换票、退出；
+/// 只按「当下在不在跑」判断会让这种票永远追不上它，白打一次注定顶掉别人链的接口。
 fn desktop_can_self_renew(account: &Account, now_ms: i64) -> bool {
     let uid = match account.user_id.as_deref().map(str::trim) {
         Some(u) if !u.is_empty() => u,
@@ -385,7 +405,24 @@ fn desktop_can_self_renew(account: &Account, now_ms: i64) -> bool {
         local.refresh_token.as_deref(),
         token_expiry_ms(&local.token).or_else(|| local.expires_at.map(norm_ms)),
         now_ms,
-    )
+    ) && desktop_is_active(now_ms, desktop_running(), crate::trae_auth::local_session_last_write_ms(uid))
+}
+
+/// 桌面端最近还在动吗（纯函数，便于单测）。
+///
+/// `last_write_ms` 读不到时算「不在动」：那种情况下宁可我们自己换一次票。
+/// 两次误判的代价不对称 —— 抢错的后果是「桌面端要重新登录」（可见、可当场补救），
+/// 让错的后果是「整条链无声过期，接管一路 401」（就是这次事故）。
+fn desktop_is_active(now_ms: i64, running: bool, last_write_ms: Option<i64>) -> bool {
+    running || last_write_ms.is_some_and(|t| now_ms - t <= RENEW_WINDOW_MS)
+}
+
+/// 本机是否有受管 Trae CN 正在运行（取**一份**进程快照再逐个判断，见 `target::running_in` 的告诫）。
+fn desktop_running() -> bool {
+    let images = crate::target::process_images();
+    crate::target::discover()
+        .iter()
+        .any(|t| t.running_in(&images))
 }
 
 /// 纯函数版判据。到期时间**读不出来时算「还活着」**：宁可多等桌面端一轮，
@@ -425,7 +462,9 @@ pub fn adopt_local_session(dir: &Path, account: &mut Account) -> Option<RenewOut
     // 新票在手：活性/冷却标记一并清掉（可能正是靠「桌面端换的新票」才能救活一条死链）
     account.invalidated_at = None;
     account.renew_blocked_until = None;
-    let _ = accounts::save_accounts(dir, &replace(dir, account));
+    // 落盘失败在这里**不是不可逆的**：票还在桌面端手里，下一轮 `is_newer` 一比又会采纳一次，
+    // 所以走「只吼不写 journal」那档（`renewed = false`），跟 OAuth 换票失败同一种待遇。
+    persist(dir, account, false);
     let exp = expiry_ms(account);
     Some(RenewOutcome {
         id: account.id.clone(),
@@ -655,6 +694,56 @@ fn replace(dir: &Path, account: &Account) -> Vec<Account> {
     all
 }
 
+/// 续签结果落盘，**不许静默失败**。
+///
+/// 为什么这条要单独写：`RefreshToken` 是一次性的 —— 新票到手的那一瞬间，盘上那枚旧的已经
+/// 作废。旧写法 `let _ = save_accounts(...)` 把这唯一不可逆的一步吞掉了：写失败（磁盘满、
+/// 权限被改）时本进程内存里是新票，重启后读回来的却是那张**已被自己作废**的旧票，
+/// 于是这条链被我们自己杀第二次，症状与 `renew.rs` 顶部那批死链一模一样、却更难归因。
+///
+/// 成功与失败的严重程度也分开：拿到新票后落盘失败要进 journal（这是要人命的事件，
+/// 内存日志只有 200 条上限）；而**冷却时间戳**落盘失败只是下一轮再试一次，不值得惊动 journal。
+fn persist(dir: &Path, account: &Account, renewed: bool) {
+    let mut last = String::from("未知错误");
+    for _ in 0..2 {
+        match accounts::save_accounts(dir, &replace(dir, account)) {
+            Ok(()) => return,
+            Err(e) => last = e,
+        }
+    }
+    crate::logs::push(
+        &account.name,
+        false,
+        format!("续签结果落盘失败（重试一次仍失败）：{last}"),
+    );
+    if renewed {
+        crate::journal::append(
+            dir,
+            "renew_persist_failed",
+            &format!(
+                "已换到新票，但没能写进 accounts.json（{last}）。本进程内存里用的还是新票；\
+                 绑了凭证池时后续同步会把它从云端接回来，没绑池则重启后只剩那枚已被作废的旧票，\
+                 需要重新登录该账号。请先确认磁盘/权限，再决定要不要重登。"
+            ),
+        );
+        // 这类事件**必须推出去**：它是整条链上唯一不可逆的一步 —— 换出去的那枚一次性
+        // refresh token 已经作废，重启后手里只剩废票。journal 与内存日志都要用户主动去看，
+        // 而这里等的是「现在就有人去修磁盘/权限」。
+        crate::alerts::notify(
+            dir,
+            &format!("renew-persist:{}", account.id),
+            crate::alerts::CRITICAL_COOLDOWN_MS,
+            "新票已换到，但没能写进盘",
+            &format!(
+                "账号 {}：续签成功却落盘失败（{last}）。\n\
+                 那枚旧 refresh token 已作废：本进程还在用新票，**重启后这条链就断了**。\n\
+                 现在能做的：确认磁盘没满、数据目录可写；绑了凭证池的话，下一轮整池同步会把新票传上去。",
+                account.name
+            ),
+        );
+    }
+}
+
 fn dig(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|k| v.get(*k))
@@ -696,6 +785,60 @@ fn fmt_ms(ms: Option<i64>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// 告警
+// ---------------------------------------------------------------------------
+
+/// 「还剩多久」那一行 —— 告警里唯一决定「要不要现在就处理」的数字。
+///
+/// 单独抽成纯函数是为了钉住三种读法：读不出来（`None`）**不能**写成「还剩 -nan 小时」，
+/// 也不能因为不知道就干脆不报 —— 票的到期时间对续签链就是「还有多少时间可救」。
+fn expiry_line(exp: Option<i64>, now_ms: i64) -> String {
+    let hours = |ms: i64| ms / 3_600_000;
+    match exp {
+        Some(e) if e <= now_ms => format!("票已过期 {} 小时", hours(now_ms - e)),
+        Some(e) => format!("票还剩 {} 小时（{} 到期）", hours(e - now_ms), fmt_ms(Some(e))),
+        None => "票的到期时间读不出来（不是 JWT，或本地没有记录）".to_string(),
+    }
+}
+
+/// 一次**失败**的续签要不要告警、告警什么。
+///
+/// 挂在这里而不是各个调用点各写一遍：巡检（未绑池）、定时签到前的顺手续、`broker::sync`
+/// （绑池）三条路都会走到同一个 `RenewOutcome`，而「该不该惊动用户」只取决于失败的**性质**，
+/// 不该取决于这轮是谁发起的。
+///
+/// 三档：
+/// - `needs_login` —— 重试一百次都是同一个结论，只有重新登录能救 ⇒ 一天提醒一次；
+/// - 其余失败 —— 下一轮巡检自己会再试 ⇒ 六小时一次，别把通道刷成静音；
+/// - `deferred` / 成功 —— 不是失败，不推。
+pub(crate) fn alert_failure(dir: &Path, account: &Account, out: &RenewOutcome) {
+    if out.renewed || out.deferred {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let (key, cooldown, title) = if out.needs_login {
+        (
+            format!("renew-dead:{}", account.id),
+            crate::alerts::DEAD_COOLDOWN_MS,
+            "续签链已死，要重新登录",
+        )
+    } else {
+        (
+            format!("renew-fail:{}", account.id),
+            crate::alerts::COOLDOWN_MS,
+            "自动续签失败",
+        )
+    };
+    crate::alerts::notify(
+        dir,
+        &key,
+        cooldown,
+        &title,
+        &format!("账号 {}：{}\n{}。", account.name, out.message, expiry_line(expiry_ms(account), now)),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 后台自动续签
 // ---------------------------------------------------------------------------
 
@@ -718,10 +861,43 @@ pub fn spawn(app: tauri::AppHandle) {
 
 /// 巡一遍全部账号：只有**进了续签窗口、且不在冷却里**的才会真的发请求
 /// （两个判断都在 [`renew_if_needed`] 里，本函数只负责遍历与记日志）。
+///
+/// ⚠️ 绑了凭证池时这一跳**改为去要一次闸**（`sync_pool_if_bound`），而不是逐账号空转。
+/// 那个分岔（[`renew_if_needed`] 开头）本身是对的 —— 几台机器各自换链就是「谁先签谁把别人
+/// 踢下线」；但它是**取消**了本地续签，不是**接替**了它。接替必须在这里做，否则绑池的机器上
+/// 「自动续签」只剩三个触发点：界面上的主动动作、定时签到那一跳、反代有真实流量。
+/// 2026-10-13 那次就是这么死的：Trae CN 没开（无流量）、用户没点界面，票 12:25 过点之后
+/// 二十小时无人尝试，唯一一次续签排在早上 08:00 的签到里。
 fn sweep(app: &tauri::AppHandle) {
     let Ok(dir) = crate::commands::try_data_dir(app) else {
         return;
     };
+    if crate::broker::bound() {
+        // 直接走 `broker::sync` 而不是 `commands::sync_pool_if_bound(_, false)`：后者按热路径
+        // 口径把结果整个吞掉，而这条心跳失败的后果是「整池几十小时没人签」—— 那种沉默刚付过代价。
+        // `force = false` 保留两分钟节流；被节流、闸在别人手里都是 `Ok(deferred)`，不记日志。
+        if let Err(e) = tauri::async_runtime::block_on(crate::broker::sync(&dir, false)) {
+            crate::logs::push("凭证池", false, format!("续签心跳：整池同步失败：{e}"));
+            crate::journal::append_dedup(
+                &dir,
+                "renew_heartbeat",
+                &format!("绑池续签心跳失败（30 分钟一跳，同类只留一条）：{e}"),
+            );
+            // 心跳失败是**整机**事件：这一跳没签成，下一跳还不一定轮得到我们。
+            // 2026-10-13 那次二十小时没人续签，缺的就是这一句 —— 日志用户不看，推送才看得见。
+            crate::alerts::notify(
+                &dir,
+                "renew-heartbeat",
+                crate::alerts::COOLDOWN_MS,
+                "绑池续签心跳失败",
+                &format!(
+                    "整池同步没做成，本机这一轮续签等于没发生：{e}\n\
+                     后果：池里的票可能一路静默过期。请检查凭证管家是否可达、绑定是否还在。"
+                ),
+            );
+        }
+        return;
+    }
     let now = chrono::Utc::now().timestamp_millis();
     for mut account in accounts::load_accounts(&dir) {
         if !renew_due(&account, now) {
@@ -740,6 +916,7 @@ fn sweep(app: &tauri::AppHandle) {
                 false,
                 format!("自动续签未成功：{}", out.message),
             );
+            alert_failure(&dir, &account, &out);
         }
     }
 }
@@ -829,6 +1006,27 @@ mod tests {
         assert!(!newer_by_iat(&jwt(1_000, 2_000), &jwt(2_000, 3_000)));
         assert!(!newer_by_iat("opaque-new", "opaque-old"));
         assert!(!newer_by_iat(&jwt(2_000, 3_000), "opaque-old"));
+    }
+
+    /// 告警里那行「还剩多久」的三种读法。
+    ///
+    /// 钉住它是因为这个数决定用户**要不要现在就处理**：把「读不出来」写成负数小时，
+    /// 或者过期了却报「还剩 -3 小时」，都会让一条真告警看起来像 bug 而被忽略。
+    #[test]
+    fn expiry_line_distinguishes_expired_remaining_and_unknown() {
+        let h: i64 = 3_600_000;
+        let now = 1_700_000_000_000;
+        assert_eq!(expiry_line(Some(now - 5 * h), now), "票已过期 5 小时");
+        assert_eq!(expiry_line(Some(now), now), "票已过期 0 小时", "刚好到点算过期");
+        assert!(
+            expiry_line(Some(now + 7 * h), now).starts_with("票还剩 7 小时（"),
+            "未过期要报剩余时间：{}",
+            expiry_line(Some(now + 7 * h), now)
+        );
+        assert!(
+            expiry_line(None, now).contains("读不出来"),
+            "读不出到期时间必须照实说，不许算成过期"
+        );
     }
 
     /// 判新主键现在是 **iat**（轮换顺序的本义）：exp 相同/死票 exp 更晚都不能翻盘；
@@ -971,6 +1169,27 @@ mod tests {
         assert!(!desktop_is_live(Some("rt"), Some(now - 1), now));
         assert!(!desktop_is_live(Some("   "), Some(now + 1), now));
         assert!(!desktop_is_live(None, Some(now + 1), now));
+    }
+
+    /// 让位的**第二重门槛**：桌面端还得真的在动。只看「票没到期」会把整窗让给一个
+    /// 从没启动过的进程 —— 两边都不动手，一起过期（`用户696006185260` 第二次死法）。
+    #[test]
+    fn only_yields_to_a_desktop_that_is_actually_running() {
+        let now = 1_790_601_750_000i64;
+        let w = RENEW_WINDOW_MS;
+        // 进程在跑：连 mtime 都读不到也该让
+        assert!(desktop_is_active(now, true, None));
+        // 没在跑，但这个窗口内回写过（两次巡检之间启动、换票、退出）：也该让
+        assert!(desktop_is_active(now, false, Some(now - w + 1)));
+        // 整整一个续签窗口没碰过：不再让，我们自己续
+        assert!(!desktop_is_active(now, false, Some(now - w - 1)));
+        assert!(!desktop_is_active(now, false, Some(now - 2 * w)));
+        // mtime 读不到 = 当作不在动。两次误判代价不对称：抢错的后果是「桌面端要重登」
+        //（可见、当场能补），让错的后果是「整条链无声过期、接管一路 401」。
+        assert!(!desktop_is_active(now, false, None));
+        // mtime 落在「未来」（系统时钟被往回调过）按「刚写过」处理：这是已知取舍 ——
+        // 那种时刻所有跟 `now` 比的判断一起漂，单独为它分支只会掩盖真正该修的东西。
+        assert!(desktop_is_active(now, false, Some(now + w)));
     }
 
     /// 真机探针：对真实账号打一次续签，打印服务端结论。

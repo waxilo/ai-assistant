@@ -183,7 +183,8 @@ pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<checkin::Accoun
         out.push(status);
     }
     if dirty {
-        let _ = accounts::save_accounts(&dir, &list);
+        // 这批保存里带着活性结论（`invalidated_at`）—— 见 [`accounts::save_accounts_noisy`]
+        accounts::save_accounts_noisy(&dir, &list, "签到状态采集");
     }
     Ok(out)
 }
@@ -264,7 +265,7 @@ pub async fn refresh_account_status(
     let client = reqwest::Client::new();
     let (status, dirty) = account_status_entry(&dir, account, &client).await;
     if dirty {
-        let _ = accounts::save_accounts(&dir, &list);
+        accounts::save_accounts_noisy(&dir, &list, "单账号刷新");
     }
     Ok(status)
 }
@@ -1152,7 +1153,7 @@ pub(crate) async fn fetch_samples(
         }
     }
     if dirty {
-        let _ = accounts::save_accounts(dir, &list);
+        accounts::save_accounts_noisy(dir, &list, "积分采集");
     }
     (at, readings)
 }
