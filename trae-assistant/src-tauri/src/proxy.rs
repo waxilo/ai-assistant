@@ -20,15 +20,21 @@
 //! 2. 路径 / 查询串 / 请求体 / 响应体（含 SSE 流）原样透传。
 //!
 //! 路由逻辑：
-//! 1. **会话粘滞**：`/chat_sessions/:id/*` 固定复用同一账号（会话属于账号，换号会丢上下文）；
-//! 2. **额度到期优先轮换**：新会话按「**到期最早优先 → 无到期数据靠后 → 积分多者优先**」
-//!    挑账号，先把快到期的额度用掉（见 [`pick_index`]）。排序依据来自
+//! 1. **额度到期优先轮换**：**每条请求**都对「当前可用的账号」纯排序，不用粘滞/归属
+//!    等历史记忆干扰——按「**到期日最早优先 → 同日则待过期积分多者优先 →
+//!    无到期数据靠后**」挑账号，先把快到期的额度用掉（见 [`pick_index`]）。
+//!    第二键比的是「最早到期日当天要作废的积分」而不是总剩余——总剩余多但大半是
+//!    远期包的账号，不该抢在「快作废的多」前面（见 [`expiring_credits`]）。
+//!    第一键取的是**自然日**而不是毫秒：界面上的到期时间本来就是日粒度，按毫秒比
+//!    会让「两个都显示同一天到期」的账号悄悄选出积分少的那个。排序依据来自
 //!    `ide_user_ent_usage` 的额度包到期时间 `expire_time`（秒级）—— **该字段实测确实返回**
 //!    （2026-09-14 用真实账号 dump 过；旧注释曾写「Trae CN 不返回到期时间」，是错的），
 //!    只统计「还有余量」的包（已用光的包到期再早也不该把排序带偏）。
-//!    快照 10 分钟 TTL 并落盘，避免每次新会话都打接口；
-//! 3. **限流无感切换**：某账号返回 429 ⇒ 打入 10 分钟冷却、解绑会话，换下一个账号重发
-//!    （上限 2 次）；全部失败则原样透传最后一个 429。冷却中的账号路由优先跳过；
+//!    快照 10 分钟 TTL 并落盘，避免每次都打接口；
+//! 2. **限流无感切换**：某账号返回 429 ⇒ 打入 10 分钟冷却（按账号整体——body 密文
+//!    拿不到模型名，物理上无法细分到「账号 × 模型」），换下一个账号重发
+//!    （上限 2 次）；全部失败则原样透传最后一个 429。冷却中的账号路由优先跳过，
+//!    冷却一过自动回到候选集；
 //! 4. **白名单**：设置里勾选的账号才有资格被扣费（未勾选的一律不参与，见
 //!    [`billing_candidates`]）；空列表 = 全部（未配置过的默认状态）；
 //! 5. **只给扣费路径换凭据**：只有 `/api/remote/v1/{chat_sessions,models,file_converts}`
@@ -64,7 +70,6 @@ const ACCEPT_POLL: Duration = Duration::from_millis(30);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const STICKY_TTL: Duration = Duration::from_secs(30 * 60);
 const COOLDOWN_TTL: Duration = Duration::from_secs(10 * 60);
 /// 积分快照缓存时长：选号不必每次都打资源接口。
 const SNAPSHOT_TTL: Duration = Duration::from_secs(600);
@@ -88,12 +93,6 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("构建 HTTP 客户端失败")
 });
-
-type Sticky = Mutex<HashMap<String, (Instant, String)>>;
-fn sticky_conv() -> &'static Sticky {
-    static S: OnceLock<Sticky> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 type Cooldown = Mutex<HashMap<String, Instant>>;
 fn cooldown_table() -> &'static Cooldown {
@@ -141,58 +140,25 @@ fn cooling(id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 会话粘滞命中：返回账号 id，刷新时间戳；顺带清理过期项。
-fn sticky_hit(conv: &str) -> Option<String> {
-    let mut map = sticky_conv().lock().ok()?;
-    map.retain(|_, (at, _)| at.elapsed() < STICKY_TTL);
-    let (at, id) = map.get_mut(conv)?;
-    *at = Instant::now();
-    Some(id.clone())
-}
-
-/// 写入/刷新会话粘滞。返回 `true` 表示该会话**换到了新账号**（首次上代理或被切换），
-/// 调用方据此写「开始使用账号」事件；同一会话的后续请求返回 `false`，避免刷屏。
-fn sticky_put(conv: &str, id: String) -> bool {
-    if let Ok(mut map) = sticky_conv().lock() {
-        let changed = map
-            .get(conv)
-            .map(|(_, cur)| cur != &id)
-            .unwrap_or(true);
-        map.insert(conv.to_string(), (Instant::now(), id));
-        return changed;
-    }
-    false
-}
-
-/// 这次请求的「身份归属范围」= 粘滞键从哪来。
+/// 这次请求的「身份归属范围」= 留痕键从哪来。
 ///
 /// 为什么要有它：`Authorization` 路线天然有会话键（`chat_sessions/<id>`），
 /// 「一个会话一个账号」就够了；而 agent 域**没有会话键**（body 是密文，见 `proxy-rules.json`
 /// 里的 `swap_token_prefixes`），只能退到「**整段链路一个账号**」——
 /// 语义上等于「让应用以某个账号的身份说话」。
 ///
-/// 两者共用同一套粘滞机制而不是各写一套，否则「账号不可用时自动重选」与「换人时留痕」
-/// 这两件事会在其中一条路线上漏掉（而它们恰好是「换给了谁」唯一能对账的地方）。
+/// 两者共用同一套**选号规则与留痕机制**而不各写一套，否则「换人时留痕」
+/// 会在其中一条路线上漏掉（而它恰好是「换给了谁」唯一能对账的地方）。
 #[derive(Clone, Debug, PartialEq)]
 enum Scope<'a> {
-    /// 一次对话一个账号（键 = 会话 id）。
+    /// 一次对话一个身份（键 = 会话 id）。
     Conversation(&'a str),
-    /// 一条链路一个账号（键 = 域前缀）。
+    /// 一条链路一个身份（键 = 域前缀）。
     Domain(&'a str),
 }
 
 impl Scope<'_> {
-    /// 这个范围要不要**粘滞**（= 在这段范围里固定一个账号）。
-    ///
-    /// **只有「有会话键」的范围才粘**：一次对话中途换账号会丢上下文。
-    /// 域范围**不粘** —— 它没有会话边界，「钉住」只会让用户的配置改动看起来没生效：
-    /// 2026-09-16 实测就是这么被投诉的 ——「我勾选了新账号，应该按照时间规则，为什么没生效」，
-    /// 原因是整段 `/api/` 被钉在旧账号上，新勾的账号（额度到期更早、按规则本该胜出）永远选不上。
-    fn sticky(&self) -> bool {
-        matches!(self, Scope::Conversation(_))
-    }
-
-    /// 粘滞键。两种范围**必须不可能相撞**：会话 id 是 24 位十六进制、不含 `:`，
+    /// 留痕键。两种范围**必须不可能相撞**：会话 id 是 24 位十六进制、不含 `:`，
     /// 所以给域键加个 `域:` 标记就够（同时也让日志里的键一眼可辨）。
     fn sticky_key(&self) -> String {
         match self {
@@ -222,13 +188,6 @@ fn pick_scope<'a>(conv: Option<&'a str>, token_prefix: Option<&'a str>) -> Optio
     match token_prefix {
         Some(p) => Some(Scope::Domain(p)),
         None => conv.map(Scope::Conversation),
-    }
-}
-
-/// 解绑会话粘滞（限流换号时调用）。
-fn sticky_remove(conv: &str) {
-    if let Ok(mut map) = sticky_conv().lock() {
-        map.remove(conv);
     }
 }
 
@@ -534,12 +493,11 @@ fn mark_token_swap_dead(prefix: &str) {
     }
 }
 
-/// 不用会话键的身份域「上一次选中的账号」—— **只用来决定要不要写 `route_start`**。
+/// 各身份范围「上一次选中的账号」—— **只用来决定要不要写 `route_start`**。
 ///
-/// ⚠️ 它**不参与选号**（这正是与 [`sticky_conv`] 的关键区别）：域范围每次都由规则重选，
-/// 见 [`Scope::sticky`]。
-/// 为什么仍然需要这个状态：`route_start` 是「这笔账换给了谁」唯一的对账入口，
-/// 没有状态就只能每请求写一条（刷屏）；有了它 ⇒ **换人才留痕、没换就沉默**。
+/// ⚠️ 它**不参与选号**：选号是每条请求的纯排序（见 [`choose_account`]），这里只负责
+/// 「换人才留痕、没换就沉默」——`route_start` 是「这笔账换给了谁」唯一的对账入口，
+/// 没有状态就只能每请求写一条（刷屏）。
 type LastPicked = Mutex<HashMap<String, String>>;
 fn last_picked() -> &'static LastPicked {
     static S: OnceLock<LastPicked> = OnceLock::new();
@@ -556,20 +514,16 @@ fn last_picked_changed(scope_key: &str, account_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 清空**路由归属的内存表**（会话粘滞 + 各域上次选中的账号）。
+/// 清空**路由留痕的内存表**（各范围上次选中的账号）。
 ///
 /// 为什么挂在「开启接管清 journal」的同一时机（`commands::enable_endpoint`）：
-/// `route_start` 只在「首次归属 / 换人」时写，判据就是这两张表；而接管动态每次开启都会清空。
-/// 表不清的话，「关接管 → 再开 → 回到同一个对话继续用」会命中粘滞而**静默复用账号** ——
+/// `route_start` 只在「首次归属 / 换人」时写，判据就是这张表；而接管动态每次开启都会清空。
+/// 表不清的话，「关接管 → 再开 → 回到同一个对话继续用」会被当成「没换人」——
 /// 积分在扣，接管动态里却一条账号记录都没有，对账入口断在开接管那一刻。
 /// 清了表 ⇒ 重开后的第一个请求必然重新写一条 `route_start`，日志与账本重新对齐。
 ///
-/// 代价（刻意接受）：粘滞被清 ⇒ 同一会话在重开接管后可能换到另一个账号。
-/// 这与「开启接管 = 新的一本账」是同一套记账：上一轮的日志本来就已清空。
+/// 选号本身不受影响（纯排序，不读这张表）；这条只关乎动态留痕的完整性。
 pub fn reset_routing_state() {
-    if let Ok(mut m) = sticky_conv().lock() {
-        m.clear();
-    }
     if let Ok(mut m) = last_picked().lock() {
         m.clear();
     }
@@ -622,13 +576,50 @@ struct CreditInfo {
     expiry_ms: Option<i64>,
     /// 剩余积分；未知为 `None`
     credits: Option<i64>,
+    /// 最早到期日当天要作废的积分（见 [`expiring_credits`]）；明细缺失时退回总剩余
+    expiring: i64,
     /// 不限量（entitlement 里存在 `credits_limit = -1` 的包）
     unlimited: bool,
 }
 
-/// 路由排序键：**到期最早者优先** → 查不到到期时间的靠后 → 剩余积分多者优先。
+/// 路由排序的第一键：把「到期时刻」压到**本地自然日**（同一天 = 同一档）。
+///
+/// 为什么按自然日而不是按毫秒：界面上的到期时间本来就是日粒度，两个同一天到期的
+/// 账号看上去一模一样；按毫秒严格比会让用户看到「都是同一天到期，却用了积分更少的
+/// 那个」而想不明白差在哪。压到自然日后同一天到期即并列，交给第二键定格。
+///
+/// 未知到期时间（`None`）排在所有有到期日的之后：它连「要不要着急」都不知道，
+/// 不该抢在「确定不着急」前面。
+fn expiry_day(expiry_ms: Option<i64>) -> i64 {
+    use chrono::{Datelike, TimeZone};
+    expiry_ms
+        .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
+        .map_or(i64::MAX, |t| t.date_naive().num_days_from_ce() as i64)
+}
+
+/// 「待过期积分」：**最早到期自然日**当天到期的额度包剩余合计。
+///
+/// 排序第二键用它而不是总剩余：同为「最早到期」一档时，谁的「马上要作废的积分」
+/// 多就先用谁——先把快作废的烧掉；总剩余多但大半是远期包的，不该抢在前面。
+///
+/// 退路：逐包明细缺失（旧档 / 只记总数）或没有到期时间时，退回总剩余，
+/// 避免把「待过期」错算成 0。
+fn expiring_credits(snap: &accounts::CreditSnapshot) -> i64 {
+    let day = expiry_day(snap.earliest_expiry_ms);
+    if snap.earliest_expiry_ms.is_none() || snap.packages.is_empty() {
+        return snap.credits.unwrap_or(0);
+    }
+    snap.packages
+        .iter()
+        .filter(|p| expiry_day(Some(p.expiry_ms)) == day)
+        .map(|p| p.remaining)
+        .sum()
+}
+
+/// 路由排序键：**到期的自然日早者优先** → 查不到到期时间的靠后 →
+/// **同一自然日内待过期积分多者优先**（见 [`expiring_credits`]）。
 fn score(info: CreditInfo) -> (i64, i64) {
-    (info.expiry_ms.unwrap_or(i64::MAX), -(info.credits.unwrap_or(0)))
+    (expiry_day(info.expiry_ms), -info.expiring)
 }
 
 /// 从候选里选出该用的账号下标。`infos` 与 `ids` 一一对应。
@@ -720,11 +711,13 @@ fn account_label(a: &accounts::Account) -> String {
 /// - **禁用（严格）**：`ban` 里的账号是本轮请求已试败的限流账号，直接剔除；剔完为空返回 None；
 /// - **冷却（软）**：近 10 分钟触发过限流的账号优先跳过，全员冷却则照常用。
 ///
-/// 候选集内的优先级从高到低：
-/// 1. **会话粘滞**——一次对话中途换账号会丢上下文；粘滞账号若已被移出候选集 / 在冷却则视为未命中；
-/// 2. **积分优先轮换**——快照过期就重拉，按 [`pick_index`] 挑（到期最早优先，无到期数据则积分多者优先）。
+/// 过滤完**直接纯排序**（[`pick_index`]：到期日最早优先 → 同一天到期则待过期积分多者
+/// 优先 → 无到期数据靠后），没有任何粘滞/归属记忆——被冷却的账号本轮自动出局，
+/// 冷却一过立刻回到候选集，全员照常排序。2026-09-16 的教训反过来也成立：
+/// 「按规则选号」不能被任何看不见的状态盖掉——当时是域范围被粘滞钉死，
+/// 用户的勾选改动怎么都不生效。
 ///
-/// 归属首次落到某个账号（或被切换到新账号）时写一条 `route_start` 接管动态。
+/// 选中账号与该范围上次选的不同时写一条 `route_start` 接管动态（留痕，不影响选号）。
 async fn choose_account(
     dir: &std::path::Path,
     scope: Option<&Scope<'_>>,
@@ -758,18 +751,10 @@ async fn choose_account(
     }
     let usable = available_candidates(&candidates, |a| cooling(&a.id));
 
-    // 1) **只有有会话键的范围**才复用粘滞账号（见 [`Scope::sticky`]）。
-    //    域范围每次都按规则重选：规则的首键是「额度到期最早」，本来就稳定；
-    //    而候选集一变（勾选改了 / 额度耗尽 / 冷却），它必须**立刻**反映出来。
-    if let Some(s) = scope.filter(|s| s.sticky()) {
-        if let Some(id) = sticky_hit(&s.sticky_key()) {
-            if let Some(a) = usable.iter().find(|a| a.id == id) {
-                return Some(a.clone());
-            }
-        }
-    }
+    // 过滤完直接纯排序：候选集已经把「本轮请求不可用」的账号剔干净了——
+    // 被冷却的账号不在里面，冷却一过自动回到候选集，排序规则见 `pick_index`。
 
-    // 2) 新会话：快照缺失/过期就从接口重拉并落盘，否则直接用持久化的积分快照
+    // 1) 快照缺失/过期就从接口重拉并落盘，否则直接用持久化的积分快照
     let ids: Vec<String> = usable.iter().map(|a| a.id.clone()).collect();
     let mut infos: Vec<CreditInfo> = Vec::with_capacity(usable.len());
     let mut need_persist = false;
@@ -780,6 +765,7 @@ async fn choose_account(
             .map(|s| CreditInfo {
                 expiry_ms: s.earliest_expiry_ms,
                 credits: s.credits,
+                expiring: expiring_credits(s),
                 unlimited: s.unlimited,
             })
             .unwrap_or_default();
@@ -798,6 +784,7 @@ async fn choose_account(
             info = CreditInfo {
                 expiry_ms: snap.earliest_expiry_ms,
                 credits: snap.credits,
+                expiring: expiring_credits(&snap),
                 unlimited: snap.unlimited,
             };
             // 回写持久化快照（含 fetched_at），下次新会话直接读、不必再打接口。
@@ -820,15 +807,9 @@ async fn choose_account(
     let idx = pick_index(&ids, &infos)?;
     let account = usable[idx].clone();
     if let Some(s) = scope {
-        // 两种范围的「要不要写这条动态」判据不同，但都只写一次、不刷屏：
-        //   · 会话：`sticky_put` 说「首次上代理 / 被切到新账号」；
-        //   · 域：`last_picked_changed` 说「和上次选到的不一样」——**与选号无关**，
-        //     选号每次都按规则来（见 [`Scope::sticky`]）。
-        let changed = if s.sticky() {
-            sticky_put(&s.sticky_key(), account.id.clone())
-        } else {
-            last_picked_changed(&s.sticky_key(), &account.id)
-        };
+        // 记录「该范围上次选了谁」，仅供动态判变化（见 `last_picked_changed`）；
+        // 换到新账号就写一条「开始使用」，同一范围的后续请求不刷屏。
+        let changed = last_picked_changed(&s.sticky_key(), &account.id);
         if changed {
             journal::append(
                 dir,
@@ -1317,7 +1298,7 @@ fn fingerprint(value: &str) -> String {
 /// 2026-09-16 真机实测：`/api/agent/v3/*` 的请求**压根没有 `Authorization`**，它们带的是
 /// `x-ide-token`（外加 `x-request-pin` / `x-request-id` / `x-custom-trace-id` / `x-flow-traceparent`）。
 /// 这一条直接动摇了「换号 = 换 `Authorization`」在这个域上的前提，所以必须逐个比清楚：
-/// **谁是凭据**（换个头就能换账号）、**谁是会话**（能稳定钉住粘滞）。
+/// **谁是凭据**（换个头就能换账号）、**谁是会话**（留痕键跟谁走）。
 fn identity_fingerprints(req: &Request) -> String {
     [
         "x-ide-token",
@@ -2034,8 +2015,8 @@ fn ws_handshake_and_relay(
 ///
 /// - 路径 / 查询 / 请求体原样透传；
 /// - **扣费路径**（[`BILLING_PREFIXES`]，可被 `proxy-rules.json` 覆盖）：
-///   `Authorization` 换成池化账号的 `Cloud-IDE-JWT`，按会话粘滞（同一会话固定同一账号，
-///   避免账号错配），429 时并入冷却、解绑粘滞、换账号重试（上限 [`FAILOVER_MAX_TRIES`]）；
+///   `Authorization` 换成池化账号的 `Cloud-IDE-JWT`，账号由 [`choose_account`] 每请求
+///   纯排序选出，429 时并入冷却、换账号重试（上限 [`FAILOVER_MAX_TRIES`]）；
 /// - **其余路径**：连凭据一起原样透传，不参与账号池；
 /// - 响应（含 SSE）边收边转，并叠加 CORS 头。
 ///
@@ -2279,14 +2260,11 @@ pub(crate) fn handle_transparent(
                 return;
             }
             // 429 发生在流式输出开始前、响应头还没写给下游，正好有重试窗口：
-            // 把限流账号打入冷却、解绑粘滞，换下一个账号重发同一请求，对 Trae CN 完全无感。
+            // 把限流账号打入冷却，换下一个账号重发同一请求，对 Trae CN 完全无感。
             Ok(resp) if resp.status() == 429 && account.is_some() => {
                 let a = account.as_ref().expect("account.is_some() 已判过");
                 if let Ok(mut m) = cooldown_table().lock() {
                     m.insert(a.id.clone(), Instant::now());
-                }
-                if let Some(s) = scope.as_ref().filter(|s| s.sticky()) {
-                    sticky_remove(&s.sticky_key());
                 }
                 if ban.len() + 1 < FAILOVER_MAX_TRIES {
                     ban.push(a.id.clone());
@@ -2468,7 +2446,7 @@ mod tests {
         assert_eq!(account_label(&a), "用户0044120650");
     }
 
-    /// 两种身份范围的粘滞键**不可能相撞**。
+    /// 两种身份范围的留痕键**不可能相撞**。
     ///
     /// 撞了的后果是「换号记录张冠李戴」—— 而「这笔扣费到底换给了谁」全靠那条记录。
     #[test]
@@ -2486,17 +2464,6 @@ mod tests {
         assert!(c.label().contains("会话"));
         assert!(d.label().contains("/api/agent/v3/"));
         assert!(!d.label().contains("会话"));
-    }
-
-    /// **只有会话说要粘**。域范围不粘，是这一版最重要的判据。
-    ///
-    /// 2026-09-16 实测投诉：「我勾选了新账号，应该按照时间规则，为什么没生效」——
-    /// 因为整段 `/api/` 被钉在旧账号上，新勾的账号（额度到期更早、按规则本该胜出）永远选不上。
-    /// **「按规则选号」这件事不能被一个看不见的粘滞状态盖掉。**
-    #[test]
-    fn only_conversation_scope_pins() {
-        assert!(Scope::Conversation("c").sticky());
-        assert!(!Scope::Domain("/api/").sticky());
     }
 
     /// token 域**一律**用域范围 —— 哪怕这条请求恰好也能认出会话键。
@@ -2671,7 +2638,7 @@ mod tests {
         assert!(!body_declares_empty_session(br#"{"session_id":null}"#));
         assert!(!body_declares_empty_session(br#"{"session_id":"abc"}"#));
         assert!(!body_declares_empty_session(br#"{"session_id":123}"#));
-        // 与主路径一致：认得出 id 时就该走粘滞，不该判成新建
+        // 与主路径一致：认得出 id 时就该按该会话留痕，不该判成新建
         assert_eq!(
             conversation_key("/api/agent/v3/workflow/start", br#"{"session_id":"c9"}"#).as_deref(),
             Some("c9")
@@ -2784,25 +2751,65 @@ mod tests {
     }
 
     /// 造一个积分画像：`(到期毫秒, 剩余积分)`。
+    ///
+    /// `expiring` 直接取总剩余，模拟「没有逐包明细 → 退回总剩余」的退路；
+    /// 要测「待过期 ≠ 总剩余」的场景时再单独改写这个字段。
     fn info(expiry_ms: Option<i64>, credits: Option<i64>) -> CreditInfo {
-        CreditInfo { expiry_ms, credits, unlimited: false }
+        CreditInfo { expiry_ms, credits, expiring: credits.unwrap_or(0), unlimited: false }
+    }
+
+    /// 本地时区下某个「年月日 时点」的毫秒时间戳。
+    ///
+    /// 测试数据必须**跨自然日**才不会退化成「同一天」，而「同一天」又是按本地时区
+    /// 算的 —— 所以用本地时区构造，换机器 / 换 CI 时区都不会跑偏。
+    fn local_ms(y: i32, m: u32, d: u32, h: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(y, m, d, h, 0, 0)
+            .single()
+            .expect("本地时间应唯一")
+            .timestamp_millis()
     }
 
     #[test]
     fn routing_prefers_earliest_expiry_then_most_credits() {
         let ids: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
         let infos = vec![
-            info(Some(2000), Some(100)),
-            info(Some(1000), Some(10)), // 最早过期 → 胜出
-            info(None, Some(99999)),    // 未知到期 → 靠后
-            info(Some(500), Some(0)),   // 积分为 0 → 跳过
+            info(Some(local_ms(2026, 3, 12, 9)), Some(100)),
+            info(Some(local_ms(2026, 3, 11, 9)), Some(10)), // 到期日更早 → 胜出
+            info(None, Some(99999)),                        // 未知到期 → 靠后
+            info(Some(local_ms(2026, 3, 10, 9)), Some(0)),  // 积分为 0 → 跳过
         ];
         assert_eq!(pick_index(&ids, &infos), Some(1));
 
-        // 到期时间相同 → 剩余积分多者优先
+        // 同一天到期（只差几小时也算「一样」）→ 待过期积分多者优先
+        //（这两条没有逐包明细，走「退回总剩余」的退路）
         let ids2: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        let infos2 = vec![info(Some(1000), Some(10)), info(Some(1000), Some(500))];
-        assert_eq!(pick_index(&ids2, &infos2), Some(1));
+        let infos2 = vec![
+            info(Some(local_ms(2026, 3, 10, 15)), Some(4772)),
+            info(Some(local_ms(2026, 3, 10, 21)), Some(4872)),
+        ];
+        assert_eq!(
+            pick_index(&ids2, &infos2),
+            Some(1),
+            "同一天到期时应按待过期积分多者优先（无明细时退回总剩余）"
+        );
+    }
+
+    #[test]
+    fn same_day_prefers_more_expiring_credits() {
+        // 同一天到期时比的不是总剩余，而是「这一天要作废的积分」：
+        // 总剩余多的账号如果大半是远期包，不该抢在「快作废的多」前面。
+        let ids: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let mut a = info(Some(local_ms(2026, 3, 10, 9)), Some(9000));
+        a.expiring = 200; // 大半是远期包
+        let mut b = info(Some(local_ms(2026, 3, 10, 15)), Some(5000));
+        b.expiring = 5000;
+        assert_eq!(
+            pick_index(&ids, &[a, b]),
+            Some(1),
+            "同一天到期时应比待过期积分：b 当天要作废 5000 > a 的 200，尽管 a 总剩余更多"
+        );
     }
 
     /// 到期信息缺失（接口失败 / 未登录）时排序退化为「积分多者优先」。

@@ -8,19 +8,22 @@
 //!
 //! 路由逻辑：
 //!
-//! 1. **会话粘滞**：带 `x-conversation-id` 的请求复用上次选中的账号 —— 一次对话中途
-//!    换账号会丢上下文，必须粘住。新会话（粘滞过期或首次）才重新选。
-//! 2. **选账号**：谁的「还有余量的资源包」到期日最早就用谁——把快过期的积分先消耗掉；
-//!    **同一天到期的账号视为并列，选剩余积分多的**（界面上的到期时间本来就是日粒度，
+//! 1. **选账号**：**每条请求**都对「当前模型可用的账号」纯排序，不用历史记忆干扰——
+//!    谁的「还有余量的资源包」到期日最早就用谁——把快过期的积分先消耗掉；
+//!    **同一天到期的账号视为并列，选「待过期积分」多的**——最早到期日当天要作废
+//!    的积分，而不是总剩余（界面上的到期时间本来就是日粒度，
 //!    按毫秒严格比会让「两个都显示 X 天后过期」的账号悄悄选出积分少的那个）；
 //!    查不到过期时间的账号排最后，剩余积分为 0 的账号直接跳过（除非全员为 0）。
-//! 3. **限流无感切换**：免费模型（从网关 `/v2/enterprises/personal/models` 动态拉取
+//!    「当前模型可用」= 没有对该模型处在限流冷却里：账号 A 因模型 M 被冷却时，
+//!    继续用 M 就是在剩下的账号里排序；**换到别的模型则 A 立刻回到候选集**，
+//!    依旧是全员排序——冷却只针对「账号 × 模型」这一对，不牵连其它模型。
+//! 2. **限流无感切换**：免费模型（从网关 `/v2/enterprises/personal/models` 动态拉取
 //!    积分倍率，倍率为 0 即免费；1h 缓存，失败兜底 hy3）触发限流（429）时，把
 //!    **「该账号 × 该模型」**冷却到上游给出的重置时刻，换下一个账号重发同一请求
-//!    （上限 2 次切换）；冷却中的「账号 × 模型」在选号时优先跳过。付费模型的 429
-//!    原样透传。冷却的粒度与时间节点见 `RateKey` / `limit_until_ms`。
-//! 4. **续签兜底**：选中的账号若凭证临近过期（<48h）会先自动续签。
-//! 5. **转发**：路径与查询串原样保留，替换 `Authorization` 为选中账号的 token，
+//!    （上限 2 次切换）。付费模型的 429 原样透传。冷却的粒度与时间节点见
+//!    `RateKey` / `limit_until_ms`。
+//! 3. **续签兜底**：选中的账号若凭证临近过期（<48h）会先自动续签。
+//! 4. **转发**：路径与查询串原样保留，替换 `Authorization` 为选中账号的 token，
 //!    去掉逐跳头（Host / Content-Length 等）后透传其余请求头。
 //!
 //! **响应一律用 chunked 流式下发。** 对话是 SSE（`text/event-stream`），实测若缓冲成
@@ -366,7 +369,7 @@ fn available_candidates<T: Clone>(candidates: &[T], is_cooling: impl Fn(&T) -> b
 /// 两个同一天到期的账号看上去一模一样。此时若按毫秒严格比，用户会看到
 /// 「两个都显示 2 天后过期，却用了积分更少的那个」，而且想不明白差在哪
 /// （2026-10-12 实测：两个账号差 112 秒，4772.45 那个比 4872.03 先被选中）。
-/// 压到自然日后同一天到期即并列，交给第二键「积分多者优先」定格。
+/// 压到自然日后同一天到期即并列，交给第二键「待过期积分多者优先」定格。
 ///
 /// 未知到期时间（`None`）排在所有有到期日的之后：它连「要不要着急」都不知道，
 /// 不该抢在「确定不着急」前面（与账号页的展示口径一致）。
@@ -377,15 +380,34 @@ fn expiry_day(expiry_ms: Option<i64>) -> i64 {
         .map_or(i64::MAX, |t| t.date_naive().num_days_from_ce() as i64)
 }
 
+/// 「待过期积分」：**最早到期自然日**当天到期的资源包剩余合计。
+///
+/// 排序第二键用它而不是总剩余：同为「最早到期」一档时，谁的「马上要作废的积分」
+/// 多就先用谁——先把快作废的烧掉；总剩余多但大半是远期包的，不该抢在前面。
+///
+/// 退路：逐包明细缺失（签到路径只记总数）或没有到期时间时，退回总剩余，
+/// 避免把「待过期」错算成 0。
+fn expiring_credits(info: &ledger::CreditFact) -> f64 {
+    let day = expiry_day(info.earliest_expiry_ms);
+    if day == i64::MAX || info.packages.is_empty() {
+        return info.credits.unwrap_or(0.0);
+    }
+    info.packages
+        .iter()
+        .filter(|p| expiry_day(p.expiry_ms) == day)
+        .map(|p| p.remaining)
+        .sum()
+}
+
 /// 路由排序键：到期的自然日早者优先 → 查不到到期时间的靠后 →
-/// **同一自然日内剩余积分多者优先**。
+/// **同一自然日内待过期积分多者优先**（见 [`expiring_credits`]）。
 ///
 /// 入参直接用台账的 [`ledger::CreditFact`]：路由的排序依据与账户展示的
 /// 「剩余 / 过期时间」是**同一个类型、同一份来源**，不再各立一份画像结构。
 fn score(info: &ledger::CreditFact) -> (i64, i64) {
     (
         expiry_day(info.earliest_expiry_ms),
-        -(info.credits.unwrap_or(0.0) * 100.0) as i64,
+        -(expiring_credits(info) * 100.0) as i64,
     )
 }
 
@@ -1329,20 +1351,15 @@ impl Request {
     }
 }
 
-/// 粘滞是否命中：命中返回账号 id，顺手清掉过期项。
-fn sticky_hit(conv: &str, model: Option<&str>) -> Option<String> {
-    let mut map = sticky().lock().ok()?;
-    map.retain(|_, (at, _)| at.elapsed() < STICKY_TTL);
-    let (at, id) = map.get_mut(&sticky_key(conv, model))?;
-    *at = Instant::now();
-    Some(id.clone())
-}
-
-/// 写入/刷新会话粘滞。返回 true 表示该「会话 × 模型」**换到了新账号**
-/// （首次上代理或被切换），调用方据此写「开始使用账号」事件；同一组合的后续
-/// 请求返回 false，不刷屏。
+/// 「会话 × 模型 → 上次选中的账号」记录：**只用于接管动态的判变化，不参与选号**。
+///
+/// 选号是每条请求的纯排序（见 [`choose_account`]），没有任何粘滞/归属记忆——
+/// 限流冷却天然按「账号 × 模型」记，换模型后全员回到候选集重新排序即可。
+/// 这份记录存在的唯一理由：`route_start` 动态只在「换到新账号」时写一条，
+/// 不刷屏；要知道「换没换」就得记住「上次是谁」。过期项在写入时顺手清掉。
 fn sticky_put(conv: &str, model: Option<&str>, account_id: String) -> bool {
     if let Ok(mut map) = sticky().lock() {
+        map.retain(|_, (at, _)| at.elapsed() < STICKY_TTL);
         let key = sticky_key(conv, model);
         let changed = map.get(&key).map(|(_, id)| id != &account_id).unwrap_or(true);
         map.insert(key, (Instant::now(), account_id));
@@ -1390,20 +1407,20 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
 
 /// 选出一个该用的账号。
 ///
-/// `model` 是本轮请求要用的模型：限流冷却（和因此产生的粘滞）都是按
-/// **账号 × 模型** 算的，选号必须知道模型是谁。
+/// `model` 是本轮请求要用的模型：限流冷却按 **账号 × 模型** 记账，选号必须知道模型是谁。
 ///
 /// 候选集 = 设置里勾选的扣费账号（未勾选的不允许扣费；全不勾 = 全部可用），再做两层过滤：
 /// - **禁用（严格）**：`ban` 里的账号是本轮请求已试败的限流账号，直接剔除；剔完为空返回 None；
 /// - **冷却（软）**：对本模型仍在限流窗口内的账号优先跳过，全员冷却则照常用。
 ///
-/// 候选集内的优先级从高到低：
-/// 1. **会话粘滞**——一次对话中途换账号会丢上下文；粘滞账号若已被移出候选集/在冷却则视为未命中；
-/// 2. **智能轮换**——快照过期就重新拉，按「到期日最早 → 同日则积分多者优先」挑。
+/// 过滤完**直接纯排序**（[`pick_index`]：到期日最早 → 同日则待过期积分多者优先），
+/// 没有任何会话粘滞/归属记忆——冷却只记「账号 × 模型」，换模型后全员自然回到
+/// 候选集；继续用出事的模型则被冷却的账号自动出局，剩下的人照常排序。
 ///
-/// 会话首次落到某个账号（或被切换到新账号）时写一条 `route_start` 事件。
-/// 单机模式下，选中的账号若触发了续签会就地保存账号列表；绑了池则不会 ——
-/// 那一份凭证在上面的整池同步里已经落过盘了。
+/// 选中的账号与该「会话 × 模型」上次选的不同时写一条 `route_start` 事件（见
+/// [`sticky_put`]，那份记录只服务动态，不影响选号）。单机模式下，选中的账号若
+/// 触发了续签会就地保存账号列表；绑了池则不会 —— 那一份凭证在上面的整池同步里
+/// 已经落过盘了。
 async fn choose_account(
     dir: &PathBuf,
     conv: Option<&str>,
@@ -1432,16 +1449,10 @@ async fn choose_account(
     }
     let usable = available_candidates(&accounts, |a| cooling(&a.id, model));
 
-    // 1) 已在进行的会话：继续用同一个账号（除非它已被移出可用集）
-    if let Some(conv) = conv {
-        if let Some(id) = sticky_hit(conv, model) {
-            if let Some(a) = usable.iter().find(|a| a.id == id) {
-                return Some(a.clone());
-            }
-        }
-    }
+    // 过滤完直接纯排序：候选集已经把「本轮请求不可用」的账号剔干净了——
+    // 出事模型被冷却的账号不在里面（换模型则全员在），排序规则见 `pick_index`。
 
-    // 2) 新会话：积分事实只看台账（账户管理页显示的就是它）。
+    // 1) 积分事实只看台账（账户管理页显示的就是它）。
     //    读数缺失/过期就用同一次拉取刷新 —— 拉回来的东西**写进台账**，
     //    不再往 accounts.json 里塞第二份会各自漂移的副本。
     let ids: Vec<String> = usable.iter().map(|a| a.id.clone()).collect();
@@ -1521,6 +1532,8 @@ async fn choose_account(
         }
     }
     if let Some(conv) = conv {
+        // 记录「该会话 × 模型上次选了谁」，仅供动态判变化（见 `sticky_put`）；
+        // 换到新账号就写一条「开始使用」，同一组合的后续请求不刷屏。
         if sticky_put(conv, model, account.id.clone()) {
             // 该会话第一次走上代理，或被切到了新账号 —— 记一条「开始使用」事件
             // 不写会话号：那是给日志比对用的内部标识，界面没人看得懂，
@@ -1738,59 +1751,47 @@ mod tests {
     }
 
     #[test]
-    fn sticky_session_reuses_the_same_account() {
-        // 一次对话中途换账号会丢上下文，必须粘住
+    fn sticky_put_reports_account_change() {
+        // 这份记录只服务接管动态的判变化：换到新账号 → true（写一条「开始使用」），
+        // 同一组合的后续请求 → false（不刷屏）。选号本身是纯排序，不看它。
         let conv = "conv-abc";
         let m = Some("hy3");
-        assert!(sticky_hit(conv, m).is_none(), "首次访问不该命中");
-        sticky_put(conv, m, "acct-1".into());
-        assert_eq!(sticky_hit(conv, m).as_deref(), Some("acct-1"));
-        sticky_put(conv, m, "acct-2".into());
-        assert_eq!(
-            sticky_hit(conv, m).as_deref(),
-            Some("acct-2"),
-            "同一会话被改写后应跟随最新值"
-        );
-        // 别的会话互不干扰
-        assert!(sticky_hit("conv-other", m).is_none());
+        assert!(sticky_put(conv, m, "acct-1".into()), "首次记录 = 换到新账号");
+        assert!(!sticky_put(conv, m, "acct-1".into()), "同一账号不刷屏");
+        assert!(sticky_put(conv, m, "acct-2".into()), "换成别的账号要报变化");
     }
 
-    /// 回归：粘滞与限流冷却同为「账号 × 模型」粒度。以前的实现只有会话一个维度，
+    /// 回归：记录与限流冷却同为「会话 × 模型」粒度。以前的实现只有会话一个维度，
     /// 于是辅助小模型（0 积分的 hy3）吃一次 429 换号，就把整段对话连同主模型一起搬走。
     #[test]
-    fn sticky_is_scoped_per_model() {
+    fn sticky_put_is_scoped_per_model() {
         let conv = "conv-multi";
         let main = Some("deepseek-v4.1-flash");
         let side = Some("hy3");
         sticky_put(conv, main, "acct-main".into());
         sticky_put(conv, side, "acct-side".into());
-        assert_eq!(sticky_hit(conv, main).as_deref(), Some("acct-main"));
-        assert_eq!(sticky_hit(conv, side).as_deref(), Some("acct-side"));
         // 非对话请求（模型未知）用空串占位，也是一个独立维度
-        assert!(sticky_hit(conv, None).is_none());
-        sticky_put(conv, None, "acct-other".into());
-        assert_eq!(sticky_hit(conv, None).as_deref(), Some("acct-other"));
-        assert_eq!(
-            sticky_hit(conv, side).as_deref(),
-            Some("acct-side"),
-            "占位维度不该覆盖同一个会话里具体模型的粘滞"
+        assert!(sticky_put(conv, None, "acct-other".into()));
+        assert!(
+            !sticky_put(conv, side, "acct-side".into()),
+            "占位维度的写入不该覆盖同一个会话里具体模型的记录"
         );
     }
 
     #[test]
-    fn sticky_entry_expires_after_ttl() {
+    fn sticky_put_prunes_expired_entries() {
         let conv = "conv-expire";
         let m = Some("hy3");
         sticky_put(conv, m, "acct-1".into());
-        // 把最后命中时刻拨回 TTL 之前
+        // 把记录时刻拨回 TTL 之前
         if let Ok(mut map) = sticky().lock() {
             if let Some((at, _)) = map.get_mut(&sticky_key(conv, m)) {
                 *at = Instant::now() - STICKY_TTL - Duration::from_secs(1);
             }
         }
         assert!(
-            sticky_hit(conv, m).is_none(),
-            "超过 TTL 的粘滞必须释放，好让新会话重新按积分选号"
+            sticky_put(conv, m, "acct-1".into()),
+            "过期记录视为「换到新账号」：隔了半小时再报一次开始使用是合理的"
         );
     }
 
@@ -2234,9 +2235,10 @@ mod tests {
         ];
         assert_eq!(pick_index(&ids, &infos), Some(1));
 
-        // 同一天到期（只差几小时也算「一样」）→ 剩余积分多者优先。
+        // 同一天到期（只差几小时也算「一样」）→ 待过期积分多者优先。
         // 就是线上那对账号的形状：4772.45 比 4872.03 早到期 112 秒，
         // 但界面两个都显示「X 天后过期」⇒ 该用积分多的那个。
+        // 这两条没有逐包明细，走「退回总剩余」的退路。
         let ids2 = vec!["a".into(), "b".into()];
         let infos2 = vec![
             credit_fact(Some(local_ms(2026, 3, 10, 15)), Some(4772.45)),
@@ -2245,7 +2247,39 @@ mod tests {
         assert_eq!(
             pick_index(&ids2, &infos2),
             Some(1),
-            "同一天到期时应按积分多者优先"
+            "同一天到期时应按待过期积分多者优先（无明细时退回总剩余）"
+        );
+    }
+
+    #[test]
+    fn same_day_prefers_more_expiring_credits() {
+        // 同一天到期时比的不是总剩余，而是「这一天要作废的积分」：
+        // 总剩余多的账号如果大半是远期包，不该抢在「快作废的多」前面。
+        let ids = vec!["a".into(), "b".into()];
+        let pkg = |remaining: f64, expiry_ms: i64| ledger::CreditPackage {
+            name: "pkg".into(),
+            remaining,
+            expiry_ms: Some(expiry_ms),
+        };
+        let a = ledger::CreditFact {
+            credits: Some(9000.0),
+            at: String::new(),
+            earliest_expiry_ms: Some(local_ms(2026, 3, 10, 9)),
+            packages: vec![
+                pkg(200.0, local_ms(2026, 3, 10, 9)),
+                pkg(8800.0, local_ms(2026, 3, 20, 9)),
+            ],
+        };
+        let b = ledger::CreditFact {
+            credits: Some(5000.0),
+            at: String::new(),
+            earliest_expiry_ms: Some(local_ms(2026, 3, 10, 15)),
+            packages: vec![pkg(5000.0, local_ms(2026, 3, 10, 15))],
+        };
+        assert_eq!(
+            pick_index(&ids, &[a, b]),
+            Some(1),
+            "同一天到期时应比待过期积分：b 当天要作废 5000 > a 的 200，尽管 a 总剩余更多"
         );
     }
 
