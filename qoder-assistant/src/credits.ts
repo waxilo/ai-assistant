@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { Account, CreditFact, CreditRow } from "./types";
+import type { Account, CreditFact, CreditGrant, CreditRow } from "./types";
 import { CREDITS_UPDATED_EVENT } from "./api";
 
 /**
@@ -86,8 +86,18 @@ export function packagesOf(book: CreditBook, id: string) {
  * 混成一个 null 就必然有一边被说错 —— 之前那个 9999 年的假日期就是这么来的。
  */
 export type SoonestExpiry =
-  | { kind: "dated"; daysUntil: number; remaining: number }
+  | { kind: "dated"; daysUntil: number; remaining: number; expiring: number | null }
   | { kind: "never"; remaining: number };
+
+/**
+ * 一笔发放对「这个日期作废多少」的贡献量。
+ *
+ * 有发放量记发放量；没有就按每日签到固定 100（与资源包弹窗 `GrantRow`
+ * 的显示规则同一条 —— 逐笔明细上线之前的笔只有日期没有量）。
+ */
+function grantDyingAmount(g: CreditGrant): number | null {
+  return g.credits ?? 100;
+}
 
 /**
  * 快过期提示：最早到期的**未过期**资源包。
@@ -97,16 +107,29 @@ export type SoonestExpiry =
  * **已到期的旧包不参与**——接口在包过期后仍会挂着正余量（服务端还没清），
  * 拿它当「最早到期」会让这一列永远停在「已过期」，把后面每一批积分的到期都挡住。
  * 全都已过期 → `null`，调用方退回 [`expiryOf`]，照旧显示「已过期」。
+ *
+ * `expiring` = **恰好在该日期作废**的那几笔之和，不是整个包的余额 ——
+ * 聚合包（附加额度）把几十笔签到合成一格，把总额挂到最早一笔的日期上，
+ * 会读成「5 天后 2340 全没」，而实际那天只死一笔（其余各笔各死各的日子）。
+ * 台账里没有逐笔数据（老台账 / 计划额度那种真·单到期日的槽位）→ `null`，
+ * 调用方退回 `remaining`。
  */
 export function soonestExpiry(book: CreditBook, id: string): SoonestExpiry | null {
   const now = Date.now();
   const pkgs = packagesOf(book, id);
   const dated = pkgs.find((p) => p.expiry_ms != null && p.expiry_ms > now);
   if (dated) {
+    const atDate = dated.grants.filter((g) => g.expires_ms === dated.expiry_ms);
+    const amounts = atDate.map(grantDyingAmount);
+    const expiring =
+      amounts.length > 0 && amounts.some((v) => v != null)
+        ? amounts.reduce<number>((s, v) => s + (v ?? 0), 0)
+        : null;
     return {
       kind: "dated",
       daysUntil: Math.ceil((dated.expiry_ms! - now) / 86_400_000),
       remaining: dated.remaining,
+      expiring,
     };
   }
   const never = pkgs.find((p) => p.never_expires);

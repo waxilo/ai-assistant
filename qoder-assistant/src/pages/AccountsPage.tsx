@@ -200,7 +200,8 @@ export function AccountsPage({
               const bal = creditsOf(book, a.id);
               const low = bal != null && bal < 100;
               const e = expiryCountdown(expiryOf(book, a.id));
-              // 快过期汇总：最早到期的**未过期**资源包还有几天、挂着多少积分（已过期旧包跳过，见 `soonestExpiry`）
+              // 快过期汇总：最早到期的**未过期**资源包还有几天、那一天作废多少
+              // （只算恰好该日到期的那几笔，不是整包余额 —— 见 `soonestExpiry`）
               const soon = soonestExpiry(book, a.id);
               const tok = tokenCountdown(a.expires_at);
               return (
@@ -230,7 +231,9 @@ export function AccountsPage({
                       >
                         {soon.kind === "never"
                           ? `不过期 ${formatCredits(soon.remaining)}`
-                          : `${soon.daysUntil} 天后过期 ${formatCredits(soon.remaining)}`}
+                          : /* 「作废多少」只算恰好这一刻到期的那几笔（见 soonestExpiry）；
+                               老台账没有逐笔数据时退回整包余额 */
+                            `${soon.daysUntil} 天后过期 ${formatCredits(soon.expiring ?? soon.remaining)}`}
                       </span>
                     ) : e.text === "—" ? (
                       <span
@@ -374,33 +377,32 @@ function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>
     try {
       seedCredits([await refreshAccountCredits(account.id)]);
     } catch (e) {
-      setErr(String(e));
+      setErr("刷新失败：" + String(e));
     } finally {
       setRefreshing(false);
     }
   };
 
-  const note = err
-    ? `刷新失败：${err}`
-    : hidden > 0
-    ? `已隐藏 ${hidden} 个已过期的资源包`
-    : "";
+  // 左侧说明的优先级：错误 > 隐藏数
+  const barNote = err || (hidden > 0 ? `已隐藏 ${hidden} 个已过期的资源包` : "");
 
   return (
     <div>
       <div className="pkg-dialog-bar">
         <span className="note" style={{ margin: 0 }}>
-          {note}
+          {barNote}
         </span>
-        <button
-          className="btn small"
-          disabled={refreshing}
-          onClick={() => void refresh()}
-          title="拉取当前账号最新的资源包"
-        >
-          <IconRefresh size={13} className={refreshing ? "spin" : ""} />
-          {refreshing ? "刷新中…" : "刷新"}
-        </button>
+        <span style={{ display: "flex", gap: 8 }}>
+          <button
+            className="btn small"
+            disabled={refreshing}
+            onClick={() => void refresh()}
+            title="拉取当前账号最新的资源包"
+          >
+            <IconRefresh size={13} className={refreshing ? "spin" : ""} />
+            {refreshing ? "刷新中…" : "刷新"}
+          </button>
+        </span>
       </div>
       {packs.length === 0 ? (
         <p className="note" style={{ margin: 0 }}>
@@ -429,13 +431,15 @@ function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>
 }
 
 /**
- * 一个资源包的行（+ 可选的一行**逐笔明细**）。
+ * 一个资源包的行（+ 可选的**逐笔明细行**，一笔一行）。
  *
  * 聚合包（「附加额度」把每天领的 100 分合成一格）在后端只有一个到期日，
- * 而它按笔到期：主行的日期是**最早一笔**（快作废的那批），
- * 下面那行列清楚每一笔各是哪天 —— 只报一个日期的话，
- * 用户没法判断「那天是只用掉一笔，还是全都没了」。
+ * 而实际每笔各有各的到期：主行是合计，下面每笔签到领的积分单独一行
+ * （量 + 这一笔自己的作废日）—— 只报一个日期或挤成一行文字，
+ * 用户都没法一眼看清「哪天的分各剩多少额度可领」。
  * 只有一笔发放（或压根没有逐笔数据）时就只渲染主行。
+ *
+ * 明细行的量是**发放时领到的**（凭据记的）；签到行缺量时按每日 100 显示（见 [`GrantRow`]）。
  */
 function PkgRows({ p }: { p: CreditPackage }) {
   return (
@@ -449,23 +453,36 @@ function PkgRows({ p }: { p: CreditPackage }) {
           {p.grants.length > 1 ? "（最早一笔）" : ""}
         </td>
       </tr>
-      {p.grants.length > 1 && (
-        <tr>
-          <td colSpan={3} style={{ paddingTop: 0 }}>
-            <span className="num-muted" style={{ fontSize: "var(--fs-cap)" }}>
-              {`共 ${p.grants.length} 笔：${p.grants.map(grantLabel).join("、")}`}
-            </span>
-          </td>
-        </tr>
-      )}
+      {p.grants.length > 1 && p.grants.map((g) => <GrantRow key={g.expires_ms} g={g} />)}
     </>
   );
 }
 
-/** 一笔发放的说明文字：「100（2026-10-18 到期）」；凭据没带回量时只报日期 */
-function grantLabel(g: CreditGrant): string {
+/**
+ * 一笔发放的明细行：来源标签 / 量 / 到期日。
+ *
+ * 「量」是**发放时领到的**（凭据记的）。回放路径常缺发放量 —— 每日签到活动
+ * 的发放量恒为 100 Credits（逆向文档 `benefit.amount`），没记到的笔按这个
+ * 常数显示。只改显示、不写台账（万一哪天不是 100，也绝不会显示成假数据）。
+ */
+function GrantRow({ g }: { g: CreditGrant }) {
   const date = packageExpiry({ expiry_ms: g.expires_ms, never_expires: false }).text;
-  return g.credits != null ? `${formatCredits(g.credits)}（${date} 到期）` : `${date} 到期`;
+  const amount = g.credits ?? 100;
+  const isDefault = g.credits == null;
+  return (
+    <tr>
+      <td className="num-muted" style={{ fontSize: "var(--fs-cap)" }}>
+        签到积分 · 到期 {date}
+      </td>
+      <td
+        className="num"
+        title={isDefault ? "发放量未记录，按每日签到 100 显示" : undefined}
+      >
+        {formatCredits(amount)}
+      </td>
+      <td className="num num-muted">{date}</td>
+    </tr>
+  );
 }
 
 /** 毫秒时间戳 → 人话的「多久之前」。与 `common.relativeTime` 同一套档位，只是吃毫秒 */

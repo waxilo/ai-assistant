@@ -371,63 +371,29 @@ fn available_candidates<T: Clone>(candidates: &[T], is_cooling: impl Fn(&T) -> b
     }
 }
 
-/// 路由排序的第一键：把「到期时刻」压到**本地自然日**（同一天 = 同一档）。
+/// 路由排序键：**积分过期时刻**早者优先 —— 谁先过期用谁的积分。
 ///
-/// 为什么按自然日而不是按毫秒：界面上的到期时间本来就是日粒度（「X 天后过期」），
-/// 两个同一天到期的账号看上去一模一样。此时若按毫秒严格比，用户会看到
-/// 「两个都显示 2 天后过期，却用了积分更少的那个」，而且想不明白差在哪。
-/// 压到自然日后同一天到期即并列，交给第二键「待过期积分多者优先」定格。
-///
+/// 毫秒级直接比，不做自然日分档：快过期的积分先烧掉，晚一天是一天。
 /// 未知到期时间（`None`）排在所有有到期日的之后：它连「要不要着急」都不知道，
 /// 不该抢在「确定不着急」前面（与账号页的展示口径一致）。
-fn expiry_day(expiry_ms: Option<i64>) -> i64 {
-    use chrono::{Datelike, TimeZone};
-    expiry_ms
-        .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
-        .map_or(i64::MAX, |t| t.date_naive().num_days_from_ce() as i64)
-}
-
-/// 「待过期积分」：**最早到期自然日**当天到期的资源包剩余合计。
-///
-/// 排序第二键用它而不是总剩余：同为「最早到期」一档时，谁的「马上要作废的积分」
-/// 多就先用谁——先把快作废的烧掉；总剩余多但大半是远期包的，不该抢在前面。
-///
-/// 退路：逐包明细缺失（签到路径只记总数）或没有到期时间时，退回总剩余，
-/// 避免把「待过期」错算成 0。
-fn expiring_credits(info: &ledger::CreditFact) -> f64 {
-    let day = expiry_day(info.earliest_expiry_ms);
-    if day == i64::MAX || info.packages.is_empty() {
-        return info.credits.unwrap_or(0.0);
-    }
-    info.packages
-        .iter()
-        .filter(|p| expiry_day(p.expiry_ms) == day)
-        .map(|p| p.remaining)
-        .sum()
-}
-
-/// 路由排序键：到期的自然日早者优先 → 查不到到期时间的靠后 →
-/// **同一自然日内待过期积分多者优先**（见 [`expiring_credits`]）。
 ///
 /// 入参直接用台账的 [`ledger::CreditFact`]：路由的排序依据与账户展示的
 /// 「剩余 / 过期时间」是**同一个类型、同一份来源**，不再各立一份画像结构。
-fn score(info: &ledger::CreditFact) -> (i64, i64) {
-    (
-        expiry_day(info.earliest_expiry_ms),
-        -(expiring_credits(info) * 100.0) as i64,
-    )
+fn score(info: &ledger::CreditFact) -> i64 {
+    info.earliest_expiry_ms.unwrap_or(i64::MAX)
 }
 
 /// 从候选里选出该用的账号下标。`infos` 与 `ids` 一一对应。
 fn pick_index(ids: &[String], infos: &[ledger::CreditFact]) -> Option<usize> {
     let mut best: Option<usize> = None;
-    let mut best_score: Option<(i64, i64)> = None;
+    let mut best_score: Option<i64> = None;
     for (i, info) in infos.iter().enumerate() {
         // 剩余积分为 0 的账号直接跳过（除非全员为 0 / 全未知）
         if info.credits == Some(0.0) {
             continue;
         }
         let s = score(info);
+        // 同刻到期（并列）时保持列表原顺序：先到先得，结果也稳定可复现
         if best_score.map_or(true, |cur| s < cur) {
             best_score = Some(s);
             best = Some(i);
@@ -1987,7 +1953,7 @@ fn has_spare_candidate(
 /// - **禁用（严格）**：`ban` 里的账号是本轮请求已试败的限流账号，直接剔除；剔完为空返回 None；
 /// - **冷却（软）**：对本模型仍在限流窗口内的账号优先跳过，全员冷却则照常用。
 ///
-/// 过滤完**直接纯排序**（[`pick_index`]：到期日最早 → 同日则待过期积分多者优先），
+/// 过滤完**直接纯排序**（[`pick_index`]：积分过期时刻最早者优先），
 /// 没有任何会话粘滞/归属记忆——冷却只记「账号 × 模型」，换模型后全员自然回到
 /// 候选集；继续用出事的模型则被冷却的账号自动出局，剩下的人照常排序。
 ///
@@ -3149,18 +3115,17 @@ mod tests {
     }
 
     #[test]
-    fn routing_prefers_earliest_expiry_then_most_credits() {
+    fn routing_prefers_earliest_expiry() {
         let ids = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         let infos = vec![
             credit_fact(Some(local_ms(2026, 3, 12, 9)), Some(100.0)),
-            credit_fact(Some(local_ms(2026, 3, 11, 9)), Some(10.0)), // 到期日更早 → 胜出
+            credit_fact(Some(local_ms(2026, 3, 11, 9)), Some(10.0)), // 到期更早 → 胜出
             credit_fact(None, Some(99999.0)),                        // 未知 → 靠后
             credit_fact(Some(local_ms(2026, 3, 10, 9)), Some(0.0)),  // 积分为 0 → 跳过
         ];
         assert_eq!(pick_index(&ids, &infos), Some(1));
 
-        // 同一天到期（只差几小时也算「一样」）→ 待过期积分多者优先。
-        // 这两条没有逐包明细，走「退回总剩余」的退路。
+        // 同一天到期、只差几小时：毫秒级直接比，早的赢 —— 与各自积分多少无关
         let ids2 = vec!["a".into(), "b".into()];
         let infos2 = vec![
             credit_fact(Some(local_ms(2026, 3, 10, 15)), Some(4772.45)),
@@ -3168,43 +3133,18 @@ mod tests {
         ];
         assert_eq!(
             pick_index(&ids2, &infos2),
-            Some(1),
-            "同一天到期时应按待过期积分多者优先（无明细时退回总剩余）"
+            Some(0),
+            "同一天也应按过期时刻先后的毫秒值比，15 点到期的先用掉"
         );
     }
 
     #[test]
-    fn same_day_prefers_more_expiring_credits() {
-        // 同一天到期时比的不是总剩余，而是「这一天要作废的积分」：
-        // 总剩余多的账号如果大半是远期包，不该抢在「快作废的多」前面。
+    fn identical_expiry_keeps_list_order() {
+        // 严格并列（同一毫秒）没有可比较的键 → 保持列表原顺序，结果稳定可复现
         let ids = vec!["a".into(), "b".into()];
-        let pkg = |remaining: f64, expiry_ms: i64| ledger::CreditPackage {
-            name: "pkg".into(),
-            remaining,
-            expiry_ms: Some(expiry_ms),
-            never_expires: false,
-            grants: vec![],
-        };
-        let a = ledger::CreditFact {
-            credits: Some(9000.0),
-            at: String::new(),
-            earliest_expiry_ms: Some(local_ms(2026, 3, 10, 9)),
-            packages: vec![
-                pkg(200.0, local_ms(2026, 3, 10, 9)),
-                pkg(8800.0, local_ms(2026, 3, 20, 9)),
-            ],
-        };
-        let b = ledger::CreditFact {
-            credits: Some(5000.0),
-            at: String::new(),
-            earliest_expiry_ms: Some(local_ms(2026, 3, 10, 15)),
-            packages: vec![pkg(5000.0, local_ms(2026, 3, 10, 15))],
-        };
-        assert_eq!(
-            pick_index(&ids, &[a, b]),
-            Some(1),
-            "同一天到期时应比待过期积分：b 当天要作废 5000 > a 的 200，尽管 a 总剩余更多"
-        );
+        let ms = local_ms(2026, 3, 10, 9);
+        let infos = vec![credit_fact(Some(ms), Some(100.0)), credit_fact(Some(ms), Some(9000.0))];
+        assert_eq!(pick_index(&ids, &infos), Some(0), "平序时先到先得");
     }
 
     #[test]

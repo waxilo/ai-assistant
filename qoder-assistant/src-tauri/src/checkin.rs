@@ -157,10 +157,16 @@ pub async fn do_checkin(account: &Account) -> CheckinRecord {
             let receipt = qoder_api::claim_campaign(account.region, &account.token, &c.id)
                 .await
                 .ok();
+            // 回放同样带回当初的发放量（`benefit.amount`，与领取时逐字相同）：
+            // 不记它，台账里这一笔就只有日期没有量，界面逐笔展示只能报「—」。
             CheckinRecord {
                 success: true,
                 already: true,
                 message: "今日已领取".into(),
+                credit: receipt
+                    .as_ref()
+                    .and_then(|r| r.amount)
+                    .or_else(|| c.benefit.as_ref().map(|b| b.amount)),
                 campaign_key: Some(c.key.clone()),
                 expires_at: receipt.and_then(|r| r.expires_at),
                 ..blank(&at)

@@ -477,9 +477,23 @@ pub fn note_grant(led: &mut AcctLedger, pkg_key: &str, expires_ms: i64, credits:
     let now = crate::timeutil::now_ms();
     let entry = led.pkgs.entry(pkg_key.to_string()).or_default();
     // 已过期的凭据不入列：它讲的那天已经过去了，留着只会让「最早一笔」永远指着过去
-    if ms >= now && !entry.grants.iter().any(|g| g.expires_ms == ms) {
-        entry.grants.push(Grant { expires_ms: ms, credits });
-        entry.grants.sort_by_key(|g| g.expires_ms);
+    match entry.grants.iter_mut().find(|g| g.expires_ms == ms) {
+        // 已存在同一笔：只有它当初没记量、而这次带回了量时才补写 ——
+        // 启动补录（`backfill_grants_from_logs`）每天重放日志，正好靠这条
+        // 把逐笔上线早期/回放路径漏记的金额填上；已有量绝不覆盖（新凭据更准）。
+        Some(g) => {
+            if g.credits.is_none() {
+                g.credits = credits;
+            }
+        }
+        None if ms >= now => {
+            entry.grants.push(Grant {
+                expires_ms: ms,
+                credits,
+            });
+            entry.grants.sort_by_key(|g| g.expires_ms);
+        }
+        None => {}
     }
     entry.grants.retain(|g| g.expires_ms >= now);
     if entry.grant_expiry_ms.map_or(true, |old| ms > old) {
@@ -1089,6 +1103,34 @@ mod tests {
             a.pkgs["qoder:addon"].grants,
             vec![Grant { expires_ms: ms, credits: Some(100.0) }],
             "重放不该改已有记录、也不该新增"
+        );
+    }
+
+    /// 重放**带量**的凭据要把当初没记上的量补上（启动补录正是靠这个逐日自愈）；
+    /// 但已有量的笔不被后来的值覆盖 —— 补录是填空，不是改账。
+    #[test]
+    fn replay_with_credits_backfills_only_the_missing_amounts() {
+        let filled = days_from_now(29);
+        let gap = days_from_now(30);
+        let mut led = Ledger::default();
+        let a = led.accts.entry("a1".into()).or_default();
+        a.pkgs.insert(
+            "qoder:addon".into(),
+            PkgEntry { remaining: 200.0, ..Default::default() },
+        );
+        // 老形态：一笔只有日期没有量，另一笔已记着 100
+        note_grant(a, "qoder:addon", gap, None);
+        note_grant(a, "qoder:addon", filled, Some(100.0));
+        // 日志重放：两笔都带回了量
+        note_grant(a, "qoder:addon", gap, Some(100.0));
+        note_grant(a, "qoder:addon", filled, Some(888.0));
+        assert_eq!(
+            a.pkgs["qoder:addon"].grants,
+            vec![
+                Grant { expires_ms: filled, credits: Some(100.0) },
+                Grant { expires_ms: gap, credits: Some(100.0) },
+            ],
+            "缺的量补上，已有的量不动"
         );
     }
 
