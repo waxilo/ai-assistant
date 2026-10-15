@@ -9,7 +9,55 @@
 
 .app {
   display: flex;
+  flex-direction: column;
   height: 100%;
+}
+.app-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* ── 自绘标题栏（decorations:false）：整条可拖，右侧三个窗口按钮 ──
+   z-index 60 > 遮罩 50：弹窗打开时窗口控制仍可用（遮罩经 Dialog portal 挂 body） */
+.titlebar {
+  position: relative;
+  z-index: 60;
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  height: 36px;
+  background: var(--glass);
+  border-bottom: 1px solid var(--hairline);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.titlebar-drag {
+  flex: 1;
+  min-width: 0;
+}
+.win-btns {
+  display: flex;
+  flex: none;
+}
+.win-btn {
+  width: 46px;
+  border: none;
+  background: none;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+.win-btn:hover {
+  background: rgba(0, 0, 0, 0.07);
+  color: var(--text);
+}
+.win-btn.close:hover {
+  background: #e81123;
+  color: #fff;
 }
 
 /* ── 侧边导航栏：半透明玻璃 + 细描边 ───────────────────────── */

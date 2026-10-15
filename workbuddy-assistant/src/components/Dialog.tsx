@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { IconX } from "./Icons";
 
 /**
@@ -74,7 +75,10 @@ export function Dialog({
     };
   }, [onClose]);
 
-  return (
+  // Portal 到 body：页面弹窗原本渲染在 `.content`（z-index:1 的层叠上下文）里，
+  // 而 pagebar 是 z-index:5 —— 弹窗一高，头部就钻到页头底下被盖掉
+  // （资源包弹窗逐笔展开后触发过）。挂到 body，遮罩的 z-index 才对全局生效。
+  return createPortal(
     <div
       className={"modal-mask" + (maskClassName ? " " + maskClassName : "")}
       onClick={onClose}
@@ -114,6 +118,7 @@ export function Dialog({
           </footer>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

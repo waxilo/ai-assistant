@@ -57,6 +57,7 @@ import {
   PoolIssuedModal,
 } from "./components/ImportModals";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { TitleBar } from "./components/TitleBar";
 
 /**
  * 应用外壳：左侧导航栏 + 右侧内容区。
@@ -597,6 +598,8 @@ export default function App() {
 
   return (
     <div className="app">
+      <TitleBar />
+      <div className="app-body">
       <aside className="sidebar">
         <div className="brand">
           <span className="logo">
@@ -879,6 +882,7 @@ export default function App() {
             />
           )}
         </main>
+      </div>
       </div>
 
       {toast && <div className={`toast toast-${toast.kind}`}>{toast.text}</div>}

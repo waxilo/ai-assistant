@@ -21,6 +21,7 @@ import {
 import type { AcctStatus, Account, BrokerStatus, Page, Settings } from "./types";
 import { accountLabel, type ConfirmReq, type Toast } from "./common";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { TitleBar } from "./components/TitleBar";
 import { BrokerBindModal, PoolIssuedModal } from "./components/BrokerModals";
 import {
   IconCheck,
@@ -575,6 +576,8 @@ export default function App() {
 
   return (
     <div className="app">
+      <TitleBar />
+      <div className="app-body">
       <aside className="sidebar">
         <div className="brand">
           <span className="logo">
@@ -717,6 +720,7 @@ export default function App() {
             )}
           </div>
         </main>
+      </div>
       </div>
 
       {toast && <div className={`toast toast-${toast.kind}`}>{toast.text}</div>}
