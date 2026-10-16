@@ -15,8 +15,8 @@ pub struct CheckinLog {
     /// 账号手机号（展示用，可空）
     #[serde(default)]
     pub account_phone: Option<String>,
-    /// 账号邮箱（展示用，可空）。与手机号一样是「这个人的标识」——
-    /// 国内版看手机号、国际版看邮箱，日志页与账号页因此长得一样。
+    /// 账号邮箱（展示用，可空）。与手机号一样是「这个人的标识」，
+    /// 日志页与账号页因此长得一样。
     #[serde(default)]
     pub account_email: Option<String>,
     pub at: String,

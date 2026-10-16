@@ -98,10 +98,9 @@
 //!   虚报一次「用量归零」（不可查）。
 
 use crate::ledger::PkgView;
-use crate::region::Region;
 use serde_json::Value;
 
-/// Qoder usage 的路径（基址由 [`Region::openapi_base`] 按账号区域给出）。
+/// Qoder usage 的路径（基址见 [`crate::qoder_api::OPENAPI_BASE`]）。
 ///
 /// 带不带 `product=app` 官方客户端都会发，这里显式带上以与官方语义对齐。
 const USAGE_PATH: &str = "/sash/api/v2/me/usage";
@@ -352,12 +351,10 @@ pub fn parse_view(root: &Value) -> Option<ResourceView> {
 /// 拉一次 Qoder 额度总览。
 ///
 /// best-effort：网络错误 / 非 JSON / 字段缺失 / 无包都回 [`ResourceView::default()`]，
-/// 绝不影响调用方的主流程。`region` 取**账号自己的**区域 —— 两套部署的额度互不相通，
-/// 打错域只会稳定 401；`token` 是登录态里的 access token
+/// 绝不影响调用方的主流程。`token` 是登录态里的 access token
 /// （来自 auth.v1.dat 的当前账号）。
-pub async fn fetch_usage(region: Region, token: &str) -> ResourceView {
+pub async fn fetch_usage(token: &str) -> ResourceView {
     let (body, auth_rejected) = crate::qoder_api::get_json_with_auth_signal(
-        region,
         token,
         USAGE_PATH,
         &[("product", "app")],
@@ -662,7 +659,6 @@ mod tests {
             )
         };
         let accounts = [crate::accounts::Account {
-            region: Region::Global,
             id: "a1".into(),
             name: "甲".into(),
             phone: None,
@@ -730,7 +726,7 @@ mod tests {
         let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
         println!("token_len={}", a.token.len());
-        let v = fetch_usage(a.region, &a.token).await;
+        let v = fetch_usage(&a.token).await;
         println!(
             "credits={:?} earliest_expiry_ms={:?} packages={}",
             v.credits,

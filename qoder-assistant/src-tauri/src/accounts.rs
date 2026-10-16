@@ -1,5 +1,4 @@
 use crate::ledger;
-use crate::region::Region;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,25 +60,14 @@ pub struct Account {
     pub phone: Option<String>,
     /// 邮箱（展示用标识，可空）。
     ///
-    /// 与 [`Account::phone`] 是一对：两套部署的登录身份不同 —— 国内版手机号、
-    /// 国际版邮箱 —— 界面按区域选一个展示（见前端 `accountIdent`）。所以**两个都要存**：
-    /// 只留手机号，国际版账号就只剩一个昵称可认（昵称会改，也常为空）。
+    /// 与 [`Account::phone`] 是一对：界面的次级标识按「手机号优先、邮箱兜底」展示
+    /// （规则与前端 `accountIdent` 同源）。**两个都要存**：只留手机号，手机号为空的
+    /// 账号就只剩一个昵称可认（昵称会改，也常为空）。
     ///
     /// 来源与手机号同一批：本机登录文件的 `user.email`、登录时的 `/api/v1/userinfo`、
     /// 以及给老账号惰性补一次的那个请求（见 `commands::fill_identity_if_missing`）。
     #[serde(default)]
     pub email: Option<String>,
-    /// **这个账号属于哪套部署**（国际版 / 国内版，见 [`Region`]）。
-    ///
-    /// 这是账号的**身份属性**，不是「可选覆盖」：同一个手机号在两套部署里是两个
-    /// 完全不同的账号（两套后端、两份 token、各自的活动权益）。所以「导入合并」的
-    /// 识别键是 **（区域, 手机号）**，而不是手机号本身 —— 用手机号单键匹配，
-    /// 会把国内版的账号合并进国际版那条记录里，token 一换就再也签不到到。
-    ///
-    /// 老 `accounts.json` 没有这个字段 → `#[serde(default)]` 落成 [`Region::Global`]：
-    /// 这个字段出现之前，能导进来的只有国际版账号。
-    #[serde(default)]
-    pub region: Region,
     pub token: String,
     /// 续签用的 refresh token（导入本机账号 / 无感登录时一并带上；老账号为 None）
     #[serde(default)]
@@ -104,7 +92,7 @@ pub struct Account {
     //   ① **只写不读** —— 转发实际读的是 `settings.default_base_url`（见 `proxy.rs`），
     //      这个字段除了导入时被写一次之外没有任何消费方；
     //   ② **写进去的值还是错的** —— 登录新账号那条路把它写成授权域（`qoder.com`，登录页），
-    //      而转发目标是模型网关（国际版 `api2.qoder.sh`、国内版 `gateway.qoder.com.cn`）。
+    //      而转发目标是模型网关（国内版 `gateway.qoder.com.cn`）。
     //      一个既没人读、内容又不对的字段，
     //      留着只会让人以为「账号可以各自配端点」。
     // Qoder 只有一套域，唯一可改的那一处是 `Settings::default_base_url`（带迁移）。
@@ -146,25 +134,18 @@ pub struct Account {
 }
 
 impl Account {
-    /// 这个账号**在自己那套部署里认人的那一样**：国内版手机号、国际版邮箱。
-    ///
-    /// 另一套部署的那个标识在缺失时兜底（国内版账号也可能绑了邮箱）—— 规则与界面
-    /// 选择展示哪一个同源（前端 `accountIdent`），两处必须一起改。
+    /// 这个账号认人的那一样：手机号优先，邮箱兜底。
     ///
     /// 它有两个消费方，都是「缺了它就认不出这是谁」的地方：
-    /// - 界面上的次级标识（国内版显示手机号、国际版显示邮箱）；
-    /// - [`completeness`] 的「有身份标识」判分 —— 只数手机号会让国际版账号在去重里
-    ///   永远比不出高低：真实账号（有邮箱）与池里收养的幽灵条目（没有邮箱）打平后
-    ///   按「谁在前」决胜，幽灵就可能留下，而它的 id 没有台账、日志挂账也跟着断。
+    /// - 界面上的次级标识（手机号为主、邮箱兜底）；
+    /// - [`completeness`] 的「有身份标识」判分 —— 只数手机号会让手机号为空的账号
+    ///   在去重里永远比不出高低：真实账号（有邮箱）与池里收养的幽灵条目（没有邮箱）
+    ///   打平后按「谁在前」决胜，幽灵就可能留下，而它的 id 没有台账、日志挂账也跟着断。
     pub fn identity(&self) -> Option<&str> {
         fn pick(v: &Option<String>) -> Option<&str> {
             v.as_deref().map(str::trim).filter(|s| !s.is_empty())
         }
-        let (first, second) = match self.region {
-            Region::Cn => (&self.phone, &self.email),
-            Region::Global => (&self.email, &self.phone),
-        };
-        pick(first).or_else(|| pick(second))
+        pick(&self.phone).or_else(|| pick(&self.email))
     }
 }
 
@@ -213,179 +194,13 @@ pub fn load_account_views(dir: &Path) -> Vec<AccountView> {
     view_accounts(load_accounts(dir), dir)
 }
 
-/// 设置里**不随区域变**的那几项：通知是整机行为（一个 webhook 频道），
-/// 两个区域的签到结果都往它推，没有「这一半是国内版的、那一半是国际版的」可分。
-///
-/// 它从 [`Settings`] 视图里抽出/塞回（[`GlobalSettings::of`] / [`GlobalSettings::apply_to`]），
-/// 是「global + regions」落盘格式里 global 那一半的全部成员。
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct GlobalSettings {
-    /// 通知总开关（关掉后定时与手动都不推送，**续签失败告警也一起静音**）
-    #[serde(default)]
-    pub notify_enabled: bool,
-    /// 通知 webhook 地址，形如 `https://…/hook/<key>`
-    #[serde(default)]
-    pub notify_webhook: String,
-    /// 定时签到结束后推送
-    #[serde(default = "default_true")]
-    pub notify_on_schedule: bool,
-    /// 手动「全部签到」结束后推送（默认关，避免连点造成刷屏）
-    #[serde(default)]
-    pub notify_on_manual: bool,
-    /// 简报是否推送到 webhook（复用通知总开关与地址）。
-    ///
-    /// 推的粒度是**天**：时条目每小时就在结算，但「今天花了多少」要等当天结束才有定论。
-    /// 同样带 `alias` 兼容旧键名。
-    #[serde(default = "default_true", alias = "notify_on_report")]
-    pub notify_on_briefing: bool,
-}
-
-impl Default for GlobalSettings {
-    fn default() -> Self {
-        Self {
-            notify_enabled: false,
-            notify_webhook: String::new(),
-            notify_on_schedule: true,
-            notify_on_manual: false,
-            notify_on_briefing: true,
-        }
-    }
-}
-
-impl GlobalSettings {
-    fn of(s: &Settings) -> Self {
-        GlobalSettings {
-            notify_enabled: s.notify_enabled,
-            notify_webhook: s.notify_webhook.clone(),
-            notify_on_schedule: s.notify_on_schedule,
-            notify_on_manual: s.notify_on_manual,
-            notify_on_briefing: s.notify_on_briefing,
-        }
-    }
-
-    /// 把全局项盖回视图上：`regions` 切片里那几份 `notify_*` 是序列化时顺带写下的
-    /// 冗余副本，**唯一可信来源是 store 的 `global`**，拼视图时必须无条件覆盖，
-    /// 否则两个区域各存一份通知配置，改一边另一边不同步，正好毁掉「通知是整机行为」这条。
-    fn apply_to(&self, s: &mut Settings) {
-        s.notify_enabled = self.notify_enabled;
-        s.notify_webhook = self.notify_webhook.clone();
-        s.notify_on_schedule = self.notify_on_schedule;
-        s.notify_on_manual = self.notify_on_manual;
-        s.notify_on_briefing = self.notify_on_briefing;
-    }
-}
-
-/// `settings.json` 的**落盘格式**：全局项 + 当前区域 + 每个区域各一份设置。
-///
-/// 界面与所有消费方拿到的仍是扁平的 [`Settings`]（[`load_settings`] 拼出来的视图），
-/// 这张嵌套表只存在于磁盘上 —— 除 [`load_settings`] / [`save_settings`] 外无人直接读写它。
-///
-/// 为什么 `takeover_region` 要**同时**存在于顶层和各切片里：切片里的值是它作为
-/// 「视图」时的自我描述（前端与消费方读它），顶层的才是「当前选中哪个区域」这个
-/// 全局意图本身。写入路径保证两者一致（[`save_settings`] 按顶层键落对应切片，
-/// 且切片的 `takeover_region` 已被视图设为同一个区域）。
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SettingsStore {
-    #[serde(default)]
-    global: GlobalSettings,
-    /// 当前区域（全局意图，左下角区域选择器改的就是它）
-    #[serde(default)]
-    takeover_region: Region,
-    /// 每个区域一份设置。**缺某个区域的键是合法的**（拼视图时回退到默认值），
-    /// 所以老数据迁移与新增区域都不需要补写占位条目。
-    #[serde(default)]
-    regions: std::collections::HashMap<Region, Settings>,
-}
-
-/// **全新安装**（本机还没有 `settings.json`）时的落盘表：当前区域缺省 = 国内版
-/// （产品决定默认选中它，见 [`default_takeover_region`]）。
-///
-/// 注意与「老扁平文件」的解析区隔开：[`SettingsStore::from_legacy`] 走的是
-/// `Settings` 字段的 serde 缺省（那是历史 = 国际版），刻意不跟着这里改成 Cn
-/// —— 否则老用户升级后会被默认丢进国内版、看到空账号库。这里只管「无文件」。
-impl Default for SettingsStore {
-    fn default() -> Self {
-        Self {
-            global: GlobalSettings::default(),
-            takeover_region: default_takeover_region(),
-            regions: std::collections::HashMap::new(),
-        }
-    }
-}
-
-impl SettingsStore {
-    /// 拼出「当前区域」的扁平视图：区域切片 + 全局通知项覆盖 + 当前区域标记。
-    fn view(&self) -> Settings {
-        let mut s = self
-            .regions
-            .get(&self.takeover_region)
-            .cloned()
-            .unwrap_or_else(Settings::default);
-        s.takeover_region = self.takeover_region;
-        self.global.apply_to(&mut s);
-        s
-    }
-
-    /// 老格式（扁平一份、无区域概念）→ 新格式：**复制进两个区域切片**。
-    ///
-    /// 复制而不是只给当前区域，是因为绝大多数可分区字段（定时时刻、风控打散、
-    /// 简报开关）在老版本里是「整机偏好」，用户在哪个区域都想要同一套策略；
-    /// 只有一类字段例外：**接管拓扑**（开关 / 端口 / 扣费与限流账号名单）——
-    /// 它描述的是一次真实安装，而老版本只可能装在一侧。把 `proxy_enabled: true`
-    /// 复制给另一侧，切过去就会「界面显示开着、反代却没跑」，且两个区域各自
-    /// 默认同一个 8789 端口必然撞车。所以非当前区域的这三项回退到默认值。
-    fn from_legacy(flat: Settings) -> Self {
-        let global = GlobalSettings::of(&flat);
-        let mut regions = std::collections::HashMap::new();
-        for r in Region::ALL {
-            let mut s = flat.clone();
-            s.takeover_region = r;
-            if r != flat.takeover_region {
-                s.proxy_enabled = false;
-                s.billing_account_ids = Vec::new();
-                s.rate_limit_models = Vec::new();
-            }
-            regions.insert(r, s);
-        }
-        SettingsStore {
-            global,
-            takeover_region: flat.takeover_region,
-            regions,
-        }
-    }
-}
-
-/// 应用设置 —— **当前区域的那一份投影视图**。
-///
-/// 落盘格式是「全局 + 按区域」（见 [`SettingsStore`]）：左下角的区域选择器切到哪一区域,
-/// [`load_settings`] 就返回哪一区域的设置，而所有消费方（反代、调度、命令、界面 IPC）
-/// 拿到的始终是这一张扁平的表 —— 字段名不变，读取路径就不变，两处口径不会分叉。
+/// 应用设置 —— `settings.json` 的**扁平落盘模型**，界面与所有消费方（反代、调度、
+/// 命令、界面 IPC）读到的都是这一张表。
 ///
 /// 新增字段一律带 `#[serde(default)]`，这样老版本写下的 settings.json
 /// 仍能反序列化（不会整个文件被判为非法而回退成默认值）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
-    /// **当前区域**（旧名「接管目标区域」，语义已升级为全局）：左下角区域选择器改的就是它。
-    ///
-    /// 它决定三件事，所以必须是**显式选择**、不能靠磁盘猜：
-    /// ① 界面各功能页展示哪一套部署的账号；② 智能接管作用于哪一套官方客户端
-    /// —— 端点写进哪个 CLI 配置目录（`~/.qoder/settings.json` / `~/.qoder-cn/settings.json`）、
-    /// 反代把对话请求转发到哪个模型网关；③ 反代的扣费账号只在该区域里选
-    /// —— 跨区域的 token 在对方网关上无效。
-    ///
-    /// 「两个官方客户端可以同时装着」是常态，而「现在该看哪一个」是用户的意图，
-    /// 不是能从文件系统推断出来的事实。
-    ///
-    /// ⚠️ 这一项**取代了旧的 `default_base_url`**：那个字段先是模板残留的 CodeBuddy
-    /// 域名（靠迁移改成 Qoder 的），随后又被当成「上游可覆盖」留着，而前端从来没有
-    /// 它的入口。上游其实由区域唯一决定，留一个可写字段只会多一处「改错了不报错」。
-    ///
-    /// 字段 serde 缺省 = [`Region::default`]（国际版）是针对**老文件**的历史语义：
-    /// 老扁平 / 老新格式文件里没有它时，那份数据默认是国际版的账号库。
-    /// 「**全新安装**默认选国内版」走的是 [`SettingsStore::default`]，这里不跟着改，
-    /// 否则老用户升级后会被默认丢进国内版、看到空账号库。
-    #[serde(default)]
-    pub takeover_region: Region,
     #[serde(default)]
     pub auto_checkin_on_start: bool,
     /// 是否开启「每天定时自动签到」
@@ -400,11 +215,8 @@ pub struct Settings {
     /// 当天挑定的时刻会写进 `schedule_state.json` 复用，重启不会重新摇。0 = 关闭随机。
     #[serde(default = "default_schedule_window")]
     pub schedule_window_minutes: u32,
-    // ── 以下几项 `notify_*` 是**全局字段**（不随区域变，见 [`GlobalSettings`]）。
-    //    它们留在视图里只为一个理由：所有既有消费方（通知、设置页、normalize）
-    //    读的都是这一张扁平的表；[`load_settings`] 从 store 拼视图时用 `global`
-    //    覆盖它们，[`save_settings`] 落盘时再把它们抽回 `global`。
-    //    区域切片里序列化出来的这几份是**冗余副本**，读侧一律忽略。
+    // ── 以下几项 `notify_*` 与 `briefing` 的推送开关是**整机行为**（一个 webhook 频道），
+    //    不随任何配置分片：签到结果、简报都往同一个频道推。
     /// 通知总开关（关掉后定时与手动都不推送，**续签失败告警也一起静音**）
     #[serde(default)]
     pub notify_enabled: bool,
@@ -483,7 +295,7 @@ pub struct Settings {
     /// 推的粒度是**天**：时条目每小时就在结算，但「今天花了多少」要等当天结束才有定论，
     /// 每小时推一条只会把通知刷成流水账。同样带 `alias` 兼容旧键名。
     ///
-    /// 与上面几项 `notify_*` 一样是**全局字段**（见 [`GlobalSettings`]）。
+    /// 与上面几项 `notify_*` 一样是**整机行为**。
     #[serde(default = "default_true", alias = "notify_on_report")]
     pub notify_on_briefing: bool,
 }
@@ -491,11 +303,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // 「当前区域」缺省 = 国内版（见 `default_takeover_region`，字段级 serde
-            // 与这里共用同一处真相）。**不要**用 `Region::default()`：那是账户 region
-            // 字段的身份缺省（老账号 = 国际版），一条线管两个含义会在默认改版时
-            // 把老账号都解析成国内版。
-            takeover_region: default_takeover_region(),
             auto_checkin_on_start: false,
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
@@ -519,15 +326,6 @@ impl Default for Settings {
             notify_on_briefing: true,
         }
     }
-}
-
-/// 「当前区域」= 国内版的缺省（做"**全新安装**默认选中国内版"的唯一一处真相）。
-///
-/// 供 [`SettingsStore::default`]（本机还没有 settings.json 时）与
-/// [`Settings::default`]（区域切片缺失时的视图回退）使用。**不要**换成
-/// [`Region::default`]：那是账户 region 字段与老文件解析的历史缺省（国际版）。
-fn default_takeover_region() -> Region {
-    Region::Cn
 }
 
 /// 风控随机间隔默认上限：45 秒足够打散节奏，又不至于让「全部签到」等太久
@@ -563,8 +361,8 @@ pub fn normalize_time(input: &str) -> Option<String> {
 }
 
 // 这里曾有 `fn default_base_url()` —— 把「模型网关上游」做成了一个可配置字段，
-// 还配了一条把 CodeBuddy 域名迁过来的迁移。上游现在由 [`Region::infer_base`]
-// 按区域唯一决定（见 `Settings::takeover_region`），设置里不再有这一项；
+// 还配了一条把 CodeBuddy 域名迁过来的迁移。上游是编译期常量（国内版网关
+// `gateway.qoder.com.cn`，见 `proxy`），设置里不再有这一项；
 // 老 `settings.json` 里的 `default_base_url` 键会被 serde 直接忽略。
 
 /// 默认定时签到时刻：**10:00**，对齐服务端的活动刷新点。
@@ -607,7 +405,15 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
         return Vec::new();
     }
     let s = fs::read_to_string(&f).unwrap_or_default();
-    let accounts: Vec<Account> = serde_json::from_str(&s).unwrap_or_default();
+    // 先读成 Value 逐条过滤：`region:"global"` 的条目是国际版账号 —— 国际版支持
+    // 已整体移除（2026-10-16），它们不再是本应用管理的账号，读入时丢弃。
+    // `region` 字段本身也已从落盘模型里删掉：清洗后保存的条目没有该字段，照常读入。
+    let accounts: Vec<Account> = serde_json::from_str::<Vec<serde_json::Value>>(&s)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v.get("region").and_then(|r| r.as_str()) != Some("global"))
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
     // 读出口就收敛重复条目：**这里是所有「给界面/路由看」的账号的唯一来源**，
     // 在别处兜底都只能治一条路（见 `dedupe_by_credential` 的说明）。
     dedupe_by_credential(accounts)
@@ -625,8 +431,8 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
 /// （否则所有「还没导入凭证」的东西会被合成一条）。
 ///
 /// 保留哪条：信息最全的那条。权重最高的是「有签到结果」——
-/// **一次成功的签到就是「这个区域标签是对的」的实证**，而幽灵记录恰恰靠区域标签错
-/// （被服务端兜成国际版）才活下来的。被并掉那条的独有字段（手机号、昵称、续签信息）
+/// **一次成功的签到就是「这份凭证真的能用」的实证**，而幽灵记录恰恰是靠身份锚点漂移
+/// （手机号后补、昵称被改）才活下来的。被并掉那条的独有字段（手机号、昵称、续签信息）
 /// 会补进保留的那条，一个字段都不丢。**幂等**：对已收敛的列表再跑一次结果不变。
 pub fn dedupe_by_credential(accounts: Vec<Account>) -> Vec<Account> {
     let mut kept: Vec<Account> = Vec::with_capacity(accounts.len());
@@ -662,7 +468,7 @@ fn same_credential(a: &Account, b: &Account) -> bool {
 }
 
 /// 信息完整度（越高越该保留这条）。三项的含义：
-/// 有签到结果 = 这份凭证真的在**这个区域**的后端上签成功过；
+/// 有签到结果 = 这份凭证真的在后端上签成功过；
 /// 有身份标识 = 认得出这是谁（见 [`Account::identity`]）；
 /// 问过服务端状态 = 至少确认过一次真实状态。
 fn completeness(a: &Account) -> u8 {
@@ -672,7 +478,7 @@ fn completeness(a: &Account) -> u8 {
 }
 
 /// 把 `from` 有、`into` 没有的字段补进去（**只补空，绝不覆盖**）。
-/// 区域、id、昵称都不是「空字段」问题，所以一律不动 —— 保留方是谁，身份就是谁。
+/// id、昵称都不是「空字段」问题，所以一律不动 —— 保留方是谁，身份就是谁。
 fn merge_gaps(into: &mut Account, from: &Account) {
     if into.token.trim().is_empty() {
         into.token = from.token.clone();
@@ -790,8 +596,8 @@ pub fn set_cosy_uid(dir: &Path, account_id: &str, uid: &str) -> bool {
 /// （[`crate::models`] 拉模型目录）都得先拿到 uid。这两处各写一份「有就用、没有就问一次
 /// 再落盘」，就会在补齐条件、失败处理上慢慢漂 —— 而漂掉的后果是「一边能签、另一边永远签不出」。
 ///
-/// `client` / `gateway` 由调用方给：取 uid 打的是**接管区域的网关**（与业务请求同域，
-/// 避免跨域拿到两套账号 id），而两个调用方手上的客户端本来就不同（反代用透传客户端、
+/// `client` / `gateway` 由调用方给：取 uid 打的是**与业务请求同域的网关**
+/// （避免跨域拿到两套账号 id），而两个调用方手上的客户端本来就不同（反代用透传客户端、
 /// 目录用直连客户端）。
 ///
 /// 返回 `None` = 拿不到 uid（没登录、token 过期、网络不通）。调用方**不能**在半签状态下
@@ -817,36 +623,46 @@ pub async fn cosy_identity(
     })
 }
 
-/// 读设置 —— 永远返回**当前区域**的扁平视图（落盘格式见 [`SettingsStore`]）。
+/// 读设置。
 ///
-/// 消费方（调度、反代、命令、界面）因此完全不需要知道「按区域存」这件事：
-/// 它们要的本来就是「现在这套配置」，区域是它们自己的 `takeover_region` 字段决定的上下文。
+/// 兼容两种历史落盘格式，都收敛成扁平的 [`Settings`]：
+/// - **「global + regions」嵌套表**（区域化年代的格式）：取国内版切片，
+///   通知项以顶层 `global` 为准（通知是整机行为，`global` 是唯一可信来源）；
+///   顶层 `takeover_region` 等已退役的键由 serde 直接忽略。
+/// - **更早的扁平格式**：整体就是一份 [`Settings`]，直接读。
+/// - 嵌套格式保存时会被**整体替换**成扁平格式（[`save_settings`] 只写新格式），
+///   即迁移在第一次保存时自然完成。
 pub fn load_settings(dir: &Path) -> Settings {
-    load_store(dir).view()
-}
-
-/// 读落盘表本体（不分区域）。迁移按**切片逐个**跑：老版本遗留值可能两份都在。
-fn load_store(dir: &Path) -> SettingsStore {
     let f = settings_file(dir);
     if !f.exists() {
-        return SettingsStore::default();
+        return Settings::default();
     }
     let s = fs::read_to_string(&f).unwrap_or_default();
-    // 先读成 Value 再分格式：老 `settings.json` 是扁平的（没有 `regions` 键），
-    // 新版本写的是「global + regions」嵌套表。判据只看结构，不看内容 ——
+    // 先读成 Value 再分格式：判据只看结构（有没有 `regions` 键），不看内容 ——
     // 内容判据（比如「有没有 notify 键」）会随字段增删悄悄失效。
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return SettingsStore::default();
+        return Settings::default();
     };
-    let mut store = if value.get("regions").is_some() {
-        serde_json::from_value::<SettingsStore>(value).unwrap_or_default()
+    let mut out = if value.get("regions").is_some() {
+        let mut slice = value
+            .get("regions")
+            .and_then(|r| r.get("cn"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(obj), Some(g)) = (
+            slice.as_object_mut(),
+            value.get("global").and_then(|g| g.as_object()),
+        ) {
+            for (k, v) in g {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(slice).unwrap_or_default()
     } else {
-        SettingsStore::from_legacy(serde_json::from_value::<Settings>(value).unwrap_or_default())
+        serde_json::from_value(value).unwrap_or_default()
     };
-    for slice in store.regions.values_mut() {
-        migrate_settings(slice);
-    }
-    store
+    migrate_settings(&mut out);
+    out
 }
 
 /// 把历史遗留的配置值挪到当前正确的取值。
@@ -858,7 +674,6 @@ fn load_store(dir: &Path) -> SettingsStore {
 fn migrate_settings(s: &mut Settings) {
     // 1) 原先这里有一条「把 CodeBuddy 的上游域名改成 Qoder 的」迁移 —— 随
     //    `default_base_url` 字段本身一起删掉了（字段没了，迁移就无从谈起）。
-    //    新增的 `takeover_region` 由 serde 默认成国际版，不需要迁移。
 
     // 2) 定时签到时刻：只迁那一个确切的历史默认值。`09:07` 在 Qoder 上落在
     //    活动刷新（10:00 UTC+8）之前的夹缝里，每天都领不到（理由见
@@ -869,38 +684,10 @@ fn migrate_settings(s: &mut Settings) {
     }
 }
 
-/// 写设置 —— **读-改-写**：只替换当前区域的切片与全局项，另一个区域的原样保留。
-///
-/// 视图来自 [`load_settings`]，它带的就是「当前区域 + 全局」这一套，
-/// 所以「保存一次界面改动」不会把另一区域的定时时刻 / 接管端口盖掉 ——
-/// 这是按区域存储之后最容易犯、也最难被发现的错误（写路径只有一条，读路径有五条）。
+/// 写设置（扁平格式整体落盘）。
 pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
-    let mut store = load_store(dir);
-    store.global = GlobalSettings::of(settings);
-    store.takeover_region = settings.takeover_region;
-    store
-        .regions
-        .insert(settings.takeover_region, settings.clone());
-    write_store(dir, &store)
-}
-
-fn write_store(dir: &Path, store: &SettingsStore) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    write_atomic(&settings_file(dir), &serde_json::to_string_pretty(store)?)
-}
-
-/// 切换「当前区域」—— 左下角区域选择器改的就是这一个指针。
-///
-/// 为什么必须单独成一条路而不能用 [`save_settings`] 代劳：视图带着**离开区域**的
-/// 全部取值，把它整个存进「进入区域」的切片，等于每次切换都把对方刚才的设置盖掉 ——
-/// 症状是「在 A 关了简报切到 B，B 的简报也关了」。切区域不动任何切片才成立。
-pub fn set_region(dir: &Path, region: Region) -> std::io::Result<()> {
-    let mut store = load_store(dir);
-    if store.takeover_region == region {
-        return Ok(());
-    }
-    store.takeover_region = region;
-    write_store(dir, &store)
+    write_atomic(&settings_file(dir), &serde_json::to_string_pretty(settings)?)
 }
 
 /// 把账号/设置文件权限设为 0600（仅当前用户可读写）。
@@ -930,7 +717,6 @@ mod tests {
     fn a_view_with_credits() -> AccountView {
         AccountView {
             account: Account {
-                region: Region::Global,
                 id: "a1".into(),
                 name: "主号".into(),
                 phone: Some("190****9775".into()),
@@ -1002,8 +788,7 @@ mod tests {
     }
 
     /// 升级路径：老 `settings.json` 里那个 `default_base_url` 键**必须还能读出来**
-    /// —— 字段已经删了，读到时直接忽略；新字段 `takeover_region` 落成历史缺省国际版
-    /// （老文件默认是国际版账号库，见字段上的注释）。
+    /// —— 字段已经删了，读到时直接忽略。
     ///
     /// 这条断言钉的是「删字段不会让整份配置报废」：serde 默认容忍未知键，
     /// 但哪天给 `Settings` 加上 `deny_unknown_fields`，老用户的配置就会**整份回退成默认值**
@@ -1014,7 +799,6 @@ mod tests {
         let s: Settings = serde_json::from_str(old).expect("多出未知键不该让整份配置报废");
         assert!(s.auto_checkin_on_start);
         assert_eq!(s.schedule_time, "08:30", "同一份配置里的其它值必须保留");
-        assert_eq!(s.takeover_region, Region::Global, "新增字段缺省 = 国际版");
     }
 
     /// 迁移：`09:07` 是 CodeBuddy 时代的默认定时签到时刻，在 Qoder 上**落在活动刷新
@@ -1048,7 +832,6 @@ mod tests {
         let old = r#"{"default_base_url":"https://x","auto_checkin_on_start":true}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert!(s.auto_checkin_on_start);
-        assert_eq!(s.takeover_region, Region::Global, "接管目标区域缺省 = 国际版");
         assert!(!s.schedule_enabled);
         // 默认时刻对齐活动刷新点（10:00 UTC+8），不是 CodeBuddy 时代的 09:07
         assert_eq!(s.schedule_time, "10:00");
@@ -1103,7 +886,7 @@ mod tests {
         assert!(s.billing_account_ids.is_empty());
     }
 
-    // ── 按区域存储（global + regions 落盘格式）────────────────────────────
+    // ── settings.json 的升级路径（嵌套表 → 扁平）────────────────────────────
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1119,126 +902,58 @@ mod tests {
         serde_json::from_str(&s).unwrap()
     }
 
-    /// 升级路径：老版扁平 `settings.json`（没有 `regions` 键）必须被拆成
-    /// 「global + 两个区域切片」，而**当前区域读出来的值一个都不许变**。
-    ///
-    /// 接管拓扑（`proxy_enabled`）只跟被证实装了接管的那一侧 —— 复制给另一侧
-    /// 会得到「切过去界面显示开着、反代却没跑」的幽灵状态（理由见
-    /// [`SettingsStore::from_legacy`]）。
+    /// 升级路径：区域化年代落盘的嵌套表（`global` + `regions`）必须被读成国内版
+    /// 的扁平设置 —— 切片值原样、通知项以顶层 `global` 为准（通知是整机行为）。
     #[test]
-    fn legacy_flat_file_expands_into_per_region_slices() {
-        let dir = temp_dir("legacy");
+    fn nested_legacy_file_reads_the_cn_slice_with_global_notify() {
+        let dir = temp_dir("nested");
         fs::write(
             settings_file(&dir),
-            r#"{"schedule_time":"08:30","proxy_enabled":true,"notify_webhook":"https://hook"}"#,
+            r#"{"global":{"notify_enabled":true,"notify_webhook":"https://hook"},"takeover_region":"cn","regions":{"cn":{"schedule_time":"08:30","proxy_enabled":true}}}"#,
         )
         .unwrap();
 
-        // 当前（老文件的历史缺省 = 国际版）：所有值原样
         let s = load_settings(&dir);
-        assert_eq!(s.takeover_region, Region::Global);
-        assert_eq!(s.schedule_time, "08:30");
+        assert_eq!(s.schedule_time, "08:30", "国内版切片的值原样");
         assert!(s.proxy_enabled);
+        assert!(s.notify_enabled, "通知以顶层 global 为准");
         assert_eq!(s.notify_webhook, "https://hook");
 
-        // 切到国内版（走切换这条正路，而不是「带着国际版的视图去保存」）：
-        // 普通偏好跟过来，接管拓扑不跟
-        set_region(&dir, Region::Cn).unwrap();
-        let s = load_settings(&dir);
-        assert_eq!(s.takeover_region, Region::Cn);
-        assert_eq!(s.schedule_time, "08:30", "整机偏好应复制到每个区域");
-        assert!(!s.proxy_enabled, "另一区域不该继承「接管已安装」的假象");
-        assert_eq!(s.notify_webhook, "https://hook", "通知是全局项，跟区域无关");
-
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 保存是**读-改-写**：一次保存只许动当前区域的切片与全局项。
-    /// 这条钉死最隐蔽的回归 ——「在 A 区域改了设置，B 区域被整体覆盖」，
-    /// 而它只在切回去之后才看得见，写路径出问题时没有任何报错。
+    /// 保存只写**扁平**格式：第一次保存就把嵌套老文件整体替换掉，
+    /// 退役键（`takeover_region` / `regions` / 顶层 `global`）不再出现。
     #[test]
-    fn saving_one_region_never_touches_the_other() {
-        let dir = temp_dir("isolate");
-        let mut v = Settings::default();
-        v.takeover_region = Region::Global;
-        v.schedule_time = "08:00".into();
-        v.proxy_enabled = true;
-        save_settings(&dir, &v).unwrap();
-
-        set_region(&dir, Region::Cn).unwrap();
-        let mut v = load_settings(&dir);
-        v.schedule_time = "20:00".into();
-        save_settings(&dir, &v).unwrap();
-
-        // 落盘格式确认：嵌套表，两个区域各有切片，顶层指针指向当前区域
-        let raw = read_raw(&dir);
-        assert_eq!(raw["takeover_region"], "cn", "{raw}");
-        assert_eq!(raw["regions"]["global"]["schedule_time"], "08:00", "{raw}");
-        assert_eq!(raw["regions"]["cn"]["schedule_time"], "20:00", "{raw}");
-
-        // 切回国际版：完好如初（切换与另一区域的保存都不许碰它）
-        set_region(&dir, Region::Global).unwrap();
-        let s = load_settings(&dir);
-        assert_eq!(s.schedule_time, "08:00", "另一区域的保存不许盖掉这里的定时时刻");
-        assert!(s.proxy_enabled);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 通知项的**唯一可信来源是 global**：即使某区域切片里残留了过时的 `notify_*`
-    /// 副本（它们是序列化时顺带写下的），拼视图时也必须被 global 覆盖。
-    #[test]
-    fn notify_fields_always_come_from_the_global_half() {
-        let dir = temp_dir("notify");
-        let mut v = Settings::default();
-        v.takeover_region = Region::Cn;
-        v.notify_webhook = "https://only-global".into();
-        save_settings(&dir, &v).unwrap();
-
-        // 篡改 cn 切片里的冗余副本 —— 视图必须无视它
-        let mut raw = read_raw(&dir);
-        raw["regions"]["cn"]["notify_webhook"] = serde_json::json!("https://stale-copy");
-        fs::write(settings_file(&dir), serde_json::to_string(&raw).unwrap()).unwrap();
-
-        let s = load_settings(&dir);
-        assert_eq!(s.notify_webhook, "https://only-global", "切片里的通知副本只是冗余，不许生效");
-
-        // 反向同样成立：在 cn 视图里改 webhook，切回 global 后拿到的也是新值
-        let mut v = s;
-        v.notify_webhook = "https://updated".into();
-        save_settings(&dir, &v).unwrap();
-        v.takeover_region = Region::Global;
-        save_settings(&dir, &v).unwrap();
-        assert_eq!(load_settings(&dir).notify_webhook, "https://updated");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 遗留值迁移（`09:07` → `10:00`）现在按**切片逐个**跑：两个区域可能都带着
-    /// 老默认值落过盘，只修当前区域会把坏的定时留在另一侧，切过去照样每天领不到。
-    #[test]
-    fn legacy_schedule_time_is_migrated_in_every_slice() {
-        let dir = temp_dir("migrate");
+    fn save_writes_the_flat_format_and_retires_the_nested_one() {
+        let dir = temp_dir("flat");
         fs::write(
             settings_file(&dir),
-            r#"{"takeover_region":"global","regions":{"global":{"schedule_time":"09:07"},"cn":{"schedule_time":"09:07"}}}"#,
+            r#"{"global":{"notify_enabled":true},"takeover_region":"cn","regions":{"cn":{"schedule_time":"08:30"}}}"#,
         )
         .unwrap();
-        assert_eq!(load_settings(&dir).schedule_time, "10:00");
 
-        let mut v = load_settings(&dir);
-        v.takeover_region = Region::Cn;
-        save_settings(&dir, &v).unwrap();
-        // ⚠️ 这里必须重新 load 而不是看内存里的 v：另一侧的修正在盘上
-        assert_eq!(load_settings(&dir).schedule_time, "10:00", "另一区域的遗留值也要被修掉");
+        let s = load_settings(&dir);
+        save_settings(&dir, &s).unwrap();
+
+        let raw = read_raw(&dir);
+        assert_eq!(raw["schedule_time"], "08:30", "{raw}");
+        assert!(raw["notify_enabled"].as_bool().unwrap(), "{raw}");
+        assert!(raw.get("regions").is_none(), "嵌套表必须整体退役：{raw}");
+        assert!(raw.get("takeover_region").is_none(), "{raw}");
+        assert!(raw.get("global").is_none(), "{raw}");
+        // 读回一致
+        let s2 = load_settings(&dir);
+        assert_eq!(s2.schedule_time, "08:30");
+        assert!(s2.notify_enabled);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 没有 `regions` 里对应条目（老数据 + 新区域的组合、或手工删过）不能炸，
-    /// 也不能把当前区域整体兜成默认值——全局项仍要生效。
+    /// 嵌套表里没有 `cn` 切片（老数据 + 从没配过国内版）不能炸：
+    /// 切片按默认值兜底，但顶层 `global` 的通知项仍要生效。
     #[test]
-    fn missing_region_slice_falls_back_to_defaults_but_keeps_globals() {
+    fn missing_cn_slice_falls_back_to_defaults_but_keeps_globals() {
         let dir = temp_dir("missing");
         fs::write(
             settings_file(&dir),
@@ -1246,24 +961,60 @@ mod tests {
         )
         .unwrap();
         let s = load_settings(&dir);
-        assert_eq!(s.takeover_region, Region::Cn);
-        assert_eq!(s.schedule_time, "10:00", "缺切片 = 该区域从没配过，用默认值");
+        assert_eq!(s.schedule_time, "10:00", "缺切片 = 国内版从没配过，用默认值");
         assert_eq!(s.notify_webhook, "https://g");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── 重复条目自愈（2026-09-19 的「凭空多一个国际版账号」）────────────────
+    /// 遗留值迁移（`09:07` → `10:00`）对嵌套老文件同样要跑 —— 迁移发生在
+    /// 格式收敛之后，两条升级路径（嵌套 / 扁平）最后过的是同一道闸。
+    #[test]
+    fn legacy_schedule_time_is_migrated_on_the_nested_file() {
+        let dir = temp_dir("migrate");
+        fs::write(
+            settings_file(&dir),
+            r#"{"takeover_region":"cn","regions":{"cn":{"schedule_time":"09:07"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_settings(&dir).schedule_time, "10:00");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-    fn mk(
-        id: &str,
-        region: Region,
-        name: &str,
-        phone: Option<&str>,
-        token: &str,
-    ) -> Account {
+    // ── 国际版账号的清退（加载时丢弃，不迁移）────────────────────────────
+
+    /// 国际版支持已整体移除：`region:"global"` 的条目在**读**的时候丢弃；
+    /// 没有 `region` 字段的条目（新格式保存的、或更老版本的）视为国内版照常读入
+    /// —— 不这样「清洗后保存」的文件第二轮就读成空了。
+    #[test]
+    fn global_accounts_are_dropped_at_load_and_regionless_rows_survive() {
+        let dir = temp_dir("drop-global");
+        fs::write(
+            accounts_file(&dir),
+            r#"[
+                {"id":"g1","name":"国际版","phone":null,"token":"tg","region":"global","refresh_token":"rt-tg"},
+                {"id":"c1","name":"国内版","phone":"191","token":"tc","region":"cn","refresh_token":"rt-tc"},
+                {"id":"old","name":"更老的条目","phone":null,"token":"to","refresh_token":"rt-to"}
+            ]"#,
+        )
+        .unwrap();
+
+        let back = load_accounts(&dir);
+        let ids: Vec<&str> = back.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "old"], "{back:?}");
+
+        // 往返：清洗后保存（新格式没有 region 字段）→ 再读不丢
+        save_accounts(&dir, &back).unwrap();
+        let again = load_accounts(&dir);
+        assert_eq!(again.len(), 2, "保存后的文件必须原样读回：{again:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── 重复条目自愈（2026-09-19 的「凭空多一个账号」）────────────────────
+
+    fn mk(id: &str, name: &str, phone: Option<&str>, token: &str) -> Account {
         Account {
             id: id.into(),
-            region,
             name: name.into(),
             phone: phone.map(str::to_string),
             email: None,
@@ -1281,10 +1032,10 @@ mod tests {
     }
 
     /// 幽灵条目的原型：池里的旧 key 认不出本机账号时 `account_from_item` 收养出来的那条
-    /// —— 同一份 token、区域被服务端兜成国际版、没有手机号、从没签过到。
+    /// —— 同一份 token、没有手机号、从没签过到。
     #[test]
     fn a_ghost_row_with_the_same_token_is_absorbed() {
-        let mut real = mk("real", Region::Cn, "nick0494015252", Some("19174256652"), "dt-abc");
+        let mut real = mk("real", "nick0494015252", Some("19174256652"), "dt-abc");
         real.last = Some(CheckinRecord {
             success: true,
             already: false,
@@ -1297,11 +1048,10 @@ mod tests {
             at: "2026-09-19 13:16:32".into(),
         });
         real.checked_today = Some(true);
-        let ghost = mk("ghost", Region::Global, "nick0494015252", None, "dt-abc");
+        let ghost = mk("ghost", "nick0494015252", None, "dt-abc");
 
         let out = dedupe_by_credential(vec![real.clone(), ghost.clone()]);
         assert_eq!(out.len(), 1, "同一份凭证只能留一条记录");
-        assert_eq!(out[0].region, Region::Cn, "保留区域标签被签到证实过的那条");
         assert_eq!(out[0].id, "real", "id 必须留在原账号上（积分台账按 id 挂账）");
         assert_eq!(out[0].phone.as_deref(), Some("19174256652"));
 
@@ -1311,17 +1061,17 @@ mod tests {
         assert_eq!(out[0].id, "real");
     }
 
-    /// 国际版的「谁更全」要看**邮箱**：那是它那套部署的身份标识。
+    /// 「谁更全」里的身份标识分要看**邮箱**：手机号为空时它是唯一的身份标识。
     ///
     /// 幽灵条目从池子里收养出来时没有邮箱（`PoolItem` 里就没有这个字段），
     /// 而真实账号有 —— 若邮箱不计分，两条会打平、按「谁在前」决胜，
     /// 幽灵留在原地就把台账挂账的 id 换掉了。
     #[test]
-    fn global_dedupe_prefers_the_row_with_the_email() {
-        let mut real = mk("real", Region::Global, "nick", None, "dt-abc");
+    fn dedupe_prefers_the_row_with_the_email() {
+        let mut real = mk("real", "nick", None, "dt-abc");
         real.email = Some("user@example.com".into());
         real.checked_today = Some(true);
-        let ghost = mk("ghost", Region::Global, "nick", None, "dt-abc");
+        let ghost = mk("ghost", "nick", None, "dt-abc");
 
         // 幽灵排在前：没有邮箱加分时它会留下
         let out = dedupe_by_credential(vec![ghost.clone(), real.clone()]);
@@ -1338,7 +1088,7 @@ mod tests {
     /// 注意方向：**只补空，绝不覆盖** —— 保留方已有的值一律不动。
     #[test]
     fn absorption_keeps_the_loser_s_unique_fields() {
-        let mut keeper = mk("keep", Region::Global, "", Some("13800000000"), "dt-t");
+        let mut keeper = mk("keep", "", Some("13800000000"), "dt-t");
         // 造出「空」：保留方没有续签信息，被并方那两份正是缺口
         keeper.refresh_token = None;
         keeper.last = Some(CheckinRecord {
@@ -1352,7 +1102,7 @@ mod tests {
             expires_at: None,
             at: "2026-09-19 13:16:32".into(),
         });
-        let mut loser = mk("lose", Region::Global, "昵称", None, "dt-t");
+        let mut loser = mk("lose", "昵称", None, "dt-t");
         loser.refresh_token = Some("rt-new".into());
         loser.rt_expires_at = Some(1_790_898_980_000);
         loser.email = Some("lose@example.com".into());
@@ -1370,7 +1120,7 @@ mod tests {
         );
 
         // 反过来：保留方有值，被并方也有值 → 保留方的值不许被覆盖
-        let mut a = mk("a", Region::Global, "n", Some("138"), "dt-t");
+        let mut a = mk("a", "n", Some("138"), "dt-t");
         a.last = Some(CheckinRecord {
             success: true,
             already: false,
@@ -1382,7 +1132,7 @@ mod tests {
             expires_at: None,
             at: "2026-09-19 13:16:32".into(),
         });
-        let mut b = mk("b", Region::Global, "n", Some("139"), "dt-t");
+        let mut b = mk("b", "n", Some("139"), "dt-t");
         b.refresh_token = Some("rt-别的".into());
         let out = dedupe_by_credential(vec![a, b]);
         assert_eq!(out.len(), 1);
@@ -1390,16 +1140,16 @@ mod tests {
         assert_eq!(out[0].refresh_token.as_deref(), Some("rt-dt-t"));
     }
 
-    /// 不同凭证（两套部署各一份 token）**绝不能**被合成一条；没 token 的也不参与。
+    /// 不同凭证（两条 token）**绝不能**被合成一条；没 token 的也不参与。
     #[test]
     fn distinct_credentials_and_tokenless_rows_are_left_alone() {
-        let a = mk("a", Region::Global, "n1", Some("138"), "dt-global");
-        let b = mk("b", Region::Cn, "n2", Some("138"), "dt-cn");
-        assert_eq!(dedupe_by_credential(vec![a, b]).len(), 2, "同手机号的两套部署是两个账号");
+        let a = mk("a", "n1", Some("138"), "dt-one");
+        let b = mk("b", "n2", Some("138"), "dt-other");
+        assert_eq!(dedupe_by_credential(vec![a, b]).len(), 2, "同手机号的不同凭证是两个账号");
 
-        let mut empty1 = mk("e1", Region::Global, "空1", None, "");
+        let mut empty1 = mk("e1", "空1", None, "");
         empty1.refresh_token = None;
-        let mut empty2 = mk("e2", Region::Global, "空2", None, " ");
+        let mut empty2 = mk("e2", "空2", None, " ");
         empty2.refresh_token = None;
         assert_eq!(dedupe_by_credential(vec![empty1, empty2]).len(), 2, "没有凭证的不参与合并");
     }
@@ -1407,8 +1157,8 @@ mod tests {
     /// 幂等：收敛过的列表再收敛一次，结果与第一次完全相同。
     #[test]
     fn dedupe_is_idempotent() {
-        let real = mk("real", Region::Cn, "n", Some("191"), "dt-t");
-        let ghost = mk("ghost", Region::Global, "n", None, "dt-t");
+        let real = mk("real", "n", Some("191"), "dt-t");
+        let ghost = mk("ghost", "n", None, "dt-t");
         let once = dedupe_by_credential(vec![real, ghost]);
         let twice = dedupe_by_credential(once.clone());
         assert_eq!(once.len(), twice.len());
@@ -1453,7 +1203,7 @@ mod tests {
     #[test]
     fn save_accounts_roundtrips_and_propagates_a_failed_write() {
         let dir = temp_dir("save_accounts");
-        let a = mk("a", Region::Global, "主号", Some("138"), "dt");
+        let a = mk("a", "主号", Some("138"), "dt");
         save_accounts(&dir, &[a.clone()]).expect("落盘应该成功");
 
         let back = load_accounts(&dir);

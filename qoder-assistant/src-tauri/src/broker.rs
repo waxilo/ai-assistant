@@ -8,15 +8,11 @@
 //!
 //! 所以这里做的事不是「同步凭证」，而是**保证同一时刻只有一台机器在续签**。
 //!
-//! ## 粒度是「一整池」，且**每个区域各绑一池**
+//! ## 粒度是「一整池」
 //!
 //! 一池一个 uuid，闸也按池给。上传 = 新建一池并把本机账号放进去；绑定 = 把别处的 uuid
 //! 抄过来。**解绑只摘本机绑定，云端那一池不动**，其他机器不受影响；本机与云端重复的
 //! 凭证会从本机移除，只留本机独有的。
-//!
-//! 国际版、国内版的账号是两套部署的两份凭证，续签链也各是各的 —— 所以**绑池这件事
-//! 本身就按区域分开**：上传 / 绑定 / 解绑 / 整池同步都只作用于指定的那个区域，
-//! 一个区域绑了不影响另一个区域继续单机续签。
 //!
 //! 上传**只在未绑定时可用**：服务端建池永远是新建，不会覆盖，所以「已绑定再上传」会在
 //! 云端留下第二池 —— 本机切到新池、旧池原地不删，两台机器于是各持一把闸，正是
@@ -36,14 +32,23 @@
 //!
 //! 抢闸带回的池内容**必须**用它去签：本地那份 refresh token 可能早就被别的机器换掉了。
 //!
-//! ## 落盘只有「区域 → uuid」
+//! ## 落盘只有「池 uuid」
 //!
 //! 版本号、上次同步时刻、上次错误都是**运行时**才知道的东西，写进文件只会多一份可能与云端
-//! 对不上的副本。`broker.json` 里只有每个区域的池 uuid —— 有它就等于那个区域绑定了。
-//! 旧版的单一 `pool_uuid` 读进来归到国际版名下（那会儿只有国际版），保存时不再写出。
+//! 对不上的副本。`broker.json` 里只有一串池 uuid —— 有它就等于绑定了。
+//! 旧版的「区域 → uuid」表（`pools`）读进来只认国内版那条；国际版支持 2026-10-16 已整体
+//! 移除，国际版那一池的 uuid、以及更早的单一 `pool_uuid`（那是国际版年代的）都直接丢弃。
+//!
+//! ## 池条目的 key 仍带 `cn:` 前缀
+//!
+//! 跨机身份锚点形如 `cn:138`。前缀是区域化年代引入的，移除国际版后它已经没有区分作用，
+//! 但**不能摘**：云端存量条目全带着它，摘掉等于给每条账号换一个 key —— 所有机器会把
+//! 同一份凭证当成新账号再存一份（2026-09-19 重复账号事故的翻版）。相反，**没有前缀的
+//! 条目**（裸 key，国际版年代的形态）与 `global:` 前缀的条目一概不采纳、不回写：
+//! 它们是另一套部署的凭证，收养了会在本机凭空长出打不通的账号（过滤在
+//! [`merge_into`] / [`union_pool`] 两个边界上做）。
 
 use crate::accounts::{self, Account};
-use crate::region::Region;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -66,32 +71,40 @@ pub const SYNC_TTL_MS: i64 = 120_000;
 
 const BROKER_FILE: &str = "broker.json";
 
+/// 跨机身份锚点的 key 前缀。见模块头「池条目的 key 仍带 `cn:` 前缀」。
+const KEY_PREFIX: &str = "cn:";
+
 // ── 状态 ──────────────────────────────────────────────────────────────────
 
-/// 落盘配置。**每个区域各一条 uuid** —— 见模块头「落盘只有 uuid 一项」。
+/// 落盘配置。只有池 uuid 一项 —— 见模块头「落盘只有『池 uuid』」。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct BrokerConfig {
-    /// 区域 → 该区域绑定的池 uuid；缺席 = 那个区域未绑定。
-    pub pools: HashMap<Region, String>,
-    /// 旧版的单一 uuid（那时只有一池、且只有国际版）。读入后归到国际版名下，
-    /// 新格式保存时不再写出。
+    /// 绑定的池 uuid；缺席 = 未绑定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// 旧版「区域 → uuid」表：只读不写，`normalized` 里只认国内版那条。
+    #[serde(rename = "pools", skip_serializing)]
+    legacy_pools: HashMap<String, String>,
+    /// 旧版的单一 uuid（国际版年代）：只读不写，`normalized` 里直接丢。
     #[serde(rename = "pool_uuid", skip_serializing)]
     legacy_pool_uuid: Option<String>,
 }
 
 impl BrokerConfig {
-    /// 旧版单池 → 国际版名下（用户确认现存那一池就是国际版的）。
-    /// 用 `or_insert`：新格式里国际版已经有自己的池时，以新格式为准。
+    /// 旧格式收敛成新格式：国际版年代的单一 `pool_uuid` 直接丢；「区域 → uuid」表里
+    /// 只继承国内版那条（国际版那一池随国际版支持一起废弃）。新格式已有值时以新格式为准。
     fn normalized(mut self) -> Self {
-        if let Some(u) = self.legacy_pool_uuid.take() {
-            self.pools.entry(Region::Global).or_insert(u);
+        self.legacy_pool_uuid = None;
+        if self.pool.is_none() {
+            self.pool = self.legacy_pools.remove("cn");
         }
+        self.legacy_pools = HashMap::new();
         self
     }
 }
 
-/// 只存在于内存的运行时状态（进程重启就重来，不影响正确性）。**一池一份**。
+/// 只存在于内存的运行时状态（进程重启就重来，不影响正确性）。
 #[derive(Default, Clone)]
 struct Runtime {
     /// 上次「真的问过管家」的时刻，用于节流
@@ -109,8 +122,7 @@ struct Runtime {
 struct State {
     dir: PathBuf,
     cfg: BrokerConfig,
-    /// 每个区域各自的运行时状态；没绑过的区域根本不会有条目
-    rt: HashMap<Region, Runtime>,
+    rt: Runtime,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -122,7 +134,7 @@ pub fn init(dir: &Path) {
         Mutex::new(State {
             dir: dir.to_path_buf(),
             cfg,
-            rt: HashMap::new(),
+            rt: Runtime::default(),
         })
     });
 }
@@ -136,7 +148,7 @@ fn load_config(dir: &Path) -> BrokerConfig {
         .normalized()
 }
 
-/// 把绑定关系（各区域的 uuid）落盘。
+/// 把绑定关系（池 uuid）落盘。
 ///
 /// ⚠️ 三个决定都反直觉，改动这块前请先读完：
 /// 1. **序列化失败要报错，不能写 `{}`**。旧的 `unwrap_or_else(|_| "{}")` 看着像兜底，
@@ -151,16 +163,13 @@ fn save_config(dir: &Path, cfg: &BrokerConfig) -> std::io::Result<()> {
     crate::accounts::write_atomic(&dir.join(BROKER_FILE), &text)
 }
 
-/// 读某区域的一份快照（uuid + 运行时状态），**不持锁跨 await**。
-fn snapshot_in(region: Region) -> (Option<String>, Runtime) {
+/// 读一份快照（uuid + 运行时状态），**不持锁跨 await**。
+fn snapshot() -> (Option<String>, Runtime) {
     let Some(lock) = STATE.get() else {
         return (None, Runtime::default());
     };
     match lock.lock() {
-        Ok(s) => (
-            s.cfg.pools.get(&region).cloned(),
-            s.rt.get(&region).cloned().unwrap_or_default(),
-        ),
+        Ok(s) => (s.cfg.pool.clone(), s.rt.clone()),
         Err(_) => (None, Runtime::default()),
     }
 }
@@ -182,33 +191,26 @@ fn mutate<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     }
 }
 
-/// 这台机器在**这个区域**绑定到某一池了吗？续签路径按账号自己的区域分岔
-/// （见 `commands::ensure_fresh_token`）：一个区域绑了池，另一个区域照常本地续签。
-pub fn bound_in(region: Region) -> bool {
-    snapshot_in(region).0.is_some()
+/// 这台机器绑定到某一池了吗？续签路径按它分岔（见 `commands::ensure_fresh_token`）：
+/// 绑了池就整池续签，没绑就各账号单机续签。
+pub fn bound() -> bool {
+    snapshot().0.is_some()
 }
 
-fn uuid_of(region: Region) -> Option<String> {
-    snapshot_in(region).0
+fn uuid() -> Option<String> {
+    snapshot().0
 }
 
-/// 记录 / 清除某区域的绑定，并**当场落盘**，返回落盘结果。
+/// 记录 / 清除绑定，并**当场落盘**，返回落盘结果。
 ///
 /// 为什么返回值不能丢（修 4）：绑定只写进内存的话，本次运行看起来一切正常 ——
 /// 续签走池、界面显示「已绑定」，可应用一重启 `load_config` 读回默认值，本机安静地
 /// 退回单机运行。此时云端那把闸仍认为这台机器绑着，于是另一台机器永远签不动，
 /// 而本机又开始单机轮换那些一次性 refresh token。旧写法 `let _ = save_config(..)`
 /// 把这条链路唯一的通知机会吞掉了。调用方负责把它说给用户听。
-fn set_uuid(region: Region, uuid: Option<String>) -> Result<(), String> {
+fn set_uuid(uuid: Option<String>) -> Result<(), String> {
     let written = mutate(|s| {
-        match uuid {
-            Some(u) => {
-                s.cfg.pools.insert(region, u);
-            }
-            None => {
-                s.cfg.pools.remove(&region);
-            }
-        }
+        s.cfg.pool = uuid;
         save_config(&s.dir, &s.cfg)
     });
     match written {
@@ -222,47 +224,43 @@ fn set_uuid(region: Region, uuid: Option<String>) -> Result<(), String> {
     }
 }
 
-fn note_start(region: Region) {
-    mutate(|s| s.rt.entry(region).or_default().syncing = true);
+fn note_start() {
+    mutate(|s| s.rt.syncing = true);
 }
 
-fn note_ok(region: Region, version: Option<i64>) {
+fn note_ok(version: Option<i64>) {
     mutate(|s| {
-        let rt = s.rt.entry(region).or_default();
-        rt.syncing = false;
-        rt.error = None;
+        s.rt.syncing = false;
+        s.rt.error = None;
         if let Some(v) = version {
-            rt.version = Some(v);
+            s.rt.version = Some(v);
         }
         let now = chrono::Utc::now().timestamp_millis();
-        rt.last_sync_ms = now;
-        rt.last_ok_ms = now;
+        s.rt.last_sync_ms = now;
+        s.rt.last_ok_ms = now;
     });
 }
 
-fn note_touched(region: Region) {
+fn note_touched() {
     // 被闸拒 / 被节流：也算「问过了」，否则热路径会每一跳都再打一次接口
     mutate(|s| {
-        let rt = s.rt.entry(region).or_default();
-        rt.syncing = false;
-        rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
+        s.rt.syncing = false;
+        s.rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
     });
 }
 
-fn note_error(region: Region, message: impl Into<String>) {
+fn note_error(message: impl Into<String>) {
     let msg = message.into();
     mutate(|s| {
-        let rt = s.rt.entry(region).or_default();
-        rt.syncing = false;
-        rt.error = Some(msg);
-        rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
+        s.rt.syncing = false;
+        s.rt.error = Some(msg);
+        s.rt.last_sync_ms = chrono::Utc::now().timestamp_millis();
     });
 }
 
 // ── 发给前端的形状 ────────────────────────────────────────────────────────
 
-/// `inline`：某个区域那池的绑定状态。前端只读它，改配置一律走 upload / link / unbind
-/// 三个动作（都作用于当前区域）。
+/// `inline`：绑定状态。前端只读它，改配置一律走 upload / link / unbind 三个动作。
 #[derive(Serialize, Clone, Debug)]
 pub struct BrokerStatus {
     pub bound: bool,
@@ -274,8 +272,8 @@ pub struct BrokerStatus {
     pub syncing: bool,
 }
 
-pub fn status(region: Region) -> BrokerStatus {
-    let (uuid, rt) = snapshot_in(region);
+pub fn status() -> BrokerStatus {
+    let (uuid, rt) = snapshot();
     BrokerStatus {
         bound: uuid.is_some(),
         uuid,
@@ -319,22 +317,19 @@ pub struct SyncReport {
 
 /// 池里的一条账号凭证。字段名与 `Account` **故意不同**（`access_token` vs `token`）：
 /// 这一层是跨机器的数据契约，不该随本地落盘模型改名而变。
+///
+/// 这里曾有 `region` 字段（条目属于哪套部署）：国际版移除后它失去意义，**从结构上删掉**。
+/// 云端存量条目带着这个键，serde 读入时直接忽略；新条目不再写出它。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct PoolItem {
-    /// **这条凭证属于哪套部署**。跨机器搬运时区域必须跟着走：两套部署可以有
-    /// 同一个手机号的两个不同账号，只靠手机号认人会把它们合成一个。
-    /// 老云端数据没有这个字段 → `#[serde(default)]` 落成国际版（那时只有国际版）。
-    #[serde(default)]
-    pub region: Region,
-    /// 跨机身份锚点（手机号 → 昵称 → 本地 id）
+    /// 跨机身份锚点（`cn:` 前缀 + 手机号 → 昵称 → 本地 id）
     pub key: String,
     pub name: String,
     pub phone: String,
-    /// **展示用的身份标识**（国际版首选邮箱、国内版首选手机号），纯携带：
-    /// 和 `phone` 一样**不进 key、不参与认人**（锚点见 [`item_key_of`]）。
-    /// 有了它，别的机器收养这条账号时当场就显示得出邮箱，不必自己再打一次
-    /// `/api/v1/userinfo`。老云端数据没有这个字段 → `#[serde(default)]` 落成空串。
+    /// **展示用的身份标识**，纯携带：和 `phone` 一样**不进 key、不参与认人**
+    /// （锚点见 [`item_key_of`]）。有了它，别的机器收养这条账号时当场就显示得出邮箱，
+    /// 不必自己再打一次 `/api/v1/userinfo`。老云端数据没有这个字段 → 落成空串。
     pub email: String,
     pub access_token: String,
     pub refresh_token: String,
@@ -343,24 +338,15 @@ pub struct PoolItem {
     pub updated_at: Option<i64>,
 }
 
-/// 池里那条 key 的**区域前缀**（`global:` / `cn:`）。
-fn region_prefix(region: Region) -> String {
-    format!("{}:", region.key())
-}
-
-/// 跨机认人的锚点：**区域 + （手机号 → 昵称 → 本地 id）**。
+/// 跨机认人的锚点：**`cn:` 前缀 +（手机号 → 昵称 → 本地 id）**。
 ///
-/// 身份那三段的选择理由不变：手机号最稳（token 会轮换、昵称会改、本地 id 每台机器
+/// 身份那三段的选择理由：手机号最稳（token 会轮换、昵称会改、本地 id 每台机器
 /// 都不一样），所以排第一。
-///
-/// 区域必须进 key：同一个手机号在两套部署里是**两个不同的账号**，只用手机号做 key
-/// 会让它们互相覆盖 —— 云端先写进去的那条被后上传的挤掉，表现是「国内版账号刚同步
-/// 上去就没了」，而两台机器都各自觉得自己是对的。
 pub fn item_key_of(account: &Account) -> String {
-    format!("{}{}", region_prefix(account.region), item_identity_of(account))
+    format!("{KEY_PREFIX}{}", item_identity_of(account))
 }
 
-/// key 里「人」的那一段（不含区域前缀）。
+/// key 里「人」的那一段（不含前缀）。
 fn item_identity_of(account: &Account) -> String {
     if let Some(p) = account.phone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return p.to_string();
@@ -371,51 +357,23 @@ fn item_identity_of(account: &Account) -> String {
     account.id.clone()
 }
 
-/// key 里带的区域前缀（`global:` / `cn:`），没有就 None。
-fn region_from_key(key: &str) -> Option<Region> {
-    let k = key.trim();
-    Region::ALL
-        .iter()
-        .copied()
-        .find(|r| k.starts_with(&region_prefix(*r)))
-}
-
-/// **这一条池条目属于哪套部署** —— 客户端认区域时的唯一入口。
+/// 这条 key 是本应用认的形态吗（[`KEY_PREFIX`] 前缀）？
 ///
-/// 顺序是「key 的 `xx:` 前缀 → `region` 字段」，与直觉相反但必须如此：
-/// 2026-09-19 之前服务端的 `normalizeItem` 根本不返回 `region`，池里所有条目的区域
-/// 都是空的（被 `#[serde(default)]` 兜成国际版）。前缀是上传方写进身份串里的，
-/// **老数据里唯一还活着的区域信息就是它**；服务端修好之后两者一致，也不冲突。
-/// 详见 `broker::merge_into` 上面那段「身份锚点」的说明。
-pub fn item_region(item: &PoolItem) -> Region {
-    region_from_key(&item.key).unwrap_or(item.region)
+/// 裸 key（国际版年代）与 `global:` 前缀（国际版条目）都**不是** —— 采纳它们等于
+/// 在本机凭空长出另一套部署的账号。merge_into / union_pool 两个边界都靠它过滤。
+fn key_is_cn(key: &str) -> bool {
+    key.trim().starts_with(KEY_PREFIX)
 }
 
-/// 把来自云端的 key 归一化成**当前格式**（带区域前缀）后再比对。
-///
-/// 老版本写进云端的 key 是裸身份（那时只有国际版），统一补上 `global:` ——
-/// 不补的话，同一条账号会被当成新账号再存一份，界面上直接变成两个。
-pub fn normalize_pool_key(key: &str) -> String {
-    let k = key.trim();
-    if region_from_key(k).is_some() {
-        return k.to_string();
-    }
-    format!("{}{}", region_prefix(Region::Global), k)
-}
-
-/// 去掉区域前缀，取回「人」那一段 —— 给「池里没带名字时用 key 生成账号名」用。
-/// 直接用整条 key 会生成 `账号-global` 这种把区域也当成人名的名字。
+/// 去掉前缀，取回「人」那一段 —— 给「池里没带名字时用 key 生成账号名」用。
+/// 直接用整条 key 会生成 `账号-cn:` 这种把前缀也当成人名的名字。
 fn key_identity(key: &str) -> &str {
     let k = key.trim();
-    Region::ALL
-        .iter()
-        .find_map(|r| k.strip_prefix(&region_prefix(*r)))
-        .unwrap_or(k)
+    k.strip_prefix(KEY_PREFIX).unwrap_or(k)
 }
 
 pub fn to_item(account: &Account) -> PoolItem {
     PoolItem {
-        region: account.region,
         key: item_key_of(account),
         name: account.name.clone(),
         phone: account.phone.clone().unwrap_or_default(),
@@ -428,11 +386,12 @@ pub fn to_item(account: &Account) -> PoolItem {
     }
 }
 
-/// 池里的一条 → 本机新账号（本地还没有这个 key 时用）
+/// 池里的一条 → 本机新账号（本地还没有这个 key 时用）。
+/// **只对 [`key_is_cn`] 成立的条目调用**：调用方（[`merge_into`]）已过滤。
 pub fn account_from_item(item: &PoolItem) -> Account {
     let name = if item.name.trim().is_empty() {
-        // 名字取自 key 的**身份段**（见 `key_identity`）：整条 key 带了区域前缀，
-        // 直接截前 6 个字符会得到 `账号-global` 这种把人名写成区域的名字。
+        // 名字取自 key 的**身份段**（见 `key_identity`）：整条 key 带了前缀，
+        // 直接截前 6 个字符会得到 `账号-cn:` 这种把前缀当人名的名字。
         format!("账号-{}", &key_identity(&item.key).chars().take(6).collect::<String>())
     } else {
         item.name.clone()
@@ -440,9 +399,6 @@ pub fn account_from_item(item: &PoolItem) -> Account {
     Account {
         id: uuid::Uuid::new_v4().to_string(),
         name,
-        // 区域只认 [`item_region`]：它是「前缀 → 字段」的统一出口，
-        // 直接用 `item.region` 会把老池里的国内版条目全标成国际版。
-        region: item_region(item),
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
         // 池里带着就带上；老条目那条是空串 → `None`，留给刷新时的
         // `fill_identity_if_missing` 就地补回来。
@@ -460,7 +416,7 @@ pub fn account_from_item(item: &PoolItem) -> Account {
     }
 }
 
-/// 池里那一条是否**严格新于**本机这一条 —— [`adopt`] 用的判据（云端 → 本地方向）。
+/// 池里那条是否**严格新于**本机这一条 —— [`adopt`] 用的判据（云端 → 本地方向）。
 ///
 /// 两个方向必须共用同一套新序判据（这里是对称的两条：[`cloud_is_newer`] / [`local_is_newer`]）：
 /// 各写一套就会出现「A 看 B 更新、B 看 A 也更新」，两台机器每轮同步都改一次整池版本、永不收敛。
@@ -568,11 +524,9 @@ pub fn adopt(account: &mut Account, item: &PoolItem) -> bool {
     true
 }
 
-/// 把池里那份并进本机账号：**并集** —— 本地独有的账号一个都不删。
-/// 返回改动的条目数。
 /// 这一条池条目与这个本机账号**是不是同一份凭证**？
 ///
-/// 这是跨机认人的**兜底锚点**，也是唯一不会漂移的那个：key 由「区域 + 人」拼成，
+/// 这是跨机认人的**兜底锚点**，也是唯一不会漂移的那个：key 由「前缀 + 人」拼成，
 /// 而「人」的第一顺位是手机号 —— 手机号是**后来才补上**的（`fill_identity_if_missing`），
 /// 昵称也可能被用户改掉，于是同一个账号的 key 会变；变的那一刻，池里按旧 key
 /// 存着的那条就再也认不出本机账号了。token 不会：它就是这份凭证本身。
@@ -588,17 +542,22 @@ fn same_credential(item: &PoolItem, account: &Account) -> bool {
 
 /// 本机这个账号「认领」这一条池条目吗？—— 合并与并集**共用同一条判据**。
 ///
-/// 两级：① 同区域同人（key 相等，续签后 token 变了也认得出）；② 同一份凭证
+/// 两级：① 同人（key 相等，续签后 token 变了也认得出）；② 同一份凭证
 /// （token 相等，手机号后补导致 key 漂移时靠它兜住）。缺任一级都会漏，
 /// 而漏掉的后果就是**凭空多出一个账号**（2026-09-19 的重复账号事故）。
 fn claims(account: &Account, item: &PoolItem) -> bool {
-    item_key_of(account) == normalize_pool_key(&item.key) || same_credential(item, account)
+    item_key_of(account) == item.key.trim() || same_credential(item, account)
 }
 
+/// 把池里那份并进本机账号：**并集** —— 本地独有的账号一个都不删。
+/// 返回改动的条目数。
+///
+/// **只采纳 `cn:` 前缀的条目**（[`key_is_cn`]）：池是跨机的共享存储，里面可能还残留着
+/// 国际版年代的条目（裸 key / `global:` 前缀），采纳它们会在本机凭空长出打不通的账号。
 pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
     let mut changed = 0;
     for item in items {
-        if item.key.trim().is_empty() {
+        if item.key.trim().is_empty() || !key_is_cn(&item.key) {
             continue;
         }
         let hit = accounts
@@ -619,8 +578,9 @@ pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
     changed
 }
 
-/// 提交给管家的整池内容 = **云端那份 ∪ 本机独有的账号**，外加一条清洗：
-/// **「同一份凭证、却挂着另一个 key」的副本要被丢掉**。
+/// 提交给管家的整池内容 = **云端那份 ∪ 本机独有的账号**，外加两条清洗：
+/// **「同一份凭证、却挂着另一个 key」的副本要被丢掉**；非 `cn:` 前缀的条目也丢掉
+/// （见 [`merge_into`]，两条清洗都会让云端池在几轮同步后自然干净）。
 ///
 /// 上一版只有前半句，于是池里那些副本一条也掉不了：身份锚点漂移（手机号后补、昵称被改）
 /// 会让同一个凭证在池里占上好几格，而每一格都会在别的机器上被当成**新账号收养**一次
@@ -632,13 +592,13 @@ pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
 pub fn union_pool(cloud: &[PoolItem], local: &[Account]) -> Vec<PoolItem> {
     let mut pool: Vec<PoolItem> = cloud
         .iter()
-        .filter(|i| !i.key.trim().is_empty() && !is_drifted_duplicate(i, local))
+        .filter(|i| key_is_cn(&i.key) && !is_drifted_duplicate(i, local))
         .cloned()
         .collect();
     for acct in local {
         let key = item_key_of(acct);
-        // 本机两个账号算出同一个 key（同区域同人）时只提交一条，免得池里出现重复
-        if key.trim().is_empty() || pool.iter().any(|i| normalize_pool_key(&i.key) == key) {
+        // 本机两个账号算出同一个 key（同人）时只提交一条，免得池里出现重复
+        if key.trim().is_empty() || pool.iter().any(|i| i.key.trim() == key) {
             continue;
         }
         pool.push(to_item(acct));
@@ -653,7 +613,7 @@ pub fn union_pool(cloud: &[PoolItem], local: &[Account]) -> Vec<PoolItem> {
 fn is_drifted_duplicate(item: &PoolItem, local: &[Account]) -> bool {
     local
         .iter()
-        .any(|a| item_key_of(a) != normalize_pool_key(&item.key) && same_credential(item, a))
+        .any(|a| item_key_of(a) != item.key.trim() && same_credential(item, a))
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
@@ -777,13 +737,13 @@ struct VersionResp {
     version: i64,
 }
 
-/// 把 `(FailKind, msg)` 变成给用户看的一句话。`Gone` 额外清掉**该区域**的本地 uuid。
-fn on_failure(kind: FailKind, message: String, region: Region) -> String {
+/// 把 `(FailKind, msg)` 变成给用户看的一句话。`Gone` 额外清掉本地 uuid。
+fn on_failure(kind: FailKind, message: String) -> String {
     match kind {
         FailKind::Gone => {
             // 这里连「摘干净」都不保证：落盘失败时磁盘上仍留着那串已经不存在的 uuid，
             // 重启后会再绑一次、再吃一次 Gone。不致命（自愈），但得让人看见。
-            let note = set_uuid(region, None).err().unwrap_or_default();
+            let note = set_uuid(None).err().unwrap_or_default();
             format!(
                 "云端那一池已经不存在了（可能已被清理），本机已退回单机运行，请重新上传或绑定。{note}"
             )
@@ -802,33 +762,22 @@ fn on_failure(kind: FailKind, message: String, region: Region) -> String {
 fn upload_guard(already_bound: bool) -> Result<(), String> {
     if already_bound {
         return Err(
-            "本区域已经绑定了云端凭证池。要重新上传，请先解绑（解绑只摘本机绑定，云端那一池保留）。"
+            "已经绑定了云端凭证池。要重新上传，请先解绑（解绑只摘本机绑定，云端那一池保留）。"
                 .to_string(),
         );
     }
     Ok(())
 }
 
-/// 把本机**这个区域**的账号整体上传：管家颁发一串 uuid 并当场绑定该区域。
-///
-/// 区域由调用方给定（当前选中的区域）：每个区域各绑一池，把另一区域的账号塞进来，
-/// 会在绑定这一池的机器上被收养成「不属于那边日常使用部署」的账号 ——
-/// 同一条过滤在 `sync` 里也有一份。
+/// 把本机的账号整体上传：管家颁发一串 uuid 并当场绑定。
 ///
 /// ⚠️ **已绑定时直接拒绝**（见 [`upload_guard`]）：服务端建池永远是新建、不会覆盖，
 /// 放行一次就会在云端留下第二池，让两台机器各持一把闸。
-pub async fn upload(dir: &Path, region: Region) -> Result<PoolOp, String> {
-    upload_guard(bound_in(region))?;
-    let items: Vec<PoolItem> = accounts::load_accounts(dir)
-        .iter()
-        .filter(|a| a.region == region)
-        .map(to_item)
-        .collect();
+pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
+    upload_guard(bound())?;
+    let items: Vec<PoolItem> = accounts::load_accounts(dir).iter().map(to_item).collect();
     if items.is_empty() {
-        return Err(format!(
-            "本区域（{}）还没有账号，先「登录新账号」或「导入本机账号」",
-            region.label()
-        ));
+        return Err("还没有账号，先「登录新账号」或「导入本机账号」".to_string());
     }
     let v = request(
         reqwest::Method::POST,
@@ -836,39 +785,38 @@ pub async fn upload(dir: &Path, region: Region) -> Result<PoolOp, String> {
         Some(serde_json::json!({ "items": items })),
     )
     .await
-    .map_err(|(k, m)| on_failure(k, m, region))?;
+    .map_err(|(k, m)| on_failure(k, m))?;
     let created: CreateResp = serde_json::from_value(v)
         .map_err(|e| format!("凭证管家返回的建池结果看不懂：{e}"))?;
 
     // 建池已经成功、绑定也写进内存了，所以这里**不失败**（失败就把云端那池退回未绑定？
     // 更糟：云端有池、本机不知道）。但必须把「这份绑定不一定留得住」写进提示 ——
     // 见 [`set_uuid`]：没落盘成功的话，重启后本机安静地退回单机，而云端那把闸还占着。
-    let bind_note = set_uuid(region, Some(created.uuid.clone()))
+    let bind_note = set_uuid(Some(created.uuid.clone()))
         .err()
         .unwrap_or_default();
     mutate(|s| {
-        let rt = s.rt.entry(region).or_default();
-        rt.version = Some(created.version);
-        rt.error = None;
+        s.rt.version = Some(created.version);
+        s.rt.error = None;
     });
-    note_ok(region, Some(created.version));
+    note_ok(Some(created.version));
 
     Ok(PoolOp {
         uuid: created.uuid,
         account_count: items.len(),
         merged: 0,
         message: append_note(
-            format!("已把本机{}的 {} 个账号放上云端", region.label(), items.len()),
+            format!("已把本机的 {} 个账号放上云端", items.len()),
             bind_note,
         ),
     })
 }
 
-/// 绑定别处复制过来的 uuid：先验证这一池真的存在，再并进本地。只作用于指定区域。
+/// 绑定别处复制过来的 uuid：先验证这一池真的存在，再并进本地。
 ///
 /// 先验证是必要的防呆：把一串打不通的 uuid 写进本地配置，之后每次同步都失败，
 /// 而用户以为已经绑好了。
-pub async fn link(dir: &Path, region: Region, raw_uuid: &str) -> Result<PoolOp, String> {
+pub async fn link(dir: &Path, raw_uuid: &str) -> Result<PoolOp, String> {
     let uuid = raw_uuid.trim();
     if uuid.is_empty() {
         return Err("请先粘贴云端凭证池的 uuid".to_string());
@@ -895,14 +843,13 @@ pub async fn link(dir: &Path, region: Region, raw_uuid: &str) -> Result<PoolOp, 
     let version = v.get("version").and_then(|x| x.as_i64());
 
     // 同 `upload`：本次运行确实绑上了，不该谎报失败；但「能不能留住」必须说清楚。
-    let bind_note = set_uuid(region, Some(uuid.to_string()))
+    let bind_note = set_uuid(Some(uuid.to_string()))
         .err()
         .unwrap_or_default();
     mutate(|s| {
-        let rt = s.rt.entry(region).or_default();
-        rt.version = version;
-        rt.error = None;
-        rt.last_sync_ms = 0; // 下一次调用立刻做一轮完整同步
+        s.rt.version = version;
+        s.rt.error = None;
+        s.rt.last_sync_ms = 0; // 下一次调用立刻做一轮完整同步
     });
 
     let mut accounts = accounts::load_accounts(dir);
@@ -911,7 +858,7 @@ pub async fn link(dir: &Path, region: Region, raw_uuid: &str) -> Result<PoolOp, 
 
     // 绑定后立刻整池同步一轮：把「本地独有的账号」也推上云（并集才是这一池的真相）。
     // 失败不影响绑定本身 —— 已经绑上了，下一跳还会再试。
-    let sync_note = match sync(dir, true, region).await {
+    let sync_note = match sync(dir, true).await {
         Ok(r) => r.message,
         Err(e) => format!("已绑定，但首次同步未完成：{e}"),
     };
@@ -935,19 +882,18 @@ fn append_note(main: String, note: String) -> String {
     format!("{main}｜{note}")
 }
 
-/// 解绑指定区域：**只摘掉本地 uuid，云端那一池不动**。
+/// 解绑：**只摘掉本地 uuid，云端那一池不动**。
 ///
 /// 同时把本机与云端重复的账号（token）从本地移除 —— 凭证已托管在云端，本机不再持有副本，
 /// 免得解绑后本机单机续签把云端那条链轮换掉；本机独有的账号（云端没有的）原样保留。
-/// 重复判据是 key（带区域前缀），所以天然只删**这个区域**的重复账号。
 ///
 /// 云端那一池还在时，必须先拿到池内容才知道哪些是重复的：拿不到（网络不可达 / 被拒绝）
 /// 就返回 Err 且**保留本地绑定** —— 静默只摘 uuid，会让本机继续持有一批与云端相同的凭证，
 /// 而用户以为自己已经解绑了。`gone`（池已不存在）例外：云端都没了，本机没有「与云端
 /// 相同」的东西，全部保留、照常解绑。
-pub async fn unbind(region: Region) -> Result<BrokerStatus, String> {
-    let Some(uuid) = uuid_of(region) else {
-        return Ok(status(region));
+pub async fn unbind() -> Result<BrokerStatus, String> {
+    let Some(uuid) = uuid() else {
+        return Ok(status());
     };
     let cloud: Vec<PoolItem> = match request(reqwest::Method::GET, &format!("/v1/pool/{uuid}"), None).await {
         Ok(v) => v
@@ -963,10 +909,10 @@ pub async fn unbind(region: Region) -> Result<BrokerStatus, String> {
     };
     let dir = data_dir().ok_or_else(|| "凭证池状态未初始化".to_string())?;
 
-    // 归一化后再比：云端那份可能是「区域前缀出现之前」写下的裸 key
+    // 本机的 key 恒带 `cn:` 前缀，所以云端那些非 cn 条目天然匹配不上，不会被当成「重复」删掉
     let cloud_keys: HashSet<String> = cloud
         .iter()
-        .map(|i| normalize_pool_key(&i.key))
+        .map(|i| i.key.trim().to_string())
         .filter(|k| !k.is_empty())
         .collect();
     let mut accounts = accounts::load_accounts(&dir);
@@ -980,20 +926,20 @@ pub async fn unbind(region: Region) -> Result<BrokerStatus, String> {
     // 解绑这个动作**只有在落盘之后才算完成**：内存里摘掉 uuid 只影响本次运行，
     // 磁盘上仍留着它的话，重启会重新绑上同一池，并把刚删掉的云端副本再收养回来 ——
     // 用户看到的症状是「解绑没生效」，而界面上那一刻确实显示了解绑。
-    set_uuid(region, None).map_err(|e| {
+    set_uuid(None).map_err(|e| {
         crate::scheduler::log_event(&dir, &format!("凭证池解绑落盘失败：{e}"));
         e
     })?;
     mutate(|s| {
-        s.rt.remove(&region);
+        s.rt = Runtime::default();
     });
-    Ok(status(region))
+    Ok(status())
 }
 
-/// 一轮完整同步（三步握手），只作用于指定区域的池。
+/// 一轮完整同步（三步握手）。
 /// **未绑定、被节流、抢不到闸都是正常返回**，不是错误。
-pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport, String> {
-    let Some(uuid) = uuid_of(region) else {
+pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
+    let Some(uuid) = uuid() else {
         return Ok(SyncReport {
             changed: false,
             deferred: true,
@@ -1002,12 +948,12 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
             failed: 0,
             blocked: 0,
             version: None,
-            message: "本区域未绑定凭证池".to_string(),
+            message: "未绑定凭证池".to_string(),
         });
     };
 
     let now = chrono::Utc::now().timestamp_millis();
-    let (_, rt) = snapshot_in(region);
+    let (_, rt) = snapshot();
     if !force && now - rt.last_sync_ms < SYNC_TTL_MS {
         return Ok(SyncReport {
             changed: false,
@@ -1021,7 +967,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
         });
     }
 
-    note_start(region);
+    note_start();
     let lease_value = match request(
         reqwest::Method::POST,
         &format!("/v1/pool/{uuid}/lease"),
@@ -1031,8 +977,8 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     {
         Ok(v) => v,
         Err((kind, m)) => {
-            let msg = on_failure(kind, m, region);
-            note_error(region, msg.clone());
+            let msg = on_failure(kind, m);
+            note_error(msg.clone());
             return Err(msg);
         }
     };
@@ -1042,7 +988,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     if !lease.granted {
         // 别的机器正在签。**不更新本地凭证**，但记下「问过了」，
         // 否则热路径每一跳都会再打一次接口。
-        note_touched(region);
+        note_touched();
         // 「冷却中」比「闸在别人手里」更需要说清楚：前者意味着整池都在等，
         // 后者下一秒可能就好了
         let cooldown_s = (lease.retry_after - chrono::Utc::now().timestamp_millis()) / 1000;
@@ -1066,37 +1012,24 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
 
     let version = lease.version;
 
-    // ① 池并进本地（并集，本地独有的保留）。只采纳**本区域**的池条目：
-    //    池按区域各绑一个，但老池（或手工绑错）里可能混着别的区域的条目 ——
-    //    采纳它们会在本机凭空长出另一区域的账号。
-    let cloud: Vec<PoolItem> = lease
-        .items
-        .iter()
-        .filter(|i| item_region(i) == region)
-        .cloned()
-        .collect();
+    // ① 池并进本地（并集，本地独有的保留）。[`merge_into`] 只采纳 `cn:` 前缀的条目，
+    //    池里残留的国际版年代条目不会长成本机账号。
     let mut accounts = accounts::load_accounts(dir);
-    let merged = merge_into(&mut accounts, &cloud);
+    let merged = merge_into(&mut accounts, &lease.items);
 
     // ② 本机执行需要做的续签。**只用抢闸带回来的那一份**做判断：
     //    本地那份可能早就被别的机器换掉了。
     //
     //    提交的初值取「云端 ∪ 本机」：`PUT` 是**整池替换**，若从 `lease.items` 起步，
     //    本机独有的账号就永远进不了正文，等于每同步一次都把并集缩回云端那份。
-    //    两侧都只碰**本区域**：续签与提交正文都轮不到另一区域的账号。
-    let local: Vec<Account> = accounts
-        .iter()
-        .filter(|a| a.region == region)
-        .cloned()
-        .collect();
-    let mut pool = union_pool(&cloud, &local);
+    let mut pool = union_pool(&lease.items, &accounts);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
     let mut blocked = 0usize;
     // 告警用的明细：界面上看不到的这一轮（绑池时整池由这里签）失败的人是谁、为什么
     let mut dead_lines: Vec<String> = Vec::new();
     let mut fail_lines: Vec<String> = Vec::new();
-    for acct in accounts.iter_mut().filter(|a| a.region == region) {
+    for acct in accounts.iter_mut() {
         // 「该续」= 进了续签窗口，**或已被上游判死**（吊销票的 expires_at 还在未来，
         // 按窗口判断它永远轮不到续，而续签是它唯一的自救通道）。
         // 冷却中的账号直接算 blocked：退避已随账号落盘，重启也不会失忆。
@@ -1113,7 +1046,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
                 // 把新的凭证写回池里那一份（保持并集：池里别的条目原样带回去）
                 if let Some(slot) = pool
                     .iter_mut()
-                    .find(|i| normalize_pool_key(&i.key) == item_key_of(acct))
+                    .find(|i| i.key.trim() == item_key_of(acct))
                 {
                     *slot = to_item(acct);
                 } else {
@@ -1183,7 +1116,7 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
             Some(serde_json::json!({ "note": note })),
         )
         .await;
-        note_error(region, format!("{note}，已让管家进入冷静期"));
+        note_error(format!("{note}，已让管家进入冷静期"));
         let tail = if blocked > 0 {
             format!("（另有 {blocked} 个是票已失效、重试没用的）")
         } else {
@@ -1206,25 +1139,22 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
     // ④ 本地 → 云端方向：把**本机比池里更新**的票回写进池。上面只回写「本轮续出来的」，
     //    这一步兜住「早就换过新票、但从没被传上去」的 —— 最典型：绑池期间在本机重新登录了一次
     //    （accounts.json 里已是新票，云端还停在旧票，别的机器每轮拿到的都是过期票）。
-    //    同样只碰本区域，判据与云端 → 本地方向对称（[`local_is_newer`]），只有严格更新才回写。
+    //    判据与云端 → 本地方向对称（[`local_is_newer`]），只有严格更新才回写。
     let mut uploaded = 0usize;
-    for acct in accounts.iter().filter(|a| a.region == region) {
+    for acct in accounts.iter() {
         // **已被上游判死的票绝不回写**（见 [`write_back_allowed`]）
         if !write_back_allowed(acct) {
             continue;
         }
         let key = item_key_of(acct);
-        if key.trim().is_empty() {
-            continue;
-        }
         let newer = pool
             .iter()
-            .find(|i| normalize_pool_key(&i.key) == key)
+            .find(|i| i.key.trim() == key)
             .is_some_and(|item| local_is_newer(acct, item));
         if newer {
             if let Some(slot) = pool
                 .iter_mut()
-                .find(|i| normalize_pool_key(&i.key) == key)
+                .find(|i| i.key.trim() == key)
             {
                 *slot = to_item(acct);
             }
@@ -1245,18 +1175,18 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
             .ok()
             .map(|r| r.version)
             .or(Some(version + 1)),
-        Err((FailKind::Gone, _)) => return Err(on_failure(FailKind::Gone, String::new(), region)),
+        Err((FailKind::Gone, _)) => return Err(on_failure(FailKind::Gone, String::new())),
         Err((kind, m)) => {
             // 提交失败不改本地：本机的续签结果已经落盘了，下一次同步再推上去。
             // 服务端那份还是旧版本 → 下次抢闸拿到它，接着重走一遍。
-            note_error(region, format!("整池提交失败：{m}"));
+            note_error(format!("整池提交失败：{m}"));
             return Err(match kind {
                 FailKind::Unreachable => format!("整池提交失败（本机凭证已更新）：{m}"),
                 _ => m,
             });
         }
     };
-    note_ok(region, next_version);
+    note_ok(next_version);
 
     let upload_note = if uploaded > 0 {
         format!("，回写 {uploaded} 个更新的本地票")
@@ -1283,22 +1213,8 @@ pub async fn sync(dir: &Path, force: bool, region: Region) -> Result<SyncReport,
 mod tests {
     use super::*;
 
-    /// 造账号：`acct` = 国际版（绝大多数用例只关心一套部署）。
     fn acct(name: &str, phone: Option<&str>, token: &str) -> Account {
-        acct_in(Region::Global, name, phone, token)
-    }
-
-    /// 国内版账号（区域不同则**不是**同一条凭证，见 `item_key_of`）
-    fn acct_in(region: Region, name: &str, phone: Option<&str>, token: &str) -> Account {
-        let mut a = acct_base(name, phone, token);
-        a.region = region;
-        a
-    }
-
-    fn acct_base(name: &str, phone: Option<&str>, token: &str) -> Account {
         Account {
-            // 占位：真正要国内版时由 `acct_in` 覆盖
-            region: Region::Global,
             id: format!("id-{name}"),
             name: name.into(),
             phone: phone.map(str::to_string),
@@ -1318,10 +1234,9 @@ mod tests {
 
     fn item(key: &str, token: &str, expires: Option<i64>) -> PoolItem {
         PoolItem {
-            region: Region::Global,
             key: key.into(),
-            name: key.into(),
-            phone: key.into(),
+            name: key_identity(key).into(),
+            phone: key_identity(key).into(),
             email: String::new(),
             access_token: token.into(),
             refresh_token: format!("rt-{token}"),
@@ -1335,32 +1250,47 @@ mod tests {
 
     #[test]
     fn key_prefers_phone_then_name_then_local_id() {
-        assert_eq!(item_key_of(&acct("n", Some("138"), "t")), "global:138");
-        assert_eq!(item_key_of(&acct("n", None, "t")), "global:n");
-        assert_eq!(item_key_of(&acct("", None, "t")), "global:id-");
-        // 国内版账号与同手机号的国际版账号**不是同一个 key** —— 池里必须各占一格
-        assert_eq!(
-            item_key_of(&acct_in(Region::Cn, "n", Some("138"), "t")),
-            "cn:138"
-        );
-        // 老云端写下的裸 key 归一到国际版，不会凭空多出一个账号
-        assert_eq!(normalize_pool_key("138"), "global:138");
-        assert_eq!(normalize_pool_key("cn:138"), "cn:138");
-        assert_eq!(normalize_pool_key(" global:138 "), "global:138");
+        assert_eq!(item_key_of(&acct("n", Some("138"), "t")), "cn:138");
+        assert_eq!(item_key_of(&acct("n", None, "t")), "cn:n");
+        assert_eq!(item_key_of(&acct("", None, "t")), "cn:id-");
     }
 
     #[test]
     fn blank_phone_falls_through_to_name() {
-        assert_eq!(item_key_of(&acct("n", Some("   "), "t")), "global:n");
+        assert_eq!(item_key_of(&acct("n", Some("   "), "t")), "cn:n");
+    }
+
+    // ── 非 cn 条目一概不采纳、不回写（国际版清退的边界）──────────────────
+
+    /// `global:` 前缀与裸 key（国际版年代的形态）都不是本应用的条目：
+    /// 采纳它们等于凭空长出另一套部署的账号（国际版账号的 token 也救不了它们 ——
+    /// 那套部署的接口已经不归本应用管）。
+    #[test]
+    fn non_cn_keys_are_never_adopted() {
+        let mut local = vec![acct("n", Some("138"), "t")];
+        let global = item("global:138", "t-global", Some(9_000));
+        let bare = item("138", "t-bare", Some(9_000));
+        assert_eq!(merge_into(&mut local, &[global, bare]), 0);
+        assert_eq!(local.len(), 1, "非 cn 条目不许长成本机账号：{local:?}");
+        assert_eq!(local[0].token, "t");
+    }
+
+    #[test]
+    fn non_cn_keys_never_enter_the_submitted_body() {
+        let cloud = vec![
+            item("cn:138", "t-cn", Some(9_000)),
+            item("global:138", "t-global", Some(9_000)),
+            item("138", "t-bare", Some(9_000)),
+        ];
+        let pool = union_pool(&cloud, &[]);
+        let keys: Vec<&str> = pool.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["cn:138"], "{keys:?}");
     }
 
     // ── 身份锚点漂移：池里同一份凭证挂了多个 key（2026-09-19 重复账号事故）─────
 
-    /// 造一条「服务端还不存 region」年代的池条目。`region: Global` 不是笔误：
-    /// 老数据被 `#[serde(default)]` 兜底成国际版，正是事故的另一半。
     fn pi(key: &str, name: &str, phone: &str, at: &str) -> PoolItem {
         PoolItem {
-            region: Region::Global,
             key: key.into(),
             name: name.into(),
             phone: phone.into(),
@@ -1373,41 +1303,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn item_region_trusts_the_key_prefix_over_the_field() {
-        // 前缀是上传方写进身份串里的真值；字段可能来自「服务端不存区域」的年代
-        assert_eq!(item_region(&pi("cn:191", "n", "191", "t")), Region::Cn);
-        assert_eq!(item_region(&pi("global:191", "n", "191", "t")), Region::Global);
-        // 赤裸 key（两套部署之前）只能是国际版
-        assert_eq!(item_region(&pi("191", "n", "191", "t")), Region::Global);
-        // 没有前缀时才轮到字段
-        let mut it = pi("k", "n", "191", "t");
-        it.region = Region::Cn;
-        assert_eq!(item_region(&it), Region::Cn);
-        // 收养新账号时走的必须是同一个出口
-        assert_eq!(
-            account_from_item(&pi("cn:191", "n", "191", "t")).region,
-            Region::Cn
-        );
-    }
-
     /// 回归：账号在「还没补上手机号」时被推上云，之后手机号补齐 → 本机 key 从
     /// `cn:nick…` 变成 `cn:19174256652`，池里那条旧 key 的副本**不能**被收养成新账号。
     #[test]
     fn a_drifted_pool_key_does_not_become_a_second_account() {
         let stale = pi("cn:nick0494015252", "nick0494015252", "", "dt-same");
         let by_phone = pi("cn:19174256652", "nick0494015252", "19174256652", "dt-same");
-        let mut local = vec![acct_in(
-            Region::Cn,
-            "nick0494015252",
-            Some("19174256652"),
-            "dt-same",
-        )];
+        let mut local = vec![acct("nick0494015252", Some("19174256652"), "dt-same")];
         local[0].refresh_token = Some("rt-dt-same".into());
 
         merge_into(&mut local, &[stale, by_phone]);
         assert_eq!(local.len(), 1, "同一份凭证只该是一条账号");
-        assert_eq!(local[0].region, Region::Cn, "区域不能被池里的兜底值改掉");
     }
 
     /// 上一条的另一面：池里同凭证的副本要被**收敛掉**，而别的机器独有的条目原样保留。
@@ -1417,12 +1323,11 @@ mod tests {
             pi("cn:19098779775", "nick4300340010", "19098779775", "dt-a"),
             pi("cn:nick0494015252", "nick0494015252", "", "dt-b"),
             pi("cn:19174256652", "nick0494015252", "19174256652", "dt-b"),
-            pi("global:nick0494015252", "nick0494015252", "", "dt-b"),
             pi("cn:13900000000", "别的机器", "13900000000", "dt-other"),
         ];
-        let mut a = acct_in(Region::Cn, "nick4300340010", Some("19098779775"), "dt-a");
+        let mut a = acct("nick4300340010", Some("19098779775"), "dt-a");
         a.refresh_token = Some("rt-dt-a".into());
-        let mut b = acct_in(Region::Cn, "nick0494015252", Some("19174256652"), "dt-b");
+        let mut b = acct("nick0494015252", Some("19174256652"), "dt-b");
         b.refresh_token = Some("rt-dt-b".into());
 
         let pool = union_pool(&cloud, &[a, b]);
@@ -1433,7 +1338,7 @@ mod tests {
             "同凭证的漂移副本要收敛掉，别的机器的条目一条不丢"
         );
         // 反复同步必须稳定（清洗是幂等的）
-        let again = union_pool(&pool, &[acct_in(Region::Cn, "x", Some("19098779775"), "dt-a")]);
+        let again = union_pool(&pool, &[acct("x", Some("19098779775"), "dt-a")]);
         assert_eq!(again.len(), pool.len(), "{again:?}");
     }
 
@@ -1443,7 +1348,7 @@ mod tests {
     fn adopts_the_newer_rotation() {
         let mut a = acct("n", Some("138"), "old");
         a.expires_at = Some(1_000);
-        assert!(adopt(&mut a, &item("138", "new", Some(2_000))));
+        assert!(adopt(&mut a, &item("cn:138", "new", Some(2_000))));
         assert_eq!(a.token, "new");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-new"));
         assert_eq!(a.expires_at, Some(2_000));
@@ -1458,7 +1363,7 @@ mod tests {
         let mut a = acct("n", Some("138"), "dead-local");
         a.invalidated_at = Some(5_000);
         // 池里那张 expires_at 更早（别处更早一轮的活票）—— exp 判据会拒绝，活性规则必须放行
-        let it = item("138", "pool-live", Some(1_000));
+        let it = item("cn:138", "pool-live", Some(1_000));
         assert!(adopt(&mut a, &it), "失效抢救不受 expires_at 判据约束");
         assert_eq!(a.token, "pool-live");
         // 换血成功后活性标记清除
@@ -1475,7 +1380,7 @@ mod tests {
         a.refresh_token = Some("rt-dead-local".into());
         a.expires_at = Some(2_000);
         a.rt_expires_at = Some(2_001);
-        assert!(!adopt(&mut a, &item("138", "dead-local", Some(1_000))));
+        assert!(!adopt(&mut a, &item("cn:138", "dead-local", Some(1_000))));
         assert_eq!(a.invalidated_at, Some(5_000), "没换血就不清标记");
     }
 
@@ -1486,7 +1391,7 @@ mod tests {
         let mut a = acct("n", Some("138"), "dead-local");
         a.invalidated_at = Some(5_000);
         a.expires_at = Some(2_000);
-        let it = item("138", "pool-live", Some(1_000));
+        let it = item("cn:138", "pool-live", Some(1_000));
         // 没有守卫时，expires_at 更晚的死票会被判成「本地更新」——守卫是必需的
         assert!(local_is_newer(&a, &it));
         assert!(!write_back_allowed(&a), "判死的票不许参与本地→云端回写");
@@ -1503,7 +1408,7 @@ mod tests {
         a.expires_at = Some(9_000);
         a.rt_expires_at = Some(9_001);
         a.refresh_token = Some("rt-fresh".into());
-        let stale = item("138", "stale", Some(1_000));
+        let stale = item("cn:138", "stale", Some(1_000));
         assert!(!adopt(&mut a, &stale));
         assert_eq!(a.token, "fresh", "更旧的那次轮换绝不能覆盖");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-fresh"));
@@ -1515,7 +1420,7 @@ mod tests {
     fn unknown_local_expiry_is_treated_as_older() {
         // 本地「不知道」→ 库里「知道」，那是信息增加，不是覆盖新值
         let mut a = acct("n", Some("138"), "local");
-        assert!(adopt(&mut a, &item("138", "cloud", Some(1))));
+        assert!(adopt(&mut a, &item("cn:138", "cloud", Some(1))));
         assert_eq!(a.token, "cloud");
     }
 
@@ -1523,7 +1428,7 @@ mod tests {
     fn copies_only_the_gaps_when_not_newer() {
         let mut a = acct("n", None, "local");
         a.expires_at = Some(9_000);
-        assert!(adopt(&mut a, &item("138", "older", Some(1_000))), "补空字段也算改动");
+        assert!(adopt(&mut a, &item("cn:138", "older", Some(1_000))), "补空字段也算改动");
         assert_eq!(a.token, "local", "凭证不动");
         assert_eq!(a.phone.as_deref(), Some("138"), "本地缺的手机号补上");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-older"), "本地没有 RT 时补上");
@@ -1533,7 +1438,7 @@ mod tests {
     #[test]
     fn blank_tokens_are_ignored_entirely() {
         let mut a = acct("n", Some("138"), "keep");
-        let mut empty = item("138", "   ", Some(99_999));
+        let mut empty = item("cn:138", "   ", Some(99_999));
         empty.refresh_token = String::new();
         assert!(!adopt(&mut a, &empty));
         assert_eq!(a.token, "keep");
@@ -1547,7 +1452,7 @@ mod tests {
         let mut a = acct("n", Some("138"), "keep");
         a.refresh_token = Some("rt-keep".into());
         // item 的 `expires_at` 为 None 时，`rt_expires_at` 也是 None（见本模块的 `item`）
-        let blank = item("138", "older", None);
+        let blank = item("cn:138", "older", None);
         assert!(!adopt(&mut a, &blank));
         assert_eq!(a.token, "keep");
         assert_eq!(a.refresh_token.as_deref(), Some("rt-keep"));
@@ -1560,7 +1465,7 @@ mod tests {
         let mut accs = vec![acct("本地独有", Some("111"), "t1")];
         let changed = merge_into(
             &mut accs,
-            &[item("111", "t1-new", Some(2_000)), item("222", "t2", Some(1))],
+            &[item("cn:111", "t1-new", Some(2_000)), item("cn:222", "t2", Some(1))],
         );
         assert_eq!(accs.len(), 2, "本地独有的一个都不许删");
         assert_eq!(changed, 2, "补一个 + 新增一个");
@@ -1568,59 +1473,10 @@ mod tests {
         assert_eq!(accs[1].phone.as_deref(), Some("222"));
     }
 
-    /// 同一个手机号在两套部署里是两条凭证：池里必须各占一格。
-    /// 挤在一格里 = 后上传的那条把前一条顶掉（「国内版账号刚同步上去就没了」）。
-    #[test]
-    fn the_same_phone_in_two_regions_occupies_two_pool_slots() {
-        let g = acct("n", Some("138"), "t-g");
-        let c = acct_in(Region::Cn, "n", Some("138"), "t-c");
-        assert_ne!(item_key_of(&g), item_key_of(&c));
-
-        let pool = union_pool(&[], &[g.clone(), c.clone()]);
-        assert_eq!(pool.len(), 2, "两套部署的同手机号不能挤在一格里");
-        assert!(pool.iter().any(|i| i.key == "global:138"));
-        assert!(pool.iter().any(|i| i.key == "cn:138"));
-        assert_eq!(
-            pool.iter().find(|i| i.key == "cn:138").unwrap().region,
-            Region::Cn
-        );
-
-        // 搬回本机：区域跟着回来，而不是全变成国际版
-        let mut local = Vec::new();
-        merge_into(&mut local, &pool);
-        assert_eq!(local.len(), 2);
-        assert_eq!(local.iter().filter(|a| a.region == Region::Cn).count(), 1);
-    }
-
-    /// 老云端数据：key 是裸手机号、没有 `region` 字段。搬回本机时应当落成国际版，
-    /// 且**不会**因为 key 格式变了而在本地多出一个同手机号的账号。
-    #[test]
-    fn a_legacy_cloud_item_maps_onto_the_local_global_account() {
-        let mut local = vec![acct("n", Some("138"), "t")];
-        // 老云端形态：裸 key、没有 region 字段、没有 updated_at。
-        // 有效期比本机更晚 = 云端那份是更新的一次轮换，才走得到「采纳」。
-        let legacy = PoolItem {
-            key: "138".into(),
-            name: "n".into(),
-            phone: "138".into(),
-            email: String::new(),
-            access_token: "t2".into(),
-            refresh_token: String::new(),
-            expires_at: Some(i64::MAX),
-            rt_expires_at: None,
-            updated_at: None,
-            region: Region::Global,
-        };
-        let changed = merge_into(&mut local, &[legacy]);
-        assert_eq!(local.len(), 1, "老 key 应归一到国际版，而不是新建一个账号");
-        assert_eq!(changed, 1, "凭证本身还是要更新");
-        assert_eq!(local[0].token, "t2");
-    }
-
     #[test]
     fn merge_skips_items_without_a_key() {
         let mut accs = vec![acct("a", Some("111"), "t1")];
-        let mut keyless = item("", "t", Some(5));
+        let mut keyless = item("cn:111", "t", Some(5));
         keyless.key = String::new();
         assert_eq!(merge_into(&mut accs, &[keyless]), 0);
         assert_eq!(accs.len(), 1);
@@ -1636,7 +1492,7 @@ mod tests {
             a
         };
         let as_item = to_item(&original);
-        assert_eq!(as_item.key, "global:19098779775");
+        assert_eq!(as_item.key, "cn:19098779775");
         assert_eq!(as_item.access_token, "at");
 
         // 另一台机器收到这一条：本地没有 → 建一个新账号，字段逐项相等
@@ -1645,20 +1501,20 @@ mod tests {
         assert_eq!(born.refresh_token.as_deref(), Some("rt"));
         assert_eq!(born.expires_at, Some(1_760_000_000_000));
         assert_eq!(born.rt_expires_at, Some(1_770_000_000_000));
-        assert_eq!(item_key_of(&born), "global:19098779775", "两机认的是同一个 key");
+        assert_eq!(item_key_of(&born), "cn:19098779775", "两机认的是同一个 key");
         assert_eq!(born.name, "waxiloao");
     }
 
     #[test]
     fn account_from_item_falls_back_to_a_generated_name() {
-        let mut nameless = item("13800000000", "t", Some(1));
+        let mut nameless = item("cn:13800000000", "t", Some(1));
         nameless.name = String::new();
         assert_eq!(account_from_item(&nameless).name, "账号-138000");
     }
 
     #[test]
     fn account_from_item_without_phone_leaves_it_empty_instead_of_blank_string() {
-        let mut no_phone = item("x", "t", Some(1));
+        let mut no_phone = item("cn:x", "t", Some(1));
         no_phone.phone = String::new();
         assert_eq!(account_from_item(&no_phone).phone, None);
     }
@@ -1671,8 +1527,8 @@ mod tests {
         // 且「一台机器补过邮箱、另一台还没有」的两台机器会来回改写池里那条。
         let mut a = acct("n", None, "t");
         a.email = Some("a@b.c".into());
-        assert_eq!(item_key_of(&a), "global:n", "锚点仍是手机号 → 昵称 → 本地 id");
-        assert_eq!(to_item(&a).key, "global:n");
+        assert_eq!(item_key_of(&a), "cn:n", "锚点仍是手机号 → 昵称 → 本地 id");
+        assert_eq!(to_item(&a).key, "cn:n");
     }
 
     #[test]
@@ -1685,7 +1541,7 @@ mod tests {
         assert_eq!(account_from_item(&to_item(&a)).email.as_deref(), Some("a@b.c"));
 
         // 老条目没有邮箱（空串）→ 落成 `None`，与「本机还没有」是同一种状态
-        let mut no_email = item("138", "t", Some(1));
+        let mut no_email = item("cn:138", "t", Some(1));
         no_email.email = String::new();
         assert_eq!(account_from_item(&no_email).email, None);
     }
@@ -1694,7 +1550,7 @@ mod tests {
     fn adopt_fills_a_missing_email_and_keeps_a_present_one() {
         // 本机缺、池里有 → 补上（这条路径省掉一次刷新）
         let mut blank = acct("n", Some("138"), "at");
-        let mut full = item("138", "older", Some(1));
+        let mut full = item("cn:138", "older", Some(1));
         full.email = "from-pool@b.c".into();
         assert!(adopt(&mut blank, &full), "补空字段算改动");
         assert_eq!(blank.email.as_deref(), Some("from-pool@b.c"));
@@ -1702,7 +1558,7 @@ mod tests {
         // 本机有 → 池里那条空的不许抹掉它（同理不许被池里另一个值顶掉）
         let mut mine = acct("n", Some("138"), "at");
         mine.email = Some("keep@x.y".into());
-        let mut stale = item("138", "older", Some(1));
+        let mut stale = item("cn:138", "older", Some(1));
         stale.email = "other@z.w".into();
         adopt(&mut mine, &stale);
         assert_eq!(mine.email.as_deref(), Some("keep@x.y"));
@@ -1715,14 +1571,14 @@ mod tests {
 
     #[test]
     fn union_pool_carries_local_only_accounts_into_the_body() {
-        let cloud = vec![item("111", "cloud", Some(10))];
+        let cloud = vec![item("cn:111", "cloud", Some(10))];
         let local = vec![
             acct("交集", Some("111"), "local-a"),
             acct("本机新增", Some("222"), "local-b"),
         ];
         let pool = union_pool(&cloud, &local);
         assert_eq!(pool.len(), 2, "本机新增的账号必须进正文");
-        assert_eq!(pool[1].key, "global:222");
+        assert_eq!(pool[1].key, "cn:222");
         assert_eq!(pool[1].access_token, "local-b");
     }
 
@@ -1730,7 +1586,7 @@ mod tests {
     fn union_pool_keeps_the_leased_copy_for_a_shared_key() {
         // 同名 key 保留**闸带回来的**那一条：闸里那份是云端的最新轮换，
         // 本机那份可能在别处已经被换掉了。真正需要覆盖时由续签循环写回。
-        let cloud = vec![item("111", "leased", Some(10))];
+        let cloud = vec![item("cn:111", "leased", Some(10))];
         let local = vec![acct("交集", Some("111"), "stale-local")];
         let pool = union_pool(&cloud, &local);
         assert_eq!(pool.len(), 1, "同一个 key 不许出现两条");
@@ -1770,43 +1626,39 @@ mod tests {
     }
 
     #[test]
-    fn config_carries_one_uuid_per_region_and_adopts_the_legacy_one() {
+    fn config_carries_one_uuid_and_adopts_the_cn_pool_from_the_legacy_map() {
         let cfg = BrokerConfig {
-            pools: HashMap::from([
-                (Region::Global, "g-pool".to_string()),
-                (Region::Cn, "c-pool".to_string()),
-            ]),
-            legacy_pool_uuid: None,
+            pool: Some("p".to_string()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(json.contains("pools"));
+        assert!(json.contains("pool"));
         assert!(!json.contains("version"), "版本号是运行时状态，不该落盘");
         assert!(!json.contains("legacy"), "旧字段只读不写");
+        assert!(!json.contains("pools"), "旧格式只读不写：{json}");
 
-        // 旧版的单一 pool_uuid 归到国际版名下 —— 那时只有国际版，且用户确认
-        // 现存的池就是国际版的。归错了区域 = 续签闸落到另一套部署的凭证上。
+        // 旧版「区域 → uuid」表：只认国内版那条；国际版那一池随国际版支持一起废弃
         let restored: BrokerConfig =
-            serde_json::from_str(r#"{"pool_uuid":"legacy-uuid"}"#).unwrap();
+            serde_json::from_str(r#"{"pools":{"global":"g","cn":"c"}}"#).unwrap();
         let restored = restored.normalized();
-        assert_eq!(
-            restored.pools.get(&Region::Global).map(String::as_str),
-            Some("legacy-uuid")
-        );
-        assert!(!restored.pools.contains_key(&Region::Cn), "不能顺手扩散到另一区域");
+        assert_eq!(restored.pool.as_deref(), Some("c"));
 
-        // 新格式里国际版已有自己的池时，以新格式为准，旧值直接丢掉
+        // 已是新格式时以新格式为准，旧值直接丢掉
         let restored: BrokerConfig =
-            serde_json::from_str(r#"{"pools":{"global":"new"},"pool_uuid":"old"}"#).unwrap();
+            serde_json::from_str(r#"{"pool":"new","pools":{"cn":"old"}}"#).unwrap();
         let restored = restored.normalized();
-        assert_eq!(
-            restored.pools.get(&Region::Global).map(String::as_str),
-            Some("new")
-        );
+        assert_eq!(restored.pool.as_deref(), Some("new"));
+
+        // 国际版年代的单一 pool_uuid：那是国际版的池，不继承
+        let restored: BrokerConfig =
+            serde_json::from_str(r#"{"pool_uuid":"legacy"}"#).unwrap();
+        let restored = restored.normalized();
+        assert_eq!(restored.pool, None, "国际版的池不继承");
 
         // 旧版本残留的未知字段要能读进来而不是整份报废
         let restored: BrokerConfig =
-            serde_json::from_str(r#"{"pools":{"cn":"c"},"enabled":true,"url":"x"}"#).unwrap();
-        assert_eq!(restored.pools.get(&Region::Cn).map(String::as_str), Some("c"));
+            serde_json::from_str(r#"{"pool":"c","enabled":true,"url":"x"}"#).unwrap();
+        assert_eq!(restored.pool.as_deref(), Some("c"));
     }
 
     /// 真实接口冒烟：上传一池 → 整池同步 → 解绑（云端保留），跑完手动把测试池删干净。
@@ -1837,19 +1689,19 @@ mod tests {
         accounts::save_accounts(&dir, &[fake]).expect("写测试账号");
 
         init(&dir);
-        assert!(!bound_in(Region::Global), "测试开始前不该是绑定的");
+        assert!(!bound(), "测试开始前不该是绑定的");
 
-        let op = upload(&dir, Region::Global).await.expect("上传失败");
+        let op = upload(&dir).await.expect("上传失败");
         println!("[冒烟] 上传成功：uuid={} 条数={} 说明={}", op.uuid, op.account_count, op.message);
-        assert!(bound_in(Region::Global));
+        assert!(bound());
         assert_eq!(op.account_count, 1);
 
-        let rep = sync(&dir, true, Region::Global).await.expect("整池同步失败");
+        let rep = sync(&dir, true).await.expect("整池同步失败");
         println!("[冒烟] 同步：{}（deferred={}）", rep.message, rep.deferred);
         assert!(!rep.deferred, "强制同步不该被跳过");
         assert!(rep.version.is_some(), "同步后应拿到云端版本号");
 
-        let st = status(Region::Global);
+        let st = status();
         println!(
             "[冒烟] 状态：version={:?} last_ok_ms={:?} error={:?}",
             st.version, st.last_ok_ms, st.error
@@ -1858,11 +1710,11 @@ mod tests {
         assert!(st.error.is_none(), "成功路径不该留下错误：{:?}", st.error);
 
         // 再同步一轮：这次会被节流挡下（两分钟窗口），是正常的
-        let throttled = sync(&dir, false, Region::Global).await.expect("节流路径不该报错");
+        let throttled = sync(&dir, false).await.expect("节流路径不该报错");
         assert!(throttled.deferred, "两分钟内第二次同步应被节流");
 
-        unbind(Region::Global).await.expect("解绑失败");
-        assert!(!bound_in(Region::Global));
+        unbind().await.expect("解绑失败");
+        assert!(!bound());
         // 解绑只摘本机绑定、云端保留：本机与云端重复的账号（这里就是那 1 个）应从本机移除
         assert_eq!(
             accounts::load_accounts(&dir).len(),
@@ -1895,15 +1747,15 @@ mod tests {
     fn uploads_only_a_strictly_newer_local_ticket() {
         let mut a = acct("n", Some("138"), "new");
         a.expires_at = Some(2_000);
-        assert!(local_is_newer(&a, &item("138", "old", Some(1_000))));
+        assert!(local_is_newer(&a, &item("cn:138", "old", Some(1_000))));
 
         // 反向：本机更旧绝不能盖云端 —— 那等于把别的机器刚续好的凭证作废，
         // 两台机器来回盖就是同步永不收敛。
         a.expires_at = Some(1_000);
-        assert!(!local_is_newer(&a, &item("138", "cloud", Some(2_000))));
+        assert!(!local_is_newer(&a, &item("cn:138", "cloud", Some(2_000))));
         // 同一到期时间也不算更新（严格大于）
         a.expires_at = Some(2_000);
-        assert!(!local_is_newer(&a, &item("138", "cloud", Some(2_000))));
+        assert!(!local_is_newer(&a, &item("cn:138", "cloud", Some(2_000))));
     }
 
     /// 单侧读不出到期：读得出的算新（与云端 → 本地方向同一条规则的方向版本）。
@@ -1911,10 +1763,10 @@ mod tests {
     fn a_readable_local_expiry_beats_a_pool_entry_with_no_expiry() {
         let mut a = acct("n", Some("138"), "local");
         a.expires_at = Some(1_000);
-        assert!(local_is_newer(&a, &item("138", "cloud", None)));
+        assert!(local_is_newer(&a, &item("cn:138", "cloud", None)));
         // 反过来「不知道」不等于「更旧」：本机读不出到期就不许盖云端
         a.expires_at = None;
-        assert!(!local_is_newer(&a, &item("138", "cloud", None)));
+        assert!(!local_is_newer(&a, &item("cn:138", "cloud", None)));
     }
 
     /// 两个方向必须**互斥**：同一对凭证不能既「该采纳云端」又「该回写云端」，
@@ -1924,22 +1776,22 @@ mod tests {
     #[test]
     fn the_two_directions_never_both_claim_to_be_newer() {
         let cases: [(Account, PoolItem); 4] = [
-            (acct("a", Some("1"), "opaque"), item("1", "other", None)),
+            (acct("a", Some("1"), "opaque"), item("cn:1", "other", None)),
             ({
                 let mut a = acct("b", Some("2"), "x");
                 a.expires_at = Some(1_000);
                 a
-            }, item("2", "y", Some(2_000))),
+            }, item("cn:2", "y", Some(2_000))),
             ({
                 let mut a = acct("c", Some("3"), "x");
                 a.expires_at = Some(2_000);
                 a
-            }, item("3", "y", Some(1_000))),
+            }, item("cn:3", "y", Some(1_000))),
             ({
                 let mut a = acct("d", Some("4"), "x");
                 a.expires_at = Some(1_000);
                 a
-            }, item("4", "y", Some(1_000))),
+            }, item("cn:4", "y", Some(1_000))),
         ];
         for (a, cloud) in &cases {
             assert!(

@@ -3,7 +3,7 @@
 //! Qoder 与 CodeBuddy 是两套完全不同的协议。Qoder 的续签走设备令牌族：
 //!
 //! ```text
-//! POST https://openapi.qoder.sh/api/v1/deviceToken/refresh
+//! POST https://openapi.qoder.com.cn/api/v1/deviceToken/refresh
 //! body: { "refresh_token": "<refreshToken>" }
 //! 头（Bx）: Accept: application/json
 //!           Authorization: Bearer <token>
@@ -83,11 +83,6 @@ pub struct Refreshed {
 /// 取 48h 而不是 24h 的理由：access token 实际有效期长，定时扫描小时级一跳，
 /// 取两天余量能保证「即使连续几天没开应用、扫描又恰好错过」，token 也不会中途失效。
 pub const REFRESH_THRESHOLD_MS: i64 = 48 * 60 * 60 * 1000;
-
-// 这里曾有 `const OPENAPI_HOST = crate::auth_file::OPENAPI_HOST`（固定指向国际版的
-// openapi 域）。续签基址现在由 `region::Region::openapi_base` 按**账号自己的区域**
-// 给出 —— 见 `refresh` 的 `region` 参数。国内版的续签同样是 `/api/v1/deviceToken/refresh`，
-// 只是域换成 `openapi.qoder.com.cn`（路径同构，实测两域都存在该路由）。
 
 /// Qoder 客户端类型：desktop app（`clientType:10, businessProduct:app, sessionType:app`）
 const COSY_CLIENT_TYPE: &str = "10";
@@ -205,15 +200,15 @@ fn str_of(v: &Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// 发起一次续签。`region` 取**账号自己的**区域 —— 续签打的是该区域的 openapi 域：
-/// 用另一套部署换回来的 token 在账号所属的网关上无效，而续签失败会表现成
-/// 「这个账号突然签到全失败」，与网络问题的症状一模一样。
+/// 发起一次续签。续签打的是 CN 的 openapi 域（[`crate::qoder_api::OPENAPI_BASE`]）。
 pub async fn refresh(
-    region: crate::region::Region,
     token: &str,
     refresh_token: &str,
 ) -> Result<Refreshed, RefreshError> {
-    let url = format!("{}/api/v1/deviceToken/refresh", region.openapi_base());
+    let url = format!(
+        "{}/api/v1/deviceToken/refresh",
+        crate::qoder_api::OPENAPI_BASE
+    );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -345,7 +340,7 @@ mod tests {
             .refresh_token
             .clone()
             .expect("登录文件里应带 refresh token");
-        let r = refresh(a.region, &a.token, &rt)
+        let r = refresh(&a.token, &rt)
             .await
             .unwrap_or_else(|e| panic!("续签失败: {e}"));
         println!(

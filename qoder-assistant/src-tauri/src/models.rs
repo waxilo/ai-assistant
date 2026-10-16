@@ -15,9 +15,9 @@
 //!
 //! | 层 | 来源 | 特点 |
 //! |---|---|---|
-//! | 1 | `GET {infer_base}/algo/api/v2/model/list` | Qoder 官方目录，最全；通了就落盘 |
-//! | 2 | `models-cache-{region}.json`（落盘快照） | 上次成功的结果，抗网络抖动与重启 |
-//! | 3 | `~/.qoder` 的本地痕迹 | 纯本地、必定可用；只覆盖「真用过的」模型 |
+//! | 1 | `GET {GATEWAY_BASE}/algo/api/v2/model/list` | Qoder 官方目录，最全；通了就落盘 |
+//! | 2 | `models-cache.json`（落盘快照） | 上次成功的结果，抗网络抖动与重启 |
+//! | 3 | `~/.qoder-cn` 的本地痕迹 | 纯本地、必定可用；只覆盖「真用过的」模型 |
 //!
 //! **三层都拿不到时返回空列表**，由界面显示空态。这里绝不再退回任何写死的模型名
 //! —— 那正是把 `hy3` 冒充成 Qoder 模型的根源。
@@ -40,16 +40,12 @@
 //!
 //! 两处都补齐后：`200`，**明文 JSON**，14 个模型、带 `price_factor`（积分倍率）
 //! 与 `promotion`（错峰折扣）。样本已落在快照的 `raw` 里。
-//! （这条是**国内版**实测；国际版走同一条代码路径、尚未验过，拉不到时自动退到
-//!   下面两层，所以不影响界面。`probe_real_catalog_fetch` 那条 ignored 测试两边都跑，
-//!   跑一次就有结论。）
 //!
 //! 顺带两条实测结论，省得下次再试：
 //! - 客户端发的 `?Encode=1` **可以去掉**。签名只覆盖剥掉 query 的 path，所以去掉它
 //!   签名照样有效，而上游就不加密响应体了（带 `Encode=1` 也是 200，但这里没必要）。
-//! - 宿主取 [`Region::infer_base`]（国际版 = 客户端的**默认**推理域 `api2.qoder.sh`；
-//!   选举之后客户端会换成 api1/api3/api6…，但这一层是**直连**、不经过接管，
-//!   用默认域即可 —— 它同样服务 `/algo/api/v2/model/list`，2026-09-29 未鉴权探测过）。
+//! - 宿主固定为 [`crate::qoder_api::GATEWAY_BASE`]（CLI 日志里 `endpointType:"infer"`
+//!   的落点；这一层是**直连**、不经过接管）。
 //!
 //! # 与路由的契约
 //!
@@ -57,17 +53,12 @@
 //! 路由的免费集合（只要 `free` 的 id，见 [`free_ids`]）。**两者必须同源** ——
 //! 否则会出现「界面显示免费、路由却不切换」这种对不上的状态。
 
-use crate::region::Region;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-// 模型目录的宿主**不是常量**：两个区域不同（国际版 / 国内版的 `infer_base`，
-// 见 `region` 模块与本模块头）。上一版这里是一处写死的 `pub const CATALOG_BASE`，
-// 等于宣告「另一套部署永远拉不到目录」。
 
 /// 模型目录的**发出去**的路径。
 ///
@@ -86,13 +77,8 @@ pub const TTL: Duration = Duration::from_secs(3600);
 /// 超出就只留解析结果，别把用户磁盘当仓库。
 const RAW_KEEP_MAX: usize = 256 * 1024;
 
-/// 落盘快照的文件名前缀（与账号 / 台账同目录）。
-///
-/// 文件名里**必须带区域**：两套部署的模型目录是两份互不相干的清单，
-/// 共用一份快照的后果是「国内版界面显示国际版的模型、并且信以为真去判免费与否」。
-/// 这是纯缓存，所以不保留旧文件名（`models-cache.json`）的回退 —— 最坏也就是
-/// 第一次多打一次网络。
-const SNAPSHOT_PREFIX: &str = "models-cache";
+/// 落盘快照文件名（与账号 / 台账同目录）。纯缓存，丢一次顶多多打一次网络。
+const SNAPSHOT_FILE: &str = "models-cache.json";
 
 // ---------------------------------------------------------------------------
 // 数据形态
@@ -411,8 +397,7 @@ fn session_logs(root: &Path) -> Vec<PathBuf> {
 /// 这是三层的最后一道：纯本地、不依赖网络，保证界面至少不是空的。
 /// 覆盖范围有限（只有用过的模型），但拿到的是**真值**，不是编的。
 ///
-/// 两个来源都是实测出来的（路径里的 `~/.qoder` 对国内版是 `~/.qoder-cn`，
-/// 由 [`Region::cli_dir_name`] 给）：
+/// 两个来源都是实测出来的（`~/.qoder-cn`，见 [`crate::qoder_api::CLI_DIR_NAME`]）：
 /// - `<cli_dir>/.models/default` → `{"key":"qmodel_38max", …}`，当前选中的模型 id
 /// - `<cli_dir>/logs/sessions/**/*.jsonl` → 模型 id 与显示名**在同一个文件的不同行**上，
 ///   按文件配对（见 [`scan_session`] / [`pair_name`]）。
@@ -423,11 +408,11 @@ fn session_logs(root: &Path) -> Vec<PathBuf> {
 /// |---|---|
 /// | `qmodel_38max` | `Qwen3.8-Max` |
 /// | `qfmodel` | `Qwen3.8-Flash` |
-pub fn local_models(region: Region) -> Vec<ModelInfo> {
+pub fn local_models() -> Vec<ModelInfo> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    let root = home.join(region.cli_dir_name());
+    let root = home.join(crate::qoder_api::CLI_DIR_NAME);
     let mut found: Vec<ModelInfo> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -470,8 +455,8 @@ struct Snapshot {
     raw: Option<Value>,
 }
 
-fn snapshot_path(dir: &Path, region: Region) -> PathBuf {
-    dir.join(format!("{SNAPSHOT_PREFIX}-{}.json", region.key()))
+fn snapshot_path(dir: &Path) -> PathBuf {
+    dir.join(SNAPSHOT_FILE)
 }
 
 fn now_ms() -> u64 {
@@ -482,8 +467,8 @@ fn now_ms() -> u64 {
 }
 
 /// 读回落盘快照。文件不存在 / 坏掉都回 `None`（只是少一层，不该让调用方出错）。
-pub fn load_snapshot(dir: &Path, region: Region) -> Option<Vec<ModelInfo>> {
-    let text = std::fs::read_to_string(snapshot_path(dir, region)).ok()?;
+pub fn load_snapshot(dir: &Path) -> Option<Vec<ModelInfo>> {
+    let text = std::fs::read_to_string(snapshot_path(dir)).ok()?;
     let snap: Snapshot = serde_json::from_str(&text).ok()?;
     (!snap.models.is_empty()).then_some(snap.models)
 }
@@ -491,7 +476,7 @@ pub fn load_snapshot(dir: &Path, region: Region) -> Option<Vec<ModelInfo>> {
 /// 写落盘快照（临时文件 + rename，避免与另一个进程读到半个文件）。
 ///
 /// 失败**只当没发生** —— 缓存写不进去不该让「拉取成功」变成失败。
-fn save_snapshot(dir: &Path, region: Region, models: &[ModelInfo], raw: Option<&Value>) {
+fn save_snapshot(dir: &Path, models: &[ModelInfo], raw: Option<&Value>) {
     let raw = raw
         .filter(|r| serde_json::to_string(r).map(|s| s.len() <= RAW_KEEP_MAX).unwrap_or(false))
         .cloned();
@@ -503,7 +488,7 @@ fn save_snapshot(dir: &Path, region: Region, models: &[ModelInfo], raw: Option<&
     let Ok(text) = serde_json::to_string(&snap) else {
         return;
     };
-    let target = snapshot_path(dir, region);
+    let target = snapshot_path(dir);
     let tmp = target.with_extension("json.tmp");
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::fs::rename(&tmp, target);
@@ -522,10 +507,9 @@ fn save_snapshot(dir: &Path, region: Region, models: &[ModelInfo], raw: Option<&
 /// 「没有客户端的原件可借环境特征」，所以走从零签的那一份。
 /// 拿普通 Bearer 打这里必然进不去（凭据不在头上，服务端解不出账号）。
 ///
-/// 宿主是 [`Region::infer_base`]（CLI 日志里的 `endpointType:"infer"`），
+/// 宿主是 [`crate::qoder_api::GATEWAY_BASE`]（CLI 日志里的 `endpointType:"infer"` 落点），
 /// 且必须带 `/algo` 前缀 —— 两处都是踩过才知道的，详见模块头。
 pub async fn fetch_remote(
-    region: Region,
     dir: &Path,
     id: &crate::cosy::Identity,
 ) -> Option<Vec<ModelInfo>> {
@@ -536,7 +520,7 @@ pub async fn fetch_remote(
     // 签名里是**剥掉 `/algo` 与 query** 的 path（`signing_path` 负责），所以这里
     // 直接把要发的 URL 路径交给它：两边天然一致。
     let reb = crate::cosy::sign(id, CATALOG_PATH, b"", now)?;
-    let url = format!("{}{CATALOG_PATH}", region.infer_base());
+    let url = format!("{}{CATALOG_PATH}", crate::qoder_api::GATEWAY_BASE);
     let resp = crate::http::api_client_direct()
         .get(&url)
         .header("authorization", reb.authorization.as_str())
@@ -557,7 +541,7 @@ pub async fn fetch_remote(
         // （也可能是接口改了结构、我们还没跟上）。
         return None;
     }
-    save_snapshot(dir, region, &list, Some(&body));
+    save_snapshot(dir, &list, Some(&body));
     Some(list)
 }
 
@@ -565,26 +549,23 @@ pub async fn fetch_remote(
 // 入口
 // ---------------------------------------------------------------------------
 
-/// 进程内缓存：(区域, 当时有没有凭证, 取到时刻, 清单, 来源)。
+/// 进程内缓存：(当时有没有凭证, 取到时刻, 清单, 来源)。
 ///
-/// **区域是键的一部分**：两套部署的模型目录是两份清单，用国际版那份去判国内版模型的
-/// 免费与否，结果是静默错判。
-///
-/// **「有没有凭证」也是键的一部分**（别删）：没凭证的那次会直接跳过第 1 层、退到本地层，
-/// 如果把那份结果缓存成一个区域级的条目，用户登录之后一小时内都会拿到「本机痕迹」那份
+/// **「有没有凭证」是键的一部分**（别删）：没凭证的那次会直接跳过第 1 层、退到本地层，
+/// 如果把那份结果缓存成一个条目，用户登录之后一小时内都会拿到「本机痕迹」那份
 /// 残缺清单 —— 而且看起来完全正常。分开存就不会互相顶掉。
-fn memo() -> &'static Mutex<Option<(Region, bool, Instant, Vec<ModelInfo>, &'static str)>> {
-    static MEMO: OnceLock<Mutex<Option<(Region, bool, Instant, Vec<ModelInfo>, &'static str)>>> =
+fn memo() -> &'static Mutex<Option<(bool, Instant, Vec<ModelInfo>, &'static str)>> {
+    static MEMO: OnceLock<Mutex<Option<(bool, Instant, Vec<ModelInfo>, &'static str)>>> =
         OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(None))
 }
 
 /// 第 2、3 层（纯本地，不需要网络也不需要凭证）：落盘快照 → 本机痕迹 → 空。
-fn offline_layers(region: Region, dir: &Path) -> (Vec<ModelInfo>, &'static str) {
-    match load_snapshot(dir, region) {
+fn offline_layers(dir: &Path) -> (Vec<ModelInfo>, &'static str) {
+    match load_snapshot(dir) {
         Some(list) => (list, "cache"),
         None => {
-            let local = local_models(region);
+            let local = local_models();
             if local.is_empty() {
                 (Vec::new(), "empty")
             } else {
@@ -598,21 +579,21 @@ fn offline_layers(region: Region, dir: &Path) -> (Vec<ModelInfo>, &'static str) 
 ///
 /// **现算、不进缓存**：它取决于「这一次调用有没有可用的签名身份」，而那是会变的
 /// （用户随时可能去登录）。把它塞进 [`memo`] 会让「刚登录完仍显示旧原因」活一小时。
-fn explain_not_fetched(region: Region, had_identity: bool) -> String {
+fn explain_not_fetched(had_identity: bool) -> String {
     if had_identity {
         // 有身份却没拉到：多半是网络或登录态（token 过期）。现在这条路是通的
         // （见模块头），所以不再甩锅给「接口不开放」。
         "联网拉取没成功（网络或登录态问题），本次显示的是缓存".to_string()
     } else {
-        format!("「{}」下还没有可签名的账号，本次没联网", region.label())
+        "还没有可签名的账号，本次没联网".to_string()
     }
 }
 
 /// 取模型清单：内存缓存 → 网络 → 落盘快照 → 本机痕迹 → 空。
 ///
-/// `identity` 为 `None`（该区域没有账号，或那个账号取不到 uid）时**跳过网络层**，
-/// 但清单照样给 —— 三层里有两层是纯本地的。把「没身份」当失败是错的：用户常常只登
-/// 一边，而接管页两个区域都要能打开。
+/// `identity` 为 `None`（本机没有账号，或那个账号取不到 uid）时**跳过网络层**，
+/// 但清单照样给 —— 三层里有两层是纯本地的。把「没身份」当失败是错的：
+/// 接管页在没登录时也要能打开。
 ///
 /// `refresh = true` 跳过内存缓存（对应接管页那颗「刷新」按钮：用户明确要求重拉，
 /// 就不该被 1 小时的缓存挡住）。注意它**只跳过内存缓存** —— 网络失败时仍然依次退到
@@ -620,7 +601,6 @@ fn explain_not_fetched(region: Region, had_identity: bool) -> String {
 ///
 /// 返回的 `source` / `note` 直接透给界面：前者说清单来自哪一层，后者说第 1 层为什么空。
 pub async fn load(
-    region: Region,
     dir: &Path,
     identity: Option<&crate::cosy::Identity>,
     refresh: bool,
@@ -628,13 +608,12 @@ pub async fn load(
     let had_identity = identity.is_some();
     if !refresh {
         if let Ok(g) = memo().lock() {
-            if let Some((r, cred, at, list, src)) = g.as_ref() {
-                if *r == region && *cred == had_identity && at.elapsed() < TTL {
+            if let Some((cred, at, list, src)) = g.as_ref() {
+                if *cred == had_identity && at.elapsed() < TTL {
                     return ModelReport {
                         models: list.clone(),
                         source: (*src).to_string(),
-                        note: (*src != "fetched")
-                            .then(|| explain_not_fetched(region, had_identity)),
+                        note: (*src != "fetched").then(|| explain_not_fetched(had_identity)),
                     };
                 }
             }
@@ -642,18 +621,18 @@ pub async fn load(
     }
 
     let (models, source) = match identity {
-        Some(id) => match fetch_remote(region, dir, id).await {
+        Some(id) => match fetch_remote(dir, id).await {
             Some(list) => (list, "fetched"),
-            None => offline_layers(region, dir),
+            None => offline_layers(dir),
         },
-        None => offline_layers(region, dir),
+        None => offline_layers(dir),
     };
 
     if let Ok(mut g) = memo().lock() {
-        *g = Some((region, had_identity, Instant::now(), models.clone(), source));
+        *g = Some((had_identity, Instant::now(), models.clone(), source));
     }
     ModelReport {
-        note: (source != "fetched").then(|| explain_not_fetched(region, had_identity)),
+        note: (source != "fetched").then(|| explain_not_fetched(had_identity)),
         models,
         source: source.to_string(),
     }
@@ -847,9 +826,9 @@ mod tests {
     fn snapshot_roundtrip_and_tolerates_garbage() {
         let dir = std::env::temp_dir().join(format!("qoder-models-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let _ = std::fs::remove_file(snapshot_path(&dir, Region::Global));
+        let _ = std::fs::remove_file(snapshot_path(&dir));
 
-        assert!(load_snapshot(&dir, Region::Global).is_none(), "没写过就该是 None");
+        assert!(load_snapshot(&dir).is_none(), "没写过就该是 None");
 
         let list = vec![ModelInfo {
             id: "qmodel_s".into(),
@@ -858,19 +837,19 @@ mod tests {
             multiplier: "x0".into(),
             original_multiplier: "x0.1".into(),
         }];
-        save_snapshot(&dir, Region::Global, &list, Some(&serde_json::json!({"raw":true})));
-        let back = load_snapshot(&dir, Region::Global);
+        save_snapshot(&dir, &list, Some(&serde_json::json!({"raw":true})));
+        let back = load_snapshot(&dir);
         assert_eq!(back, Some(list.clone()), "新字段要能过一遍落盘再读回来");
 
         // 原始响应要留下来（给日后收紧解析当样本）
-        let text = std::fs::read_to_string(snapshot_path(&dir, Region::Global)).unwrap();
+        let text = std::fs::read_to_string(snapshot_path(&dir)).unwrap();
         assert!(text.contains("\"raw\""), "raw 样本应被保留");
         assert!(text.contains("at_ms"));
         assert!(text.contains("original_multiplier"));
 
-        std::fs::write(snapshot_path(&dir, Region::Global), b"{ not json").unwrap();
+        std::fs::write(snapshot_path(&dir), b"{ not json").unwrap();
         assert!(
-            load_snapshot(&dir, Region::Global).is_none(),
+            load_snapshot(&dir).is_none(),
             "坏文件 → None，不 panic"
         );
 
@@ -880,39 +859,12 @@ mod tests {
             "models": [{"id": "old", "free": false, "multiplier": "x0.5"}]
         });
         std::fs::write(
-            snapshot_path(&dir, Region::Global),
+            snapshot_path(&dir),
             serde_json::to_string(&old_snapshot).unwrap(),
         )
         .unwrap();
-        let old = load_snapshot(&dir, Region::Global).expect("缺字段的老快照不能读成 None");
+        let old = load_snapshot(&dir).expect("缺字段的老快照不能读成 None");
         assert_eq!(old[0].original_multiplier, "");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 两个区域的快照**必须各存各的**：共用一份会让「国内版界面显示国际版的模型」
-    /// 一直活下去，而界面看不出这份清单是从哪来的。
-    #[test]
-    fn snapshots_are_kept_per_region() {
-        let dir = std::env::temp_dir().join(format!("qoder-models-r-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mk = |id: &str| ModelInfo {
-            id: id.into(),
-            name: id.into(),
-            free: true,
-            multiplier: "x0".into(),
-            original_multiplier: String::new(),
-        };
-        save_snapshot(&dir, Region::Global, &[mk("g")], None);
-        save_snapshot(&dir, Region::Cn, &[mk("c")], None);
-
-        assert_eq!(load_snapshot(&dir, Region::Global), Some(vec![mk("g")]));
-        assert_eq!(load_snapshot(&dir, Region::Cn), Some(vec![mk("c")]));
-        assert_ne!(
-            snapshot_path(&dir, Region::Global),
-            snapshot_path(&dir, Region::Cn),
-            "文件名必须按区域分开"
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -963,52 +915,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 真机冒烟：把第 3 层（`~/.qoder` 痕迹）读到的模型逐条打出来。
+    /// 真机冒烟：把第 3 层（`~/.qoder-cn` 痕迹）读到的模型逐条打出来。
     ///
     /// 接管页显示不出模型时**先跑这个**，它能一眼分开两种情况：
-    /// 「这台机器压根没有 Qoder 痕迹」（正常，去用一次 CLI）与
+    /// 「这台机器压根没有 Qoder CN 的 CLI 痕迹」（正常，去用一次 CLI）与
     /// 「痕迹在、但解析没认出来」（是我们的 bug）。
     ///
-    /// 依赖跑测试这台机器的 `~/.qoder`，所以不进默认用例。
+    /// 依赖跑测试这台机器的 `~/.qoder-cn`，所以不进默认用例。
     #[test]
-    #[ignore = "读本机 ~/.qoder，结果随环境变"]
+    #[ignore = "读本机 ~/.qoder-cn，结果随环境变"]
     fn smoke_local_traces() {
-        for region in Region::ALL {
-            let list = local_models(region);
-            println!("== {}（{} 条）==", region.label(), list.len());
-            for m in &list {
-                println!(
-                    "  id={:<20} name={:<16} free={} multiplier={:?}",
-                    m.id, m.name, m.free, m.multiplier
-                );
-            }
-            println!("免费集合 = {:?}", free_ids(&list));
+        let list = local_models();
+        println!("== 本机痕迹（{} 条）==", list.len());
+        for m in &list {
+            println!(
+                "  id={:<20} name={:<16} free={} multiplier={:?}",
+                m.id, m.name, m.free, m.multiplier
+            );
         }
+        println!("免费集合 = {:?}", free_ids(&list));
     }
 
     /// **没有可签名的账号不是错误。** 第 1 层缺席而已，清单照样给，并且必须说清为什么。
     ///
-    /// 这条钉的是曾经的真实故障：`free_models` 在没有账号的区域直接返回
-    /// `Err("xxx 下暂无账号，无法拉取模型列表")`。于是「只看一眼清单」——一件
-    /// 纯本地、两层来源都不需要网络的事 —— 被一个与它无关的条件整个拦掉，
-    /// 用户看到红字，而账号在另一个区域是登着的。
+    /// 这条钉的是曾经的真实故障：模型清单在没有账号时直接返回
+    /// `Err("暂无账号，无法拉取模型列表")`。于是「只看一眼清单」——一件
+    /// 纯本地、两层来源都不需要网络的事 —— 被一个与它无关的条件整个拦掉。
     #[tokio::test]
-    async fn a_region_without_an_identity_still_gets_a_list_and_a_reason() {
+    async fn no_identity_still_gets_a_list_and_a_reason() {
         let dir = std::env::temp_dir().join(format!("qoder-models-noc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        for region in Region::ALL {
-            // 第一圈走「现算」，第二圈命中刚写进 memo 的那条 —— 两条出口都要带原因
-            let fresh = load(region, &dir, None, true).await;
-            let cached = load(region, &dir, None, false).await;
-            for (r, which) in [(&fresh, "现算"), (&cached, "命中缓存")] {
-                assert_ne!(r.source, "fetched", "{which}：没身份不可能来自拉取");
-                let note = r.note.as_deref().unwrap_or_else(|| {
-                    panic!("{which}：{} 下没身份必须说明原因", region.label())
-                });
-                assert!(note.contains(region.label()), "{which}：原因要点名区域：{note}");
-                assert!(note.contains("没联网"), "{which}：要说清没走网络：{note}");
-            }
+        // 第一圈走「现算」，第二圈命中刚写进 memo 的那条 —— 两条出口都要带原因
+        let fresh = load(&dir, None, true).await;
+        let cached = load(&dir, None, false).await;
+        for (r, which) in [(&fresh, "现算"), (&cached, "命中缓存")] {
+            assert_ne!(r.source, "fetched", "{which}：没身份不可能来自拉取");
+            let note = r
+                .note
+                .as_deref()
+                .unwrap_or_else(|| panic!("{which}：没身份必须说明原因"));
+            assert!(note.contains("还没有"), "{which}：要说清该去登录：{note}");
+            assert!(note.contains("没联网"), "{which}：要说清没走网络：{note}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1026,13 +974,13 @@ mod tests {
             multiplier: "x0".into(),
             original_multiplier: String::new(),
         }];
-        save_snapshot(&dir, Region::Cn, &list, None);
+        save_snapshot(&dir, &list, None);
 
-        let r = load(Region::Cn, &dir, None, true).await;
+        let r = load(&dir, None, true).await;
         assert_eq!(r.source, "cache", "有快照就该用快照");
         assert_eq!(r.models, list);
         let note = r.note.expect("仍然要说清第 1 层为什么是空的");
-        assert!(note.contains("国内版") && note.contains("还没有"), "{note}");
+        assert!(note.contains("还没有"), "{note}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1042,11 +990,10 @@ mod tests {
     /// 与己无关的提示使劲，而不知道该检查登录态还是网络。
     #[test]
     fn the_reason_distinguishes_no_identity_from_a_failed_fetch() {
-        let no_id = explain_not_fetched(Region::Global, false);
-        let failed = explain_not_fetched(Region::Cn, true);
-        assert!(no_id.contains("国际版") && no_id.contains("还没有"), "{no_id}");
+        let no_id = explain_not_fetched(false);
+        let failed = explain_not_fetched(true);
+        assert!(no_id.contains("还没有"), "{no_id}");
         assert!(!no_id.contains("缓存"), "没身份时可能压根没有缓存可显示：{no_id}");
-        assert!(!failed.contains("国内版"), "有身份那句不必点名区域：{failed}");
         assert!(failed.contains("登录态") || failed.contains("网络"), "{failed}");
         assert!(failed.contains("缓存"), "要告诉用户现在看的是缓存：{failed}");
         assert!(!failed.contains("还没有"), "{failed}");
@@ -1055,10 +1002,10 @@ mod tests {
     /// 真机冒烟（手动跑）：走**生产路径**那一份（[`fetch_remote`]）打真实网关。
     ///
     /// 与上面的 `smoke_local_traces` 分工：那条看第 3 层（本机痕迹），这条看第 1 层
-    /// （官方目录 + 自签 COSY + 解析 + 落盘快照）。跑完顺手把 `models-cache-cn.json`
+    /// （官方目录 + 自签 COSY + 解析 + 落盘快照）。跑完顺手把 `models-cache.json`
     /// 写进临时目录，可以直接 `cat` 出来核对字段。
     ///
-    /// 需要：本机 `accounts.json` 里有一个该区域、token 仍有效的账号。
+    /// 需要：本机 `accounts.json` 里有一个 token 仍有效的账号。
     #[tokio::test]
     #[ignore = "打真实网关，需要本机已导入账号"]
     async fn probe_real_catalog_fetch() {
@@ -1071,44 +1018,45 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qoder-catalog-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        for region in Region::ALL {
-            let Some(acc) = crate::accounts::load_accounts(&accounts_dir)
-                .into_iter()
-                .filter(|a| a.region == region)
-                .find(|a| !a.token.is_empty())
-            else {
-                println!("{}：本机没有账号，跳过", region.label());
-                continue;
-            };
-            let client = crate::http::api_client_direct();
-            // uid 在 openapi 上（国际版），目录在 infer 上 —— 两件事，别混
-            let gateway = region.identity_base();
-            let Some(id) =
-                crate::accounts::cosy_identity(&accounts_dir, &acc, &client, gateway).await
-            else {
-                println!("{}：拿不到签名身份（token 过期？）", region.label());
-                continue;
-            };
-            match fetch_remote(region, &dir, &id).await {
-                None => println!("{}：拉取失败", region.label()),
-                Some(list) => {
-                    println!("{}：拉到 {} 个模型", region.label(), list.len());
-                    for m in &list {
-                        println!(
-                            "  {:<16} {:<18} free={:<5} {}{}",
-                            m.id,
-                            m.name,
-                            m.free,
-                            m.multiplier,
-                            if m.original_multiplier.is_empty() {
-                                String::new()
-                            } else {
-                                format!("（原价 {}）", m.original_multiplier)
-                            }
-                        );
-                    }
-                    assert_eq!(load_snapshot(&dir, region).map(|v| v.len()), Some(list.len()));
+        let Some(acc) = crate::accounts::load_accounts(&accounts_dir)
+            .into_iter()
+            .find(|a| !a.token.is_empty())
+        else {
+            println!("本机没有账号，跳过");
+            return;
+        };
+        let client = crate::http::api_client_direct();
+        // uid 与目录同域（国内版都是网关域），但两件事别混：uid 走 /api/v3，目录走 /algo
+        let Some(id) = crate::accounts::cosy_identity(
+            &accounts_dir,
+            &acc,
+            &client,
+            crate::qoder_api::GATEWAY_BASE,
+        )
+        .await
+        else {
+            println!("拿不到签名身份（token 过期？）");
+            return;
+        };
+        match fetch_remote(&dir, &id).await {
+            None => println!("拉取失败"),
+            Some(list) => {
+                println!("拉到 {} 个模型", list.len());
+                for m in &list {
+                    println!(
+                        "  {:<16} {:<18} free={:<5} {}{}",
+                        m.id,
+                        m.name,
+                        m.free,
+                        m.multiplier,
+                        if m.original_multiplier.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（原价 {}）", m.original_multiplier)
+                        }
+                    );
                 }
+                assert_eq!(load_snapshot(&dir).map(|v| v.len()), Some(list.len()));
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

@@ -11,7 +11,6 @@ import {
   openAppManagement,
 } from "../api";
 import { AccountCell, accountIdent } from "../common";
-import { regionLabel, useRegions } from "../regions";
 import type { ConfirmReq, Toast } from "../common";
 import { IconBolt, IconInfo, IconUser } from "../components/Icons";
 import { Row, Toggle } from "../components/SettingsControls";
@@ -53,9 +52,6 @@ function eventKind(e: JournalEvent): {
 
 /**
  * 全选归一：勾选集覆盖**整池**时存空（= 默认全选，之后新增的账号自动可扣费）。
- *
- * 池 = 当前区域的账号。设置本身按区域各存一份，切走再切回来勾选集原样还在，
- * 所以这里不需要（也不应该）在换区域时做任何清理。
  */
 function normalizeBilling(list: string[], pool: string[]): string[] {
   return pool.length > 0 && list.length === pool.length ? [] : list;
@@ -99,7 +95,6 @@ export function TakeoverPage({
   onSettings,
   onReloadSettings,
   onToast,
-  onSwitchRegion,
 }: {
   settings: Settings;
   accounts: Account[];
@@ -109,12 +104,6 @@ export function TakeoverPage({
   /** 从磁盘重读设置：任何一次操作失败后都要用它把界面拉回与后端一致 */
   onReloadSettings: () => Promise<void>;
   onToast: (t: Toast) => void;
-  /**
-   * 请求切换「当前区域」—— 本页不再自己切：切区域是全局动作（左下角选择器的职责），
-   * 且接管开启中是一律禁止的（产品决定）。这里只把空态提示那颗按钮转交给同一个
-   * 处理器，让它带上全局的闸门（proxy 检查、防连点、失败回读）。
-   */
-  onSwitchRegion: (key: string) => void;
 }) {
   // ⚠️ 这一页曾经有 6 个镜像 state（`proxyOn` / `proxyPort` / `region` / `billing` /
   // `rlModels` / `rlFailover`，逐个 `useState(settings.x)`）。它们是这页最贵的 bug：
@@ -126,8 +115,6 @@ export function TakeoverPage({
   // 现在事实源只有一个：`settings`（props）。本地只留两类**草稿** ——
   // 弹窗里尚未提交的勾选、端口输入框的中间态。
   const [portDraft, setPortDraft] = useState<string | null>(null);
-  const region = settings.takeover_region;
-  const regionOpts = useRegions();
   const billing = settings.billing_account_ids;
   const rlModels = settings.rate_limit_models;
   const rlFailover = settings.failover_on_rate_limit;
@@ -154,31 +141,17 @@ export function TakeoverPage({
   const [fmBusy, setFmBusy] = useState(false);
   const [mdlFailover, setMdlFailover] = useState<boolean | null>(null);
 
+  /** 全部账号的 id：扣费池的合法取值范围（设置里残留的已删除账号 id 由 effective 清掉） */
+  const accountIds = useMemo(() => accounts.map((a) => a.id), [accounts]);
+
   /**
-   * 本区域的账号。反代只在这个区域里选号扣费（跨区域的 token 在对方网关上无效），
-   * 所以扣费池与模型池的口径都按它算，界面上也就只该列它。
-   */
-  const regionAccounts = useMemo(
-    () => accounts.filter((a) => a.region === region),
-    [accounts, region]
-  );
-  const regionIds = useMemo(
-    () => regionAccounts.map((a) => a.id),
-    [regionAccounts]
-  );
-  /** 区域标识 → 中文名（清单还没到货时退回显示标识本身，不留空） */
-  const labelOf = (key: string) => regionLabel(regionOpts, key) ?? key;
-  /**
-   * 实际生效的扣费池。
-   *
-   * 语义没变（空设置 = 全选），但口径收到**本区域**：设置里可能残留另一个区域的账号 id
-   * （换区域之前选的），那些 id 对现在的代理毫无意义 —— 留着会让弹窗里的勾选状态
-   * 与真实扣费池对不上。本区域一个都没指定时，同样按「全选本区域」处理。
+   * 实际生效的扣费池。语义没变（空设置 = 全选）；设置里残留的已删除账号 id
+   * 在这里清掉，别让弹窗里的勾选状态与真实扣费池对不上。
    */
   const effective = useMemo(() => {
-    const scoped = billing.filter((id) => regionIds.includes(id));
-    return scoped.length === 0 ? regionIds : scoped;
-  }, [billing, regionIds]);
+    const scoped = billing.filter((id) => accountIds.includes(id));
+    return scoped.length === 0 ? accountIds : scoped;
+  }, [billing, accountIds]);
 
   /** 刷新接管状态与事件流（15 秒自动轮询） */
   const refreshStealth = useCallback(async () => {
@@ -199,16 +172,15 @@ export function TakeoverPage({
   }, []);
 
   /**
-   * 拉取模型列表（控制条摘要 + 限流切换弹窗共用）：打开这一页时拉，**换区域时重拉** ——
-   * 两个区域的模型目录不在同一个域上，清单本来就该跟着区域走。
+   * 拉取模型列表（控制条摘要 + 限流切换弹窗共用）：打开这一页时拉一次。
    *
    * 刻意不把 `loadFreeModels` 写进依赖：它还依赖 `onToast` 的引用，而那个引用只要外层
-   * 重渲染就会变，会把「换区域时拉一次」变成「每次重渲染都拉一次」。
+   * 重渲染就会变，会把「进页拉一次」变成「每次重渲染都拉一次」。
    */
   useEffect(() => {
     void loadFreeModels(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [region]);
+  }, []);
 
   /** 手动刷新接管动态（重拉状态与事件流） */
   const doRefreshFeed = useCallback(async () => {
@@ -257,14 +229,14 @@ export function TakeoverPage({
     async (refresh: boolean) => {
       setFmBusy(true);
       try {
-        setFm(await freeModels(refresh, region));
+        setFm(await freeModels(refresh));
       } catch (e) {
         onToast({ kind: "err", text: "拉取模型列表失败：" + String(e) });
       } finally {
         setFmBusy(false);
       }
     },
-    [onToast, region]
+    [onToast]
   );
 
   /** 弹窗里勾/去勾某个付费模型（只改草稿；免费模型恒生效不可点） */
@@ -353,12 +325,6 @@ export function TakeoverPage({
     }
   };
 
-  // 这里曾有 `onChangeRegion`：本页自己切区域（开着接管走安全切换流程、关着走
-  // saveSettings）。两个理由让它退役了：① 产品决定「接管开启中不允许切换区域」；
-  // ② 设置按区域各存一份之后，「带着当前区域取值的视图存进另一区域」会把对方的
-  // 设置整个盖掉 —— 后端已把 save_settings / apply_settings 两条路的改区域一律拒掉，
-  // 切区域只剩左下角选择器一条路（`set_region`，只动全局指针不碰切片）。
-
   /** 端口只在接管关闭时可改；失焦时若变了就立即落盘（纯配置，不动任何进程） */
   const onPortBlur = async () => {
     const port = Number(proxyPort) || 8789;
@@ -381,7 +347,7 @@ export function TakeoverPage({
   /** 弹框「保存」：草稿落库立即生效（纯账号池调整，不需要重启） */
   const doSaveBilling = async () => {
     if (draft == null) return;
-    const next = normalizeBilling(draft, regionIds);
+    const next = normalizeBilling(draft, accountIds);
     setBusy(true);
     setErr("");
     try {
@@ -421,10 +387,10 @@ export function TakeoverPage({
     }
   };
 
-  /** 扣费账号弹框草稿里勾/去勾（基准：草稿为空视为「本区域全选」） */
+  /** 扣费账号弹框草稿里勾/去勾（基准：草稿为空视为「全部账号」） */
   const toggleDraft = (id: string) =>
     setDraft((list) => {
-      const base = list == null ? effective : list.length === 0 ? regionIds : list;
+      const base = list == null ? effective : list.length === 0 ? accountIds : list;
       return base.includes(id)
         ? base.filter((x) => x !== id)
         : [...base, id];
@@ -432,14 +398,14 @@ export function TakeoverPage({
 
   const live = stealth?.installed && stealth.alive;
 
-  /** 扣费账号摘要（控制条上的那颗胶囊按钮）。数字的口径是**本区域**（见 `effective`） */
+  /** 扣费账号摘要（控制条上的那颗胶囊按钮）。数字的口径见 `effective` */
   const billingSummary =
-    regionAccounts.length === 0
+    accounts.length === 0
       ? "暂无账号"
       : billing.length === 0
-      ? `全部 ${regionAccounts.length} 个（默认）`
+      ? `全部 ${accounts.length} 个（默认）`
       : `已选 ${effective.length} · 未选 ${
-          regionAccounts.length - effective.length
+          accounts.length - effective.length
         }`;
 
   /**
@@ -461,28 +427,6 @@ export function TakeoverPage({
           : `${freeCount} 免费 · 付费 ${rlModels.length}`) +
         (SOURCE_SHORT[fm.source] ? ` · ${SOURCE_SHORT[fm.source]}` : "") +
         (rlFailover ? "" : " · 不换号");
-
-  /**
-   * 「接管区域上还没有账号」的提示（没有则为 null）。
-   *
-   * 只在**当前区域 0 个账号、而另一个区域有**时给出来 —— 那正是「用户只登了一边、
-   * 而设置里躺着缺省值」的形态：这一页于是什么都没得选（扣费池是空的，模型清单
-   * 只能靠本机痕迹），看起来像功能坏了。
-   *
-   * 只提示 + 给一键切换，**不悄悄改设置**：接管区域决定端点写进哪一套客户端的配置，
-   * 那是用户的意图（见 `Settings::takeover_region`），不该由「哪个区域碰巧有账号」去推断。
-   */
-  const regionNudge = useMemo(() => {
-    if (regionAccounts.length > 0) return null;
-    const n = (key: string) => accounts.filter((a) => a.region === key).length;
-    return (
-      regionOpts
-        .filter((r) => r.key !== region && n(r.key) > 0)
-        .map((r) => ({ key: r.key, label: r.label, n: n(r.key) }))
-        // 两个区域都有账号时取多的那个：那是用户实际在用的部署
-        .sort((a, b) => b.n - a.n)[0] ?? null
-    );
-  }, [regionAccounts.length, regionOpts, accounts, region]);
 
   /**
    * 状态副文案。只说盘上为真的事：端点写没写进去、反代在不在听。
@@ -516,20 +460,20 @@ export function TakeoverPage({
     return out;
   }, [events]);
 
-  /** 弹框内按用户名 / 手机号 / 邮箱过滤（范围内本来就只有本区域的账号） */
+  /** 弹框内按用户名 / 手机号 / 邮箱过滤 */
   const filteredAccounts = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return regionAccounts;
-    return regionAccounts.filter(
+    if (!q) return accounts;
+    return accounts.filter(
       (a) =>
         a.name.toLowerCase().includes(q) ||
         (a.phone ?? "").includes(q) ||
         (a.email ?? "").toLowerCase().includes(q)
     );
-  }, [regionAccounts, query]);
+  }, [accounts, query]);
 
   const draftEffective =
-    draft == null ? effective : draft.length === 0 ? regionIds : draft;
+    draft == null ? effective : draft.length === 0 ? accountIds : draft;
 
   return (
     <section className="panel-page tk-page">
@@ -538,8 +482,6 @@ export function TakeoverPage({
         <span>
           开启后 Qoder 的对话请求由本地代理转发，按「积分最早过期优先」在账号间分配扣费；
           下方记录每一次开关、路由与异常。
-          <b>接管作用于当前区域</b>（跟随后台左下角的全局区域选择器）：端点写进那一套客户端的 worker 产物，
-          扣费也只在该区域的账号里选（跨区域的 token 在对方网关上无效）。
           <b>改动在下一次对话生效，无需重启</b>：Qoder 每次会话都新起一个 worker 线程、
           从磁盘重读那份产物 —— 所以开关接管后，<b>正在进行的那轮会话</b>仍走旧端点，
           下一次对话起就是新的（2026-09-24 活体标记实验裁决）。
@@ -600,7 +542,7 @@ export function TakeoverPage({
         <span className="spacer" />
         <button
           className="tk-accts"
-          title={`只有${labelOf(region)}的账号允许被扣费（跨区域的 token 在对方网关上无效）；点击细选`}
+          title="全部账号默认可扣费；点击细选"
           onClick={() => {
             setDraft(billing);
             setQuery("");
@@ -638,25 +580,6 @@ export function TakeoverPage({
       </div>
 
       {err && <p className="form-err">{err}</p>}
-
-      {/* ── 接管区域上还没有账号：说清这一页为什么没得选，并给一键换到有账号的那边 ── */}
-      {regionNudge && (
-        <p className="tk-nudge">
-          <IconInfo size={14} />
-          <span>
-            <b>{labelOf(region)}</b> 下还没有账号：扣费池是空的，模型清单也只能靠本机痕迹。
-          </span>
-          <span className="spacer" />
-          <button
-            className="btn small"
-            disabled={proxyOn}
-            title={proxyOn ? "接管开启中不能切换区域：请先关闭接管" : undefined}
-            onClick={() => onSwitchRegion(regionNudge.key)}
-          >
-            切到{regionNudge.label}（{regionNudge.n} 个账号）
-          </button>
-        </p>
-      )}
 
       {/* ── 接管动态：铺满剩余空间，列表内部滚动（滚动条隐藏） ── */}
       <div className="card tk-feed">
@@ -730,8 +653,8 @@ export function TakeoverPage({
           tools={
             <button
               className="btn small"
-              onClick={() => setDraft(regionIds)}
-              disabled={regionAccounts.length === 0}
+              onClick={() => setDraft(accountIds)}
+              disabled={accounts.length === 0}
             >
               全部勾选
             </button>
@@ -762,8 +685,6 @@ export function TakeoverPage({
             <span>
               勾选的账号才允许被扣费（会话粘滞 + 积分最早过期优先轮换），未勾选的账号会被排除；
               默认全部勾选（智能轮换）。点「保存」立即生效，无需重启。
-              这里<b>只列「{labelOf(region)}」的账号</b>：反代只在该区域里选号扣费，
-              另一个区域的账号召上来也收不到请求。
             </span>
           </p>
           {/* 一个普通的文本输入框：`.modal input` 已经给了外观，
@@ -774,10 +695,9 @@ export function TakeoverPage({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-          {regionAccounts.length === 0 ? (
+          {accounts.length === 0 ? (
             <p className="empty">
-              还没有{labelOf(region)}的账号。先到「账号签到」页登录或导入，
-              或在左下角把区域切成另一个版本。
+              还没有账号。先到「账号签到」页登录或导入。
             </p>
           ) : filteredAccounts.length === 0 ? (
             <p className="empty">没有匹配「{query}」的账号。</p>
@@ -801,7 +721,7 @@ export function TakeoverPage({
                         此前这里是手拼的两段文字，与表格里的账号列长得不一样 */}
                     <AccountCell
                       name={a.name}
-                      ident={accountIdent(a.region, a.phone, a.email)}
+                      ident={accountIdent(a.phone, a.email)}
                     />
                     <span className="pick-tail">
                       <span className="pick-state">
@@ -855,10 +775,8 @@ export function TakeoverPage({
               对话完全无感；换号按「积分最早过期」优先（先消耗快过期的额度）。
               0 积分（免费）模型默认全部生效、不可取消；付费模型勾选后同样生效。
               清单的来源依次是：Qoder 模型目录（联网，缓存 1 小时）→ 落盘快照 →
-              本机 Qoder 的记录。该接口实测「对常规客户端不开放」（国际版 404、国内版 503），
-              所以多数时候给的是后两层 —— 那不是这台机器的网络问题，点「刷新」也一样。
-              清单<b>跟着左下角选的「{labelOf(region)}」区域走</b> ——
-              两个区域的模型目录不在同一个域上，缓存也是分开存的。
+              本机 Qoder 的记录。第 1 层拉不到时自动退到后两层 ——
+              那不是这台机器的网络问题，点「刷新」可强制重拉。
             </span>
           </p>
           <Row
@@ -885,11 +803,8 @@ export function TakeoverPage({
             <p className="empty">加载中…</p>
           ) : fm.models.length === 0 ? (
             <p className="empty">
-              {regionAccounts.length === 0
-                ? `「${labelOf(region)}」下还没有账号，清单只能靠本机痕迹，而这台机器也没留下记录。` +
-                  "先在「账号签到」页登录一个该区域的账号，或在左下角把区域切成另一个版本。"
-                : "暂未发现模型：Qoder 模型目录、落盘快照、本机记录三层都没拿到。" +
-                  "确认 Qoder 已登录、且本机跑过一次对话，再点右上角「刷新」。"}
+              暂未发现模型：Qoder 模型目录、落盘快照、本机记录三层都没拿到。
+              确认 Qoder 已登录、且本机跑过一次对话，再点右上角「刷新」。
             </p>
           ) : (
             <ul className="pick-list">

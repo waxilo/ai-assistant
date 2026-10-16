@@ -4,19 +4,10 @@
 //!
 //! 智能接管 = 让官方客户端的所有对话请求自动走本应用的反代。真正的落点是
 //! **客户端 `app.asar.unpacked` 里那份被执行的 worker 产物**（见 [`crate::patch`]），
-//! 而**不是**任何配置文件：`~/.qoder[-cn]/settings.json` 的 `env` 块**没有消费者**，
-//! 写进去只是自我安慰 —— 旧实现写的 `env.CODEBUDDY_BASE_URL` 是 WorkBuddy/CodeBuddy
-//! 时代的残留键，Qoder 两个客户端都不读，所以那时接管一直在空转
+//! 而**不是**任何配置文件：配置里的 `env` 块**没有消费者**，写进去只是自我安慰 ——
+//! 旧实现写的 `env.CODEBUDDY_BASE_URL` 是 WorkBuddy/CodeBuddy 时代的残留键，
+//! 客户端根本不读，所以那时接管一直在空转
 //! （配置写成功、界面显示已开启、端口在听，对话依旧直连官方）。
-//!
-//! # 区域（[`Region`]）
-//!
-//! 两套部署各有自己的客户端与 SDK 目录，所以本模块的**每一个入口都必须带区域**：
-//! 装错那一份的后果不是报错，而是「界面显示接管已开启、实际一个请求都没被接管」。
-//! 租约也把区域记下来 —— 卸载 / 清扫时手里只有租约，而「该动哪一份产物」正是它决定的。
-//! 两个区域都支持，但**引流的落点不同**：国内版写 env 键（客户端自己换端点）、
-//! 国际版改 TLS 连接目标（见 [`Region::takeover`]）—— 注入段由 [`crate::patch`]
-//! 按区域各自渲染，本模块只负责装卸与租约。
 //!
 //! # 能装不是本事，「保证一定能卸」才是
 //!
@@ -31,11 +22,9 @@
 //! # 与 netfix 的关系
 //!
 //! `netfix` 的「智能接管」判定直接问产物（[`crate::patch::is_installed`]）：租约新鲜
-//! 且指的就是那个区域 → 正常工作中，不算问题；否则是僵尸注入，照常判为会断网。
+//! 且注入还在 → 正常工作中，不算问题；否则是僵尸注入，照常判为会断网。
 //! 这样「一键恢复」清掉的是真残留，不会把正在工作的接管误伤掉。
-//! 它同样是**逐区域**问的：两个区域各可能留一份，一个是工作中的、另一个是残留。
 
-use crate::region::{Region, Takeover};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -338,11 +327,6 @@ fn is_clean_tail(f: &mut fs::File) -> bool {
 /// 新版本误还原成旧版。老租约里残留的 `previous` 同样被 serde 忽略。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Lease {
-    /// **这个租约装在哪个区域上**。卸载 / 清扫时手里只有租约，而「该动哪个
-    /// 客户端的产物」只有它知道，所以区域必须随租约落盘。
-    /// 老租约没有这个字段 → `#[serde(default)]` 落成国际版（那个字段出现之前只有国际版）。
-    #[serde(default)]
-    pub region: Region,
     /// 注入客户端的端点值，如 `https://127.0.0.1:8789`
     pub url: String,
     pub port: u16,
@@ -417,41 +401,37 @@ fn url_for_port(port: u16) -> String {
     format!("https://127.0.0.1:{port}")
 }
 
-/// 读取**指定区域**当前注入的端点（另一个区域装了什么不影响这个答案）。
-pub fn current_endpoint(region: Region) -> Option<String> {
-    crate::patch::current_url(region)
+/// 当前注入的端点。
+pub fn current_endpoint() -> Option<String> {
+    crate::patch::current_url()
 }
 
-/// **装**：把端点注入**指定区域**客户端的 worker 产物（**所有真实存在的副本**，
+/// **装**：把端点注入客户端的 worker 产物（**所有真实存在的副本**，
 /// 见 [`crate::patch::install_everywhere`]），并落下租约。
 ///
-/// 幂等：已装着、且区域与端口都一致 → 只续一次心跳，不重复写 33MB 的产物文件。
+/// 幂等：已装着、且端口一致 → 只续一次心跳，不重复写 33MB 的产物文件。
 /// 但**每次都复查一遍注入是否还在、是不是这一版**：官方更新会把整个文件换掉，
 /// 而本应用的构建改了注入段代码（url/CA 不变）时盘上那份也已过时 ——
 /// 判据是文件头标记里的注入体指纹（`js=`），心跳（每 5s）正是发现这两件事
 /// 最自然的时机，复查只读文件头 4KB。换新构建后无需手动关开接管。
 ///
-/// 区域不一致时**先按旧租约卸干净**再装新的：换区域等于换一个客户端接管，
-/// 旧客户端上的注入必须一起摘掉，否则它会一直指向本机端口，而我们已不为它服务。
-///
 /// `ca_pem` 是反代那张自签 CA 的证书：端点被客户端强制成 https，客户端必须
 /// 认得出它。证书随注入一起写进产物，见 [`crate::patch`]。
-pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Result<(), String> {
+pub fn install(data_dir: &Path, port: u16, ca_pem: &str) -> Result<(), String> {
     let url = url_for_port(port);
-    if crate::patch::worker_paths(region).is_empty() {
+    if crate::patch::worker_paths().is_empty() {
         return Err(format!(
-            "找不到{}客户端的 worker 产物，无法接管：请确认官方客户端已安装在 {}。",
-            region.label(),
-            region.install_hint()
+            "找不到官方客户端的 worker 产物，无法接管：请确认 Qoder CN 已安装在 {}。",
+            crate::patch::install_hint()
         ));
     }
 
     if let Some(mut lease) = load_lease(data_dir) {
-        if lease.region == region && lease.port == port && lease.url == url {
+        if lease.port == port && lease.url == url {
             lease.heartbeat_ms = now_ms();
             let _ = save_lease(data_dir, &lease);
             // 值可能被官方更新覆盖掉，这里保证它仍是我们期望的那个（已一致则空操作）
-            return match crate::patch::install_everywhere(region, &url, ca_pem) {
+            return match crate::patch::install_everywhere(&url, ca_pem) {
                 Ok((_, failed)) => {
                     record_install_failures(data_dir, &failed);
                     // 上一次失败过、这次好了 → 把旧错误清掉，别让界面继续报陈年故障
@@ -467,12 +447,11 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
                 }
             };
         }
-        // 区域或端口变了：先按旧租约卸干净，再装新的
-        let _ = uninstall(lease.region, data_dir);
+        // 端口变了：先按旧租约卸干净，再装新的
+        let _ = uninstall(data_dir);
     }
 
     let lease = Lease {
-        region,
         url: url.clone(),
         port,
         installed_at_ms: now_ms(),
@@ -481,7 +460,7 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
     };
     // 先落租约再改产物：中途崩了也留有记录，sweep 能收尾
     save_lease(data_dir, &lease).map_err(|e| format!("写入租约失败：{e}"))?;
-    let (installed, failed) = match crate::patch::install_everywhere(region, &url, ca_pem) {
+    let (installed, failed) = match crate::patch::install_everywhere(&url, ca_pem) {
         Ok(ok) => ok,
         Err(e) => {
             // 注入失败：把原文留在租约里，界面会照读 —— 别让它变成一句只有 stderr 知道的秘密
@@ -506,27 +485,18 @@ pub fn install(region: Region, data_dir: &Path, port: u16, ca_pem: &str) -> Resu
     journal_append_reset(
         data_dir,
         "install",
-        &format!(
-            "接管已开启（{}）：对话请求已改由本应用转发，扣费备选：{names}{note}",
-            region.label()
-        ),
+        &format!("接管已开启：对话请求已改由本应用转发，扣费备选：{names}{note}"),
     );
     // 落点路径 / 引流方式 / 端点值只在排查时有用，端到界面上既占地方又答非所问 ——
     // 它们进调试日志。上面那条 reset 刚清过文件，所以这是新一轮的第一条细节。
-    let how = match region.takeover() {
-        Takeover::EndpointEnv(key) => format!("env.{key}={url}"),
-        Takeover::HostRedirect => format!(
-            "{url}：把模型网关族（api*.qoder.sh / api*.qoder.com.cn）的连接目标改写过去、\
-             保留 SNI 供反代选上游"
-        ),
-    };
     debug_append(
         data_dir,
         "install_target",
         &format!(
-            "端点已注入 {} 份产物副本：{}（{how}），并注入了本机 CA 以信任本地 TLS",
+            "端点已注入 {} 份产物副本：{}（env.{}={url}），并注入了本机 CA 以信任本地 TLS",
             installed.len(),
-            joined_paths(&installed)
+            joined_paths(&installed),
+            crate::patch::ENDPOINT_ENV_KEY
         ),
     );
     Ok(())
@@ -554,20 +524,19 @@ fn joined_paths(paths: &[PathBuf]) -> String {
 /// 剥的是**所有真实存在的副本**（见 [`crate::patch::uninstall_everywhere`]）——
 /// fast-update 之后同一份客户端可能有多份副本，漏一份就留一份指向死端口的注入。
 /// 只认**我们自己的注入标记**：产物里没有那段就什么都不做 —— 不去猜
-/// 「文件里这个端点值是不是我们写进去的」，因为那是别人的文件，
+/// 「文件里这个端点值是不是我们写进去的」，那是别人的文件，
 /// 而且补丁模型本就不需要「记住原来是什么」（摘除是精确剥离）。
 ///
 /// 这里**不碰任何客户端进程**，也不需要碰：客户端每次会话都新起 worker 线程、
 /// 从磁盘重读产物，摘除在下一次对话即生效（2026-09-24 活体标记实验裁决）。
-pub fn uninstall(region: Region, data_dir: &Path) -> Result<(), String> {
-    let label = region.label();
-    let targets = crate::patch::worker_paths(region);
-    let changed = crate::patch::uninstall_everywhere(region)?;
+pub fn uninstall(data_dir: &Path) -> Result<(), String> {
+    let targets = crate::patch::worker_paths();
+    let changed = crate::patch::uninstall_everywhere()?;
     if changed > 0 {
         journal_append(
             data_dir,
             "uninstall",
-            &format!("接管已关闭（{label}）：客户端产物已还原成官方原样，下一次对话起恢复直连"),
+            "接管已关闭：客户端产物已还原成官方原样，下一次对话起恢复直连",
         );
         // 「还原了哪些文件的哪一段」只有排查时用得上
         debug_append(
@@ -584,53 +553,31 @@ pub fn uninstall(region: Region, data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// **把两个区域上的注入全部剥掉**（一键网络恢复用）。
+/// **卸干净**（一键网络恢复用）：产物里还有注入就剥掉，租约一并删。
 ///
-/// 两个客户端都可能被上一轮接管过，只清一个区域会留下另一个客户端继续指向
-/// 已经不存在的本机端口。判定不靠租约，靠**产物里有没有我们的注入段** ——
-/// 租约文件丢了也能清干净。
-///
-/// 返回第一个错误（清理会尽量做完，不会因为一个区域失败就半途而废）。
+/// 判定不靠租约，靠**产物里有没有我们的注入段** —— 租约文件丢了也能清干净。
 pub fn uninstall_all(data_dir: &Path) -> Result<(), String> {
-    let mut first_err: Option<String> = None;
-    for region in Region::ALL {
-        if !crate::patch::is_installed(region) {
-            continue;
-        }
-        if let Err(e) = uninstall(region, data_dir) {
-            first_err.get_or_insert(e);
-        }
+    if crate::patch::is_installed() {
+        uninstall(data_dir)?;
     }
     let _ = fs::remove_file(lease_path(data_dir));
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 /// **清扫僵尸**：启动时调用。
 ///
 /// 上一轮可能是崩溃退出的（`kill -9`、系统重启），此时产物里还留着指向本机的注入，
-/// 而反代已经不在 —— 这就是断网现场。判定同样只看「有没有我们的注入段」，
+/// 而反代已经不在 —— 这就是断网现场。判定只看「有没有我们的注入段」，
 /// 不依赖租约是否还在（租约可能跟进程一起丢了）。
-///
-/// **两个区域都扫**：上一轮接管的是哪一个不一定还查得到（用户可能中途换过区域），
-/// 而残留留在任何一个区域上都会让那个客户端出问题。
 pub fn sweep(data_dir: &Path) {
-    let lease = load_lease(data_dir);
-    for region in Region::ALL {
-        if !crate::patch::is_installed(region) {
-            continue;
-        }
-        // 租约指向本区域且心跳还新鲜 → 是本进程装的（或上个进程刚交出去的），留着
-        if lease
-            .as_ref()
-            .is_some_and(|l| l.region == region && is_alive(l))
-        {
-            continue;
-        }
-        let _ = uninstall(region, data_dir);
+    if !crate::patch::is_installed() {
+        return;
     }
+    // 租约心跳还新鲜 → 是本进程装的（或上个进程刚交出去的），留着
+    if load_lease(data_dir).is_some_and(|l| is_alive(&l)) {
+        return;
+    }
+    let _ = uninstall(data_dir);
 }
 
 /// 给前端展示的接管状态
@@ -638,12 +585,10 @@ pub fn sweep(data_dir: &Path) {
 pub struct StealthStatus {
     /// 设置里是否开启
     pub enabled: bool,
-    /// 端点是否真的写进 Qoder 配置了
+    /// 端点是否真的写进客户端产物了
     pub installed: bool,
     /// 租约是否新鲜（心跳还在跳）
     pub alive: bool,
-    /// 这份状态描述的是**哪个区域**的接管 —— 界面要据此显示「正在接管：国内版」
-    pub region: Region,
     pub port: u16,
     pub url: String,
     /// 人话说明当前状态与下一步该做什么
@@ -651,48 +596,36 @@ pub struct StealthStatus {
 }
 
 /// 综合「设置 + 租约 + 产物里的注入」给出状态。只读，不改动任何东西。
-///
-/// `region` 由调用方给（正常路径 = `settings.takeover_region`），这样界面在
-/// **切换区域但还没保存**时也能预览目标区域的状态，而不是必须先把设置写坏。
-pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
+pub fn status(data_dir: &Path) -> StealthStatus {
     let settings = crate::accounts::load_settings(data_dir);
     let port = settings.proxy_port;
     let url = url_for_port(port);
     let lease = load_lease(data_dir);
-    // 租约必须**也属于这个区域**才算「我们的」：另一个区域的旧租约还在心跳期时，
-    // 不能让它把当前区域的状态说成「已装载」。
-    let alive = lease
-        .as_ref()
-        .is_some_and(|l| l.region == region && is_alive(l));
+    let alive = lease.as_ref().is_some_and(|l| is_alive(l));
     // 「装好了」= 产物里的注入正是我们要的那个端点。官方更新会把注入冲掉，
     // 于是这里立刻变回 false —— 界面如实回落，而不是继续显示「生效中」。
     // 反过来，判据也从不是「我们写过没有」，而是**文件现在是什么样**。
-    let installed = current_endpoint(region).as_deref() == Some(url.as_str());
+    let installed = current_endpoint().as_deref() == Some(url.as_str());
     // 展示用落点：主候选（版本目录优先于顶层）。真正注入的是**所有**存在的副本
     // （见 [`crate::patch::install_everywhere`]），这里只挑主落点进文案。
-    let target = crate::patch::worker_path(region)
+    let target = crate::patch::worker_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "（未找到客户端产物）".to_string());
 
-    let label = region.label();
     let note = match (settings.proxy_enabled, installed, alive) {
         (false, _, _) => format!(
-            "未开启。开启后 {label} 客户端的对话请求会自动走本机反代（按选定的扣费账号轮换）；\
+            "未开启。开启后客户端的对话请求会自动走本机反代（按选定的扣费账号轮换）；\
              端点在下一次对话被客户端读到，无需重启。"
         ),
         (true, true, true) => format!(
-            "接管生效中（{label}）：端点已注入 {target}，本机反代在 {url} 上监听 TLS。\
+            "接管生效中：端点已注入 {target}，本机反代在 {url} 上监听 TLS。\
              客户端每次会话都重读这份产物，改动在下一次对话起生效。"
         ),
         (true, true, false) => {
             format!("注入还在 {target}，但心跳已停 —— 本应用的反代可能已退出，请点「停止接管」清理。")
         }
         (true, false, _) => {
-            if let Some(err) = lease
-                .as_ref()
-                .filter(|l| l.region == region)
-                .and_then(|l| l.last_error.as_deref())
-            {
+            if let Some(err) = lease.as_ref().and_then(|l| l.last_error.as_deref()) {
                 // 注入失败的**真实原因**就在这里，原样端出去。
                 // 界面上「接管已开启」而产物没被改，是用户最难自查的一种状态 ——
                 // 原因不该只活在监督线程的 stderr 里。
@@ -705,18 +638,13 @@ pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
             }
         }
     };
-    // 「接管开着、签到也都正常，只有对话全部 503」只有一个成因：被接管那个区域里
-    // 一个账号都没有（路由只在同区域的账号里选）。这句话必须由状态本身说出来，
+    // 「接管开着、签到也都正常，只有对话全部 503」只有一个成因：一个账号都没有
+    // （路由只能在没有账号可轮换时失败）。这句话必须由状态本身说出来，
     // 而不是让用户去翻日志猜 —— 它是**接线之后**第一个会撞上的坑。
-    let note = if settings.proxy_enabled
-        && !crate::accounts::load_accounts(data_dir)
-            .iter()
-            .any(|a| a.region == region)
-    {
+    let note = if settings.proxy_enabled && crate::accounts::load_accounts(data_dir).is_empty() {
         format!(
-            "{note} ⚠️ 当前没有任何{}账号：反代只在同区域账号里选号（一个都没有时对话请求会全部 503），\
-             先在「账号」页登录或导入一个该区域的账号。",
-            region.label()
+            "{note} ⚠️ 当前没有任何账号：反代无号可选（一个都没有时对话请求会全部 503），\
+             先在「账号」页登录或导入一个账号。"
         )
     } else {
         note
@@ -726,7 +654,6 @@ pub fn status(region: Region, data_dir: &Path) -> StealthStatus {
         enabled: settings.proxy_enabled,
         installed,
         alive,
-        region,
         port,
         url,
         note,
@@ -757,13 +684,11 @@ fn billing_account_names(data_dir: &Path, selected: &[String]) -> String {
     format!("{}（未选中的不扣费）", names.join("、"))
 }
 
-/// 查询接管状态（只读）。区域取自设置里的 `takeover_region` ——
-/// 「当前在接管哪一个」本来就是设置的一部分，不该由前端各传一份。
+/// 查询接管状态（只读）。
 #[tauri::command]
 pub fn stealth_status(app: tauri::AppHandle) -> Result<StealthStatus, String> {
     let dir = crate::commands::try_data_dir(&app)?;
-    let region = crate::accounts::load_settings(&dir).takeover_region;
-    Ok(status(region, &dir))
+    Ok(status(&dir))
 }
 
 /// 接管通知流（新的在前）：开启 / 关闭 / 这轮对话用了哪个账号 / 限流切换 / 真故障。
@@ -894,21 +819,18 @@ mod tests {
         format!("https://127.0.0.1:{}", default_port(data))
     }
 
-    fn official_file(sdk: &Path, region: Region) -> PathBuf {
-        sdk.join(region.key())
-            .join("dist")
+    fn official_file(sdk: &Path) -> PathBuf {
+        sdk.join("dist")
             .join("_worker")
             .join("qoder-worker-runtime.obf.mjs")
     }
 
-    /// 在临时 SDK 根下铺好两个区域的官方产物，并在该根下执行 f。
+    /// 在临时 SDK 根下铺好官方产物，并在该根下执行 f。
     ///
     /// 必须用临时根：真去动 `/Applications` 下那份会把用户装好的客户端改坏。
-    /// 生产路径永远走 `Region::worker_sdk_roots()`，`patch::with_sdk_root` 只在测试里生效。
+    /// 生产路径永远走 `patch::worker_sdk_roots()`，`patch::with_sdk_root` 只在测试里生效。
     fn with_client<T>(sdk: &Path, f: impl FnOnce() -> T) -> T {
-        for region in Region::ALL {
-            crate::patch::plant_worker(sdk, region, OFFICIAL);
-        }
+        crate::patch::plant_worker(sdk, OFFICIAL);
         crate::patch::with_sdk_root(sdk, f)
     }
 
@@ -916,16 +838,16 @@ mod tests {
     fn install_injects_and_uninstall_restores_the_official_bytes() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
-            assert_eq!(current_endpoint(Region::Cn).as_deref(), Some(ours(&data).as_str()));
-            let injected = fs::read_to_string(official_file(&sdk, Region::Cn)).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
+            assert_eq!(current_endpoint().as_deref(), Some(ours(&data).as_str()));
+            let injected = fs::read_to_string(official_file(&sdk)).unwrap();
             assert!(injected.ends_with(OFFICIAL), "官方原文必须原样接在注入段之后");
             assert!(injected.contains("QODERCN_SERVER_ENDPOINT"));
 
-            uninstall(Region::Cn, &data).unwrap();
-            assert_eq!(current_endpoint(Region::Cn), None, "端点必须被摘掉");
+            uninstall(&data).unwrap();
+            assert_eq!(current_endpoint(), None, "端点必须被摘掉");
             assert_eq!(
-                fs::read_to_string(official_file(&sdk, Region::Cn)).unwrap(),
+                fs::read_to_string(official_file(&sdk)).unwrap(),
                 OFFICIAL,
                 "还原必须逐字节一致"
             );
@@ -943,10 +865,9 @@ mod tests {
     fn a_failed_injection_surfaces_its_reason_in_the_status_note() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            // 设置里「接管开着、区域是国内版」，status 才会走「已开启但没装上」那条分支
+            // 设置里「接管开着」，status 才会走「已开启但没装上」那条分支
             let mut s = crate::accounts::load_settings(&data);
             s.proxy_enabled = true;
-            s.takeover_region = Region::Cn;
             crate::accounts::save_settings(&data, &s).unwrap();
 
             // 把产物与其所在目录都设成只读 ⇒ 写回必然失败（EPERM/EACCES）。
@@ -955,7 +876,7 @@ mod tests {
             //   Windows 上目录的 readonly 属性不阻止创建文件，锁了也白锁；
             // - 锁文件 → Windows 上写回失败、且 rename 兜底顶不掉只读文件；
             //   macOS 上 rename 兜底能顶掉只读文件，单锁文件不够。
-            let file = official_file(&sdk, Region::Cn);
+            let file = official_file(&sdk);
             let dir = file.parent().unwrap().to_path_buf();
             let mut dperms = fs::metadata(&dir).unwrap().permissions();
             dperms.set_readonly(true);
@@ -964,10 +885,10 @@ mod tests {
             fperms.set_readonly(true);
             fs::set_permissions(&file, fperms.clone()).unwrap();
 
-            let err = install(Region::Cn, &data, default_port(&data), CA).unwrap_err();
+            let err = install(&data, default_port(&data), CA).unwrap_err();
             assert!(err.contains("失败"), "错误得说清是哪一步失败：{err}");
 
-            let st = status(Region::Cn, &data);
+            let st = status(&data);
             assert!(!st.installed, "产物没被改，状态就不能说装好了");
             assert!(
                 st.note.contains("接管没能生效"),
@@ -990,21 +911,21 @@ mod tests {
     fn install_is_idempotent_and_retargets_on_port_change() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            let file = official_file(&sdk, Region::Cn);
+            let file = official_file(&sdk);
             let p = default_port(&data);
-            install(Region::Cn, &data, p, CA).unwrap();
+            install(&data, p, CA).unwrap();
 
             // 探针：参数一字未变时，复查只读文件头，不该整份重写（探针会活下来）
             let before = fs::read_to_string(&file).unwrap();
             fs::write(&file, format!("{before}// heartbeat-probe\n")).unwrap();
-            install(Region::Cn, &data, p, CA).unwrap();
+            install(&data, p, CA).unwrap();
             assert!(
                 fs::read_to_string(&file).unwrap().contains("heartbeat-probe"),
                 "参数没变时不该重写产物"
             );
 
-            install(Region::Cn, &data, 8899, CA).unwrap();
-            assert_eq!(current_endpoint(Region::Cn).as_deref(), Some("https://127.0.0.1:8899"));
+            install(&data, 8899, CA).unwrap();
+            assert_eq!(current_endpoint().as_deref(), Some("https://127.0.0.1:8899"));
             assert_eq!(load_lease(&data).unwrap().port, 8899);
             let text = fs::read_to_string(&file).unwrap();
             assert!(!text.contains(&format!("127.0.0.1:{p}")), "旧端点不能残留");
@@ -1018,18 +939,18 @@ mod tests {
     fn official_update_is_healed_by_the_next_heartbeat() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            let file = official_file(&sdk, Region::Cn);
+            let file = official_file(&sdk);
             let p = default_port(&data);
-            install(Region::Cn, &data, p, CA).unwrap();
+            install(&data, p, CA).unwrap();
 
             // 模拟官方更新：整份文件被换成新版原版
             let updated = format!("{OFFICIAL}// v1.1.54\n");
             fs::write(&file, &updated).unwrap();
-            assert_eq!(current_endpoint(Region::Cn), None, "被覆盖后要立刻如实回落");
+            assert_eq!(current_endpoint(), None, "被覆盖后要立刻如实回落");
 
-            install(Region::Cn, &data, p, CA).unwrap();
+            install(&data, p, CA).unwrap();
             assert_eq!(
-                current_endpoint(Region::Cn).as_deref(),
+                current_endpoint().as_deref(),
                 Some(ours(&data).as_str()),
                 "心跳要自动重打注入"
             );
@@ -1043,33 +964,9 @@ mod tests {
     fn install_reports_a_missing_client_instead_of_failing_silently() {
         let (sdk, data) = sandbox();
         crate::patch::with_sdk_root(&sdk, || {
-            let err = install(Region::Cn, &data, default_port(&data), CA).unwrap_err();
+            let err = install(&data, default_port(&data), CA).unwrap_err();
             assert!(err.contains("worker 产物"), "{err}");
-            assert!(err.contains("国内版"), "{err}");
-        });
-        let _ = fs::remove_dir_all(sdk.parent().unwrap());
-    }
-
-    /// 国际版**不再被拒**：没有可读的 env 键，但注入段改的是 TLS 连接目标
-    /// （见 [`Region::takeover`]）—— 所以它必须真的改到文件，而不是写一段没人读的注入
-    /// （写成功、显示已开启、请求全直连官方，正是这块历史踩过的坑）。
-    #[test]
-    fn global_region_is_injected_through_the_redirect_path() {
-        let (sdk, data) = sandbox();
-        with_client(&sdk, || {
-            install(Region::Global, &data, default_port(&data), CA).unwrap();
-            let injected = fs::read_to_string(official_file(&sdk, Region::Global)).unwrap();
-            assert_ne!(injected, OFFICIAL, "国际版的产物必须被真的改到");
-            assert!(injected.contains("__qaGw"), "走的是 TLS 目标重定向那条路：{injected:.200}");
-            assert!(
-                !injected.contains("process.env["),
-                "国际版构建里那个 env 键恒不生效，不许写"
-            );
-            assert_eq!(
-                fs::read_to_string(official_file(&sdk, Region::Cn)).unwrap(),
-                OFFICIAL,
-                "装国际版不能顺手动国内版那份"
-            );
+            assert!(err.contains("Qoder CN"), "{err}");
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }
@@ -1078,7 +975,7 @@ mod tests {
     fn sweep_clears_injections_left_by_a_crash() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
             // 模拟崩溃：心跳拨回很久以前，就像应用被 kill -9 后再也没起来
             let mut lease = load_lease(&data).unwrap();
             lease.heartbeat_ms = now_ms() - LEASE_TTL.as_millis() as i64 - 1_000;
@@ -1086,8 +983,8 @@ mod tests {
             assert!(!is_alive(&lease), "过期租约必须判定为不存活");
 
             sweep(&data);
-            assert_eq!(current_endpoint(Region::Cn), None, "僵尸注入必须被摘掉");
-            assert_eq!(fs::read_to_string(official_file(&sdk, Region::Cn)).unwrap(), OFFICIAL);
+            assert_eq!(current_endpoint(), None, "僵尸注入必须被摘掉");
+            assert_eq!(fs::read_to_string(official_file(&sdk)).unwrap(), OFFICIAL);
             assert!(!lease_path(&data).exists());
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
@@ -1097,10 +994,10 @@ mod tests {
     fn sweep_keeps_a_live_lease() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
             sweep(&data);
             assert_eq!(
-                current_endpoint(Region::Cn).as_deref(),
+                current_endpoint().as_deref(),
                 Some(ours(&data).as_str()),
                 "心跳新鲜的接管不能被清扫掉"
             );
@@ -1114,46 +1011,31 @@ mod tests {
     fn sweep_clears_an_orphan_injection_without_a_lease() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
             let _ = fs::remove_file(lease_path(&data));
-            assert!(current_endpoint(Region::Cn).is_some());
+            assert!(current_endpoint().is_some());
 
             sweep(&data);
-            assert_eq!(current_endpoint(Region::Cn), None, "无租约的孤儿注入要清掉");
-            assert_eq!(fs::read_to_string(official_file(&sdk, Region::Cn)).unwrap(), OFFICIAL);
+            assert_eq!(current_endpoint(), None, "无租约的孤儿注入要清掉");
+            assert_eq!(fs::read_to_string(official_file(&sdk)).unwrap(), OFFICIAL);
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }
 
-    /// 一键恢复要把**两个**客户端都摘干净；同时不能碰没被接管的那个区域的产物。
+    /// 一键恢复要把注入摘干净、租约删掉 —— 哪怕产物已经找不到（is_installed 为 false）
+    /// 也不能留租约。
     #[test]
     fn uninstall_all_detaches_every_injection() {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
             uninstall_all(&data).unwrap();
-            assert_eq!(current_endpoint(Region::Cn), None);
+            assert_eq!(current_endpoint(), None);
             assert!(!lease_path(&data).exists());
             assert_eq!(
-                fs::read_to_string(official_file(&sdk, Region::Global)).unwrap(),
+                fs::read_to_string(official_file(&sdk)).unwrap(),
                 OFFICIAL,
-                "国际版的产物全程不该被动过"
-            );
-        });
-        let _ = fs::remove_dir_all(sdk.parent().unwrap());
-    }
-
-    /// 装国内版时不能顺手动到国际版的产物 —— 装错文件不会报错，
-    /// 只会让界面显示「接管已开启」而实际一个请求都没被接管。
-    #[test]
-    fn install_never_touches_the_other_regions_file() {
-        let (sdk, data) = sandbox();
-        with_client(&sdk, || {
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
-            assert_eq!(current_endpoint(Region::Global), None);
-            assert_eq!(
-                fs::read_to_string(official_file(&sdk, Region::Global)).unwrap(),
-                OFFICIAL
+                "产物要还原成官方原样"
             );
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
@@ -1168,26 +1050,18 @@ mod tests {
             st.proxy_enabled = true;
             crate::accounts::save_settings(&data, &st).unwrap();
 
-            let before = status(Region::Cn, &data);
+            let before = status(&data);
             assert!(!before.installed);
 
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
-            let on = status(Region::Cn, &data);
-            assert!(on.installed && on.alive && on.region == Region::Cn);
+            install(&data, default_port(&data), CA).unwrap();
+            let on = status(&data);
+            assert!(on.installed && on.alive);
             assert!(on.note.contains("生效中"), "{}", on.note);
 
             // 官方更新把注入冲掉 → 状态立即回落，绝不能继续显示「生效中」
-            fs::write(official_file(&sdk, Region::Cn), OFFICIAL).unwrap();
-            let off = status(Region::Cn, &data);
+            fs::write(official_file(&sdk), OFFICIAL).unwrap();
+            let off = status(&data);
             assert!(!off.installed, "{}", off.note);
-
-            // 国际版也走同一套状态：装上就如实说「生效中」，落点也是它自己那份产物
-            install(Region::Global, &data, default_port(&data), CA).unwrap();
-            let g = status(Region::Global, &data);
-            assert!(g.installed && g.alive && g.region == Region::Global);
-            assert!(g.note.contains("生效中"), "{}", g.note);
-            // 换区域接管是**搬家**：装国际版时国内版那份注入要被摘掉（见 install 的区域切换）
-            assert!(!status(Region::Cn, &data).installed);
         });
         let _ = fs::remove_dir_all(sdk.parent().unwrap());
     }
@@ -1199,20 +1073,20 @@ mod tests {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
             // 没装过就卸载：不该留下事件（噪声会让诊断误判）
-            uninstall(Region::Cn, &data).unwrap();
+            uninstall(&data).unwrap();
             assert!(journal_read(&data).is_empty());
 
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
-            uninstall(Region::Cn, &data).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
+            uninstall(&data).unwrap();
             let events = journal_read(&data);
             assert_eq!(
                 events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
                 vec!["install", "uninstall"],
                 "只记真实发生的变更：{events:?}"
             );
-            // 对客通知说人话：哪个客户端、扣谁的钱
-            assert!(events[0].detail.contains("国内版"), "{}", events[0].detail);
-            assert!(events[1].detail.contains("国内版"));
+            // 对客通知说人话：开关动了、扣谁的钱
+            assert!(events[0].detail.contains("接管已开启"), "{}", events[0].detail);
+            assert!(events[1].detail.contains("接管已关闭"));
             // 而「写到了哪个文件、用的哪个 env 键、端点值是什么」是排查细节 ——
             // 它们必须还在，只是搬到了调试日志里（界面上看不到）。
             let log = fs::read_to_string(debug_log_path(&data)).unwrap();
@@ -1253,7 +1127,7 @@ mod tests {
     #[test]
     fn debug_events_never_reach_the_ui_feed() {
         let (_sdk, data) = sandbox();
-        journal_append(&data, "install", "接管已开启（国内版）");
+        journal_append(&data, "install", "接管已开启");
         debug_append(&data, "proxy_auth", "收到 POST /algo/xxx | 鉴权 Bearer COSY.eyJ…");
         debug_append(&data, "proxy_conn_closed", "客户端连上后未发数据即断开");
 
@@ -1318,7 +1192,7 @@ mod tests {
             journal_append(&data, "uninstall", "上一轮：接管已关闭");
             assert_eq!(journal_read(&data).len(), 2);
 
-            install(Region::Cn, &data, default_port(&data), CA).unwrap();
+            install(&data, default_port(&data), CA).unwrap();
             let events = journal_read(&data);
             assert_eq!(events.len(), 1, "开启接管应清空历史：{events:?}");
             assert_eq!(events[0].event, "install");
@@ -1338,9 +1212,9 @@ mod tests {
         let (sdk, data) = sandbox();
         with_client(&sdk, || {
             let p = default_port(&data);
-            install(Region::Cn, &data, p, CA).unwrap();
+            install(&data, p, CA).unwrap();
             journal_append(&data, "route_start", "本轮：使用账号 A");
-            install(Region::Cn, &data, p, CA).unwrap();
+            install(&data, p, CA).unwrap();
             let events = journal_read(&data);
             assert_eq!(
                 events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),

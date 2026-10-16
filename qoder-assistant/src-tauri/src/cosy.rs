@@ -286,8 +286,8 @@ pub fn rebuild_with_secret(
 
 /// 用账号 token 取 COSY 需要的 uid（`/api/v3/user/status` 的 `id`）。
 ///
-/// `base` 传**接管区域的网关**（国内版 `gateway.qoder.com.cn`）—— 与业务请求同域，
-/// 避免跨域拿到两套账号 id。
+/// `base` 传**模型网关**（`gateway.qoder.com.cn`）—— 与业务请求同域，
+/// 拿到的账号 id 才是同一套。
 pub async fn fetch_uid(
     client: &reqwest::Client,
     base: &str,

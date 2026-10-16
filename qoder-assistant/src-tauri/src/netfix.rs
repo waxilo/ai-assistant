@@ -37,7 +37,7 @@
 //! 并为此在恢复流程里补了「重启刚被摘掉注入的客户端」一步。
 //!
 //! **2026-09-24 惰性标记活体实验推翻了那一半**：0.3.4 起的客户端每次会话都新起
-//! worker 线程、从磁盘重读产物（CN / 国际两变体都是，run manifest 的 pid = 桌面主进程
+//! worker 线程、从磁盘重读产物（无一例外，run manifest 的 pid = 桌面主进程
 //! pid），所以摘干净磁盘之后，运行中的客户端在**下一次对话**就回到直连 ——
 //! 重启步骤整体删除。09-21 观察到的「不重启就直连」描述的是旧版（≤0.3.3）独立
 //! 长驻子进程架构，且当时多半混入了「补丁打在没人读的副本上」的干扰（见
@@ -47,7 +47,6 @@
 //! 家目录是**参数**而不是到处调 `dirs::home_dir()`：这样整条恢复流程能在临时目录里跑完
 //! 单测，不会碰到用户真实配置（见文末 tests）。
 
-use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
@@ -129,18 +128,15 @@ pub struct NetRestoreReport {
 // 扫描位置（家目录一律由调用方传入）
 // ---------------------------------------------------------------------------
 
-/// Qoder 可能写「服务端点」的配置文件 —— **两套部署各扫一份**。
+/// Qoder 可能写「服务端点」的配置文件。
 ///
-/// 只扫 `~/.qoder` 是上一版的做法：国内版（`~/.qoder-cn`）会被整块漏掉，于是
-/// 「诊断说一切正常、国内版明明连不上」这种最难查的状态就能一直存在。
+/// 国内版的 CLI 目录是 `~/.qoder-cn`（不是 `~/.qoder` —— 那是上一版扫错过的坑）。
 /// `.codebuddy` 保留在列表里 —— 那是更早一代的目录，清理时要一起清。
 fn config_files(home: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Region::ALL
-        .iter()
-        .map(|r| home.join(r.cli_dir_name()).join("settings.json"))
-        .collect();
-    out.push(home.join(".codebuddy").join("settings.json"));
-    out
+    vec![
+        home.join(".qoder-cn").join("settings.json"),
+        home.join(".codebuddy").join("settings.json"),
+    ]
 }
 
 /// 可能导出全局环境变量的 shell 启动脚本
@@ -413,49 +409,42 @@ pub fn diagnose(home: &Path, data_dir: &Path) -> NetReport {
 /// 端点已不再写进任何配置文件（`settings.json` 的 `env` 块根本没有消费者），
 /// 所以「扫配置文件」这件事对判断接管状态彻底失效 —— 必须直接问产物。
 ///
-/// 心跳还在且租约指的就是这个区域 → `ok`（正常工作中），不污染 `healthy`，
-/// 免得用户点一次「一键恢复」把自己刚开的功能关掉；心跳停了 → 那是崩溃留下的
-/// 僵尸注入，它会让这个客户端的所有对话都打到一个没人监听的端口上，判为断网。
+/// 心跳还在 → `ok`（正常工作中），不污染 `healthy`，免得用户点一次「一键恢复」
+/// 把自己刚开的功能关掉；心跳停了 → 那是崩溃留下的僵尸注入，它会让这个客户端的
+/// 所有对话都打到一个没人监听的端口上，判为断网。
 fn takeover_issues(data_dir: &Path) -> Vec<NetIssue> {
     let lease = crate::stealth::load_lease(data_dir);
-    let mut out = Vec::new();
-    for region in Region::ALL {
-        if !crate::patch::is_installed(region) {
-            continue;
-        }
-        let url = crate::patch::current_url(region).unwrap_or_default();
-        // 租约必须「新鲜 **且** 说的就是这个区域」才算工作正常：
-        // 两个区域各可能留一份注入，其中一份是上一轮接手时的残留。
-        let mine = lease.as_ref().filter(|l| l.region == region);
-        let working = mine.is_some_and(crate::stealth::is_alive);
-        out.push(NetIssue {
-            id: format!("takeover:{}", region.key()),
-            scope: if working {
-                "智能接管".into()
-            } else {
-                "客户端产物".into()
-            },
-            target: format!("{} · worker 产物", region.label()),
-            value: truncate(&url, 120),
-            // ok 不参与 healthy 判定，界面上显示成「正常」
-            level: if working { "ok".into() } else { "block".into() },
-            note: if working {
-                format!(
-                    "本应用「智能接管」正在工作：端点已注入该客户端的 worker 产物，对话请求经 \
-                     127.0.0.1:{} 转发，按你勾选的扣费账号轮换。这是你自己开的功能，不需要处理；\
-                     想停用请到「智能接管」页关闭。",
-                    mine.map(|l| l.port).unwrap_or_default()
-                )
-            } else {
-                "这里留着本应用「智能接管」写下的端点，但心跳已停（应用可能崩溃退出）——\
-                 它会让这个客户端的所有对话都打到没人监听的端口上。\
-                 「一键恢复」会清掉这段注入；客户端下一次对话重读产物，自然回到直连。"
-                    .into()
-            },
-            fixable: true,
-        });
+    if !crate::patch::is_installed() {
+        return Vec::new();
     }
-    out
+    let url = crate::patch::current_url().unwrap_or_default();
+    let working = lease.as_ref().is_some_and(crate::stealth::is_alive);
+    vec![NetIssue {
+        id: "takeover:client".into(),
+        scope: if working {
+            "智能接管".into()
+        } else {
+            "客户端产物".into()
+        },
+        target: "Qoder CN · worker 产物".into(),
+        value: truncate(&url, 120),
+        // ok 不参与 healthy 判定，界面上显示成「正常」
+        level: if working { "ok".into() } else { "block".into() },
+        note: if working {
+            format!(
+                "本应用「智能接管」正在工作：端点已注入该客户端的 worker 产物，对话请求经 \
+                 127.0.0.1:{} 转发，按你勾选的扣费账号轮换。这是你自己开的功能，不需要处理；\
+                 想停用请到「智能接管」页关闭。",
+                lease.map(|l| l.port).unwrap_or_default()
+            )
+        } else {
+            "这里留着本应用「智能接管」写下的端点，但心跳已停（应用可能崩溃退出）——\
+             它会让这个客户端的所有对话都打到没人监听的端口上。\
+             「一键恢复」会清掉这段注入；客户端下一次对话重读产物，自然回到直连。"
+                .into()
+        },
+        fixable: true,
+    }]
 }
 
 fn launchctl_getenv(key: &str) -> Option<String> {
@@ -787,10 +776,7 @@ mod tests {
         ));
         let home = base.join("home");
         let data = base.join("data");
-        // 两套部署的目录都建出来（区域化之后诊断要扫两边）
-        for region in Region::ALL {
-            fs::create_dir_all(home.join(region.cli_dir_name())).unwrap();
-        }
+        fs::create_dir_all(home.join(".qoder-cn")).unwrap();
         fs::create_dir_all(&data).unwrap();
         (home, data)
     }
@@ -801,7 +787,7 @@ mod tests {
     const OFFICIAL_WORKER: &str =
         "// qoder worker runtime (official)\nexport const boot = () => {};\n";
 
-    /// 在**临时 SDK 根**下铺好两个区域的官方产物，并覆盖 `patch` 的根。
+    /// 在**临时 SDK 根**下铺好官方产物，并覆盖 `patch` 的根。
     ///
     /// 必须隔离：`diagnose` 现在直接去问客户端 worker 产物「有没有我们的注入」，
     /// 不隔离就会读到**这台机器上真装着的那个客户端** —— 本机装过又接管过时，
@@ -812,9 +798,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        for region in Region::ALL {
-            crate::patch::plant_worker(&sdk, region, OFFICIAL_WORKER);
-        }
+        crate::patch::plant_worker(&sdk, OFFICIAL_WORKER);
         let out = crate::patch::with_sdk_root(&sdk, f);
         let _ = fs::remove_dir_all(&sdk);
         out
@@ -910,7 +894,7 @@ mod tests {
     #[test]
     fn diagnose_flags_pollution_and_restore_cleans_it() {
         let (home, data) = sandbox();
-        let cfg = home.join(".qoder").join("settings.json");
+        let cfg = home.join(".qoder-cn").join("settings.json");
         fs::write(
             &cfg,
             r#"{
@@ -995,7 +979,7 @@ mod tests {
     fn live_stealth_takeover_is_reported_as_healthy_not_pollution() {
         let (home, data) = sandbox();
         with_client(|| {
-            crate::stealth::install(Region::Cn, &data, 8787, &ca(&data)).unwrap();
+            crate::stealth::install(&data, 8787, &ca(&data)).unwrap();
 
             let rep = diagnose(&home, &data);
             let hit = rep
@@ -1015,7 +999,7 @@ mod tests {
     fn stale_stealth_takeover_is_reported_as_blocker() {
         let (home, data) = sandbox();
         with_client(|| {
-            crate::stealth::install(Region::Cn, &data, 8787, &ca(&data)).unwrap();
+            crate::stealth::install(&data, 8787, &ca(&data)).unwrap();
 
             // 把心跳拨到很早以前，模拟应用被 kill -9 后再没起来
             let lease = crate::stealth::lease_path(&data);
@@ -1048,9 +1032,9 @@ mod tests {
             let mut s = crate::accounts::load_settings(&data);
             s.proxy_enabled = true;
             crate::accounts::save_settings(&data, &s).unwrap();
-            crate::stealth::install(Region::Cn, &data, 8787, &ca(&data)).unwrap();
+            crate::stealth::install(&data, 8787, &ca(&data)).unwrap();
             assert_eq!(
-                crate::stealth::current_endpoint(Region::Cn).as_deref(),
+                crate::stealth::current_endpoint().as_deref(),
                 Some("https://127.0.0.1:8787"),
                 "端点必须被注入（且是 https —— 客户端只认 https origin）"
             );
@@ -1062,7 +1046,7 @@ mod tests {
             let after = crate::accounts::load_settings(&data);
             assert!(!after.proxy_enabled, "接管开关必须被关掉");
             assert_eq!(
-                crate::stealth::current_endpoint(Region::Cn),
+                crate::stealth::current_endpoint(),
                 None,
                 "注入要摘干净"
             );

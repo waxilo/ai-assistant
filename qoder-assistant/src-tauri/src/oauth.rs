@@ -25,40 +25,33 @@
 //! # 为什么授权链接里**故意不带** `redirect_uri`
 //!
 //! 官方桌面端填的是 `qoder-app://`（asar 里 `authRedirectUris.stable`）。但那个 scheme
-//! 不是公共设施，是**官方应用自己注册占用的**：
-//!
-//! - `/Applications/Qoder.app/Contents/Info.plist` → `CFBundleURLSchemes = [qoder, qoder-app]`；
-//! - `lsregister -dump` → `Qoder` 这个 bundle 的 `claimed schemes: qoder-app:, qoder:`。
-//!
+//! 不是公共设施，是**官方应用自己注册占用的**：国际版客户端的
+//! `Info.plist → CFBundleURLSchemes = [qoder, qoder-app]`（`lsregister -dump` 可见）。
 //! 于是浏览器走完登录、服务端把用户送到设备流最后一步时，**系统会按 scheme 把 Qoder
-//! 桌面应用拉起来**。这不是巧合 —— Qoder 主进程里 `Ke.on("open-url")` 明确把 `qoder-app://`
-//! 当成它自己的登录回调（`o8 = () => authService.notifyLoginCallback()`），
-//! 「浏览器授权完 → 唤起客户端」本来就是它的设计。
+//! 桌面应用拉起来** —— Qoder 主进程里 `Ke.on("open-url")` 明确把 `qoder-app://`
+//! 当成它自己的登录回调，「浏览器授权完 → 唤起客户端」本来就是它的设计。
 //!
 //! 结论：照抄官方的 `redirect_uri` = **借用了别人的回调地址**，代价是用户每在我们这里
-//! 登录一次，Qoder 桌面端就被拽到前台一次（2026-09-18 用户实报的就是这个现象）。
-//! 我们靠轮询取凭证、**不需要任何浏览器回调**，所以这个参数直接留空；官方实现同样
-//! 允许它为空（`...e.redirectUri ? { redirect_uri } : {}`），且实测「带 / 不带」在
-//! 授权入口表现完全一致（都是 302 到 sign-in，oauth_callback 里也不塞该参数）。
+//! 登录一次，Qoder 桌面端就被拽到前台一次（2026-09-18 用户实报的就是这个现象，
+//! 当时登录的还是国际版客户端）。我们靠轮询取凭证、**不需要任何浏览器回调**，
+//! 所以这个参数直接留空；官方实现同样允许它为空（`...e.redirectUri ? { redirect_uri } : {}`），
+//! 且实测「带 / 不带」在授权入口表现完全一致（都是 302 到 sign-in，oauth_callback 里
+//! 也不塞该参数）。国内版客户端更进一步：它的 `authRedirectUris.stable` 直接是 `null`，
+//! 官方自己在这条路上都不用自定义 scheme。
 //!
 //! 实测（2026-09-18）：`poll` 用假 nonce 打过去返回 `HTTP 404 {"errorCode":"NotFound"}`，
 //! `selectAccounts` 返回 `302` 到 sign-in 页 —— 端点与流程都对得上。
 //!
-//! # 区域（两套部署），所以「区域」是真的参数
+//! # 域不是参数
 //!
-//! 旧版（CodeBuddy 时代）有国内版 / 国际版多套域，[`OAuthStart`] / [`OAuthPoll`] 都带一个
+//! 旧版（CodeBuddy 时代）有多套域，[`OAuthStart`] / [`OAuthPoll`] 都带一个
 //! `host` 字段、前端配了个下拉框。Qoder 当时只有一套 Global 域，于是那个参数**恒被忽略**、
 //! 字段**恒是同一个常量** —— 2026-09-18 整体删除。判断依据是：**不能改的域不该以「参数」
 //! 的形态出现在签名里**，否则下一个人会以为这里可以选。
 //!
-//! 2026-09-19 Qoder 真的有两套部署了（国际版 `qoder.com` / 国内版 `qoder.cn`，
-//! 域、CLI 目录、官方客户端全不同，实测见 [`crate::region`]），于是「区域」**回来了** ——
-//! 但它不是当年那个 `host` 的复活：`host` 是「猜一个恒被忽略的值」，
-//! 而 [`Region`] 是**用户在选择登录入口时明确指定的**那一个。同一条判据仍然成立：
-//! 现在这个参数**真的能改**，所以它才配出现在签名里。
-//!
-//! 一次登录只属于一个区域：区域存进 [`Pending`] 会话，轮询与取用户信息都在它的
-//! OpenAPI 上做，前端拿到 [`OAuthStart::region`] 后原样带进导入项。
+//! 中间一段时间这里真的有「区域」参数（国际版 / 国内版两套部署，域、客户端全不同）；
+//! 2026-10-16 本应用改为**只支持国内版**，域重新变回常量（见 [`crate::qoder_api`]），
+//! 这条判据再次成立：参数只该在「真的能改」的时候存在。
 //!
 //! 其余字段与语义：
 //! - `phone` 取 `/api/v1/userinfo` 的 `security_mobile`（**2026-09-19 更正**：旧版写的
@@ -66,7 +59,6 @@
 //! - `verification_uri` 是 `/device/selectAccounts` 那条地址（不是旧的 `login?state=`）。
 
 use crate::qoder_api;
-use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -114,9 +106,6 @@ pub struct OAuthStart {
     /// 交给系统浏览器打开的授权地址
     pub verification_uri: String,
     pub expires_in: u64,
-    /// 这一轮登录打的是哪套部署 —— 前端导入时原样带回（见 `ImportItem::region`）。
-    /// 授权链接本身不含区域信息，**只有发起方知道**用户点的是哪个入口。
-    pub region: Region,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -129,8 +118,7 @@ pub struct OAuthPoll {
     pub uid: Option<String>,
     pub nickname: Option<String>,
     pub phone: Option<String>,
-    /// 邮箱（`/api/v1/userinfo` 的 `email`）。国际版账号认的就是它
-    /// —— 国内版的那套按手机号登录，邮箱常为空。
+    /// 邮箱（`/api/v1/userinfo` 的 `email`）。手机号之外的第二展示标识，常为空。
     pub email: Option<String>,
     /// access token 过期时间（毫秒时间戳）
     pub expires_at: Option<i64>,
@@ -171,10 +159,6 @@ struct Pending {
     verifier: String,
     /// 本轮 nonce（既是会话标识也是轮询参数）
     nonce: String,
-    /// 这一轮登录所属的区域 —— 轮询与取用户信息都打它的 OpenAPI。
-    /// 存在会话里而不是让调用方每次传：前端手里只有 `login_id`，
-    /// 「这个 login_id 属于哪套部署」只有发起时才知道。
-    region: Region,
     expires_at: Instant,
     result: Option<OAuthPoll>,
 }
@@ -228,8 +212,8 @@ fn own_machine_id_path() -> Option<std::path::PathBuf> {
 ///
 /// 与官方 `MachineIdentity` 的差别只有一处：官方读不到时会**写回 Qoder 的目录**，
 /// 我们改写自己的 —— 「不改别的应用的私有数据」比「少写一个文件」重要。
-fn machine_id(region: Region) -> String {
-    for dir in region.profile_dirs() {
+fn machine_id() -> String {
+    for dir in qoder_api::profile_dirs() {
         if let Ok(raw) = std::fs::read_to_string(dir.join(MACHINE_ID_FILE)) {
             let t = raw.trim();
             if is_uuid(t) {
@@ -285,16 +269,14 @@ fn pkce_challenge(verifier: &str) -> String {
 /// `qoder-app://`，而系统按这个 scheme 拉起的是**官方桌面端**，不是我们。
 /// 顺带一提：国内版客户端的 `authRedirectUris.stable` 直接是 `null`，
 /// 官方自己在这条路上都不用自定义 scheme。
-///
-/// `region` 决定 `{authBase}`（`qoder.com` / `qoder.cn`）；`client_id` 两个区域相同。
-fn authorization_url(region: Region, challenge: &str, nonce: &str, machine_id: &str) -> String {
+fn authorization_url(challenge: &str, nonce: &str, machine_id: &str) -> String {
     format!(
         "{}/device/selectAccounts?challenge={}&challenge_method=S256&nonce={}&machine_id={}&client_id={}",
-        region.auth_base(),
+        qoder_api::AUTH_BASE,
         urlencode(challenge),
         urlencode(nonce),
         urlencode(machine_id),
-        urlencode(Region::AUTH_CLIENT_ID),
+        urlencode(qoder_api::AUTH_CLIENT_ID),
     )
 }
 
@@ -368,9 +350,9 @@ pub(crate) fn parse_poll_response(v: &Value, now_ms: i64) -> Option<TokenReady> 
 ///
 /// # 邮箱也在同一个响应里，字段叫 `email`
 ///
-/// 两套部署的登录身份不同：国内版手机号、国际版邮箱（实测响应见
+/// 展示身份手机号为主、邮箱兜底（实测响应见
 /// `basedata/20260918_Qoder缺失接口逆向.md`，两个字段同框）。这里一次取全，
-/// 免得再为邮箱单开一趟请求 —— 界面按区域选一个展示（见前端 `accountIdent`）。
+/// 免得再为邮箱单开一趟请求（见前端 `accountIdent`）。
 ///
 /// 只认官方那**一个**键：这里不是「猜服务端可能叫什么」，而是抄官方实现，
 /// 多列几个近义词反而会让「字段真的改名了」这件事被静默掩盖。
@@ -399,15 +381,12 @@ pub(crate) fn parse_userinfo(v: &Value) -> UserInfo {
 }
 
 /// 第一步：生成 PKCE 材料并给出授权地址。
-///
-/// `region` 是用户选的那个登录入口（国际版 / 国内版），它决定授权页的域、
-/// 机器身份的来源目录，以及后续轮询打哪套 OpenAPI。
-pub async fn start(region: Region) -> Result<OAuthStart, String> {
+pub async fn start() -> Result<OAuthStart, String> {
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
     let nonce = uuid::Uuid::new_v4().to_string();
-    let machine = machine_id(region);
-    let verification_uri = authorization_url(region, &challenge, &nonce, &machine);
+    let machine = machine_id();
+    let verification_uri = authorization_url(&challenge, &nonce, &machine);
 
     let login_id = format!("qoder_{}", uuid::Uuid::new_v4().simple());
     {
@@ -418,7 +397,6 @@ pub async fn start(region: Region) -> Result<OAuthStart, String> {
             Pending {
                 verifier,
                 nonce,
-                region,
                 expires_at: Instant::now() + Duration::from_secs(OAUTH_TIMEOUT_SECS),
                 result: None,
             },
@@ -428,7 +406,6 @@ pub async fn start(region: Region) -> Result<OAuthStart, String> {
         login_id,
         verification_uri,
         expires_in: OAUTH_TIMEOUT_SECS,
-        region,
     })
 }
 
@@ -447,13 +424,12 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
             (
                 p.verifier.clone(),
                 p.nonce.clone(),
-                p.region,
                 p.expires_at,
                 p.result.clone(),
             )
         })
     };
-    let Some((verifier, nonce, region, expires_at, cached)) = snapshot else {
+    let Some((verifier, nonce, expires_at, cached)) = snapshot else {
         return Ok(OAuthPoll::failed("登录请求不存在或已过期，请重新发起"));
     };
     if let Some(r) = cached {
@@ -467,7 +443,7 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
 
     let url = format!(
         "{}/api/v1/deviceToken/poll?nonce={}&verifier={}&challenge_method=S256",
-        region.openapi_base(),
+        qoder_api::OPENAPI_BASE,
         urlencode(&nonce),
         urlencode(&verifier),
     );
@@ -493,7 +469,7 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
     };
 
     // 拿到 token 后取账号信息：失败不致命（token 已经到手，只是少了几样标识）
-    let info = match qoder_api::get_json(region, &ready.token, "/api/v1/userinfo", &[]).await {
+    let info = match qoder_api::get_json(&ready.token, "/api/v1/userinfo", &[]).await {
         Some(v) => parse_userinfo(&v),
         None => UserInfo {
             uid: None,
@@ -580,28 +556,26 @@ mod tests {
     #[test]
     fn authorization_url_carries_every_required_param() {
         let url = authorization_url(
-            Region::Global,
             "abc-DEF_123",
             "9ecfb156-86c9-49b8-8563-a6cef3987f5c",
             "m1",
         );
-        assert!(url.starts_with("https://qoder.com/device/selectAccounts?"), "{url}");
+        assert!(url.starts_with("https://qoder.cn/device/selectAccounts?"), "{url}");
         assert!(url.contains("challenge=abc-DEF_123"), "base64url 字符不该被转义：{url}");
         assert!(url.contains("challenge_method=S256"));
         assert!(url.contains("nonce=9ecfb156-86c9-49b8-8563-a6cef3987f5c"));
         assert!(url.contains("machine_id=m1"));
-        assert!(url.contains(Region::AUTH_CLIENT_ID));
+        assert!(url.contains(qoder_api::AUTH_CLIENT_ID));
     }
 
-    /// 回归：两个区域的授权链接里都**绝不能**出现 `redirect_uri`。
+    /// 回归：授权链接里**绝不能**出现 `redirect_uri`。
     ///
     /// 官方那条链接的末尾是 `&redirect_uri=qoder-app://`，而系统按这个 scheme 拉起的是
-    /// **官方桌面端**（`lsregister` 里 `qoder-app:` 归 `/Applications/Qoder.app`）。
-    /// 一旦有人「照着官方补回来」，用户每在我们这里登录一次，Qoder 应用就被拽到前台一次。
+    /// **官方桌面端**。一旦有人「照着官方补回来」，用户每在我们这里登录一次，
+    /// Qoder 应用就被拽到前台一次。
     #[test]
     fn authorization_url_never_carries_a_redirect_uri() {
         let url = authorization_url(
-            Region::Global,
             "c",
             "9ecfb156-86c9-49b8-8563-a6cef3987f5c",
             "m",
@@ -709,7 +683,7 @@ mod tests {
 
     /// 邮箱字段的边界：只认 `email`，空白值不算数（与手机号同一条规矩）。
     ///
-    /// 国际版账号的展示身份就是它 —— 落成 `Some("")` 会在界面上显示一个空格子，
+    /// 手机号为空时展示身份就是它 —— 落成 `Some("")` 会在界面上显示一个空格子，
     /// 也会让「有身份标识」的判分（去重时用）把一条没用的记录算成完整的。
     #[test]
     fn email_comes_from_the_email_key_only_and_blank_is_none() {
@@ -755,7 +729,6 @@ mod tests {
         map.insert(
             "old".to_string(),
             Pending {
-                region: Region::Global,
                 verifier: "v".into(),
                 nonce: "n".into(),
                 expires_at: Instant::now() - Duration::from_secs(RESULT_RETENTION_SECS + 10),
@@ -765,7 +738,6 @@ mod tests {
         map.insert(
             "fresh".to_string(),
             Pending {
-                region: Region::Global,
                 verifier: "v".into(),
                 nonce: "n".into(),
                 expires_at: Instant::now() + Duration::from_secs(60),
@@ -785,20 +757,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "真实网络调用"]
     async fn smoke_real_device_flow() {
-        // 两个区域各起一轮：域不同（`qoder.com` / `qoder.cn`），其余拼法一致
-        let s = start(Region::Global).await.expect("start 不该失败（纯本地生成）");
+        let s = start().await.expect("start 不该失败（纯本地生成）");
         println!("login_id={}", s.login_id);
         println!("verification_uri={}", s.verification_uri);
-        assert!(s.verification_uri.starts_with("https://qoder.com/device/selectAccounts?"));
-        assert_eq!(s.region, Region::Global);
-        let cn = start(Region::Cn).await.expect("start 不该失败（纯本地生成）");
-        assert!(
-            cn.verification_uri
-                .starts_with("https://qoder.cn/device/selectAccounts?"),
-            "国内版的授权页必须打在 qoder.cn 上：{}",
-            cn.verification_uri
-        );
-        assert_eq!(cn.region, Region::Cn);
+        assert!(s.verification_uri.starts_with("https://qoder.cn/device/selectAccounts?"));
         assert!(s.verification_uri.contains("directLogin") || s.verification_uri.contains("client_id"));
 
         let r = poll(&s.login_id).await.expect("poll 不该返回 Err");

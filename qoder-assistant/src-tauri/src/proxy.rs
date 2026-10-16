@@ -43,7 +43,6 @@ use crate::checkin::fetch_resource_view;
 use crate::commands;
 use crate::cosy;
 use crate::ledger;
-use crate::region::Region;
 use crate::stealth;
 use chrono;
 use regex::Regex;
@@ -412,10 +411,8 @@ pub fn spawn(app: tauri::AppHandle) {
             stealth::sweep(&dir);
         }
 
-        // 当前装着端点的是**哪个区域 + 哪个端口**。区域必须一起记：
-        // 只记端口的话，用户换区域时这个循环会以为「已经装好了」，
-        // 新区域的 worker 永远不会被改，而界面显示「接管生效中」。
-        let mut installed: Option<(Region, u16)> = None;
+        // 当前装着端点的**端口**。开启态下端口变了就退出去重绑。
+        let mut installed: Option<u16> = None;
         let mut disabled_cleaned = false;
         loop {
             let Ok(dir) = commands::try_data_dir(&app) else {
@@ -425,12 +422,7 @@ pub fn spawn(app: tauri::AppHandle) {
             let settings = accounts::load_settings(&dir);
             if !settings.proxy_enabled {
                 if !disabled_cleaned || installed.take().is_some() {
-                    // 摘**租约上那个区域**的：设置里的区域可能刚被改过，
-                    // 而真正注入到磁盘上的是租约记的那一个。
-                    let region = stealth::load_lease(&dir)
-                        .map(|l| l.region)
-                        .unwrap_or(settings.takeover_region);
-                    if let Err(e) = stealth::uninstall(region, &dir) {
+                    if let Err(e) = stealth::uninstall(&dir) {
                         eprintln!("[proxy] 摘除接管端点失败：{e}");
                     }
                     disabled_cleaned = true;
@@ -441,7 +433,6 @@ pub fn spawn(app: tauri::AppHandle) {
 
             disabled_cleaned = false;
             let port = settings.proxy_port;
-            let region = settings.takeover_region;
 
             // TLS 材料必须在**监听之前**就绪：端点键只接受 https，客户端一连上来
             // 就是 TLS 握手。证书没准备好就把端点装上去，只会把对话打断 —— 比空转更糟。
@@ -460,12 +451,12 @@ pub fn spawn(app: tauri::AppHandle) {
 
             match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(listener) => {
-                    if let Err(e) = stealth::install(region, &dir, port, &ca_pem) {
+                    if let Err(e) = stealth::install(&dir, port, &ca_pem) {
                         eprintln!("[proxy] 安装接管端点失败：{e}");
                         std::thread::sleep(INSTALL_RETRY_BACKOFF);
                         continue;
                     }
-                    installed = Some((region, port));
+                    installed = Some(port);
                     // 监听必须非阻塞，才能在 accept 之余顺带轮询配置；
                     // 但 accept 出来的连接会被 Windows 传染非阻塞，必须逐连接复位——见 configure_conn
                     let _ = listener.set_nonblocking(true);
@@ -474,11 +465,7 @@ pub fn spawn(app: tauri::AppHandle) {
                     loop {
                         if last_cfg.elapsed() >= CONFIG_POLL {
                             let current = accounts::load_settings(&dir);
-                            // 区域也参与判定：换了区域就退出去重装（端口可能没变）
-                            if !current.proxy_enabled
-                                || current.proxy_port != port
-                                || current.takeover_region != region
-                            {
+                            if !current.proxy_enabled || current.proxy_port != port {
                                 break;
                             }
                             last_cfg = Instant::now();
@@ -502,7 +489,7 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
                 Err(e) => {
                     if installed.take().is_some() {
-                        let _ = stealth::uninstall(region, &dir);
+                        let _ = stealth::uninstall(&dir);
                     }
                     eprintln!("[proxy] 无法监听 127.0.0.1:{port}：{e}");
                     std::thread::sleep(Duration::from_secs(2));
@@ -526,26 +513,21 @@ fn serve(stream: TcpStream, tls: Arc<rustls::ServerConfig>, app: tauri::AppHandl
         return;
     }
     if !looks_like_tls(&stream) {
-        handle_conn(stream, app, None);
+        handle_conn(stream, app);
         return;
     }
-    match handshake_and_sni(stream, tls) {
-        Ok((stream, sni)) => handle_conn(stream, app, sni),
+    match handshake(stream, tls) {
+        Ok(stream) => handle_conn(stream, app),
         Err(e) => eprintln!("[proxy] {e}"),
     }
 }
 
-/// 握手 + 取 SNI。抽成独立函数**是为了能被测**：`serve` 要一个 `AppHandle`，
-/// 单测造不出来，而这几行正是国际版上游选择的唯一依据（[`upstream_host`]）。
-///
-/// 握手必须**显式走完**再读 SNI：`server_name()` 只有读过 ClientHello 才有值，
-/// 顺序写反（先读再握）会永远拿到 `None` —— 表现是静默回落到 `infer_base`，
-/// 选举到 api3 的机器全部打到 api2 上。顺带的好处是握手失败在这里就返回，
-/// 不会带着一个「半开」的连接进 [`handle_conn`] 去读请求。
-fn handshake_and_sni(
+/// 完成 TLS 握手。抽成独立函数：`serve` 要一个 `AppHandle`，单测造不出来；
+/// 且握手失败必须在这里就返回，不能带着一个「半开」的连接进 [`handle_conn`] 去读请求。
+fn handshake(
     stream: TcpStream,
     tls: Arc<rustls::ServerConfig>,
-) -> Result<(rustls::StreamOwned<rustls::ServerConnection, TcpStream>, Option<String>), String> {
+) -> Result<rustls::StreamOwned<rustls::ServerConnection, TcpStream>, String> {
     let conn = rustls::ServerConnection::new(tls).map_err(|e| format!("TLS 会话建立失败：{e}"))?;
     let mut stream = rustls::StreamOwned::new(conn, stream);
     // 客户端连上就走、或中间有防火墙 —— 够不上「故障」，但得留个脚印
@@ -553,8 +535,7 @@ fn handshake_and_sni(
         .conn
         .complete_io(&mut stream.sock)
         .map_err(|e| format!("TLS 握手未完成：{e}"))?;
-    let sni = stream.conn.server_name().map(str::to_string);
-    Ok((stream, sni))
+    Ok(stream)
 }
 
 /// 探测首字节是不是 TLS 握手（`0x16` = handshake record）。
@@ -936,45 +917,10 @@ fn clip(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-/// 上游选谁：**由客户端握手里的 SNI 决定**（国际版的 TLS 重定向专门保留了它，
-/// 见 `region::Takeover::HostRedirect`）。
-///
-/// - 族内 SNI（`api*.qoder.sh` / `api*.qoder.com.cn`）→ 就用它。这是国际版**唯一**
-///   正确的来源：客户端每天按选举换域，写死一个上游就会「今天能用、明天 404」。
-/// - 没有 SNI（明文调试分支、国内版的 env 覆盖连的是 IP，而 SNI 不带 IP）→
-///   回落 [`Region::infer_base`]。国内版的正常路径走的就是这一支。
-/// - SNI 是回环地址：同上按回落处理（某些运行时会照着 host 给 IP 也带上 servername）。
-/// - SNI 是族外的域 → `Err`，**不猜也不转发**：那不是我们的注入发来的，拿这种域去
-///   拼上游等于把本机变成一个能转发到任意域的开放代理。
-///
-/// 返回的形态是 `https://<host>`（与 [`Region::infer_base`] 同形，直接喂 [`upstream_url`]）。
-fn upstream_host(region: Region, sni: Option<&str>) -> Result<String, String> {
-    let Some(sni) = sni.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(region.infer_base().to_string());
-    };
-    if crate::region::is_model_gateway_host(sni) {
-        return Ok(format!("https://{sni}"));
-    }
-    if matches!(sni, "127.0.0.1" | "localhost" | "::1") {
-        return Ok(region.infer_base().to_string());
-    }
-    Err(sni.to_string())
-}
-
-/// 「客户端今天连的是哪个上游」每个取值只记一次。
-///
-/// 按请求记会把调试日志刷满（一次对话几十个请求）；而「选举把域换掉了」恰恰是排查
-/// 接管失效时第一个要看的量 —— 所以按**取值去重**，换一个域留一条。
-fn note_upstream_once(dir: &Path, host: &str) {
-    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-    let first = SEEN
-        .lock()
-        .map(|mut s| s.insert(host.to_string()))
-        .unwrap_or(false);
-    if first {
-        let _ = stealth::debug_append(dir, "proxy_upstream", &format!("本轮上游：{host}"));
-    }
-}
+// 转发目标恒为 [`crate::qoder_api::GATEWAY_BASE`]：接管注入把客户端的端点整个指向本机
+// 反代（`QODERCN_SERVER_ENDPOINT`），反代收到什么路径就原样发到网关的同一条路径上。
+// 国际版「按握手 SNI 在网关族里选举换域」的那套上游选择（`upstream_host` / 421 分支 /
+// `note_upstream_once`）已随国际版一起移除 —— 现在上游只有一个，写死即可。
 
 /// 处理一条已建立的连接。
 ///
@@ -984,9 +930,7 @@ fn note_upstream_once(dir: &Path, host: &str) {
 ///
 /// 套接字层面的设置（阻塞模式 / 读写超时）必须在**包装成 TLS 之前**做完：
 /// `StreamOwned` 上没有 `set_read_timeout`，见 `configure_conn` 的文档。
-///
-/// `sni` 来自 TLS 握手（明文分支为 `None`），决定转发到哪个上游 —— 见 [`upstream_host`]。
-fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option<String>) {
+fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
     // 数据目录：选账号 / 写接管日志都要用；取不到直接 500，不再读请求
     let Ok(dir) = commands::try_data_dir(&app) else {
         respond(&mut stream, 500, "text/plain", b"internal error", &[]);
@@ -1060,25 +1004,8 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let settings = accounts::load_settings(&dir);
-    // 转发目标：优先按握手里的 SNI（国际版的选举会换域），拿不到才回落到区域默认。
-    // 这里曾经读 `settings.default_base_url` —— 那是个既没人能改、内容还是模板残留的
-    // 字段，已随区域模型一起删掉。
-    let region = settings.takeover_region;
-    let host = match upstream_host(region, sni.as_deref()) {
-        Ok(h) => h,
-        Err(other) => {
-            // 族外的 SNI：来的不是我们的注入（或客户端新版换了域）。**不猜、不转发**，
-            // 如实回 421 —— 猜错的代价是把请求发到用户没打算去的地方。
-            let _ = stealth::debug_append(
-                &dir,
-                "proxy_bad_sni",
-                &format!("握手 SNI 不在模型网关族内，回 421：{other}"),
-            );
-            respond(&mut stream, 421, "text/plain", b"unexpected sni", &[]);
-            return;
-        }
-    };
-    note_upstream_once(&dir, &host);
+    // 转发目标恒为国内版模型网关（见上面那段说明）。
+    let host = crate::qoder_api::GATEWAY_BASE;
     let bare = normalize_target(&req.target);
     let path = bare;
     let is_chat = is_inference_path(bare);
@@ -1113,15 +1040,12 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option
         // COSY 签名身份（uid + 名字 + 该账号的 dt- token）。**在闭包外先取一次**：
         // 下面两处都要用 —— 重签发往上的请求、以及拉「免费模型集」。
         // 它只在账号第一次被路由到时才联网（拿 uid 并落盘），平时是纯本地的一次字段读。
-        //
-        // 取 uid 打的是 [`Region::identity_base`]，**不是**转发目标（`host`）：国际版的
-        // uid 只在 openapi 上，而网关族里没有这条路径 —— 指错的表现是「换号签名永远
-        // 做不成」而界面只说「接管已开启」。
+        // uid 查询与转发同域（国内版网关上两条路径都有，见 `cosy` 模块）。
         let cosy_id = tauri::async_runtime::block_on(accounts::cosy_identity(
             &dir,
             &account,
             &CLIENT,
-            region.identity_base(),
+            crate::qoder_api::GATEWAY_BASE,
         ));
 
         // 选中的账号**接不接得下这单**：聊天类 COSY 请求必须重签才谈得上换号，
@@ -1140,7 +1064,6 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option
             let can_switch = ban.len() + 1 < FAILOVER_MAX_TRIES
                 && has_spare_candidate(
                     &accounts::load_accounts(&dir),
-                    region,
                     &settings.billing_account_ids,
                     &tried,
                 );
@@ -1332,10 +1255,10 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option
         // 免费模型集：与接管页同一份（[`crate::models`] 的三层来源 + 1h 内存缓存）。
         // 三层都拿不到就是**空集** ⇒ 只有流程里那些「上游 429 也原样透传」的模型不再自动换号；
         // 这里不会退回任何写死的模型名。
-        // 拿不到签名身份（该区域没账号 / uid 取不到）时**只是不走网络那层**，
+        // 拿不到签名身份（没有账号 / uid 取不到）时**只是不走网络那层**，
         // 缓存与本机痕迹照给 —— 热路径上不该因为一次网络失败就没有清单。
         let free_set = if is_chat {
-            ensure_free_models(&dir, account.region, cosy_id.as_ref())
+            ensure_free_models(&dir, cosy_id.as_ref())
         } else {
             HashSet::new()
         };
@@ -1392,7 +1315,6 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle, sni: Option
                     if ban.len() + 1 < FAILOVER_MAX_TRIES
                         && has_spare_candidate(
                             &accounts::load_accounts(&dir),
-                            region,
                             &settings.billing_account_ids,
                             &tried,
                         )
@@ -1474,8 +1396,8 @@ fn is_inference_path(bare: &str) -> bool {
 ///
 /// 与 [`is_inference_path`] **不是**一回事，别合并：
 /// - `is_inference_path` 认的是 OpenAI 风格的 `/…/completions`，服务的是**限流换号**那套
-///   （要读响应体、要按模型冷却）；国际版走这条。
-/// - 国内版的对话走 `/algo/api/v2/service/pro/sse/agent_chat_generation`（**SSE 包裹**），
+///   （要读响应体、要按模型冷却）。
+/// - 对话生成走 `/algo/api/v2/service/pro/sse/agent_chat_generation`（**SSE 包裹**），
 ///   路径形态完全不同，2026-09-19 实测。它需要的是「扣费账号」证据埋点，不是那套重试。
 ///
 /// 把两者混在一起，会让「读响应体」的重试逻辑落到流式响应上 —— 那是另一个量级的风险，
@@ -1504,7 +1426,7 @@ fn normalize_target(target: &str) -> &str {
 //
 // 在 Qoder 上这条改写**已被证伪，必须去掉**（2026-09-19 未鉴权探测当时的国际版网关
 // `api2-v2.qoder.sh`，401 = 路由存在、404 = 不存在。该域如今只剩旧的
-// `/model/v1/chat/completions`，现役网关是 `api2/api3.qoder.sh` 那一族 —— 见 `region`）：
+// `/model/v1/chat/completions`，现役网关是 `api2/api3.qoder.sh` 那一族）：
 //
 //   POST /model/v1/chat/completions  → 401   ← 客户端真正在用的路径
 //   POST /v2/chat/completions        → 404   ← 旧改写指向的地方，**根本不存在**
@@ -1532,10 +1454,9 @@ fn body_model(body: &[u8]) -> Option<String> {
 /// 模型名当成了免费模型。接口与兜底都已作废，理由见 [`crate::models`] 的模块说明。
 fn ensure_free_models(
     dir: &Path,
-    region: Region,
     identity: Option<&crate::cosy::Identity>,
 ) -> HashSet<String> {
-    let report = tauri::async_runtime::block_on(crate::models::load(region, dir, identity, false));
+    let report = tauri::async_runtime::block_on(crate::models::load(dir, identity, false));
     crate::models::free_ids(&report.models)
 }
 
@@ -1566,49 +1487,42 @@ fn is_rate_limited_model(
 /// 清单与免费判定都交给 [`crate::models`] —— 那边有内存缓存 / 落盘快照 / 本机痕迹三层，
 /// 且**与路由侧同源**（见 `ensure_free_models`）。
 ///
-/// # 这个命令**不要求本区域有账号**
+/// # 这个命令**不要求有账号**
 ///
 /// 三层来源里两层是纯本地的，「没账号」只该让第 1 层缺席，不该让整件事失败
-/// （`note` 里会写明原因，界面照常显示清单）。
+/// （`note` 里会写明原因，界面照常显示清单）。详见 [`crate::models`]。
 ///
-/// 早先这里是 `load_accounts(..).find(..).ok_or_else(|| "xx 下暂无账号，无法拉取模型列表")`，
-/// 后果是：用户只登了一边的账号时，接管页每次打开都弹一条与事实无关的红字 ——
-/// 而那个区域他们本来就没打算用（真正要接管的是另一边，页面上换个区域就好了）。
-/// 一个纯本地查询被一个无关条件整个拦掉，是最没信息量的一种失败。详见 [`crate::models`]。
-///
-/// # 顺手删掉的续签
+/// # 不做续签
 ///
 /// 绑了池先整池同步一轮（本地那份 token 可能早被别的机器换掉了）—— 这条留着。
-/// 但**不再调 `ensure_fresh_token`**：`free_models` 不落盘，而续签会轮换 refresh token，
-/// 于是「看一眼清单」可能把轮换出来的新凭证直接丢掉。真过期了会怎样？第 1 层拿不到身份，
-/// 自动退到缓存与本机痕迹两层 —— 界面不空、也不赔上凭证。净亏，删掉。
+/// 但**不调 `ensure_fresh_token`**：`free_models` 不落盘，而续签会轮换 refresh token，
+/// 「看一眼清单」可能把轮换出来的新凭证直接丢掉。真过期了会怎样？第 1 层拿不到身份，
+/// 自动退到缓存与本机痕迹两层 —— 界面不空、也不赔上凭证。净亏，不做。
 #[tauri::command]
 pub async fn free_models(
     app: tauri::AppHandle,
     refresh: Option<bool>,
-    region: Option<Region>,
 ) -> Result<crate::models::ModelReport, String> {
     let dir = crate::commands::try_data_dir(&app)?;
     crate::commands::sync_pool_if_bound(&dir).await;
-    // 缺省 = 设置里的接管目标区域（接管页默认看的就是它要接管的那一套）；
-    // 前端显式传值时用于「换了区域但还没保存就先看看清单」。
-    let region = region.unwrap_or_else(|| accounts::load_settings(&dir).takeover_region);
     // 找得到账号就组出签名身份，试一次第 1 层；找不到（或 uid 取不到）给 `None`，
     // 让 [`crate::models::load`] 直接走本地两层 —— 那不是错误。
     let account = accounts::load_accounts(&dir)
         .into_iter()
-        .filter(|a| a.region == region)
         .find(|a| !a.token.is_empty());
     let identity = match &account {
         Some(a) => {
-            // uid 查询打的是 [`Region::identity_base`]（国际版在 openapi、国内版与业务同域），
-            // 与转发目标 `infer_base` 是两件事 —— 见 [`crate::region`]。
-            accounts::cosy_identity(&dir, a, &crate::http::api_client_direct(), region.identity_base())
-                .await
+            accounts::cosy_identity(
+                &dir,
+                a,
+                &crate::http::api_client_direct(),
+                crate::qoder_api::GATEWAY_BASE,
+            )
+            .await
         }
         None => None,
     };
-    Ok(crate::models::load(region, &dir, identity.as_ref(), refresh.unwrap_or(false)).await)
+    Ok(crate::models::load(&dir, identity.as_ref(), refresh.unwrap_or(false)).await)
 }
 
 /// 不该回给客户端的响应头：逐跳头、reqwest 已代劳解压后失效的，
@@ -1924,8 +1838,8 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
 
 /// 除 `tried` 之外，还有没有可换的候选账号？（纯函数，便于单测）
 ///
-/// 判据与 [`choose_account`] 的候选集**逐句对齐**：先按区域过滤，再取勾选的
-/// 扣费备选（未勾选 = 全部）。入参是**已读好的**账号表 —— 它被调用在路由热路径上，
+/// 判据与 [`choose_account`] 的候选集**逐句对齐**：取勾选的扣费备选
+/// （未勾选 = 全部）。入参是**已读好的**账号表 —— 它被调用在路由热路径上，
 /// 不能顺手读盘，更不能有网络副作用（`choose_account` 会顺手补积分、续签、
 /// 写粘滞，绝不能拿它来「试算」）。
 ///
@@ -1934,12 +1848,10 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
 /// 对话是通的。所以「换下一个」的前提永远是「真的有下一个」。
 fn has_spare_candidate(
     all: &[crate::accounts::Account],
-    region: Region,
     selected: &[String],
     tried: &[String],
 ) -> bool {
-    let in_region: Vec<_> = all.iter().filter(|a| a.region == region).cloned().collect();
-    billing_candidates(&in_region, selected)
+    billing_candidates(all, selected)
         .iter()
         .any(|a| !tried.iter().any(|t| t == &a.id))
 }
@@ -1949,7 +1861,7 @@ fn has_spare_candidate(
 /// `model` 是本轮请求要用的模型：限流冷却按 **账号 × 模型** 记账，选号必须知道模型是谁。
 ///
 /// 候选集 = 设置里勾选的扣费账号（未勾选的不允许扣费；全不勾 = 全部可用），
-/// 先按区域过滤，再做两层过滤：
+/// 再做两层过滤：
 /// - **禁用（严格）**：`ban` 里的账号是本轮请求已试败的限流账号，直接剔除；剔完为空返回 None；
 /// - **冷却（软）**：对本模型仍在限流窗口内的账号优先跳过，全员冷却则照常用。
 ///
@@ -1970,19 +1882,9 @@ async fn choose_account(
     let settings = accounts::load_settings(dir);
     // ⚠️ 整池同步必须在**读账号之前**：它会把云端那一份并进 accounts.json，
     // 而闸带回来的才是最新凭证。顺序颠倒 = 整轮请求都在用已作废的 token。
-    // 它是热路径，但节流（`broker::SYNC_TTL_MS`）让绝大多数调用只是读一下内存；
-    // 区域用上面刚读到的设置，别为它多翻一遍盘。
-    crate::commands::sync_pool_if_bound_in(dir, settings.takeover_region).await;
+    // 它是热路径，但节流（`broker::SYNC_TTL_MS`）让绝大多数调用只是读一下内存。
+    crate::commands::sync_pool_if_bound(dir).await;
     let all = accounts::load_accounts(dir);
-    if all.is_empty() {
-        return None;
-    }
-    // **只在被接管那个区域的账号里选**。跨区域的 token 在对方网关上无效，
-    // 送过去只会吃一个 401 —— 而界面上看起来是「这些账号怎么都不好使」，
-    // 完全看不出是「选错了区域」。过滤放在最前面：后面的粘滞、冷却、排序
-    // 都只该看见本区域的候选。
-    let region = settings.takeover_region;
-    let all: Vec<_> = all.into_iter().filter(|a| a.region == region).collect();
     if all.is_empty() {
         return None;
     }
@@ -2023,7 +1925,7 @@ async fn choose_account(
         if !snapshot_stale(snaps[i].as_ref().map(|f| f.at.as_str())) {
             continue;
         }
-        let view = fetch_resource_view(acct.region, &acct.token).await;
+        let view = fetch_resource_view(&acct.token).await;
         readings.push(ledger::Reading {
             id: acct.id.clone(),
             packages: view.packages,
@@ -2276,8 +2178,7 @@ mod tests {
     /// 否则会出现「以为有备选 → ban 空 → choose_account 返回 None → 给客户端回 503」。
     #[test]
     fn spare_candidate_detection_mirrors_choose_account() {
-        let mk = |id: &str, region: Region| crate::accounts::Account {
-            region,
+        let mk = |id: &str| crate::accounts::Account {
             id: id.into(),
             name: id.into(),
             phone: None,
@@ -2293,27 +2194,16 @@ mod tests {
             renew_blocked_until: None,
             last: None,
         };
-        let all = vec![
-            mk("g1", Region::Global),
-            mk("g2", Region::Global),
-            mk("c1", Region::Cn),
-        ];
+        let all = vec![mk("a"), mk("b"), mk("c")];
         let tried = |ids: &[&str]| -> Vec<String> { ids.iter().map(|s| s.to_string()).collect() };
-        // 未勾选 = 全部可用：试过 g1 还有 g2（同区的 c1 不算数，跨区 token 在对面网关无效）
-        assert!(has_spare_candidate(&all, Region::Global, &[], &tried(&["g1"])));
-        // 全域都试过了 → 没有备选
-        assert!(!has_spare_candidate(&all, Region::Global, &[], &tried(&["g1", "g2"])));
-        // 勾选只认勾了的那几个：勾了 g1，试过 g1 = 没有备选（g2 未勾选不参战）
-        assert!(!has_spare_candidate(
-            &all,
-            Region::Global,
-            &tried(&["g1"]),
-            &tried(&["g1"])
-        ));
-        // 勾选的 id 全不存在（账号删光）→ 与 choose_account 一样退回全区
-        assert!(has_spare_candidate(&all, Region::Global, &tried(&["zzz"]), &tried(&["g1"])));
-        // 跨区域的账号不在候选里
-        assert!(!has_spare_candidate(&all, Region::Cn, &[], &tried(&["c1"])));
+        // 未勾选 = 全部可用：试过 a 还有 b、c
+        assert!(has_spare_candidate(&all, &[], &tried(&["a"])));
+        // 全都试过了 → 没有备选
+        assert!(!has_spare_candidate(&all, &[], &tried(&["a", "b", "c"])));
+        // 勾选只认勾了的那几个：勾了 a，试过 a = 没有备选（b、c 未勾选不参战）
+        assert!(!has_spare_candidate(&all, &tried(&["a"]), &tried(&["a"])));
+        // 勾选的 id 全不存在（账号删光）→ 与 choose_account 一样退回全部
+        assert!(has_spare_candidate(&all, &tried(&["zzz"]), &tried(&["a"])));
     }
 
     #[test]
@@ -2322,164 +2212,6 @@ mod tests {
             upstream_url("https://copilot.tencent.com/", "/chat/completions"),
             "https://copilot.tencent.com/chat/completions"
         );
-    }
-
-    /// 上游选谁：族内 SNI 说了算（国际版），没有 SNI 才回落区域默认（国内版）。
-    ///
-    /// 这条守的是国际版的**核心假设**：客户端按选举在 api1/api2/api3/api6 之间换域，
-    /// 注入段只改 TCP 目标、把 `servername` 原样留给反代 —— 反代认不出来就会
-    /// 静默回落到 `infer_base`（api2），于是「今天能用、明天全 404」。
-    #[test]
-    fn upstream_follows_the_sni_and_falls_back_without_one() {
-        // 族内 SNI：就用它（选举到哪就跟到哪）
-        for (sni, want) in [
-            ("api3.qoder.sh", "https://api3.qoder.sh"),
-            ("api1.qoder.sh", "https://api1.qoder.sh"),
-            ("api2-v2.qoder.sh", "https://api2-v2.qoder.sh"),
-            ("api6.qoder.com.cn", "https://api6.qoder.com.cn"),
-        ] {
-            assert_eq!(
-                upstream_host(Region::Global, Some(sni)).unwrap(),
-                want,
-                "国际版要跟着 SNI 走"
-            );
-            // 国内版收到族内 SNI 也照走：那不是 CN 客户端发得出来的（它连的是 IP），
-            // 只可能是切换区域时的残留 —— 转发比乱猜好，日志里看得见
-            assert_eq!(upstream_host(Region::Cn, Some(sni)).unwrap(), want);
-        }
-        // 没有 SNI（明文调试、国内版连 IP）：回落区域默认
-        assert_eq!(
-            upstream_host(Region::Global, None).unwrap(),
-            Region::Global.infer_base()
-        );
-        assert_eq!(
-            upstream_host(Region::Cn, None).unwrap(),
-            Region::Cn.infer_base()
-        );
-        assert_eq!(
-            upstream_host(Region::Cn, Some("")).unwrap(),
-            Region::Cn.infer_base(),
-            "空 SNI 等同没有"
-        );
-        // 回环地址当 SNI（有的运行时会照 host 填）：按「没有」处理，别去连 localhost
-        for local in ["127.0.0.1", "localhost", "::1"] {
-            assert_eq!(
-                upstream_host(Region::Cn, Some(local)).unwrap(),
-                Region::Cn.infer_base(),
-                "{local}"
-            );
-        }
-        // 族外的域：**拒绝**，不猜也不转发 —— 否则本机就成了能转发到任意域的开放代理
-        for foreign in [
-            "center.qoder.sh",
-            "openapi.qoder.sh",
-            "qoder.com",
-            "api3.qoder.sh.evil.com",
-            "example.com",
-        ] {
-            assert_eq!(
-                upstream_host(Region::Global, Some(foreign)).unwrap_err(),
-                foreign,
-                "{foreign} 必须原样报出来（排查时要知道对端发的到底是什么）"
-            );
-        }
-    }
-
-    /// SNI 只有**真握手之后**才读得到 —— 这条用真实 TLS 握手钉住
-    /// [`handshake_and_sni`] 的用法（先 `complete_io`、再 `server_name`）。
-    ///
-    /// 顺序写反的表现不是报错，而是所有国际版请求静默回落到 `infer_base`：
-    /// 「接管开着、一个请求都到不了选举出来的那个域」。客户端那一侧同款做法
-    /// （TCP 目标是 127.0.0.1、servername 是原域）也在这里一并演练。
-    #[test]
-    fn sni_survives_a_real_handshake_when_only_the_tcp_target_moved() {
-        use rustls::client::danger::{
-            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-        };
-        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-
-        #[derive(Debug)]
-        struct TrustAnything;
-        impl ServerCertVerifier for TrustAnything {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &CertificateDer<'_>,
-                _intermediates: &[CertificateDer<'_>],
-                _server_name: &ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: UnixTime,
-            ) -> Result<ServerCertVerified, rustls::Error> {
-                Ok(ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
-
-        let dir = std::env::temp_dir().join(format!("qa-sni-{}", uuid::Uuid::new_v4()));
-        let cfg = certs::ensure(&dir)
-            .and_then(|c| certs::server_config(&c))
-            .expect("自签证书应能装配");
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // 服务端：走的就是 `serve` 用的那个函数
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            configure_conn(&stream).unwrap();
-            handshake_and_sni(stream, cfg).unwrap().1
-        });
-
-        // 客户端：TCP 目标已改成 127.0.0.1（注入段干的），servername 仍是选举出来的域
-        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TrustAnything))
-        .with_no_client_auth();
-        let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut client = rustls::StreamOwned::new(
-            rustls::ClientConnection::new(
-                Arc::new(client_cfg),
-                ServerName::try_from("api3.qoder.sh").unwrap(),
-            )
-            .unwrap(),
-            sock,
-        );
-        client.conn.complete_io(&mut client.sock).unwrap();
-
-        let seen = server.join().unwrap();
-        assert_eq!(
-            seen.as_deref(),
-            Some("api3.qoder.sh"),
-            "握手之后必须读得到 SNI —— 读不到就只能回落 infer_base"
-        );
-        assert_eq!(
-            upstream_host(Region::Global, seen.as_deref()).unwrap(),
-            "https://api3.qoder.sh"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2514,7 +2246,6 @@ mod tests {
     #[test]
     fn billing_candidates_restricts_to_selected_accounts() {
         let mk = |id: &str| crate::accounts::Account {
-            region: Region::Global,
             id: id.into(),
             name: id.into(),
             phone: None,
@@ -2544,7 +2275,6 @@ mod tests {
     #[test]
     fn available_candidates_skips_cooling_unless_all_cooling() {
         let mk = |id: &str| crate::accounts::Account {
-            region: Region::Global,
             id: id.into(),
             name: id.into(),
             phone: None,
@@ -2938,7 +2668,6 @@ mod tests {
         let mut server = down.accept().unwrap().0;
 
         let acct = accounts::Account {
-            region: Region::Global,
             id: "acct-e2e".into(),
             name: "端到端".into(),
             phone: None,
@@ -3049,7 +2778,6 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", down_port)).unwrap();
         let mut server = down.accept().unwrap().0;
         let acct = accounts::Account {
-            region: Region::Global,
             id: "acct-e2e".into(),
             name: "端到端".into(),
             phone: None,

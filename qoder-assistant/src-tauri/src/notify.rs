@@ -184,7 +184,7 @@ pub fn summary_message(views: &[AccountView]) -> String {
     if !unsigned.is_empty() {
         s.push_str("\n未签明细：");
         for a in unsigned.iter().take(5) {
-            // 展示标识与界面同一套规则（国内版手机号 / 国际版邮箱，见 `Account::identity`）：
+            // 展示标识与界面同一套规则（见 `Account::identity`）：
             // 推送里的「谁没签上」与界面上看到的名字必须是同一条
             let who = match a.identity() {
                 Some(id) => format!("{}（{}）", a.name, id),
@@ -207,7 +207,6 @@ pub fn summary_message(views: &[AccountView]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::region::Region;
     use super::*;
     use crate::accounts::CheckinRecord;
 
@@ -216,7 +215,6 @@ mod tests {
     fn acct(name: &str, phone: Option<&str>, rec: Option<CheckinRecord>) -> AccountView {
         AccountView {
             account: Account {
-                region: Region::Global,
                 id: name.to_string(),
                 name: name.to_string(),
                 phone: phone.map(|p| p.to_string()),
@@ -409,10 +407,10 @@ mod tests {
         assert!(m.contains("成功 1 / 已签 1 / 活动未开 1 / 失败 2（共 5 个账号）"), "{m}");
     }
 
-    /// 国际版账号的展示标识是邮箱：手机号为空的失败账号不能再退回「只有名字」，
+    /// 手机号为空、只有邮箱的失败账号不能再退回「只有名字」，
     /// 那会让多条失败记录在推送里长得一模一样、分不出是谁
     #[test]
-    fn a_global_failure_is_named_by_its_email() {
+    fn an_email_only_failure_is_named_by_its_email() {
         let mut a = acct("小号", None, Some(rec(false, false, false, "HTTP 401 (token expired)")));
         a.account.email = Some("a@b.c".into());
         let m = summary_message(&[a]);

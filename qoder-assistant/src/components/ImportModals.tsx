@@ -4,7 +4,6 @@ import type {
   ImportItem,
   ImportReport,
   LocalAccount,
-  LocalProbe,
   OAuthPoll,
 } from "../types";
 import {
@@ -14,7 +13,6 @@ import {
   openExternal,
 } from "../api";
 import { accountIdent, baseName, copyText, maskPhone, maskToken } from "../common";
-import { regionLabel, useRegions } from "../regions";
 import type { Toast } from "../common";
 import { Dialog } from "./Dialog";
 import {
@@ -44,29 +42,26 @@ import {
  * 而且一次就能拿到 token + 昵称 + 手机号 / 邮箱（导入时一并带上）。
  * 代价是它只能拿到**已经在本机登录过**的账号；要收新账号请用「登录新账号」。
  *
- * 两套部署的目录都会扫（`com.qoder.app.stable` / `com.qodercn.app.stable`），
- * 所以每条结果都带着「来自哪个区域」—— 同一条凭据在两边是完全不同的账号。
+ * 只扫国内版那一套目录（`com.qodercn.app.stable`）；「读到了什么 / 为什么没读到」
+ * 由后端写成一句人话一起带回来（[`LocalScan`] 的 `note`），界面原样摆出来。
  */
 export function LocalAccountsModal({
   accounts,
-  region,
   onImport,
   onClose,
   onToast,
 }: {
   accounts: Account[];
-  /** 当前区域（左下角全局选择器）；null = 还没读到 settings（首屏那一瞬），此时展示全部 */
-  region: string | null;
   onImport: (items: ImportItem[]) => Promise<ImportReport>;
   onClose: () => void;
   onToast: (t: Toast) => void;
 }) {
   const [list, setList] = useState<LocalAccount[]>([]);
-  const [probes, setProbes] = useState<LocalProbe[]>([]);
+  // 「读到了什么 / 为什么没读到」：后端把原因写成一句人话（见 LocalScan.note）。
+  // 不写这句，用户最容易猜错的结论就是「我是不是没登录」。
+  const [note, setNote] = useState("");
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
-  // 区域清单：后端给的「国际版 / 国内版」中文名，列表里那个标签要用
-  const regionOpts = useRegions();
 
   const scan = useCallback(async () => {
     setLoading(true);
@@ -76,10 +71,10 @@ export function LocalAccountsModal({
       // 表现成「打开导入弹窗，整个应用白屏」，而不是「这个弹窗里没有账号」。
       const result = await discoverLocalAccounts();
       setList(result?.accounts ?? []);
-      setProbes(result?.probes ?? []);
+      setNote(result?.note ?? "");
     } catch {
       setList([]);
-      setProbes([]);
+      setNote("");
     } finally {
       setLoading(false);
     }
@@ -89,35 +84,23 @@ export function LocalAccountsModal({
     void scan();
   }, [scan]);
 
-  // 「已添加」的判据是**区域 + token**：只看 token 会在极端情况下把另一个区域里的
-  // 凭据也算成「已添加」—— 而两套部署签发的 token 本来就互不相通，区域是这条凭据的一半身份。
+  // 「已添加」的判据是 token：本机文件里同一串 token 就是同一条凭据。
   // 这里故意不做手机号 / 邮箱匹配（后端合并会认）：本机文件里的 token 一旦轮换过，
   // 那条正是需要导进来刷新凭证的，判成「已添加」反而把该做的事挡在了门外。
   const addedKeys = useMemo(
-    () => new Set(accounts.map((a) => `${a.region}\n${a.token}`)),
+    () => new Set(accounts.map((a) => a.token)),
     [accounts]
   );
-  const isAdded = (d: LocalAccount) =>
-    addedKeys.has(`${d.region}\n${d.token}`);
+  const isAdded = (d: LocalAccount) => addedKeys.has(d.token);
 
-  // 数据隔离：只展示当前区域（左下角全局选择器）的本机账号。两套部署的凭据互不相通，
-  // 后端确实扫了全部目录（`discover_local_accounts` 一次给全量），但在这里**不混**，
-  // 只把当前区域那几条列出来、也只导入它们 —— 另一区域切过去再看。
-  // region 为 null（settings 未就绪）时退回展示全部，避免弹窗白屏。
-  const visible = region ? list.filter((d) => d.region === region) : list;
-  const probesShown = region
-    ? probes.filter((p) => p.region === region)
-    : probes;
   // 已存在的账号会被跳过而不是重复添加
-  const pending = visible.filter((d) => !isAdded(d));
+  const pending = list.filter((d) => !isAdded(d));
 
   const toItem = (d: LocalAccount): ImportItem => ({
-    // 区域必须带上：登录文件本身不写区域，而下游每个请求都要靠它选域
-    region: d.region,
     token: d.token,
     name: d.nickname || d.phone,
     phone: d.phone,
-    // 邮箱与手机号同为识别键（国内版看手机号、国际版看邮箱），带着它导入才能
+    // 邮箱与手机号同为识别键，带着它导入才能
     // 让「token 已轮换、手机号/邮箱没变」的账号并到同一条上，而不是新增一条
     email: d.email,
     // 不带这三个字段的话，导入的账号永远无法自动续签（前两个换来新 token，
@@ -187,45 +170,26 @@ export function LocalAccountsModal({
         <span>
           Qoder 登录后会把账号与凭证写到本机的 <code>auth.v1.dat</code>（Chromium safeStorage
           加密；macOS 的密钥在系统钥匙串里，首次读取若弹出授权，点「始终允许」以后就不再问）。
-          这里直接读取它，<b>只扫「当前区域」那个目录</b>（跟随左下角的区域选择器）；
-          <b>不需要 Qoder 正在运行，也不用改启动方式</b>，而且能一次拿到昵称与手机号 / 邮箱。
-          仅读取、不外传。另一区域的账号切到左下角再看。
+          这里直接读取它，<b>不需要 Qoder 正在运行，也不用改启动方式</b>，
+          而且能一次拿到昵称与手机号 / 邮箱。仅读取、不外传。
         </span>
       </p>
 
-      {/* 当前区域的读取情况：一行。这一段是该弹窗里最该被看见的东西 ——
-          「没读到」的原因必须写在脸上，否则用户只能去猜，
-          而最容易猜错的结论就是「我是不是没登录」。 */}
-      {!loading && probesShown.length > 0 && (
-        <ul className="probe-list">
-          {probesShown.map((p) => (
-            <li
-              key={p.region}
-              className={"probe-item" + (p.found ? " ok" : "")}
-            >
-              <span className={"badge " + (p.found ? "badge-ok" : "badge-idle")}>
-                {regionLabel(regionOpts, p.region) ?? p.region}
-              </span>
-              <span className="probe-detail">{p.detail}</span>
-            </li>
-          ))}
-        </ul>
-      )}
+      {/* 读取情况一行（读到 / 没读到都非空）。「没读到」的原因必须写在脸上，
+          否则用户只能去猜，而最容易猜错的结论就是「我是不是没登录」。 */}
+      {!loading && note && <p className="modal-meta">{note}</p>}
 
       {loading ? (
         <p className="empty">读取中…</p>
-      ) : visible.length === 0 ? (
+      ) : list.length === 0 ? (
         <p className="empty">
-          当前区域没有可导入的账号 —— 具体原因见上面那一行
-          （本工具只读，不会改动 Qoder 的登录文件）。
+          本机没有可导入的账号（本工具只读，不会改动 Qoder 的登录文件）。
         </p>
       ) : (
         <ul className="pick-list">
-          {visible.map((d) => {
+          {list.map((d) => {
             const added = isAdded(d);
-            const rg = regionLabel(regionOpts, d.region);
-            // 展示标识按区域选（国内版手机号 / 国际版邮箱）：与导入后账号页看到的是同一个
-            const ident = accountIdent(d.region, d.phone, d.email);
+            const ident = accountIdent(d.phone, d.email);
             return (
               <li
                 key={d.file}
@@ -237,8 +201,6 @@ export function LocalAccountsModal({
                     {ident && (
                       <span className="ac-ident">{maskPhone(ident)}</span>
                     )}
-                    {/* 这条凭据来自哪套部署：两个目录都会扫到，不标出来就分不清 */}
-                    {rg && <span className="ac-region">{rg}</span>}
                     {d.is_current && (
                       <span className="badge badge-ok">当前登录</span>
                     )}
@@ -273,20 +235,12 @@ export function LocalAccountsModal({
  *
  * 独立于「导入本机账号」——后者只能拿到**已经登录过**的账号，
  * 这条通道能主动把新账号签发进来，且不重启、不打断当前 Qoder、不改本机登录文件。
- *
- * **跟随当前区域**：国际版与国内版是两套**互不相通**的部署（账号 / 积分 / 活动各自独立），
- * 而授权链接本身**不含**区域信息 —— 只有发起方知道用户点的是哪个入口，
- * 所以不是让弹窗里再选一遍，而是直接取左下角那个全局区域选择器的值（见 `oauth_start` 的 `region`）。
- * 要登到另一个区域，先在左下角切过去再打开这里。
  */
 export function OAuthModal({
-  region,
   onImport,
   onClose,
   onToast,
 }: {
-  /** 当前区域（左下角全局选择器）；null = 还没读到 settings，此时取清单第一个兜底 */
-  region: string | null;
   onImport: (items: ImportItem[]) => Promise<ImportReport>;
   onClose: () => void;
   onToast: (t: Toast) => void;
@@ -322,7 +276,6 @@ export function OAuthModal({
   // 只会让这个组件变成两个都想管状态的容器。
   return (
     <OAuthPanel
-      defaultRegion={region}
       importing={importing}
       onImport={doImport}
       onToast={onToast}
@@ -337,37 +290,24 @@ export function OAuthModal({
  * 轮询期服务端回 404 是**正常等待态**（用户还没点完），不是错误。
  */
 function OAuthPanel({
-  defaultRegion,
   importing,
   onImport,
   onToast,
   onClose,
 }: {
-  /** 当前区域（左下角全局选择器）；null = 还没读到 settings，此时取清单第一个兜底 */
-  defaultRegion: string | null;
   importing: boolean;
   onImport: (items: ImportItem[]) => Promise<void>;
   onToast: (t: Toast) => void;
   onClose: () => void;
 }) {
   const [phase, setPhase] = useState<"idle" | "waiting" | "done" | "error">("idle");
-  // 这一轮授权**实际**用的区域（后端会话里记的那个）：导入时以它为准，
-  // 而不是以界面此刻的显示为准 —— 那才是这次授权的真实身份。
-  const [sessionRegion, setSessionRegion] = useState("");
   const [uri, setUri] = useState("");
   const [result, setResult] = useState<OAuthPoll | null>(null);
   const [err, setErr] = useState("");
   const [waited, setWaited] = useState(0);
 
-  // 直接跟随左下角全局区域选择器：不再让弹窗里自己挑一遍区域（数据隔离）。
-  // 兜底只取清单第一个，用于 settings 还没读到的首帧那一瞬。
-  const regionOpts = useRegions();
-  const region = defaultRegion ?? regionOpts[0]?.key ?? "";
-  const selLabel = regionLabel(regionOpts, region);
-  // 授权成功那条预览的展示标识（国内版手机号 / 国际版邮箱）：按本轮**实际**授权的区域选
-  const doneIdent = result
-    ? accountIdent(sessionRegion || region, result.phone, result.email)
-    : null;
+  // 授权成功那条预览的展示标识（手机号 / 邮箱）
+  const doneIdent = result ? accountIdent(result.phone, result.email) : null;
 
   const timer = useRef<number | null>(null);
   const busy = useRef(false);
@@ -389,8 +329,7 @@ function OAuthPanel({
     setUri("");
     setPhase("waiting");
     try {
-      const s = await oauthStart(region);
-      setSessionRegion(s.region);
+      const s = await oauthStart();
       setUri(s.verification_uri);
       try {
         await openExternal(s.verification_uri);
@@ -469,7 +408,6 @@ function OAuthPanel({
               onClick={() =>
                 void onImport([
                   {
-                    region: sessionRegion || region,
                     token: result.token as string,
                     name: result.nickname || result.phone,
                     phone: result.phone,
@@ -495,11 +433,8 @@ function OAuthPanel({
             <button className="btn ghost" onClick={onClose}>
               关闭
             </button>
-            {/* 区域清单还没到货时不能开始：那时 region 是空串，
-                后端会把「认不出的区域标识」当成一次失败而不是默认放行 */}
             <button
               className="btn primary"
-              disabled={!region}
               onClick={() => void begin()}
             >
               打开授权页并开始
@@ -519,20 +454,13 @@ function OAuthPanel({
       </p>
 
       {phase === "idle" && (
-        <>
-          <p className="modal-meta">
-            将登入<b>{selLabel ?? "当前区域"}</b> —— 跟随左下角的区域选择器。
-            要登到另一个区域，请先在左下角切过去，再打开这里。
-          </p>
-          <p className="note">
-            <IconInfo size={14} />
-            <span>
-              两个版本是<b>两套互不相通的部署</b>：账号、积分、签到活动各自独立，
-              所以新账号会收进<b>当前区域</b>，不会混到另一个版本去，
-              <b>也不影响本机已经登录的那个客户端</b>。
-            </span>
-          </p>
-        </>
+        <p className="note">
+          <IconInfo size={14} />
+          <span>
+            新账号只收进本应用的账号列表，
+            <b>不影响本机已经登录的那个 Qoder 客户端</b>。
+          </span>
+        </p>
       )}
 
       {phase === "waiting" && (
@@ -540,7 +468,6 @@ function OAuthPanel({
           <p className="note info">
             <IconClock size={14} />
             <span>
-              正在登入<b>{selLabel ?? "所选区域"}</b>。
               请在弹出的浏览器窗口中完成登录 / 扫码…… 已等待 {waited}s（10 分钟内有效）。
               完成后这个窗口会自己跳到下一步，不用你回来点任何东西。
               浏览器那一页<b>不会</b>唤起 Qoder 客户端，跑完直接关掉即可。
@@ -567,11 +494,6 @@ function OAuthPanel({
               {result.nickname || result.uid?.slice(0, 8) || "新账号"}
               {doneIdent && (
                 <span className="ac-ident">{maskPhone(doneIdent)}</span>
-              )}
-              {regionLabel(regionOpts, sessionRegion) && (
-                <span className="ac-region">
-                  {regionLabel(regionOpts, sessionRegion)}
-                </span>
               )}
             </div>
             <div className="ac-meta">

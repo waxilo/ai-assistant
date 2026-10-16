@@ -24,21 +24,14 @@
 
 use crate::accounts::{Account, CheckinRecord};
 use crate::qoder_api::{self, Campaign, CampaignView};
-use crate::region::Region;
 use crate::usage::ResourceView;
 
 /// 一次拉取「剩余积分 + 最早过期时间 + 逐包明细」—— **额度读数的唯一入口**。
 ///
 /// `commands`（刷新 / 采样 / 批量签到后的补读）与 `proxy`（路由前补拉）都调它，
-/// 再交给 `ledger` 落同一份盘。
-///
-/// **为什么要收 `region`**：上一版这里收的是一个**恒被忽略**的 `host` 参数
-/// （CodeBuddy 时代「按 token 的 `iss` 猜域」的残留）。现在域真的有两个了，
-/// 但它**依然不该由调用方猜** —— 传进来的必须是 [`Account::region`]，
-/// 即账号自己登记的区域。理由是同一个：猜错的代价是静默 401，
-/// 而唯一知道答案的地方就是账号记录本身。
-pub async fn fetch_resource_view(region: Region, token: &str) -> ResourceView {
-    crate::usage::fetch_usage(region, token).await
+/// 再交给 `ledger` 落同一份盘。域由 [`crate::qoder_api`] 统一给出，调用方只带 token。
+pub async fn fetch_resource_view(token: &str) -> ResourceView {
+    crate::usage::fetch_usage(token).await
 }
 
 /// 把这一轮的**活性结论**回写到账号上：usage 接口 401 → 记 `invalidated_at`；
@@ -72,7 +65,7 @@ pub fn apply_liveness(account: &mut Account, view: &ResourceView) -> bool {
 /// 「今天没有这条活动」「活动已过期」「查询失败」都不等于「没领」，
 /// 编一个布尔值出去只会让界面显示一个假状态。
 pub async fn query_checked_today(account: &Account) -> Option<bool> {
-    let view = qoder_api::fetch_campaigns(account.region, &account.token).await?;
+    let view = qoder_api::fetch_campaigns(&account.token).await?;
     checked_from_status(&view.daily_claim()?.claim_status)
 }
 
@@ -132,7 +125,7 @@ fn plan(view: &CampaignView) -> Plan<'_> {
 /// - 都不是：真失败（网络 / 鉴权 / 服务端拒绝），`message` 里带原因
 pub async fn do_checkin(account: &Account) -> CheckinRecord {
     let at = now();
-    let Some(view) = qoder_api::fetch_campaigns(account.region, &account.token).await else {
+    let Some(view) = qoder_api::fetch_campaigns(&account.token).await else {
         return CheckinRecord {
             message: "活动接口不可用（网络或登录态异常）".into(),
             ..blank(&at)
@@ -154,9 +147,7 @@ pub async fn do_checkin(account: &Account) -> CheckinRecord {
             //
             // 失败一律不致命：拿不到到期时间只是少一个展示字段，不能把
             // 「今天已领」这个既成事实报成失败。
-            let receipt = qoder_api::claim_campaign(account.region, &account.token, &c.id)
-                .await
-                .ok();
+            let receipt = qoder_api::claim_campaign(&account.token, &c.id).await.ok();
             // 回放同样带回当初的发放量（`benefit.amount`，与领取时逐字相同）：
             // 不记它，台账里这一笔就只有日期没有量，界面逐笔展示只能报「—」。
             CheckinRecord {
@@ -187,7 +178,7 @@ pub async fn do_checkin(account: &Account) -> CheckinRecord {
 async fn claim(account: &Account, c: &Campaign, at: &str) -> CheckinRecord {
     // 活动声明的数量（仅作兜底）：发放凭据里的 `benefit.amount` 是**实际发下来多少**，以它为准。
     let declared = c.benefit.as_ref().map(|b| b.amount);
-    let mut rec = match qoder_api::claim_campaign(account.region, &account.token, &c.id).await {
+    let mut rec = match qoder_api::claim_campaign(&account.token, &c.id).await {
         Ok(receipt) => {
             let amount = receipt.amount.or(declared);
             CheckinRecord {
@@ -226,14 +217,14 @@ async fn claim(account: &Account, c: &Campaign, at: &str) -> CheckinRecord {
     // 领取成功 → 立刻补一次额度读数，让台账马上能看到这一笔。
     // best-effort：读不到就留空，界面显示「—」而不是谎报 0。
     if rec.success {
-        rec.balance = fetch_resource_view(account.region, &account.token).await.credits;
+        rec.balance = fetch_resource_view(&account.token).await.credits;
     }
     rec
 }
 
 /// 复查某条活动是否已经变成 `CLAIMED`（只读；查询失败即 `false`）。
 async fn claimed_afterwards(account: &Account, campaign_id: &str) -> bool {
-    qoder_api::fetch_campaigns(account.region, &account.token)
+    qoder_api::fetch_campaigns(&account.token)
         .await
         .and_then(|v| v.campaigns.into_iter().find(|c| c.id == campaign_id))
         .is_some_and(|c| c.claim_status == "CLAIMED")
@@ -414,7 +405,7 @@ mod tests {
         let a = list.first().expect("本机应存在 Qoder 登录信息");
         // 这里直接打接口（而不是 `query_campaigns`）：本机登录文件给的是 `LocalAccount`，
         // 与落盘的 `Account` 不是一个类型，冒烟测试没有理由为了一个 token 去造后者
-        let v = qoder_api::fetch_campaigns(a.region, &a.token)
+        let v = qoder_api::fetch_campaigns(&a.token)
             .await
             .expect("活动接口应可用");
         println!(
@@ -428,48 +419,14 @@ mod tests {
         }
     }
 
-    /// 真实接口对照冒烟（**只读**，国际版 vs 国内版）：确认两套部署当天是否都在
-    /// `campaigns[]` 里给出每日 `CLAIM_BENEFIT`，以及各自 `claimStatus`。
-    /// 这才是「为什么国际版报活动未开」的第一现场：国内版正常、国际版此刻没当天活动。
-    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_campaigns_both_regions`
-    #[tokio::test]
-    #[ignore = "真实网络调用，需本机已登录 Qoder"]
-    async fn smoke_real_campaigns_both_regions() {
-        for a in crate::auth_file::discover_local_accounts().accounts {
-            let Some(v) = qoder_api::fetch_campaigns(a.region, &a.token).await else {
-                println!("{}：活动接口不可用", a.region.label());
-                continue;
-            };
-            let daily = v.daily_claim().map(|c| {
-                format!(
-                    "{} status={} {}..{}",
-                    c.key,
-                    c.claim_status,
-                    c.start_at,
-                    c.end_at
-                )
-            });
-            println!(
-                "{} uid={:?} show={} claimable={} 每日活动={:?} 总数={}",
-                a.region.label(),
-                a.uid,
-                v.show_campaign,
-                v.claimable,
-                daily,
-                v.campaigns.len()
-            );
-        }
-    }
-
-    /// 真实接口冒烟：额度读数（重构后 `fetch_resource_view` 收的是**账号自己的区域**，
-    /// 用来确认本机账号的区域登记与真实域对得上）。
+    /// 真实接口冒烟：额度读数。
     /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_credits_endpoint`
     #[tokio::test]
     #[ignore = "真实网络调用，需本机已登录 Qoder"]
     async fn smoke_real_credits_endpoint() {
         let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
-        let v = fetch_resource_view(a.region, &a.token).await;
+        let v = fetch_resource_view(&a.token).await;
         println!(
             "剩余={:?} 最早到期={:?} 包数={}",
             v.credits,
@@ -492,7 +449,7 @@ mod tests {
     async fn smoke_real_grant_receipt() {
         let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
-        let v = qoder_api::fetch_campaigns(a.region, &a.token)
+        let v = qoder_api::fetch_campaigns(&a.token)
             .await
             .expect("活动接口应可用");
         let Some(c) = v.daily_claim() else {
@@ -506,7 +463,7 @@ mod tests {
             );
             return;
         }
-        let r = qoder_api::claim_campaign(a.region, &a.token, &c.id)
+        let r = qoder_api::claim_campaign(&a.token, &c.id)
             .await
             .expect("已领的活动应当能回放");
         println!(
@@ -540,7 +497,7 @@ mod tests {
         let a = list.first().expect("本机应存在 Qoder 登录信息");
 
         // 1) 采样：免费号这一步拿不到任何真实到期时间
-        let view = fetch_resource_view(a.region, &a.token).await;
+        let view = fetch_resource_view(&a.token).await;
         let mut led = ledger::Ledger::default();
         ledger::observe(
             led.accts.entry("smoke".into()).or_default(),
@@ -553,7 +510,7 @@ mod tests {
         println!("采样后 earliest={:?}", led.accts["smoke"].earliest_expiry_ms);
 
         // 2) 发放凭据：这一笔积分自己的到期时间
-        let campaigns = qoder_api::fetch_campaigns(a.region, &a.token)
+        let campaigns = qoder_api::fetch_campaigns(&a.token)
             .await
             .expect("活动接口应可用");
         let c = campaigns.daily_claim().expect("当天应有每日活动");
@@ -561,7 +518,7 @@ mod tests {
             println!("今天还没领（claimStatus={}），跳过", c.claim_status);
             return;
         }
-        let receipt = qoder_api::claim_campaign(a.region, &a.token, &c.id)
+        let receipt = qoder_api::claim_campaign(&a.token, &c.id)
             .await
             .expect("已领的活动应当能回放");
         let exp = receipt.expires_at.expect("回放必须带 expiresAt");
@@ -625,7 +582,7 @@ mod tests {
             .into_iter()
             .filter(|a| !a.token.is_empty())
         {
-            let Some(view) = qoder_api::fetch_campaigns(a.region, &a.token).await else {
+            let Some(view) = qoder_api::fetch_campaigns(&a.token).await else {
                 println!("跳过 {}：活动接口不可用（网络或登录态）", a.name);
                 continue;
             };

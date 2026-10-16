@@ -10,7 +10,7 @@
 //!
 //! | | Windows | macOS |
 //! |---|---|---|
-//! | 钥匙放在哪 | `<profile>/Local State` 的 `os_crypt.encrypted_key` | 钥匙串 `Qoder[ CN] App Safe Storage` / `Qoder[ CN] App Key` |
+//! | 钥匙放在哪 | `<profile>/Local State` 的 `os_crypt.encrypted_key` | 钥匙串 `Qoder CN App Safe Storage` / `Qoder CN App Key` |
 //! | 钥匙怎么来 | `CryptUnprotectData` → **32 字节原始密钥** | 钥匙串密码（base64 文本）→ PBKDF2-HMAC-SHA1(`saltysalt`, 1003 轮) → **16 字节** |
 //! | 数据怎么封 | `v10` + nonce(12) + **AES-256-GCM** 密文 + tag(16) | `v10` + **AES-128-CBC**(IV = 16 个空格, PKCS7) |
 //!
@@ -30,15 +30,12 @@
 //! 「导入本机账号」**恒返回空**，界面还会补一句「请先在 Qoder 桌面端登录一次」——
 //! 而用户明明已经登录了。解不出的是「不解钥匙串」，不是「解不了」。
 //!
-//! # 每套部署各一个账号
+//! # 一个账号
 //!
 //! `auth.v1.dat` 只保存**当前登录的那一个账号**，切号/重登都会覆盖它 —— 因此没有 workbuddy
-//! 那种「多账号列表」，Qoder 是单账号跟随模型。
-//!
-//! 但**两套部署各有自己的这一份**：国际版在 `com.qoder.app.stable`、国内版在
-//! `com.qodercn.app.stable`（同机可以各登录一个）。所以本模块是「按区域各取一条」，
-//! 扫描一遍最多回 2 条，每条都带上它所属的 [`Region`]：登录文件本身不写区域，
-//! 区域只能由**它来自哪个目录**决定。
+//! 那种「多账号列表」，Qoder 是单账号跟随模型。数据目录是 Qoder CN 的
+//! `com.qodercn.app.stable`（候选路径见 [`crate::qoder_api::profile_dirs`]）；
+//! 登录文件本身不写「属于谁」，靠的正是「它来自哪个目录」。
 //!
 //! # 写回策略
 //!
@@ -46,7 +43,6 @@
 //! 所以写回只需按**同一个平台分支**重新封一次：GCM 换一个随机 nonce，CBC 沿用固定 IV。
 //! 写回走"临时文件 + rename"保证原子性，避免与 Qoder 主进程读到半个文件。
 
-use crate::region::Region;
 use crate::timeutil::token_expiry;
 use aead::{Aead, KeyInit};
 use aes::Aes128;
@@ -62,12 +58,25 @@ use serde_json::Value;
 use sha1::Sha1;
 use std::path::{Path, PathBuf};
 
-// 这里曾有 `pub const OPENAPI_HOST`（= 国际版的 openapi 域），给 `refresh.rs` 续签用。
-// 域现在由 `region::Region::openapi_base` 按**账号自己的区域**给出 ——
-// 两套部署的账号必须各打各的域，否则续签拿到的 token 在对方网关上无效。
+// 这里曾有 `pub const OPENAPI_HOST`（给 `refresh.rs` 续签用），后来「按账号区域取域」，
+// 又随国际版移除回到常量 —— 域的唯一事实表现在是 [`crate::qoder_api`]。
 
 /// auth.v1.dat 的名字（固定）
 const AUTH_FILE: &str = "auth.v1.dat";
+
+/// macOS 钥匙串里 `safeStorage` 主密码的**服务名**。
+///
+/// ⚠️ 实测字面量，**不要**图省事按客户端产品名拼：钥匙串里是
+/// `Qoder CN App Safe Storage` —— **多一个 `App`**。这个名字来自 Electron 侧的产品名，
+/// `Info.plist` 的 `CFBundleName` / `CFBundleDisplayName` 里都没有它，只能钉死。
+///
+/// 拼错的后果不报错：`security` 找不到条目 → 与「那个版本没登录」长得一模一样。
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "Qoder CN App Safe Storage";
+
+/// 同上，钥匙串条目的**账号名**（实测 = 服务名去掉 ` Safe Storage` 再加 ` Key`）。
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "Qoder CN App Key";
 
 /// OSCrypt 的版本前缀（两个平台都是它）
 const V10: &[u8] = b"v10";
@@ -110,20 +119,15 @@ pub struct LocalAccount {
     pub token: String,
     /// 续签用的 refresh token
     pub refresh_token: Option<String>,
-    /// **这条凭据属于哪套部署** —— 由它来自哪个 profile 目录决定，不是猜出来的。
-    ///
-    /// 两套部署的登录文件分别在 `com.qoder.app.stable` 与 `com.qodercn.app.stable` 下，
-    /// 同一台机器上可以各有一个「当前账号」。导入时必须把它一起带上：
-    /// 登录文件本身不写区域，而下游每一个请求都要靠它选域。
-    pub region: Region,
     pub source: String,
     // 这里曾经有 `pub host: Option<String>`，恒等于 `OPENAPI_HOST`。一个永远取同一个值的
     // 字段不携带任何信息，只会让「这里可以选域」的错觉活下去，2026-09-18 删除。
     pub uid: Option<String>,
     pub nickname: Option<String>,
+    /// 手机号（展示用标识）。国内版按手机号登录，这是账号的**第一顺位**身份锚点
+    /// （合并/去重时也按它认人）。
     pub phone: Option<String>,
-    /// 邮箱（展示用标识）。**国际版账号认的就是它** —— 那套部署按邮箱登录，
-    /// 登录文件里的 `user.phone` 常为空，没了邮箱就只剩昵称可认。
+    /// 邮箱（展示用标识）。国内版账号通常没有它，常为空。
     pub email: Option<String>,
     /// access token 过期时间（毫秒时间戳）
     pub expires_at: Option<i64>,
@@ -134,26 +138,14 @@ pub struct LocalAccount {
     pub file: String,
 }
 
-/// 单个区域的读取结果。
-///
-/// 存在的理由：[`LocalScan::accounts`] 只能表达「有没有」，而「没有」至少有三种**互不相同**
-/// 的原因 —— 那个版本从未登录过 / 钥匙串里没条目（或用户拒绝授权）/ 解密失败。
-/// 上一版把三种都渲染成「请先在 Qoder 桌面端登录一次」，于是已经登录的用户被告知去登录。
-#[derive(Serialize, Clone, Debug)]
-pub struct LocalProbe {
-    pub region: Region,
-    /// 该区域是否读到了账号
-    pub found: bool,
-    /// 一句话说明：读到了什么，或者**为什么没读到**
-    pub detail: String,
-}
-
-/// 一次「导入本机账号」扫描的完整结果：凭据 + 每个区域各自的读取情况。
+/// 一次「导入本机账号」扫描的完整结果：凭据 + 没读到时的人话原因。
 #[derive(Serialize, Clone, Debug)]
 pub struct LocalScan {
     pub accounts: Vec<LocalAccount>,
-    /// 每个区域一条，顺序同 [`Region::ALL`]（界面直接按它渲染，不要再自己按区域分组）
-    pub probes: Vec<LocalProbe>,
+    /// 读到了什么，或者**为什么没读到**（至少有三种互不相同的原因：
+    /// 从未登录过 / 钥匙串里没条目（或用户拒绝授权）/ 解密失败）。
+    /// 上一版把它们都渲染成「请先在 Qoder 桌面端登录一次」，于是已经登录的用户被告知去登录。
+    pub note: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +179,8 @@ pub(crate) enum Key {
 /// 若写回时再去钥匙串 / DPAPI 取一次，不仅多一次系统调用，
 /// 还多出一个「读的时候是一把、写的时候换成了另一把」的窗口。
 ///
-/// 这里**不**存 `region` / `dir`：从 `read_credentials` 的那一端开始它们就不再被用到
-/// （钥匙已经拿在手上），留着只会让人误以为写回还要靠它们选域或找文件。
+/// 这里**不**存 `dir`：从 `read_credentials` 的那一端开始它就不再被用到
+/// （钥匙已经拿在手上），留着只会让人误以为写回还要靠它找文件。
 pub(crate) struct Credentials {
     pub file: PathBuf,
     pub key: Key,
@@ -282,15 +274,15 @@ fn derive_gcm_key(profile_dir: &Path) -> Result<[u8; 32], String> {
 ///
 /// 不走 shell（`Command` 直接传 argv），密码只留在内存里；不进日志、不落盘。
 #[cfg(target_os = "macos")]
-fn keychain_password(region: Region) -> Result<String, String> {
-    let service = region.keychain_service();
+fn keychain_password() -> Result<String, String> {
+    let service = KEYCHAIN_SERVICE;
     let out = crate::proc::cmd(KEYCHAIN_TOOL)
         .args([
             "find-generic-password",
             "-s",
             service,
             "-a",
-            region.keychain_account(),
+            KEYCHAIN_ACCOUNT,
             "-w",
         ])
         .output()
@@ -357,20 +349,20 @@ fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
-fn open_key(_region: Region, profile_dir: &Path) -> Result<Key, String> {
+fn open_key(profile_dir: &Path) -> Result<Key, String> {
     derive_gcm_key(profile_dir).map(Key::Gcm)
 }
 
 #[cfg(target_os = "macos")]
-fn open_key(region: Region, _profile_dir: &Path) -> Result<Key, String> {
-    let password = keychain_password(region)?;
+fn open_key(_profile_dir: &Path) -> Result<Key, String> {
+    let password = keychain_password()?;
     let mut key = [0u8; 16];
     pbkdf2_hmac_sha1(password.as_bytes(), MAC_SALT, MAC_ROUNDS, &mut key);
     Ok(Key::Cbc(key))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn open_key(_region: Region, _profile_dir: &Path) -> Result<Key, String> {
+fn open_key(_profile_dir: &Path) -> Result<Key, String> {
     Err("当前平台没有 OSCrypt 钥匙通道（Windows 走 DPAPI、macOS 走钥匙串），请改用「登录新账号」"
         .to_string())
 }
@@ -453,7 +445,7 @@ fn str_at(root: &Value, path: &[&str]) -> Option<String> {
 }
 
 /// 把解密出的 Qoder 凭据 JSON 映射成 [`LocalAccount`]。
-fn parse_credentials(region: Region, path: &Path, json: &Value) -> Option<LocalAccount> {
+fn parse_credentials(path: &Path, json: &Value) -> Option<LocalAccount> {
     if !json.is_object() {
         return None;
     }
@@ -467,7 +459,6 @@ fn parse_credentials(region: Region, path: &Path, json: &Value) -> Option<LocalA
     Some(LocalAccount {
         token,
         refresh_token: str_at(json, &["refreshToken"]).or_else(|| str_at(json, &["refresh_token"])),
-        region,
         source,
         uid: str_at(json, &["user", "id"]),
         nickname: str_at(json, &["user", "name"]).or_else(|| str_at(json, &["user", "username"])),
@@ -492,66 +483,43 @@ fn parse_credentials(region: Region, path: &Path, json: &Value) -> Option<LocalA
 // 公开入口
 // ---------------------------------------------------------------------------
 
-/// 扫描本机凭据：**两套部署各扫一遍**，每套最多回 1 条（Qoder 是单账号跟随模型）。
+/// 扫描本机凭据：最多回 1 条（Qoder 是单账号跟随模型）。
 ///
-/// 顺序就是 [`Region::ALL`] 的顺序（国际版在前），界面与冒烟测试都按这个顺序取第一条。
-///
-/// 与「返回 `Vec<LocalAccount>`」的上一版不同，这里把**每个区域为什么没有**也一起带回来：
-/// 「没读到」至少有三种互不相同的原因，界面必须能区分（见 [`LocalProbe`]）。
+/// 「没读到」的原因也一起带回来（[`LocalScan::note`]）：至少有三种互不相同的原因，
+/// 界面必须能区分，不能一律渲染成「请先在 Qoder 桌面端登录一次」。
 pub fn discover_local_accounts() -> LocalScan {
     let mut accounts = Vec::new();
-    let mut probes = Vec::new();
-    for region in Region::ALL {
-        match read_credentials(region) {
-            Ok(creds) => match parse_credentials(region, &creds.file, &creds.json) {
-                Some(account) => {
-                    probes.push(LocalProbe {
-                        region,
-                        found: true,
-                        detail: format!("已读到本机登录文件（{}）", creds.file.display()),
-                    });
-                    accounts.push(account);
-                }
-                None => probes.push(LocalProbe {
-                    region,
-                    found: false,
-                    detail: "登录文件里没有可用的 token（内容是占位串或已登出）".to_string(),
-                }),
-            },
-            Err(detail) => probes.push(LocalProbe {
-                region,
-                found: false,
-                detail,
-            }),
-        }
-    }
-    LocalScan { accounts, probes }
+    let note = match read_credentials() {
+        Ok(creds) => match parse_credentials(&creds.file, &creds.json) {
+            Some(account) => {
+                accounts.push(account);
+                format!("已读到本机登录文件（{}）", creds.file.display())
+            }
+            None => "登录文件里没有可用的 token（内容是占位串或已登出）".to_string(),
+        },
+        Err(detail) => detail,
+    };
+    LocalScan { accounts, note }
 }
 
 /// 读 + 解密出「凭据 + 钥匙 + 文件路径」；任何一环失败都给**人话**原因（不 panic）。
 ///
-/// `region` 必填：两套部署的凭据文件在**不同目录**、用**各自的钥匙**加密，
-/// 「扫一遍全机」这种模糊语义在这里是有害的 —— 拿 A 区域的钥匙去解 B 区域的密文
-/// 只会得到「读不出来」，与「没装」长得一模一样。
-///
 /// 多候选目录时才用 `continue`：第一个目录里没有文件**不代表**别的候选也没有
 /// （上一版在这里写的是 `?`，等于把「多路径」变成了摆设）。
-pub(crate) fn read_credentials(region: Region) -> Result<Credentials, String> {
-    let dirs = region.profile_dirs();
+pub(crate) fn read_credentials() -> Result<Credentials, String> {
+    let dirs = crate::qoder_api::profile_dirs();
     if dirs.is_empty() {
-        return Err(format!("{}：当前平台没有已知的数据目录", region.label()));
+        return Err("当前平台没有已知的 Qoder CN 数据目录".to_string());
     }
     let mut miss = String::new();
     for dir in dirs {
         let file = dir.join(AUTH_FILE);
         if !file.exists() {
-            // 措辞**不带区域名**：界面那一条的左端已经有区域徽章了，
-            // 再来一句「国际版…」会读成「国际版 国际版还没有登录过」。
             miss = format!("还没有登录过（{} 不存在）", file.display());
             continue;
         }
         let data = std::fs::read(&file).map_err(|e| format!("读取 {} 失败：{e}", file.display()))?;
-        let key = open_key(region, &dir)?;
+        let key = open_key(&dir)?;
         let plain =
             decrypt_blob(&key, &data).map_err(|e| format!("{} 解密失败：{e}", file.display()))?;
         let json: Value = serde_json::from_slice(&plain)
@@ -595,22 +563,21 @@ pub(crate) fn write_back(creds: &Credentials, json: &Value) -> Result<(), String
 /// 登录文件里记的还是它，才说明「这个文件就是刚才那个账号的登录态」。
 /// 少了这道核对会出两种事故：
 ///
-/// - **一台机器两个区域池 / 界面里多账号**：给 A 续签换回来的 token 被写进 B 的登录文件，
-///   B 的桌面端第二天带着 A 的票去请求；
+/// - **界面里的账号不止一个**：给 A 续签换回来的 token 被写进登录文件，
+///   而桌面端当前登录的其实是 B —— 第二天带着 A 的票去请求；
 /// - **桌面端自己已经续过一轮**：它文件里那条链比我们的新，写回去等于把别人手里
 ///   还能用的凭证换成我们手里这枚已经过时的 —— 症状是 IDE 突然要重新登录。
 ///
 /// 两种都返回 Err 并**一个字节都不写**。跳过写回不影响续签本身：界面上那条链照常有效，
 /// 而桌面端更新的那一轮会被 `commands::adopt_file_sessions` 反过来接住。
 pub(crate) fn apply_refresh(
-    region: Region,
     prev_token: &str,
     token: &str,
     refresh_token: Option<&str>,
     expires_at: Option<i64>,
     rt_expires_at: Option<i64>,
 ) -> Result<(), String> {
-    let Ok(creds) = read_credentials(region) else {
+    let Ok(creds) = read_credentials() else {
         return Ok(());
     };
     let json = creds.json.clone();
@@ -618,10 +585,10 @@ pub(crate) fn apply_refresh(
         .or_else(|| str_at(&json, &["accessToken"]))
         .or_else(|| str_at(&json, &["access_token"]));
     if !same_token_on_file(&on_file, prev_token) {
-        return Err(format!(
-            "{} 的登录文件里记的不是本次被换掉的那枚 token，已跳过写回（不覆盖别人的登录态）",
-            region.label()
-        ));
+        return Err(
+            "登录文件里记的不是本次被换掉的那枚 token，已跳过写回（不覆盖别人的登录态）"
+                .to_string(),
+        );
     }
     let mut json = json;
     json["token"] = Value::String(token.to_string());
@@ -803,14 +770,14 @@ mod tests {
     #[test]
     fn parse_requires_token_of_plausible_length() {
         let json = serde_json::json!({ "token": "x".repeat(32) });
-        let acc = parse_credentials(Region::Global, Path::new("a"), &json).unwrap();
+        let acc = parse_credentials(Path::new("a"), &json).unwrap();
         assert_eq!(acc.uid, None);
         assert!(acc.is_current);
         // 过短占位不被当作凭证
         let short = serde_json::json!({ "token": "short" });
-        assert!(parse_credentials(Region::Global, Path::new("a"), &short).is_none());
+        assert!(parse_credentials(Path::new("a"), &short).is_none());
         // 非对象
-        assert!(parse_credentials(Region::Global, Path::new("a"), &serde_json::json!([1, 2])).is_none());
+        assert!(parse_credentials(Path::new("a"), &serde_json::json!([1, 2])).is_none());
     }
 
     #[test]
@@ -823,7 +790,7 @@ mod tests {
             "refreshTokenExpiresAt": 1700000000000i64,
             "user": { "id": "u-1", "name": "waxilo", "email": "a@b.c", "phone": "13800000000" }
         });
-        let acc = parse_credentials(Region::Global, Path::new("auth.v1.dat"), &json).unwrap();
+        let acc = parse_credentials(Path::new("auth.v1.dat"), &json).unwrap();
         assert_eq!(acc.uid.as_deref(), Some("u-1"));
         assert_eq!(acc.nickname.as_deref(), Some("waxilo"));
         assert_eq!(acc.phone.as_deref(), Some("13800000000"));
@@ -846,7 +813,7 @@ mod tests {
             "user": { "id": "u-1", "name": "someone", "email": "a@b.c", "phone": "13800000000" },
             "firstLoginOnboardingSeen": true
         });
-        let acc = parse_credentials(Region::Global, Path::new("auth.v1.dat"), &json).unwrap();
+        let acc = parse_credentials(Path::new("auth.v1.dat"), &json).unwrap();
         assert_eq!(acc.expires_at, Some(1_792_309_913_000));
         assert_eq!(acc.rt_expires_at, Some(1_820_821_913_000));
         // refresh 比 access 长得多（实测一年 vs 一个月），这是「续签链还能活多久」的依据
@@ -916,20 +883,15 @@ mod tests {
         assert!(bad["expiresAt"].is_string());
     }
 
-    /// 扫描结果必须把「两个区域各一条 probe」带上，且顺序与 [`Region::ALL`] 一致 ——
-    /// 界面直接按它渲染，少一条就会让「那个版本为什么没有」重新变成空白。
+    /// 扫描结果必须带上「为什么没读到」的人话原因 —— 哪怕本机真的登录过，
+    /// 这条测试也不依赖登录状态：`note` 永远非空，且读到的账号数与它自洽。
     #[test]
-    fn a_scan_always_probes_every_region() {
+    fn a_scan_always_carries_a_human_note() {
         let scan = discover_local_accounts();
-        assert_eq!(scan.probes.len(), Region::ALL.len());
-        for (probe, region) in scan.probes.iter().zip(Region::ALL) {
-            assert_eq!(probe.region, region);
-            assert!(!probe.detail.trim().is_empty(), "必须给出人话原因");
-        }
-        // 读到的账号必须都在 `accounts` 里，且都带区域
-        assert_eq!(scan.accounts.len(), scan.probes.iter().filter(|p| p.found).count());
-        for account in &scan.accounts {
-            assert!(Region::ALL.contains(&account.region));
+        assert!(!scan.note.trim().is_empty(), "必须给出人话说明");
+        assert!(scan.accounts.len() <= 1, "Qoder 单账号模型，最多一条");
+        if !scan.accounts.is_empty() {
+            assert!(scan.note.contains("已读到本机登录文件"));
         }
     }
 
@@ -954,13 +916,10 @@ mod tests {
     #[ignore]
     fn smoke_reads_real_qoder_credentials() {
         let scan = discover_local_accounts();
-        for probe in &scan.probes {
-            println!("probe region={} found={} detail={}", probe.region.key(), probe.found, probe.detail);
-        }
+        println!("note={}", scan.note);
         for a in &scan.accounts {
             println!(
-                "region={} uid={:?} nickname={:?} phone={:?} current={} token_len={} at_exp={:?} rt_exp={:?}",
-                a.region.key(),
+                "uid={:?} nickname={:?} phone={:?} current={} token_len={} at_exp={:?} rt_exp={:?}",
                 a.uid,
                 a.nickname,
                 a.phone,

@@ -8,8 +8,7 @@
 //!
 //! 所以这里把三件事收成一处，其余模块只消费：
 //!
-//! - **基址**：桌面端 `app.asar` 的 `E8.environments.prod`（`https://qoder.com` 与
-//!   `https://openapi.qoder.sh`）—— 模板里的 `www.qoder.cn` / `codebuddy.*` 全是猜测，已作废；
+//! - **基址**：见下方四个 `pub const`（国内版实测域）—— 本模块是它们的唯一事实表；
 //! - **请求头**：官方 `Bx()` 那一组（Accept / Authorization / Cosy-ClientType / User-Agent）；
 //! - **解析**：照抄官方的校验规则（见 `basedata/20260918_Qoder缺失接口逆向.md` 第 3 节），
 //!   官方会因为「分级不是 4 档」「日期重复」而报错，我们也一样 —— 静默接受坏数据比报错更糟。
@@ -20,20 +19,61 @@
 //! `parse_*` 只吃 `&Value`、可单测；`fetch_*` 负责网络，失败一律 `Option::None` / 默认值，
 //! 绝不 panic、也绝不影响调用方主流程。响应原文（实测）直接当 fixture 进单测。
 
-use crate::region::Region;
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-// 这里曾经有四个 `pub const &str` 基址（`OPENAPI_BASE` / `AUTH_BASE` / `AUTH_CLIENT_ID`
-// / `INFER_BASE`）。它们在「Qoder 只有一个域」的前提下还算收敛，但**Qoder 其实有两套
-// 部署**（国际版 `qoder.com` 与国内版 `qoder.cn`，域、CLI 目录、官方客户端全不同，
-// 实测见 `region` 模块头）。四个常量留下的形态是「每加一个区域就要在四处各补一次」，
-// 而少补一处不报错、只表现成「另一个区域的请求打到错的域上」。
-//
-// 所以基址、client id、模型目录、本地目录、进程名**一律改由 `Region` 提供**：
-// 账号带着自己的区域，每个请求现场取基址。模块里不再有任何域常量。
+// 这里曾经有四个 `pub const &str` 基址，后被改成「由 `Region` 按账号所在区域现场取」——
+// 那是两套部署并存年代的形态。2026-10-16 起国际版支持整体移除，只剩国内版一套部署，
+// 基址回到常量，**本模块就是它们的唯一事实表**，别处只消费、不自己拼。
+
+/// 登录 / OAuth 基址。
+pub const AUTH_BASE: &str = "https://qoder.cn";
+/// OpenAPI 基址：额度 / 活动权益 / 用户信息。
+pub const OPENAPI_BASE: &str = "https://openapi.qoder.com.cn";
+/// 模型网关基址：反代转发目标、模型目录、COSY uid 查询（国内版三条路径同域，实测
+/// `~/.qoder-cn/logs/runs/*/qodercli.log` 里出现的就是它）。
+pub const GATEWAY_BASE: &str = "https://gateway.qoder.com.cn";
+/// OAuth 的 client id（客户端 app.asar 实测）。
+pub const AUTH_CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
+
+/// Qoder CN 桌面端的用户数据目录名（Electron `app.getPath("userData")`）。
+/// `auth.machine-id`、`auth.v1.dat` 都在它下面；钥匙串服务名也按它对得上
+/// 「Qoder CN App Safe Storage」（见 [`crate::auth_file`]）。
+pub(crate) const PROFILE_DIR_NAME: &str = "com.qodercn.app.stable";
+
+/// 桌面端用户数据目录的候选路径（按平台）。
+///
+/// 目录里那个 `auth.v1.dat` 是 Chromium `safeStorage`（OSCrypt）写出来的，
+/// 两个平台的密钥通道不同、但**都能端外解**：Windows 走 DPAPI，
+/// macOS 走钥匙串（见 [`crate::auth_file`]）。
+pub(crate) fn profile_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(roaming) = dirs::data_dir() {
+            out.push(roaming.join(PROFILE_DIR_NAME));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            out.push(
+                home.join("Library")
+                    .join("Application Support")
+                    .join(PROFILE_DIR_NAME),
+            );
+        }
+    }
+    let _ = &mut out;
+    out
+}
+
+/// Qoder CN 的 CLI 目录（`~` 下的相对名）。
+///
+/// 会话日志、当前选中的模型等本地痕迹都在它下面（`models::local_models`），
+/// 接管探测也按它找客户端配置。
+pub(crate) const CLI_DIR_NAME: &str = ".qoder-cn";
 
 /// 单次请求的超时。额度类接口都很小，慢就是不正常。
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -73,184 +113,19 @@ pub fn client() -> reqwest::Client {
         .expect("构建 Qoder HTTP 客户端失败")
 }
 
-// ---------------------------------------------------------------- 国际版原生设备身份
+// ---------------------------------------------------------------- 请求封装
 
-/// Qoder 国际版活动接口会校验一套由官方 `runtime-info` 原生二进制导出的设备身份
-/// `{machineToken, machineType, machineCode}`：不带时国际版返回的 `campaigns[]` 里
-/// **没有**当天那条每日 `CLAIM_BENEFIT`（界面就报「活动未开」）；带上后才会下发。
-/// 国内版无此校验，一直正常；macOS 上实测**同样**需要这套头。
-///
-/// 这套身份来源于官方 `runtime-info`（调用形态 `runtime-info <env> --account-stdin`，
-/// `<env>` 对 global 部署为 `3`，account 从 stdin 传 `{"account": uid}`）。三个值**每次
-/// 运行都会重新生成**，但同一次运行里必然配套 —— 服务端认可的正是「整体、自洽」的身份，
-/// 所以每次取值必须来自**同一次**输出，不可混用历史值。
-///
-/// 官方拿到身份后会缓存约 1 小时再刷新（`WJt = 3600_000`ms），因此这里也缓存复用，
-/// 避免每次请求都拉起一个子进程。缓存见 [`machine_identity`]。
-#[derive(Clone)]
-struct MachineIdentity {
-    token: String,
-    machine_type: String,
-    machine_code: String,
-}
-
-/// 设备身份缓存：`(身份, 取到时刻)`。只在缓存过期时才重新拉起官方二进制。
-static MACHINE_CACHE: OnceLock<Mutex<Option<(MachineIdentity, Instant)>>> = OnceLock::new();
-
-/// 缓存时长。官方约 1 小时，签到节奏一天一次，10 分钟足够且更宽松。
-const MACHINE_TTL: Duration = Duration::from_secs(600);
-
-fn machine_cache() -> &'static Mutex<Option<(MachineIdentity, Instant)>> {
-    MACHINE_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-/// 定位官方 `runtime-info` 原生二进制 —— 两套安装形态都要认：
-/// - Windows：`~/.qoder/.bin/<umid-…>/runtime-info.exe`（藏在子目录里）
-/// - macOS / Linux：`~/.qoder/.bin/runtime-info-<os>-<arch>-<hash>`（直接放的裸文件）
-///
-/// 之前只认 Windows 形态，mac 上于是永远「没装官方环境」→ 国际版永远报「活动未开」。
-/// 官方每升一版会留一个新的、旧的还在，多个候选取**修改时间最新**的那个
-/// （身份要跟官方客户端当前用的版本一致，旧版本那份不该拿去用）。
-/// 未安装官方 Qoder（或路径变了）就 `None` —— 此时国际版只能退回「不带头」的旧行为。
-fn runtime_info_bin() -> Option<std::path::PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let bin = std::path::Path::new(&home).join(".qoder").join(".bin");
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(bin).ok()?.flatten() {
-        let path = entry.path();
-        let cand = if path.is_dir() {
-            let inner = path.join("runtime-info.exe");
-            inner.is_file().then_some(inner)
-        } else {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            name.starts_with("runtime-info").then_some(path)
-        };
-        let Some(cand) = cand else { continue };
-        let Ok(mtime) = std::fs::metadata(&cand).and_then(|m| m.modified()) else {
-            continue;
-        };
-        let newer = match &best {
-            None => true,
-            Some((t, _)) => mtime > *t,
-        };
-        if newer {
-            best = Some((mtime, cand));
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-/// 官方 `Cosy-MachineId` 的来源：`~/.qoder/installation_id`（实测它和国际版
-/// `machine_id` 都能被服务端接受，取 `installation_id` 即可）。
-fn installation_id() -> Option<String> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let s = std::fs::read_to_string(std::path::Path::new(&home).join(".qoder").join("installation_id"))
-        .ok()?;
-    let s = s.trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-/// 真正拉起官方 `runtime-info` 一次，返回新鲜整套身份。
-fn spawn_machine_identity(region: Region) -> Option<MachineIdentity> {
-    let exe = runtime_info_bin()?;
-    // 官方 `dZe`：global 部署 `environment = 3`，其它（含国内）为 `0`。
-    let env = if region == Region::Global { "3" } else { "0" };
-    let mut child = crate::proc::cmd(exe)
-        .args([env, "--account-stdin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    {
-        use std::io::Write;
-        if let Some(stdin) = child.stdin.as_mut() {
-            // account 走 stdin；身份本身是自洽的随机整体，account 不参与其有效性。
-            let _ = stdin.write_all(b"{\"account\":\"qoder-assistant\"}\n");
-        }
-    }
-    let out = child.wait_with_output().ok()?;
-    let first = String::from_utf8_lossy(&out.stdout).lines().next()?.to_string();
-    let v: Value = serde_json::from_str(&first).ok()?;
-    let token = v["machineToken"].as_str()?.to_string();
-    let machine_type = v["machineType"].as_str()?.to_string();
-    let machine_code = v["machineCode"].as_str()?.to_string();
-    if token.is_empty() || machine_type.is_empty() || machine_code.is_empty() {
-        return None;
-    }
-    Some(MachineIdentity {
-        token,
-        machine_type,
-        machine_code,
-    })
-}
-
-/// 取（并缓存）原生设备身份。**仅国际版**参与：国内版不需要、也不应被这个随机身份打扰。
-/// 官方环境（`runtime-info` 二进制，两平台形态见 [`runtime_info_bin`]）缺失时回 `None`，
-/// 调用方保持「不带机器头」的旧行为。
-fn machine_identity(region: Region) -> Option<MachineIdentity> {
-    if region != Region::Global {
-        return None;
-    }
-    {
-        let cache = machine_cache().lock().ok()?;
-        if let Some((m, at)) = cache.as_ref() {
-            if at.elapsed() < MACHINE_TTL {
-                return Some(m.clone());
-            }
-        }
-    }
-    let m = spawn_machine_identity(region)?;
-    if let Ok(mut cache) = machine_cache().lock() {
-        *cache = Some((m.clone(), Instant::now()));
-    }
-    Some(m)
-}
-
-/// 给请求补上官方那组 `Cosy-*` 设备头 —— 国际版活动接口的「门票」。
-///
-/// 只有国际版、且本机有能力取到原生身份时才加；其余情况（国内版 / 没装官方环境 /
-/// `runtime-info` 失败）原样放行，为的是**不破坏**国内版与「无头也能过的场景」。
-fn apply_machine_headers(req: reqwest::RequestBuilder, region: Region) -> reqwest::RequestBuilder {
-    if region != Region::Global {
-        return req;
-    }
-    let (m, machine_id) = match (machine_identity(region), installation_id()) {
-        (Some(m), Some(id)) => (m, id),
-        _ => return req,
-    };
-    let host = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".into());
-    req.header("Cosy-Version", "0.3.4")
-        .header("Cosy-MachineOS", std::env::consts::OS)
-        .header("Cosy-MachineHostname", host)
-        .header("Cosy-MachineId", machine_id)
-        .header("Cosy-MachineToken", m.token)
-        .header("Cosy-MachineCode", m.machine_code)
-        .header("Cosy-MachineType", m.machine_type)
-}
-
-/// 发一个带鉴权的 GET（打 **OpenAPI**，基址取 [`Region::openapi_base`]），拿 JSON。
+/// 发一个带鉴权的 GET（打 **OpenAPI**），拿 JSON。
 /// 任何失败（网络 / 非 2xx / 非 JSON）都回 `None`。
-///
-/// `region` 必填、且**必须来自账号自己**：它是「这个 token 属于哪套部署」的唯一凭据。
-/// 传错不会报错，只会稳定拿到 401（另一套部署不认识这个 token），
-/// 表现成「某个账号突然什么都查不到」。
 ///
 /// `query` 里值为空的项会被跳过 —— 调用方因此可以无脑塞 `("product", product)`，
 /// 不必自己判断「这个接口要不要带它」。
 pub async fn get_json(
-    region: Region,
     token: &str,
     path: &str,
     query: &[(&str, &str)],
 ) -> Option<Value> {
-    get_json_with_auth_signal(region, token, path, query)
+    get_json_with_auth_signal(token, path, query)
         .await
         .0
 }
@@ -262,7 +137,6 @@ pub async fn get_json(
 /// 「本地死票锁死」事故的根源）。其余失败（5xx/超时/解析）归入 `(None, false)`，
 /// 「不知道」不下结论。
 pub async fn get_json_with_auth_signal(
-    region: Region,
     token: &str,
     path: &str,
     query: &[(&str, &str)],
@@ -273,7 +147,7 @@ pub async fn get_json_with_auth_signal(
         .filter(|(_, v)| !v.is_empty())
         .collect();
     let Ok(resp) = client()
-        .get(format!("{}{path}", region.openapi_base()))
+        .get(format!("{}{path}", OPENAPI_BASE))
         .query(&pairs)
         .bearer_auth(token)
         .send()
@@ -577,21 +451,14 @@ pub fn parse_campaigns(root: &Value) -> Option<CampaignView> {
     })
 }
 
-/// 拉活动状态（打账号所属区域的 OpenAPI）。失败回 `None`。
-///
-/// 国际版这条接口会校验原生设备身份（见模块头），这里通过 [`apply_machine_headers`]
-/// 补上那组 `Cosy-*` 头 —— 否则国际版永远拿不到当天那条每日 `CLAIM_BENEFIT`，
-/// 表现为「活动未开」。国内版不受影响。
-pub async fn fetch_campaigns(region: Region, token: &str) -> Option<CampaignView> {
-    let resp = apply_machine_headers(
-        client()
-            .get(format!("{}{CAMPAIGN_PATH}", region.openapi_base()))
-            .bearer_auth(token),
-        region,
-    )
-    .send()
-    .await
-    .ok()?;
+/// 拉活动状态。失败回 `None`。
+pub async fn fetch_campaigns(token: &str) -> Option<CampaignView> {
+    let resp = client()
+        .get(format!("{}{CAMPAIGN_PATH}", OPENAPI_BASE))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -670,14 +537,7 @@ pub fn parse_receipt(root: &Value) -> Option<ClaimReceipt> {
 /// 因此这个函数同时是「领取」与「**取回发放凭据**」两个用途的同一个入口：
 /// 想要那笔积分的到期时间，不必等到当天首次领取，靠回放也能拿到。
 /// 调用方仍应只在需要时打（见 `checkin::do_checkin`：每天每账号至多一次）。
-///
-/// `region` 必须来自账号自己：领错区域的接口只会拿到 401/404，而**打卡本身就是写操作**，
-/// 打偏了没有「重试一次就好」的余地。
-pub async fn claim_campaign(
-    region: Region,
-    token: &str,
-    campaign_id: &str,
-) -> Result<ClaimReceipt, String> {
+pub async fn claim_campaign(token: &str, campaign_id: &str) -> Result<ClaimReceipt, String> {
     // 路径参数直接拼进 URL，所以只放行 UUID 的字符集。正常响应里它是 UUID，
     // 但「服务端给什么就拼什么」是路径穿越的经典入口（`../` 会被当成路径分隔符）。
     if campaign_id.is_empty()
@@ -687,18 +547,15 @@ pub async fn claim_campaign(
     {
         return Err(format!("campaignId 形态异常，拒绝拼路径：{campaign_id:?}"));
     }
-    let resp = apply_machine_headers(
-        client()
-            .post(format!(
-                "{}{CAMPAIGN_PATH}/{campaign_id}/claim",
-                region.openapi_base()
-            ))
-            .bearer_auth(token),
-        region,
-    )
-    .send()
-    .await
-    .map_err(|e| format!("领取请求失败：{e}"))?;
+    let resp = client()
+        .post(format!(
+            "{}{CAMPAIGN_PATH}/{campaign_id}/claim",
+            OPENAPI_BASE
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("领取请求失败：{e}"))?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -971,9 +828,7 @@ mod tests {
     async fn smoke_real_campaigns() {
         let list = crate::auth_file::discover_local_accounts().accounts;
         let a = list.first().expect("本机应存在 Qoder 登录信息");
-        let c = fetch_campaigns(a.region, &a.token)
-            .await
-            .expect("活动接口应可用");
+        let c = fetch_campaigns(&a.token).await.expect("活动接口应可用");
         println!(
             "showCampaign={} claimable={} url={:?}",
             c.show_campaign, c.claimable, c.campaign_url
@@ -995,120 +850,6 @@ mod tests {
         assert!(parse_campaigns(&serde_json::json!({})).is_none());
     }
 
-    /// 只读实验 2：**用官方 `runtime-info` 现取一整套原生设备身份
-    /// （`machineToken` / `machineType` / `machineCode`），再把 `Cosy-*` 机器头逐个补齐，
-    /// 验证国际版活动接口此时是否下发当天可领的每日活动**。
-    ///
-    /// 逆向结论（app.asar 0.3.4 `dZe`/`AXe`）：官方以
-    /// `runtime-info <environment> --account-stdin` 调用，account 从 stdin 传
-    /// `{"account": uid}`；全局部署 `environment = 3`。输出为一段 JSON，
-    /// 官方只取 `{machineToken, machineType, machineCode}`。关键点：这三个值**每次调用
-    /// 都重新生成**（并非持久化），所以「同一次运行里三值必然配套」才是可用的资格，
-    /// 用任意历史值都可能被拒绝。
-    ///
-    /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_campaigns_with_runtime_identity`
-    #[tokio::test]
-    #[ignore = "真实网络调用 + 本机原生工具，需已登录国际版；只读，绝不发 claim"]
-    async fn smoke_real_campaigns_with_runtime_identity() {
-        let list = crate::auth_file::discover_local_accounts().accounts;
-        let Some(acc) = list.iter().find(|a| a.region == Region::Global) else {
-            println!("本机没有国际版账号，跳过");
-            return;
-        };
-        // 定位官方二进制（两平台形态见 `runtime_info_bin`），之后调用走生产同款
-        let Some(exe) = runtime_info_bin() else {
-            println!("未找到 runtime-info 二进制，跳过");
-            return;
-        };
-        // 调用官方同款：environment=3(global) --account-stdin，account 走 stdin
-        let mut child = crate::proc::cmd(&exe)
-            .args(["3", "--account-stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("无法启动 runtime-info");
-        {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut() {
-                let uid = acc.uid.as_deref().unwrap_or("");
-                let _ = stdin.write_all(format!("{{\"account\":\"{uid}\"}}\n").as_bytes());
-            }
-        }
-        let output = child.wait_with_output().expect("等待 runtime-info 失败");
-        let out_txt = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let first_line = out_txt.lines().next().unwrap_or("");
-        let Ok(idv) = serde_json::from_str::<Value>(first_line) else {
-            println!("runtime-info 输出无法解析：{out_txt}");
-            return;
-        };
-        let (m_token, m_type, m_code) = (
-            idv["machineToken"].as_str().unwrap_or(""),
-            idv["machineType"].as_str().unwrap_or(""),
-            idv["machineCode"].as_str().unwrap_or(""),
-        );
-        println!("runtime-info => token={} type={} code={}", m_token.len(), m_type, m_code);
-        if m_token.is_empty() || m_type.is_empty() || m_code.is_empty() {
-            println!("runtime-info 缺 machineToken/machineType/machineCode");
-            return;
-        }
-        // Cosy-MachineId 用本机真实的 installation_id / machine_id 轮流试
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| ".".into());
-        let qoder_dir = std::path::Path::new(&home).join(".qoder");
-        let id_candidates = [
-            std::fs::read_to_string(qoder_dir.join("installation_id")).ok(),
-            std::fs::read_to_string(qoder_dir.join(".auth").join("machine_id")).ok(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-        let host = std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "unknown".into());
-
-        for mid in id_candidates {
-            println!("----- Cosy-MachineId = {mid} -----");
-            let req = super::client()
-                .get(format!("{}/sash/api/v1/me/campaigns", acc.region.openapi_base()))
-                .bearer_auth(&acc.token)
-                .header("Cosy-Version", "0.3.4")
-                .header("Cosy-MachineOS", std::env::consts::OS)
-                .header("Cosy-MachineHostname", host.as_str())
-                .header("Cosy-MachineId", mid.as_str())
-                .header("Cosy-MachineToken", m_token)
-                .header("Cosy-MachineCode", m_code)
-                .header("Cosy-MachineType", m_type);
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("请求失败：{e}");
-                    continue;
-                }
-            };
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                println!("HTTP {status} 非 JSON：{}", text.chars().take(120).collect::<String>());
-                continue;
-            };
-            let view = parse_campaigns(&v);
-            println!("HTTP {status} show={:?} claimable={:?}",
-                v.get("showCampaign"), v.get("claimable"));
-            if let Some(v) = view {
-                println!("每日活动={:?}", v.daily_claim().map(|c| (c.key.as_str(), c.claim_status.as_str())));
-                for c in &v.campaigns {
-                    println!("  - {} {} {} status={}", c.id, c.key, c.action_type, c.claim_status);
-                }
-            } else {
-                println!("  响应体：{}", text.chars().take(300).collect::<String>());
-            }
-        }
-    }
-
     /// 本机数据目录（池内账号所在）。优先环境变量，否则按平台的 Tauri 约定。
     fn pool_data_dir() -> std::path::PathBuf {
         if let Ok(p) = std::env::var("QODER_ASSISTANT_DATA_DIR") {
@@ -1124,13 +865,10 @@ mod tests {
     }
 
     /// 打一次活动接口，回 `(HTTP 状态, 响应体)`；连不上回 `(0, 错误原文)`。
-    async fn raw_campaigns(region: Region, token: &str) -> (u16, String) {
-        let req = apply_machine_headers(
-            client()
-                .get(format!("{}{CAMPAIGN_PATH}", region.openapi_base()))
-                .bearer_auth(token),
-            region,
-        );
+    async fn raw_campaigns(token: &str) -> (u16, String) {
+        let req = client()
+            .get(format!("{}{CAMPAIGN_PATH}", OPENAPI_BASE))
+            .bearer_auth(token);
         match req.send().await {
             Ok(r) => {
                 let st = r.status().as_u16();
@@ -1148,12 +886,9 @@ mod tests {
     /// 真实接口冒烟（**只读**）：**池内每个账号**今天各自拿到什么活动。
     ///
     /// 「活动未开」有两个完全不同的来源，界面上的文案却是同一句：
-    /// ① 服务端对这个账号没下发当天的每日活动（资格 / 地区 / 时刻）；
+    /// ① 服务端对这个账号没下发当天的每日活动（资格 / 时刻）；
     /// ② 本地把响应解错了（`showCampaign` 缺失、`claimStatus` 不认）。
-    /// 这里逐个打印 HTTP 状态与每日活动那条的 `claimStatus`，
-    /// 并**交叉打一次另一套部署**：同一个 token 若在对面也返回 200，
-    /// 说明账号的 `region` 登记错了（真·地区问题）；对面 401 而本区 200 却没活动，
-    /// 那就是服务端对这个账号没下发 —— 与地区无关。
+    /// 这里逐个打印 HTTP 状态与每日活动那条的 `claimStatus`。
     ///
     /// 运行：`cargo test --lib -- --ignored --nocapture smoke_real_pool_campaigns`
     #[tokio::test]
@@ -1164,17 +899,16 @@ mod tests {
         println!("数据目录：{}（{} 个账号）", dir.display(), accounts.len());
         for a in &accounts {
             let who = a
-                .email
+                .phone
                 .clone()
-                .or_else(|| a.phone.clone())
+                .or_else(|| a.email.clone())
                 .unwrap_or_else(|| a.name.clone());
             println!(
-                "\n=== {} / {} / token {} 字 ===",
+                "\n=== {} / token {} 字 ===",
                 who,
-                a.region.label(),
                 a.token.len()
             );
-            let (st, body) = raw_campaigns(a.region, &a.token).await;
+            let (st, body) = raw_campaigns(&a.token).await;
             match serde_json::from_str::<Value>(&body) {
                 Ok(v) => match parse_campaigns(&v) {
                     Some(view) => {
@@ -1207,11 +941,7 @@ mod tests {
                 },
                 Err(_) => println!("  HTTP {st} 非 JSON：{}", head(&body, 200)),
             }
-            for other in Region::ALL.iter().copied().filter(|r| *r != a.region) {
-                let (ost, obody) = raw_campaigns(other, &a.token).await;
-                println!("  交叉（换 {} 打同一 token）：HTTP {} {}", other.label(), ost, head(&obody, 120));
-            }
-            let view = crate::usage::fetch_usage(a.region, &a.token).await;
+            let view = crate::usage::fetch_usage(&a.token).await;
             println!(
                 "  额度：剩余={:?} 最早到期={:?} 包数={}",
                 view.credits,

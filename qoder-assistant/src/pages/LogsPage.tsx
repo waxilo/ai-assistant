@@ -26,14 +26,11 @@ import { IconTrash, IconList } from "../components/Icons";
  */
 export function LogsPage({
   accounts,
-  region,
   initialAccountId,
   askConfirm,
   onToast,
 }: {
   accounts: Account[];
-  /** 当前区域（左下角选择器）；null = 还没读到 settings（首屏那一瞬），此时展示全部 */
-  region: string | null;
   initialAccountId?: string;
   askConfirm: (opts: Omit<ConfirmReq, "resolve">) => Promise<boolean>;
   onToast: (t: Toast) => void;
@@ -42,16 +39,6 @@ export function LogsPage({
   const [loading, setLoading] = useState(true);
   // 空串 = 全部账号；从账号条目进入时初始为该账号
   const [accountId, setAccountId] = useState(initialAccountId ?? "");
-
-  // 日志按当前区域过滤：后端的 get_checkin_logs 只有「按账号」一个筛选维度，
-  // 没有区域维度，所以这里在前端按区域账号的 id 集合过一遍。列表本身限最近
-  // 300 条 —— 过滤是在这 300 条里挑本区域的，不会因此漏掉更早的本区域记录
-  // 之外的任何东西（想看更早的本来就没有）。
-  const regionIds = new Set(
-    (region ? accounts.filter((a) => a.region === region) : accounts).map((a) => a.id)
-  );
-  const regionAccounts = accounts.filter((a) => regionIds.has(a.id));
-  const shownLogs = logs.filter((l) => regionIds.has(l.account_id));
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -65,17 +52,16 @@ export function LogsPage({
     refresh();
   }, [refresh]);
 
-  /** 清空当前筛选范围内的日志（不可恢复）。「全部账号」也只清**本区域**的：
-      清空是危险动作，范围必须与这页展示的口径一致 —— 界面上看不到另一区域的
-      日志，一键却把它们删了，等于让人替别人按了删除键。后端只支持按单账号清，
-      所以这里逐个账号调一遍。 */
+  /** 清空当前筛选范围内的日志（不可恢复）。「全部账号」也清全部：
+      清空是危险动作，范围必须与这页展示的口径一致。后端只支持按单账号清，
+      所以「全部」是逐个账号调一遍。 */
   const doClear = async () => {
     const acc = accounts.find((a) => a.id === accountId);
     const ok = await askConfirm({
       title: "清空日志",
       body: acc
-        ? `确认清空「${accountLabel(acc.name, accountIdent(acc.region, acc.phone, acc.email))}」的全部签到日志？`
-        : "确认清空当前区域全部账号的签到日志？",
+        ? `确认清空「${accountLabel(acc.name, accountIdent(acc.phone, acc.email))}」的全部签到日志？`
+        : "确认清空全部账号的签到日志？",
       okText: "清空",
       danger: true,
     });
@@ -84,7 +70,7 @@ export function LogsPage({
       if (accountId) {
         await clearCheckinLogs(accountId);
       } else {
-        for (const a of regionAccounts) await clearCheckinLogs(a.id);
+        for (const a of accounts) await clearCheckinLogs(a.id);
       }
       onToast({ kind: "ok", text: "日志已清空" });
       refresh();
@@ -101,18 +87,18 @@ export function LogsPage({
           账号
           <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
             <option value="">全部账号</option>
-            {regionAccounts.map((a) => (
+            {accounts.map((a) => (
               <option key={a.id} value={a.id}>
-                {accountLabel(a.name, accountIdent(a.region, a.phone, a.email))}
+                {accountLabel(a.name, accountIdent(a.phone, a.email))}
               </option>
             ))}
           </select>
         </label>
         <span className="spacer" />
-        <span className="count">{loading ? "加载中…" : `共 ${shownLogs.length} 条`}</span>
+        <span className="count">{loading ? "加载中…" : `共 ${logs.length} 条`}</span>
         <button
           className="btn small danger"
-          disabled={shownLogs.length === 0}
+          disabled={logs.length === 0}
           onClick={() => void doClear()}
         >
           <IconTrash size={15} />
@@ -122,7 +108,7 @@ export function LogsPage({
 
       {loading ? (
         <p className="empty">加载中…</p>
-      ) : shownLogs.length === 0 ? (
+      ) : logs.length === 0 ? (
         <EmptyState
           icon={<IconList size={26} />}
           title="暂无签到记录"
@@ -145,16 +131,14 @@ export function LogsPage({
               </tr>
             </thead>
             <tbody>
-              {shownLogs.map((l) => {
+              {logs.map((l) => {
                 const st = logStatus(l);
                 return (
                   <tr key={l.id}>
                     <td>
-                      {/* 区域取自当前筛选（这页按区域过滤过，可见行的账号必属该区域）；
-                          没读到 settings 时 region 为 null ⇒ 退回手机号优先的展示 */}
                       <AccountCell
                         name={l.account_name}
-                        ident={accountIdent(region, l.account_phone, l.account_email)}
+                        ident={accountIdent(l.account_phone, l.account_email)}
                       />
                     </td>
                     <td>

@@ -52,7 +52,7 @@ pub struct BriefAccount {
     pub name: String,
     #[serde(default)]
     pub phone: Option<String>,
-    /// 邮箱（展示用标识；国际版账号看它，见 `accounts::Account::identity`）
+    /// 邮箱（展示用标识，见 `accounts::Account::identity`）
     #[serde(default)]
     pub email: Option<String>,
     /// 这一小时（日条目里是这一天）的消耗
@@ -474,12 +474,10 @@ pub fn upsert(hours: &mut Vec<HourEntry>, entry: HourEntry) {
 
 #[cfg(test)]
 mod tests {
-    use crate::region::Region;
     use super::*;
 
     fn account(id: &str, name: &str) -> Account {
         Account {
-            region: Region::Global,
             id: id.into(),
             name: name.into(),
             phone: None,
