@@ -554,10 +554,33 @@ pub(crate) fn write_back(creds: &Credentials, json: &Value) -> Result<(), String
     Ok(())
 }
 
+/// 写回结果 —— 调用方据此决定「记日志」还是「告警」（见 `commands::refresh_account_in_place`）。
+///
+/// 为什么不是 `Result`：核对不匹配有两种性质完全不同的成因 ——
+/// 桌面端登录的是**别的账号**（多账号形态下的常态，桌面端毫发无损），与
+/// **同一个人的链分叉了**（桌面端手里那枚旧票已作废，会要求重新登录）。
+/// 前者推送是噪音，后者必须吭声；只有把文件里那位的身份一起带回去，调用方才分得开。
+pub(crate) enum WriteBack {
+    /// 已原子写回
+    Written,
+    /// 读不到凭据（那个版本没登录 / 钥匙串拒绝授权）：没东西可写，跳过
+    NoCredentials,
+    /// 文件里的 token 与本次被换掉的对不上，**一个字节未写**。
+    /// `file_phone` / `file_email` 是文件里那位的身份（取值路径与 [`parse_credentials`]
+    /// 同源）；两个都为 `None` 说明这份文件连身份都认不出 —— 是不是同一个人都不知道。
+    Mismatch {
+        file_phone: Option<String>,
+        file_email: Option<String>,
+    },
+    /// 读写 I/O 失败（原文件未动）
+    Failed(String),
+}
+
 /// 续签成功后，把新 token 对与有效期**原子写回** `auth.v1.dat`。
 ///
 /// 只改 token / refreshToken 及两者有效期四项，其余字段（`user` 等）原样保留。
-/// 读不到凭据（那个版本没登录）时静默返回 Ok —— 写回是尽力而为，失败不该影响续签本身。
+/// 读不到凭据（那个版本没登录）时返回 [`WriteBack::NoCredentials`] —— 写回是尽力而为，
+/// 失败不该影响续签本身。
 ///
 /// ⚠️ `prev_token` 是**这次被换掉的那枚旧 access token**，写回前用它核对身份：
 /// 登录文件里记的还是它，才说明「这个文件就是刚才那个账号的登录态」。
@@ -568,7 +591,9 @@ pub(crate) fn write_back(creds: &Credentials, json: &Value) -> Result<(), String
 /// - **桌面端自己已经续过一轮**：它文件里那条链比我们的新，写回去等于把别人手里
 ///   还能用的凭证换成我们手里这枚已经过时的 —— 症状是 IDE 突然要重新登录。
 ///
-/// 两种都返回 Err 并**一个字节都不写**。跳过写回不影响续签本身：界面上那条链照常有效，
+/// 核对不上时返回 [`WriteBack::Mismatch`] 并**一个字节都不写**，同时带回文件里那位的
+/// 身份：调用方区分「别的账号」（常态，只记日志）与「同一个人、链分叉了」（告警）。
+/// 跳过写回不影响续签本身：界面上那条链照常有效，
 /// 而桌面端更新的那一轮会被 `commands::adopt_file_sessions` 反过来接住。
 pub(crate) fn apply_refresh(
     prev_token: &str,
@@ -576,19 +601,19 @@ pub(crate) fn apply_refresh(
     refresh_token: Option<&str>,
     expires_at: Option<i64>,
     rt_expires_at: Option<i64>,
-) -> Result<(), String> {
+) -> WriteBack {
     let Ok(creds) = read_credentials() else {
-        return Ok(());
+        return WriteBack::NoCredentials;
     };
     let json = creds.json.clone();
     let on_file = str_at(&json, &["token"])
         .or_else(|| str_at(&json, &["accessToken"]))
         .or_else(|| str_at(&json, &["access_token"]));
     if !same_token_on_file(&on_file, prev_token) {
-        return Err(
-            "登录文件里记的不是本次被换掉的那枚 token，已跳过写回（不覆盖别人的登录态）"
-                .to_string(),
-        );
+        return WriteBack::Mismatch {
+            file_phone: str_at(&json, &["user", "phone"]).or_else(|| str_at(&json, &["phone"])),
+            file_email: str_at(&json, &["user", "email"]).or_else(|| str_at(&json, &["email"])),
+        };
     }
     let mut json = json;
     json["token"] = Value::String(token.to_string());
@@ -598,7 +623,10 @@ pub(crate) fn apply_refresh(
     }
     set_expiry(&mut json, "expiresAt", expires_at);
     set_expiry(&mut json, "refreshTokenExpiresAt", rt_expires_at);
-    write_back(&creds, &json)
+    match write_back(&creds, &json) {
+        Ok(()) => WriteBack::Written,
+        Err(e) => WriteBack::Failed(e),
+    }
 }
 
 /// 文件里的 token 与「本次换出去的旧 token」是否同一枚。

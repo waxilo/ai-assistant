@@ -172,29 +172,124 @@ pub(crate) async fn refresh_account_in_place(
     // 用户看到的症状是「客户端要我重新登录」，而账号本身在 assistant 这边完全正常 ——
     // 两件事看着不像同一个原因。旧写法 `let _ =` 把它彻底吞掉，于是这条永远查不到。
     // 与「积分台账落盘失败」同一个通道（[`crate::scheduler::log_event`]）。
-    if let Err(e) =
-        crate::auth_file::apply_refresh(&prev_token, &r.token, next_rt.as_deref(), r.expires_at, r.rt_expires_at)
-    {
-        crate::scheduler::log_event(
-            dir,
-            &format!("续签成功但写回 Qoder 登录文件失败：{}（{e}）", account.name),
-        );
-        // 这条要推出去：新的一对 token 已经换到手，而桌面端文件里那枚旧的**当场作废**。
-        // 助手这边一切正常，用户只在客户端被要求重新登录时才发现 —— 那时已经看不出是
-        // 「写回失败」造成的了。冷却取最短的一档：这类事件本来就极少发生。
-        crate::alerts::notify(
-            dir,
-            &format!("auth-writeback:{}", account.id),
-            crate::alerts::CRITICAL_COOLDOWN_MS,
-            &format!(
-                "账号 {}：续签成功，但没能写回桌面端登录文件（{e}）。\n\
-                 桌面端手里那枚旧的 refresh token 已经作废，它下次自续必然被拒、会要求重新登录；\n\
-                 助手这边的票是新的，接管不受影响。请确认磁盘可写（登录文件用系统钥匙串加过密）。",
-                account.name
-            ),
-        );
+    match crate::auth_file::apply_refresh(
+        &prev_token,
+        &r.token,
+        next_rt.as_deref(),
+        r.expires_at,
+        r.rt_expires_at,
+    ) {
+        crate::auth_file::WriteBack::Written | crate::auth_file::WriteBack::NoCredentials => {}
+        crate::auth_file::WriteBack::Failed(e) => {
+            crate::scheduler::log_event(
+                dir,
+                &format!("续签成功但写回 Qoder 登录文件失败：{}（{e}）", account.name),
+            );
+            // 这条要推出去：新的一对 token 已经换到手，而桌面端文件里那枚旧的**当场作废**。
+            // 助手这边一切正常，用户只在客户端被要求重新登录时才发现 —— 那时已经看不出是
+            // 「写回失败」造成的了。冷却取最短的一档：这类事件本来就极少发生。
+            crate::alerts::notify(
+                dir,
+                &format!("auth-writeback:{}", account.id),
+                crate::alerts::CRITICAL_COOLDOWN_MS,
+                &format!(
+                    "账号 {}：续签成功，但没能写回桌面端登录文件（{e}）。\n\
+                     桌面端手里那枚旧的 refresh token 已经作废，它下次自续必然被拒、会要求重新登录；\n\
+                     助手这边的票是新的，接管不受影响。请确认磁盘可写（登录文件用系统钥匙串加过密）。",
+                    account.name
+                ),
+            );
+        }
+        crate::auth_file::WriteBack::Mismatch {
+            file_phone,
+            file_email,
+        } => match file_identity_kind(
+            account.phone.as_deref(),
+            account.email.as_deref(),
+            file_phone.as_deref(),
+            file_email.as_deref(),
+        ) {
+            WritebackIdentity::OtherPerson => {
+                // 桌面端当前登录的是别的账号：这个文件本来就不归这个账号，跳过是**常态**
+                // （多账号 + 绑池形态下几乎每轮续签都走到这里），桌面端毫发无损。
+                // 绝不推送：2026-10-17 那两连发告警就是它 —— 两个账号同一秒都核对不上，
+                // 全是这种良性跳过，按 CRITICAL 推只会把通道刷到没人再看。
+                crate::scheduler::log_event(
+                    dir,
+                    &format!(
+                        "续签成功但写回桌面端登录文件跳过：{}（文件里是别的账号的登录态，不覆盖）",
+                        account.name
+                    ),
+                );
+            }
+            kind => {
+                let why = match kind {
+                    // 同一个人、token 却对不上：这条链从同一份登录态分叉出去了
+                    //（桌面端自己续过一轮，或被绑池的别的机器换过）——
+                    // 桌面端手里那枚旧票确实已作废，这才是当初要告警的事故。
+                    WritebackIdentity::SamePerson => {
+                        "文件里是同一账号的另一条链（桌面端自己续过，或这条链在别处被换过）"
+                    }
+                    // 身份都认不出就没法排除是本账号的登录态：按「要出事」处理。
+                    // 宁可多推一条，也不能把真被踢的场景静默掉（与 alerts::due 的取向一致）。
+                    WritebackIdentity::Unknown => "登录文件里认不出账号身份，无法排除是本账号的登录态",
+                    WritebackIdentity::OtherPerson => unreachable!("上面的分支已处理"),
+                };
+                crate::scheduler::log_event(
+                    dir,
+                    &format!("续签成功但没写回桌面端登录文件：{}（{why}）", account.name),
+                );
+                crate::alerts::notify(
+                    dir,
+                    &format!("auth-writeback:{}", account.id),
+                    crate::alerts::CRITICAL_COOLDOWN_MS,
+                    &format!(
+                        "账号 {}：续签成功，但没能写回桌面端登录文件（{why}）。\n\
+                         桌面端手里那枚旧的 refresh token 已经作废，它下次自续必然被拒、会要求重新登录；\n\
+                         助手这边的票是新的，接管不受影响。",
+                        account.name
+                    ),
+                );
+            }
+        },
     }
     Ok(())
+}
+
+/// 写回核对不匹配时，登录文件里那位与本地账号的关系（纯函数，便于单测）。
+enum WritebackIdentity {
+    /// 同一个人：token 不同意味着这条链分叉了，桌面端手里的旧票已被本次续签作废
+    SamePerson,
+    /// 另一个人：桌面端当前登录的就是别的账号，跳过写回对谁都没影响
+    OtherPerson,
+    /// 文件里连手机号/邮箱都读不出 —— 是不是同一个人都不知道
+    Unknown,
+}
+
+/// 只比手机号/邮箱，判据与 [`same_person_in_file`] 一致（trim + 忽略大小写）。
+/// 身份取值路径与 `auth_file::parse_credentials` 同源（`user.phone` / `user.email`）；
+/// 空白串按「无身份」归一（与 `str_at` 的语义一致），两边都无身份返回 [`WritebackIdentity::Unknown`]。
+fn file_identity_kind(
+    account_phone: Option<&str>,
+    account_email: Option<&str>,
+    file_phone: Option<&str>,
+    file_email: Option<&str>,
+) -> WritebackIdentity {
+    fn norm(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let eq = |l: Option<&str>, r: Option<&str>| match (l, r) {
+        (Some(l), Some(r)) => !l.is_empty() && !r.is_empty() && l.eq_ignore_ascii_case(r),
+        _ => false,
+    };
+    let (file_phone, file_email) = (norm(file_phone), norm(file_email));
+    match (file_phone, file_email) {
+        (None, None) => WritebackIdentity::Unknown,
+        _ if eq(file_phone, norm(account_phone)) || eq(file_email, norm(account_email)) => {
+            WritebackIdentity::SamePerson
+        }
+        _ => WritebackIdentity::OtherPerson,
+    }
 }
 
 /// 采纳**桌面端已经换好的那一轮**：把 `auth.v1.dat` 里的凭证并回本地账号。
@@ -752,6 +847,43 @@ mod import_tests {
             file: "auth.v1.dat".into(),
         }
     }
+
+    /// 写回核对不匹配后按身份分类：同一个人的链分叉要告警，别的账号只记日志，
+    /// 身份读不出按「可能是同人」保守处理 —— 2026-10-17 两连发告警的修正在此分岔。
+    #[test]
+    fn writeback_mismatch_is_classified_by_identity() {
+        use WritebackIdentity::{OtherPerson, SamePerson, Unknown};
+        // 同一人：手机号任一对上即认（trim + 忽略大小写，与 same_person_in_file 同一条规矩）
+        assert!(matches!(
+            file_identity_kind(Some("138"), None, Some(" 138 "), None),
+            SamePerson
+        ));
+        // 邮箱也能认（国内版手机号、绑邮箱的账号认邮箱）
+        assert!(matches!(
+            file_identity_kind(None, Some("a@b.c"), None, Some("A@B.C")),
+            SamePerson
+        ));
+        // 两个人：桌面端当前登录的是别的账号，跳过写回对谁都没影响
+        assert!(matches!(
+            file_identity_kind(Some("138"), None, Some("999"), None),
+            OtherPerson
+        ));
+        assert!(matches!(
+            file_identity_kind(Some("138"), None, None, Some("x@y.z")),
+            OtherPerson
+        ));
+        // 文件里两样都读不出：没法排除是本账号 → 保守按 Unknown 处理（调用点会告警）
+        assert!(matches!(
+            file_identity_kind(Some("138"), None, None, None),
+            Unknown
+        ));
+        // 空白串不算身份（与 str_at 的语义一致）：别让空字段冒充「认得出」
+        assert!(matches!(
+            file_identity_kind(Some("138"), None, Some("   "), None),
+            Unknown
+        ));
+    }
+
 
     /// 「无法重登」时唯一能自动复活这条链的路径：本地票已死、桌面端自己换过一轮。
     #[test]
