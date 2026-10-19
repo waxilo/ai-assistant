@@ -10,9 +10,9 @@
 //!
 //! 1. **选账号**：**每条请求**都对「当前模型可用的账号」纯排序，不用历史记忆干扰——
 //!    谁的「还有余量的资源包」到期日最早就用谁——把快过期的积分先消耗掉；
-//!    **同一天到期的账号视为并列，选「待过期积分」多的**——最早到期日当天要作废
-//!    的积分，而不是总剩余（界面上的到期时间本来就是日粒度，
-//!    按毫秒严格比会让「两个都显示 X 天后过期」的账号悄悄选出积分少的那个）；
+//!    **同一天到期的账号视为并列，选「待过期积分」少的**——先清掉最早到期日当天
+//!    要作废的小余额，而不是看总剩余；被选中的账号越用越少，纯排序天然稳定
+//!    （界面上的到期时间本来就是日粒度，按毫秒严格比会让相差几秒的同日账号随机定序）；
 //!    查不到过期时间的账号排最后，剩余积分为 0 的账号直接跳过（除非全员为 0）。
 //!    「当前模型可用」= 没有对该模型处在限流冷却里：账号 A 因模型 M 被冷却时，
 //!    继续用 M 就是在剩下的账号里排序；**换到别的模型则 A 立刻回到候选集**，
@@ -116,17 +116,6 @@ fn sticky_key(conv: &str, model: Option<&str>) -> (String, String) {
 fn sticky() -> &'static Mutex<HashMap<(String, String), (Instant, String)>> {
     static STICKY: OnceLock<Mutex<HashMap<(String, String), (Instant, String)>>> = OnceLock::new();
     STICKY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 粘滞主选：最近一次按排序选中的账号，及其「当选依据」——当时的最早到期自然日。
-///
-/// 选号不再每条请求都纯排序：主选要粘到「它当选那天要过期的积分用完」才重新排序换人。
-/// 否则同一天到期的两个账号会随消耗互相反超，来回乒乓（2026-10-16 用户实测：
-/// 账号积分被消耗后频繁切换）。进程内存活即可：重启后第一次请求重新排序，
-/// 排序是确定性的，胜者与粘滞前一致。
-fn champion() -> &'static Mutex<Option<(String, i64)>> {
-    static CHAMPION: OnceLock<Mutex<Option<(String, i64)>>> = OnceLock::new();
-    CHAMPION.get_or_init(|| Mutex::new(None))
 }
 
 /// 同一次客户端请求里，最多换几个账号重试（首次 + 2 次切换）
@@ -380,7 +369,7 @@ fn available_candidates<T: Clone>(candidates: &[T], is_cooling: impl Fn(&T) -> b
 /// 两个同一天到期的账号看上去一模一样。此时若按毫秒严格比，用户会看到
 /// 「两个都显示 2 天后过期，却用了积分更少的那个」，而且想不明白差在哪
 /// （2026-10-12 实测：两个账号差 112 秒，4772.45 那个比 4872.03 先被选中）。
-/// 压到自然日后同一天到期即并列，交给第二键「待过期积分多者优先」定格。
+/// 压到自然日后同一天到期即并列，交给第二键「待过期积分少者优先」定格。
 ///
 /// 未知到期时间（`None`）排在所有有到期日的之后：它连「要不要着急」都不知道，
 /// 不该抢在「确定不着急」前面（与账号页的展示口径一致）。
@@ -393,8 +382,11 @@ fn expiry_day(expiry_ms: Option<i64>) -> i64 {
 
 /// 「待过期积分」：**最早到期自然日**当天到期的资源包剩余合计。
 ///
-/// 排序第二键用它而不是总剩余：同为「最早到期」一档时，谁的「马上要作废的积分」
-/// 多就先用谁——先把快作废的烧掉；总剩余多但大半是远期包的，不该抢在前面。
+/// 排序第二键用它而不是总剩余，且**少者优先**。两个理由：
+/// 1. 同一天到期的账号里先烧「马上要作废」少的那个，能把小余额清干净再换下一个，
+///    不会留到最后一起过期；总剩余多但大半是远期包的，本来也不该抢在前面。
+/// 2. 它每被消耗一笔只会更小，不会再被另一个账号反超——纯排序天然稳定，
+///    不会出现「多者优先」那种随消耗来回乒乓（2026-10-16 用户实测）。
 ///
 /// 退路：逐包明细缺失（签到路径只记总数）或没有到期时间时，退回总剩余，
 /// 避免把「待过期」错算成 0。
@@ -411,14 +403,14 @@ fn expiring_credits(info: &ledger::CreditFact) -> f64 {
 }
 
 /// 路由排序键：到期的自然日早者优先 → 查不到到期时间的靠后 →
-/// **同一自然日内待过期积分多者优先**（见 [`expiring_credits`]）。
+/// **同一自然日内待过期积分少者优先**（见 [`expiring_credits`]）。
 ///
 /// 入参直接用台账的 [`ledger::CreditFact`]：路由的排序依据与账户展示的
 /// 「剩余 / 过期时间」是**同一个类型、同一份来源**，不再各立一份画像结构。
 fn score(info: &ledger::CreditFact) -> (i64, i64) {
     (
         expiry_day(info.earliest_expiry_ms),
-        -(expiring_credits(info) * 100.0) as i64,
+        (expiring_credits(info) * 100.0) as i64,
     )
 }
 
@@ -441,80 +433,6 @@ fn pick_index(ids: &[String], infos: &[ledger::CreditFact]) -> Option<usize> {
     best.or(if ids.is_empty() { None } else { Some(0) })
 }
 
-/// 主选账号「当选日」当天要过期的积分还剩多少：逐包明细里到期日 = 当选日的包剩余合计。
-///
-/// 没有逐包明细（签到路径只记总数）时退回总剩余——与 [`expiring_credits`] 的退路一致，
-/// 别把「待过期」错算成 0 而提前换人。
-fn remaining_on_day(info: &ledger::CreditFact, day: i64) -> f64 {
-    if info.packages.is_empty() {
-        return info.credits.unwrap_or(0.0);
-    }
-    info.packages
-        .iter()
-        .filter(|p| expiry_day(p.expiry_ms) == day)
-        .map(|p| p.remaining)
-        .sum()
-}
-
-/// 主选是否还值得粘住：它「当选那天」要过期的积分还没用完（见 [`remaining_on_day`]）。
-///
-/// 「用完」是可观测的：包耗尽后余量归 0，投影给 [`ledger::CreditFact`] 的逐包明细
-/// 只留余量 > 0 的包，耗尽的包会从明细里消失。读数从没拿到过（余额与明细都缺）
-/// 视为还活着：等补拉出读数再判，不能凭「不知道」就把主选换掉。
-fn champion_alive(info: &ledger::CreditFact, day: i64) -> bool {
-    if info.credits.is_none() && info.packages.is_empty() {
-        return true;
-    }
-    if info.packages.is_empty() {
-        return info.credits != Some(0.0);
-    }
-    remaining_on_day(info, day) > 0.0
-}
-
-/// 主选裁决（纯函数，便于单测）：本轮用谁、主选要不要换。
-///
-/// 输入：当前主选 `(账号 id, 当选日)`、扣费候选 id 集（勾选名单，不含本轮禁用）、
-/// 本轮可用 id 集（候选再剔除冷却；与 `infos` 一一对应）、取积分事实的闭包。
-/// 输出：`(本轮下标, 新主选)`。
-///
-/// 规则：
-/// 1. 主选还在候选集里、且「当选日」要过期的积分没用完（[`champion_alive`]）→ 保留主选；
-/// 2. 主选在本轮可用集里 → 直接用它（不排序）；
-/// 3. 主选在候选集里但本轮被冷却/禁用 → 本轮照常排序绕行，**主选不动**——
-///    冷却一过就回到它继续烧，它当天的额度还没用完；
-/// 4. 主选失效（被删 / 被取消勾选 / 当天积分耗尽 / 还没有主选）→ 重新排序，
-///    赢家成为新主选。勾选改动必须立即生效，不能被任何看不见的状态钉死
-///    （trae 2026-09-16 的教训在这里同样成立）。
-fn resolve_champion(
-    champ: Option<(String, i64)>,
-    candidate_ids: &[String],
-    usable_ids: &[String],
-    infos: &[ledger::CreditFact],
-    fact_of: impl Fn(&str) -> Option<ledger::CreditFact>,
-) -> (Option<usize>, Option<(String, i64)>) {
-    let mut champ = champ.filter(|(id, _)| candidate_ids.iter().any(|c| c == id));
-    if let Some((id, day)) = &champ {
-        if !fact_of(id).map_or(true, |f| champion_alive(&f, *day)) {
-            champ = None;
-        }
-    }
-    if let Some((id, _)) = &champ {
-        if let Some(i) = usable_ids.iter().position(|c| c == id) {
-            return (Some(i), champ);
-        }
-    }
-    match pick_index(usable_ids, infos) {
-        Some(i) => {
-            // 只有主选真的失效了才补写新主选；绕行场景主选保留原样
-            if champ.is_none() {
-                champ = Some((usable_ids[i].clone(), expiry_day(infos[i].earliest_expiry_ms)));
-            }
-            (Some(i), champ)
-        }
-        None => (None, champ),
-    }
-}
-
 /// 监督线程：按设置启停 / 换端口重绑，并负责接管端点的装卸与心跳。
 ///
 /// 必须先成功监听，再安装端点。否则端口被占时会把 WorkBuddy 指向无人监听的地址。
@@ -533,6 +451,7 @@ pub fn spawn(app: tauri::AppHandle) {
             };
             let settings = accounts::load_settings(&dir);
             if !settings.proxy_enabled {
+                crate::tray::set_takeover_active(&app, false, settings.proxy_port);
                 if !disabled_cleaned || installed_port.take().is_some() {
                     if let Some(home) = dirs::home_dir() {
                         if let Err(e) = stealth::uninstall(&home, &dir) {
@@ -550,15 +469,18 @@ pub fn spawn(app: tauri::AppHandle) {
             match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(listener) => {
                     let Some(home) = dirs::home_dir() else {
+                        crate::tray::set_takeover_active(&app, false, port);
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     };
                     if let Err(e) = stealth::install(&home, &dir, port) {
+                        crate::tray::set_takeover_active(&app, false, port);
                         eprintln!("[proxy] 安装接管端点失败：{e}");
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
                     installed_port = Some(port);
+                    crate::tray::set_takeover_active(&app, true, port);
                     // 监听必须非阻塞，才能在 accept 之余顺带轮询配置；
                     // 但 accept 出来的连接会被 Windows 传染非阻塞，必须逐连接复位——见 configure_conn
                     let _ = listener.set_nonblocking(true);
@@ -589,6 +511,7 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                 }
                 Err(e) => {
+                    crate::tray::set_takeover_active(&app, false, port);
                     if installed_port.take().is_some() {
                         if let Some(home) = dirs::home_dir() {
                             let _ = stealth::uninstall(&home, &dir);
@@ -810,8 +733,8 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
         }
     };
 
-    // 2. 选账号：粘住主选账号，直到它「当天要过期的积分」耗尽才按排序换下一个
-    //    （限流/禁用时当轮绕行，见 `resolve_champion`）
+    // 2. 选账号：每条请求按当下读数纯排序——最早到期优先，同一天则待过期积分少者优先
+    //    （限流/禁用当轮剔除，见 `pick_index`）
     //
     // 无鉴权：监听 127.0.0.1，来源只可能是本机进程（WorkBuddy 或调试用的 curl）。
     let body_start = req.head_end;
@@ -1439,7 +1362,8 @@ impl Request {
 
 /// 「会话 × 模型 → 上次选中的账号」记录：**只用于接管动态的判变化，不参与选号**。
 ///
-/// 选号粘在「主选账号」上，直到它当选那天要过期的积分耗尽才换（见 [`resolve_champion`]）。
+/// 选号是每条请求的纯排序（见 [`pick_index`]），没有任何会话/全局粘滞——
+/// 限流冷却天然按「账号 × 模型」记，换模型后全员回到候选集重新排序即可。
 /// 这份记录存在的唯一理由：`route_start` 动态只在「换到新账号」时写一条，
 /// 不刷屏；要知道「换没换」就得记住「上次是谁」。过期项在写入时顺手清掉。
 fn sticky_put(conv: &str, model: Option<&str>, account_id: String) -> bool {
@@ -1498,10 +1422,9 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
 /// - **禁用（严格）**：`ban` 里的账号是本轮请求已试败的限流账号，直接剔除；剔完为空返回 None；
 /// - **冷却（软）**：对本模型仍在限流窗口内的账号优先跳过，全员冷却则照常用。
 ///
-/// 过滤完交给**粘滞主选**裁决（[`resolve_champion`]）：主选要粘到「它当选那天要过期
-/// 的积分用完」才重新排序换人，不再每条请求都纯排序——同日到期的账号会随消耗互相
-/// 反超，纯排序会来回乒乓（2026-10-16 用户实测：积分被消耗后频繁切换）。主选本轮被
-/// 冷却/禁用时照常排序绕行、主选不动，冷却一过回到它；被删/被取消勾选则立刻失效。
+/// 过滤完**直接纯排序**（[`pick_index`]：到期日最早 → 同日则待过期积分少者优先），
+/// 没有任何会话/全局粘滞——每条请求都按当下读数重新排，勾选与积分变化立即生效。
+/// 同日「少者优先」的排序天然稳定：被选中的账号越用越少，不会被另一个反超来回乒乓。
 ///
 /// 选中的账号与该「会话 × 模型」上次选的不同时写一条 `route_start` 事件（见
 /// [`sticky_put`]，那份记录只服务动态，不影响选号）。单机模式下，选中的账号若
@@ -1525,7 +1448,6 @@ async fn choose_account(
     // 这里**不给账号配积分读数**：路由排序直接用台账本身（见下方 `store.fact_of`），
     // 在这儿再配一份投影就是第二个会漂移的口径 —— 而漂移正是这次要消掉的东西。
     let candidates = billing_candidates(&all, &settings.billing_account_ids);
-    let candidate_ids: Vec<String> = candidates.iter().map(|a| a.id.clone()).collect();
     // 限流重试时已试败的账号严格剔除：再试一次只会再吃一个 429
     let accounts: Vec<_> = candidates
         .into_iter()
@@ -1536,8 +1458,8 @@ async fn choose_account(
     }
     let usable = available_candidates(&accounts, |a| cooling(&a.id, model));
 
-    // 过滤完交给主选裁决：候选集已经把「本轮请求不可用」的账号剔干净了——
-    // 出事模型被冷却的账号不在里面（换模型则全员在），裁决规则见 `resolve_champion`。
+    // 过滤完直接排序：候选集已经把「本轮请求不可用」的账号剔干净了——
+    // 出事模型被冷却的账号不在里面（换模型则全员在），排序规则见 `pick_index`。
 
     // 1) 积分事实只看台账（账户管理页显示的就是它）。
     //    读数缺失/过期就用同一次拉取刷新 —— 拉回来的东西**写进台账**，
@@ -1584,18 +1506,8 @@ async fn choose_account(
         .map(|a| store.fact_of(&a.id).unwrap_or_default())
         .collect();
 
-    let (picked, new_champ) = resolve_champion(
-        champion()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-        &candidate_ids,
-        &ids,
-        &infos,
-        |id| store.fact_of(id),
-    );
-    *champion().lock().unwrap_or_else(|e| e.into_inner()) = new_champ;
-    let mut account = usable[picked?].clone();
+    let picked = pick_index(&ids, &infos)?;
+    let mut account = usable[picked].clone();
     // 单机模式下选中的账号临期就先续签（绑了池的恒为「没动」：那一份在上面整池同步好了）。
     // 失败不阻断，仍用旧 token 试
     if commands::ensure_fresh_token(&mut account).await.unwrap_or(false) {
@@ -2322,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_prefers_earliest_expiry_then_most_credits() {
+    fn routing_prefers_earliest_expiry_then_fewer_credits() {
         let ids = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         let infos = vec![
             credit_fact(Some(local_ms(2026, 3, 12, 9)), Some(100.0)),
@@ -2332,9 +2244,8 @@ mod tests {
         ];
         assert_eq!(pick_index(&ids, &infos), Some(1));
 
-        // 同一天到期（只差几小时也算「一样」）→ 待过期积分多者优先。
-        // 就是线上那对账号的形状：4772.45 比 4872.03 早到期 112 秒，
-        // 但界面两个都显示「X 天后过期」⇒ 该用积分多的那个。
+        // 同一天到期（只差几小时也算「一样」）→ 待过期积分少者优先。
+        // 先烧小的，把小余额清干净；消耗只会让它更少，不会被另一个反超。
         // 这两条没有逐包明细，走「退回总剩余」的退路。
         let ids2 = vec!["a".into(), "b".into()];
         let infos2 = vec![
@@ -2343,15 +2254,15 @@ mod tests {
         ];
         assert_eq!(
             pick_index(&ids2, &infos2),
-            Some(1),
-            "同一天到期时应按待过期积分多者优先（无明细时退回总剩余）"
+            Some(0),
+            "同一天到期时应按待过期积分少者优先（无明细时退回总剩余）"
         );
     }
 
     #[test]
-    fn same_day_prefers_more_expiring_credits() {
+    fn same_day_prefers_fewer_expiring_credits() {
         // 同一天到期时比的不是总剩余，而是「这一天要作废的积分」：
-        // 总剩余多的账号如果大半是远期包，不该抢在「快作废的多」前面。
+        // 总剩余多的账号如果大半是远期包，不该抢在前面；先烧当天要作废少的。
         let ids = vec!["a".into(), "b".into()];
         let pkg = |remaining: f64, expiry_ms: i64| ledger::CreditPackage {
             name: "pkg".into(),
@@ -2375,8 +2286,8 @@ mod tests {
         };
         assert_eq!(
             pick_index(&ids, &[a, b]),
-            Some(1),
-            "同一天到期时应比待过期积分：b 当天要作废 5000 > a 的 200，尽管 a 总剩余更多"
+            Some(0),
+            "同一天到期时应比待过期积分：a 当天要作废 200 < b 的 5000，尽管 a 总剩余更多"
         );
     }
 
@@ -2416,110 +2327,27 @@ mod tests {
         }
     }
 
+    /// 同一天到期的两个账号：先烧「当天要作废积分」少的那个。
+    ///
+    /// 它的余额被消耗后只会更少，因此下一轮排序仍然是它——不需要任何粘滞状态，
+    /// 纯排序天然稳定。直到它当天的包耗尽、最早到期日推到下一天，才轮到另一个。
     #[test]
-    fn champion_sticks_until_day_credits_are_gone() {
+    fn same_day_ordering_is_stable_while_burning_down() {
         let day = local_ms(2026, 3, 10, 9);
         let later = local_ms(2026, 3, 20, 9);
-        let candidates = vec!["a".into(), "b".into()];
+        let ids = vec!["a".into(), "b".into()];
 
-        // a：当天 500 + 远期 8800；b：当天 800。首读：同日待过期 b 多 → b 当选
+        // a：当天 500 + 远期 8800；b：当天 800 → a 当天要作废的更少，先用 a
         let a = pkg_fact(Some(day), vec![(500.0, Some(day)), (8800.0, Some(later))]);
         let b = pkg_fact(Some(day), vec![(800.0, Some(day))]);
-        let facts = |id: &str| if id == "a" { Some(a.clone()) } else { Some(b.clone()) };
-        let (idx, champ) =
-            resolve_champion(None, &candidates, &candidates, &[a.clone(), b.clone()], facts);
-        assert_eq!(idx, Some(1));
-        assert_eq!(champ.as_ref().map(|(id, _)| id.as_str()), Some("b"));
+        assert_eq!(pick_index(&ids, &[a.clone(), b.clone()]), Some(0));
 
-        // b 消耗到 300、被 a 反超（纯排序此刻会乒乓切走）——主选不动，仍用 b
-        let b_low = pkg_fact(Some(day), vec![(300.0, Some(day))]);
-        let facts2 =
-            |id: &str| if id == "a" { Some(a.clone()) } else { Some(b_low.clone()) };
-        let (idx2, champ2) = resolve_champion(
-            champ.clone(),
-            &candidates,
-            &candidates,
-            &[a.clone(), b_low.clone()],
-            facts2,
-        );
-        assert_eq!(idx2, Some(1), "主选没烧完当天额度，不应被同日反超的账号换掉");
-        assert_eq!(champ, champ2);
+        // a 消耗到 300：依旧最少，继续用 a（不会反超切到 b）
+        let a_low = pkg_fact(Some(day), vec![(300.0, Some(day)), (8800.0, Some(later))]);
+        assert_eq!(pick_index(&ids, &[a_low, b.clone()]), Some(0));
 
-        // b 的当天包耗尽（明细里消失、只剩远期包）：主选失效 → 重新排序 → a 当选
-        let b_burnt = pkg_fact(Some(later), vec![(4000.0, Some(later))]);
-        let facts3 =
-            |id: &str| if id == "a" { Some(a.clone()) } else { Some(b_burnt.clone()) };
-        let (idx3, champ3) = resolve_champion(
-            champ,
-            &candidates,
-            &candidates,
-            &[a.clone(), b_burnt.clone()],
-            facts3,
-        );
-        assert_eq!(idx3, Some(0));
-        assert_eq!(
-            champ3.as_ref().map(|(id, d)| (id.as_str(), *d)),
-            Some(("a", expiry_day(Some(day))))
-        );
-    }
-
-    #[test]
-    fn champion_survives_cooling_detour() {
-        let d9 = local_ms(2026, 3, 9, 9);
-        let d10 = local_ms(2026, 3, 10, 9);
-        let candidates = vec!["a".into(), "b".into()];
-        let a = pkg_fact(Some(d9), vec![(500.0, Some(d9))]);
-        let b = pkg_fact(Some(d10), vec![(800.0, Some(d10))]);
-        let facts = |id: &str| if id == "a" { Some(a.clone()) } else { Some(b.clone()) };
-
-        // a 到期日更早 → a 当选
-        let (_, champ) =
-            resolve_champion(None, &candidates, &candidates, &[a.clone(), b.clone()], facts);
-        assert_eq!(champ.as_ref().map(|(id, _)| id.as_str()), Some("a"));
-
-        // a 本轮被冷却（可用集只剩 b）：当轮排序绕行用 b，但主选保持 a——
-        // 冷却一过就回它继续烧，它当天的额度还没用完
-        let (idx, champ2) =
-            resolve_champion(champ, &candidates, &["b".into()], &[b.clone()], facts);
-        assert_eq!(idx, Some(0));
-        assert_eq!(champ2.as_ref().map(|(id, _)| id.as_str()), Some("a"));
-    }
-
-    #[test]
-    fn champion_drops_when_removed_from_billing_list() {
-        // 主选被取消勾选/删除 → 立刻换人，不能被看不见的状态钉死（trae 2026-09-16 教训）
-        let d9 = local_ms(2026, 3, 9, 9);
-        let d10 = local_ms(2026, 3, 10, 9);
-        let a = pkg_fact(Some(d9), vec![(500.0, Some(d9))]);
-        let b = pkg_fact(Some(d10), vec![(800.0, Some(d10))]);
-        let facts = |id: &str| if id == "a" { Some(a.clone()) } else { Some(b.clone()) };
-        let (idx, champ) = resolve_champion(
-            Some(("a".into(), expiry_day(Some(d9)))),
-            &["b".into()],
-            &["b".into()],
-            &[b.clone()],
-            facts,
-        );
-        assert_eq!(idx, Some(0));
-        assert_eq!(champ.as_ref().map(|(id, _)| id.as_str()), Some("b"));
-    }
-
-    #[test]
-    fn champion_alive_judges_by_day_packages() {
-        let day = local_ms(2026, 3, 10, 9);
-        let later = local_ms(2026, 3, 20, 9);
-        let d = expiry_day(Some(day));
-
-        // 当天包还在 → 活
-        let alive = pkg_fact(Some(day), vec![(500.0, Some(day)), (8800.0, Some(later))]);
-        assert!(champion_alive(&alive, d));
-        // 当天包耗尽（明细里消失）→ 死，哪怕总剩余还很大
-        let burnt = pkg_fact(Some(later), vec![(8800.0, Some(later))]);
-        assert!(!champion_alive(&burnt, d), "远期包不算当选日的待过期积分");
-        // 无逐包明细 → 退回总剩余：0 = 死，非 0 = 活
-        assert!(champion_alive(&credit_fact(Some(day), Some(5.0)), d));
-        assert!(!champion_alive(&credit_fact(Some(day), Some(0.0)), d));
-        // 从没读到过 → 活（等补拉出读数再判，不凭「不知道」换人）
-        assert!(champion_alive(&ledger::CreditFact::default(), d));
+        // a 当天包耗尽、只剩远期包 → 最早到期日推到后面 → 轮到 b
+        let a_burnt = pkg_fact(Some(later), vec![(8800.0, Some(later))]);
+        assert_eq!(pick_index(&ids, &[a_burnt, b]), Some(1));
     }
 }
