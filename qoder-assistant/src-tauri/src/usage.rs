@@ -334,7 +334,7 @@ pub fn parse_view(root: &Value) -> Option<ResourceView> {
     let credits = Some(crate::ledger::round2(
         packages.iter().map(|p| p.remaining).sum::<f64>(),
     ));
-    // 还有余量的包里最早到期时间（毫秒）；已用完的包对路由排序没有意义，不参与
+    // 还有余量的包里最早到期时间（毫秒）；已用完的包对到期提醒没有意义，不参与
     let earliest_expiry_ms = packages
         .iter()
         .filter(|p| p.remaining > 0.0)
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(v.credits, Some(750.0));
         assert_eq!(v.packages[0].key, "rp-1");
         assert_eq!(v.packages[0].cycle_start, "");
-        // 已用完的包不参与「最早到期」——否则路由会天天盯一个没存量的大限
+        // 已用完的包不参与「最早到期」——否则到期提醒会天天盯一个没存量的大限
         assert_eq!(v.earliest_expiry_ms, Some(1_800_000_000_000));
     }
 

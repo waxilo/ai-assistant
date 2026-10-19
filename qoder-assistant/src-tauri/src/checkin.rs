@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(
             f.earliest_expiry_ms,
             Some(exp),
-            "接管路由排序用的最早到期也要把它算进去"
+            "账号页与到期提醒用的最早到期也要把它算进去"
         );
     }
 

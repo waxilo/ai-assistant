@@ -8,20 +8,21 @@
 //!
 //! 路由逻辑：
 //!
-//! 1. **选账号**：**每条请求**都对「当前模型可用的账号」纯排序，不用历史记忆干扰——
-//!    谁的「还有余量的资源包」到期日最早就用谁——把快过期的积分先消耗掉；
-//!    **同一天到期的账号视为并列，选「待过期积分」多的**——最早到期日当天要作废
-//!    的积分，而不是总剩余（界面上的到期时间本来就是日粒度，
-//!    按毫秒严格比会让「两个都显示 X 天后过期」的账号悄悄选出积分少的那个）；
-//!    查不到过期时间的账号排最后，剩余积分为 0 的账号直接跳过（除非全员为 0）。
-//!    「当前模型可用」= 没有对该模型处在限流冷却里：账号 A 因模型 M 被冷却时，
-//!    继续用 M 就是在剩下的账号里排序；**换到别的模型则 A 立刻回到候选集**，
-//!    依旧是全员排序——冷却只针对「账号 × 模型」这一对，不牵连其它模型。
+//! 1. **选账号（会话级绑定）**：新会话第一次走代理时，在扣费备选里按**剩余积分从多到少**
+//!    选一个账号，然后**整段会话都用它**——哪怕别的账号积分更多也不换。只有绑定账号
+//!    **积分用完**（或它被删除 / 从扣费备选里取消勾选）时，才按当时的积分重新选一次。
+//!    积分未知（还没读到过）的账号排在已知有余量的账号之后；积分为 0 的账号直接跳过
+//!    （除非全员为 0）。
+//!    会话标识优先取请求头 `X-Session-ID`（当前 Qoder 的模型请求必带），再退到
+//!    `X-Qoder-Session-Id` / `X-Conversation-Id`，最后从请求体
+//!    `metadata.context.session_id` 兜底。没有会话标识的请求（模型清单、遥测等）
+//!    不属于任何对话，按单次请求的积分排序选号。
 //! 2. **限流无感切换**：免费模型（清单与免费判定见 [`crate::models`] —— 三层来源：
 //!    Qoder 官方目录 / 落盘快照 / 本机痕迹，**绝不退回写死的模型名**）触发限流（429）时，把
 //!    **「该账号 × 该模型」**冷却到上游给出的重置时刻，换下一个账号重发同一请求
 //!    （上限 2 次切换）。付费模型的 429 原样透传。冷却的粒度与时间节点见
-//!    `RateKey` / `limit_until_ms`。
+//!    `RateKey` / `limit_until_ms`。这种切换只是**同一请求内的临时绕行**：会话绑定
+//!    仍是原账号，下一轮请求照旧先回到它——「一个会话只选一个」不因限流而改变。
 //! 3. **续签兜底**：选中的账号若凭证临近过期（<48h）会先自动续签。
 //! 4. **转发**：路径与查询串原样保留，替换 `Authorization` 为选中账号的 token，
 //!    去掉逐跳头（Host / Content-Length 等）后透传其余请求头。
@@ -51,14 +52,26 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-/// Qoder 对话请求带的会话标识，用作粘滞键
-pub const CONV_HEADER: &str = "X-Conversation-Id";
+/// Qoder 模型请求带的会话标识头，按优先级探测。
+///
+/// 当前版本 agent SDK 的 HTTP 推理通道固定带 `X-Session-ID`（与正文
+/// `metadata.context.session_id` 同源，见 `session_id_of` 的说明）；其余名字是
+/// 不同版本/入口的兜底。实测旧版客户端（2026-09-21）一个都不带，所以正文兜底不能省。
+const SESSION_HEADERS: [&str; 4] = [
+    "X-Session-ID",
+    "X-Qoder-Session-Id",
+    "X-Conversation-Id",
+    "x-internal-session-id",
+];
 /// 积分快照缓存时长：路由决策不必每次都打资源接口
 const SNAPSHOT_TTL: Duration = Duration::from_secs(600);
-/// 同一会话多久没新请求就释放粘滞（换回按积分重新选）
-const STICKY_TTL: Duration = Duration::from_secs(30 * 60);
+/// 会话绑定多久没新请求就释放（只做内存清理）。
+///
+/// 给足一周：Qoder 的对话可以隔天接着聊，绑定不该因为「昨晚没说话」就悄悄换人。
+/// 真正的新会话本来就不会命中旧 id，这个窗口只影响「同一会话停很久后恢复」。
+const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// accept 空轮询间隔（非阻塞监听）：它直接等于「请求到达 → 被 accept」的额外延迟
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 /// 配置（接管开关 / 端口）轮询间隔。比 accept 轮询慢得多：每轮 accept 都去读一次
@@ -108,20 +121,51 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 // 它只统一 UA、**绝不向请求注入身份头**（CLI 自己带的头必须原样过去）。
 // 原先这里那个 `API_CLIENT` 是给「自己拉模型清单」用的，随那段逻辑一起搬走后就没了使用者。
 
-/// 会话粘滞键：**会话 × 模型**。
+/// 会话绑定：会话 id → (最后活跃时刻, 账号 id)。
 ///
-/// 带上模型是为了跟限流冷却的粒度对齐（见 `RateKey`）：粘滞的意义是「别在同一次对话
-/// 中途换账号」，而换号可能是被「某个模型的限流」逼出来的——辅助小模型（0 积分那类）
-/// 吃 429 换了号，不该把主模型的后续请求也一起搬走。各模型各自粘，互不牵连。
-/// 模型未知（非对话请求）用空串占位，等价于原来按会话粘。
-fn sticky_key(conv: &str, model: Option<&str>) -> (String, String) {
-    (conv.to_string(), model.unwrap_or_default().to_string())
+/// 这是**真正的路由状态**，不再是只服务日志的记录：同一会话的所有请求都从这张表
+/// 拿绑定账号，只有积分用完 / 账号不可用时才改绑（见 [`pick_for_session`] 与
+/// [`should_rebind`]）。键**不含模型**——用户要的是「一个会话只选一个账号」，
+/// 辅助小模型与主模型也必须扣在同一个账号上。
+///
+/// 时刻用 `SystemTime` 而不是 `Instant`：Windows 的 `Instant` 以开机时长为基准，
+/// 「now 减 7 天」在刚开机几小时的机器上会直接溢出（单测就踩过）。TTL 是 7 天量级，
+/// 系统时钟被校准几分钟对结果没有影响。
+fn session_bindings() -> &'static Mutex<HashMap<String, (SystemTime, String)>> {
+    static BINDINGS: OnceLock<Mutex<HashMap<String, (SystemTime, String)>>> = OnceLock::new();
+    BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 会话粘滞：(会话, 模型) → (最后命中时刻, 账号 id)
-fn sticky() -> &'static Mutex<HashMap<(String, String), (Instant, String)>> {
-    static STICKY: OnceLock<Mutex<HashMap<(String, String), (Instant, String)>>> = OnceLock::new();
-    STICKY.get_or_init(|| Mutex::new(HashMap::new()))
+/// 取会话绑定的账号，并顺手刷新活跃时刻（滑动续期）。过期 / 没绑过返回 `None`。
+fn session_bound_account(session: &str) -> Option<String> {
+    let mut map = session_bindings().lock().ok()?;
+    let expired = map.get(session).map_or(true, |(at, _)| {
+        at.elapsed().map_or(false, |elapsed| elapsed >= SESSION_TTL)
+    });
+    if expired {
+        map.remove(session);
+        return None;
+    }
+    map.get_mut(session).map(|(at, id)| {
+        *at = SystemTime::now();
+        id.clone()
+    })
+}
+
+/// 绑定会话，返回**旧绑定**（`None` = 新会话或旧绑定已过期）。
+///
+/// 写入时顺手清掉过期项 —— 这张表随会话数增长，但只有真实请求过的会话才会进来，
+/// 一周窗口足够小。
+fn bind_session(session: &str, account_id: &str) -> Option<String> {
+    let Ok(mut map) = session_bindings().lock() else {
+        return None;
+    };
+    map.retain(|_, (at, _)| at.elapsed().map_or(true, |elapsed| elapsed < SESSION_TTL));
+    map.insert(
+        session.to_string(),
+        (SystemTime::now(), account_id.to_string()),
+    )
+    .map(|(_, id)| id)
 }
 
 /// 同一次客户端请求里，最多换几个账号重试（首次 + 2 次切换）
@@ -359,47 +403,102 @@ fn parse_reset_text(text: &str) -> Option<i64> {
     }
 }
 
-/// 候选软过滤（纯函数，便于单测）：优先剔除冷却中的账号；
-/// 若剔完为空（全员都在冷却）则原样返回——让上游裁决也比代理直接 503 有信息量。
-fn available_candidates<T: Clone>(candidates: &[T], is_cooling: impl Fn(&T) -> bool) -> Vec<T> {
-    let usable: Vec<T> = candidates.iter().filter(|a| !is_cooling(a)).cloned().collect();
-    if usable.is_empty() {
-        candidates.to_vec()
-    } else {
-        usable
-    }
-}
-
-/// 路由排序键：**积分过期时刻**早者优先 —— 谁先过期用谁的积分。
+/// 路由排序键：**剩余积分多者优先** —— 哪个账号积分多用哪个。
 ///
-/// 毫秒级直接比，不做自然日分档：快过期的积分先烧掉，晚一天是一天。
-/// 未知到期时间（`None`）排在所有有到期日的之后：它连「要不要着急」都不知道，
-/// 不该抢在「确定不着急」前面（与账号页的展示口径一致）。
+/// 未知积分（`None`）用 `-∞` 参与比较：不知道余量的账号不该抢在「确定更充足」的
+/// 账号前面，但也不像 0 积分那样被跳过（它可能还有额度）。同一分数保持列表原顺序，
+/// 结果稳定可复现。
 ///
 /// 入参直接用台账的 [`ledger::CreditFact`]：路由的排序依据与账户展示的
 /// 「剩余 / 过期时间」是**同一个类型、同一份来源**，不再各立一份画像结构。
-fn score(info: &ledger::CreditFact) -> i64 {
-    info.earliest_expiry_ms.unwrap_or(i64::MAX)
+fn score(info: &ledger::CreditFact) -> f64 {
+    info.credits.unwrap_or(f64::NEG_INFINITY)
 }
 
-/// 从候选里选出该用的账号下标。`infos` 与 `ids` 一一对应。
+/// 积分是否确定已经用完。`None`（没读到过）不算用完了 —— 不能凭「不知道」换号。
+fn is_exhausted(info: &ledger::CreditFact) -> bool {
+    info.credits.is_some_and(|c| c <= 0.0)
+}
+
+/// 从候选里选出积分最多的账号下标。`infos` 与 `ids` 一一对应。
 fn pick_index(ids: &[String], infos: &[ledger::CreditFact]) -> Option<usize> {
     let mut best: Option<usize> = None;
-    let mut best_score: Option<i64> = None;
+    let mut best_score = f64::NEG_INFINITY;
     for (i, info) in infos.iter().enumerate() {
-        // 剩余积分为 0 的账号直接跳过（除非全员为 0 / 全未知）
-        if info.credits == Some(0.0) {
+        // 积分确定用完的账号直接跳过（除非全员为 0 / 全未知）
+        if is_exhausted(info) {
             continue;
         }
         let s = score(info);
-        // 同刻到期（并列）时保持列表原顺序：先到先得，结果也稳定可复现
-        if best_score.map_or(true, |cur| s < cur) {
-            best_score = Some(s);
+        // 并列时保持列表原顺序：先到先得，结果也稳定可复现
+        if best.is_none() || s > best_score {
+            best_score = s;
             best = Some(i);
         }
     }
     // 全员为 0 时退化为取第一个（让上游自己报错，比代理直接 503 更有信息量）
     best.or(if ids.is_empty() { None } else { Some(0) })
+}
+
+/// 从候选里决定本轮用哪个账号（纯函数，便于单测）：返回 `accounts` 里的下标。
+///
+/// - 会话已绑定、且绑定账号**仍在候选中、积分没确定用完** → 无条件用它，
+///   不看别的账号积分多少，也不因它对本模型冷却而预先绕行（用户要的是
+///   「一个会话只选一个」；真的 429 了，由该路径既有的重试逻辑处理，且不改变绑定）；
+/// - 否则（新会话 / 绑定账号积分用完 / 绑定账号已被 ban / 删除 / 取消勾选）→
+///   在**未冷却**的账号里按积分从多到少选；全员冷却则全员参与。
+///
+/// 是否要**改绑**由 [`should_rebind`] 单独判断 —— 被 ban 的临时绕行不改绑。
+fn pick_for_session(
+    ids: &[String],
+    infos: &[ledger::CreditFact],
+    cold: &[bool],
+    bound: Option<&str>,
+) -> Option<usize> {
+    if let Some(b) = bound {
+        if let Some(i) = ids.iter().position(|id| id == b) {
+            if !is_exhausted(&infos[i]) {
+                return Some(i);
+            }
+        }
+    }
+    let pool: Vec<usize> = (0..ids.len()).filter(|&i| !cold[i]).collect();
+    let pool = if pool.is_empty() {
+        (0..ids.len()).collect()
+    } else {
+        pool
+    };
+    let pool_ids: Vec<String> = pool.iter().map(|&i| ids[i].clone()).collect();
+    let pool_infos: Vec<ledger::CreditFact> = pool.iter().map(|&i| infos[i].clone()).collect();
+    let best = pick_index(&pool_ids, &pool_infos)?;
+    Some(pool[best])
+}
+
+/// 本轮要不要把会话改绑到选中的账号（纯函数，便于单测）。
+///
+/// - 新会话 → 绑；
+/// - 绑定账号因**本轮请求**的 ban 被排除（429 重试）→ **不绑**，本轮只是临时绕行；
+/// - 绑定账号仍在候选里 → 积分确定用完才改绑；
+/// - 绑定账号已不在候选里（删除 / 取消勾选）→ 改绑。
+///
+/// 「被 ban 且同时耗尽」这一种重叠不在这里区分：本轮先按绕行处理，下一轮请求
+/// 的 `ban` 清空后会看到 0 积分并改绑。
+fn should_rebind(
+    bound: Option<&str>,
+    ids: &[String],
+    infos: &[ledger::CreditFact],
+    bound_banned: bool,
+) -> bool {
+    let Some(b) = bound else {
+        return true;
+    };
+    if bound_banned {
+        return false;
+    }
+    match ids.iter().position(|id| id == b) {
+        Some(i) => is_exhausted(&infos[i]),
+        None => true,
+    }
 }
 
 /// 监督线程：按设置启停 / 换端口重绑，并负责接管端点的装卸与心跳。
@@ -421,6 +520,7 @@ pub fn spawn(app: tauri::AppHandle) {
             };
             let settings = accounts::load_settings(&dir);
             if !settings.proxy_enabled {
+                crate::tray::set_takeover_active(&app, false, settings.proxy_port);
                 if !disabled_cleaned || installed.take().is_some() {
                     if let Err(e) = stealth::uninstall(&dir) {
                         eprintln!("[proxy] 摘除接管端点失败：{e}");
@@ -443,6 +543,7 @@ pub fn spawn(app: tauri::AppHandle) {
             }) {
                 Ok(v) => v,
                 Err(e) => {
+                    crate::tray::set_takeover_active(&app, false, port);
                     eprintln!("[proxy] 准备 TLS 材料失败，暂不接管：{e}");
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
@@ -452,11 +553,13 @@ pub fn spawn(app: tauri::AppHandle) {
             match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(listener) => {
                     if let Err(e) = stealth::install(&dir, port, &ca_pem) {
+                        crate::tray::set_takeover_active(&app, false, port);
                         eprintln!("[proxy] 安装接管端点失败：{e}");
                         std::thread::sleep(INSTALL_RETRY_BACKOFF);
                         continue;
                     }
                     installed = Some(port);
+                    crate::tray::set_takeover_active(&app, true, port);
                     // 监听必须非阻塞，才能在 accept 之余顺带轮询配置；
                     // 但 accept 出来的连接会被 Windows 传染非阻塞，必须逐连接复位——见 configure_conn
                     let _ = listener.set_nonblocking(true);
@@ -488,6 +591,7 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                 }
                 Err(e) => {
+                    crate::tray::set_takeover_active(&app, false, port);
                     if installed.take().is_some() {
                         let _ = stealth::uninstall(&dir);
                     }
@@ -666,6 +770,36 @@ fn header_value<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+/// 取这次请求的会话标识（头优先，正文兜底）。
+///
+/// 当前 Qoder 的 HTTP 推理请求由 agent SDK 构造，固定带 `X-Session-ID`，正文里也有
+/// 同一份 `metadata.context.session_id`（见 `zxn()`）。两处都取是为了扛住版本差异：
+/// 2026-09-21 抓到的旧版客户端一个会话头都没带，那时只能从正文认会话。
+fn session_id_of(req: &Request, body: &[u8]) -> Option<String> {
+    for name in SESSION_HEADERS {
+        if let Some(v) = header_value(req, name)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+    body_session(body)
+}
+
+/// 从请求体 `metadata.context.session_id` 取会话标识（纯函数，便于单测）。
+fn body_session(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("metadata")?
+        .get("context")?
+        .get("session_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// 不该透传给上游的请求头
@@ -999,10 +1133,7 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         Some(b) => b.as_slice(),
         None => buf.get(body_start..body_start + req.body_len).unwrap_or(&[]),
     };
-    let conv = header_value(&req, CONV_HEADER)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let session = session_id_of(&req, body);
     let settings = accounts::load_settings(&dir);
     // 转发目标恒为国内版模型网关（见上面那段说明）。
     let host = crate::qoder_api::GATEWAY_BASE;
@@ -1022,7 +1153,7 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
     loop {
         let Some(account) = tauri::async_runtime::block_on(choose_account(
             &dir,
-            conv.as_deref(),
+            session.as_deref(),
             &ban,
             model.as_deref(),
         )) else {
@@ -1305,8 +1436,8 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
                     let model_name = model.as_deref().unwrap_or("未知");
                     // 封禁粒度 = 账号 × 模型：上游就是这么算的，这个账号的**其它模型**照用
                     let note = cooldown_note(set_cooldown(&account.id, model_name, until_ms, source));
-                    // 粘滞不必解绑：冷却表已保证该「账号 × 模型」在有效期内不会被选中；
-                    // 而粘滞按「会话 × 模型」分开记，这次冷却不会牵连同会话的其它模型。
+                    // 会话绑定不必解绑：本次换号只是同一请求内的临时绕行——
+                    // `choose_account` 因 ban 暂时避开它，绑定仍是原账号，下一轮就回去。
                     // 「还有没有下一个」必须**先问清楚**：把候选 ban 空后，下一轮
                     // `choose_account` 只会返回 None，反代就得给客户端回 503 ——
                     // 宁可这轮把 429 原样透传（下面那条路），也不能让对话起不来。
@@ -1750,31 +1881,12 @@ impl Request {
     }
 }
 
-/// 「会话 × 模型 → 上次选中的账号」记录：**只用于接管动态的判变化，不参与选号**。
-///
-/// 选号是每条请求的纯排序（见 [`choose_account`]），没有任何粘滞/归属记忆——
-/// 限流冷却天然按「账号 × 模型」记，换模型后全员回到候选集重新排序即可。
-/// 这份记录存在的唯一理由：`route_start` 动态只在「换到新账号」时写一条，
-/// 不刷屏；要知道「换没换」就得记住「上次是谁」。过期项在写入时顺手清掉。
-/// （实测客户端并不带 `X-Conversation-Id`，这份记录在实际流量里大多停在空转。）
-fn sticky_put(conv: &str, model: Option<&str>, account_id: String) -> bool {
-    if let Ok(mut map) = sticky().lock() {
-        map.retain(|_, (at, _)| at.elapsed() < STICKY_TTL);
-        let key = sticky_key(conv, model);
-        let changed = map.get(&key).map(|(_, id)| id != &account_id).unwrap_or(true);
-        map.insert(key, (Instant::now(), account_id));
-        return changed;
-    }
-    false
-}
-
 /// 「本次对话由账号 X 提供」这条**对客通知**的去重窗口。
 ///
-/// 为什么不能靠会话 id 去重：`CONV_HEADER`（`X-Conversation-Id`）实测**客户端并不带** ——
-/// 2026-09-19 那轮对话的 6 个请求一个都没带，于是 `sticky_*` 在实际流量里从未命中，
-/// 「开始使用账号」事件一条都没产出过（界面上恰恰缺了最该有的那条信息）。
-/// 退化成时间窗：同账号同模型在 [`SESSION_GAP`] 内只通知一次。
-/// 宁可少报也不能每请求一条 —— 对客时间线一刷屏就等于没有。
+/// 会话绑定已经保证「同一会话不会无故换号」，但一次对话里会有多个模型请求
+/// （主模型 + 辅助小模型 + 重试），没有去重就会刷屏。这里用「同账号同模型
+/// 5 分钟内只报一次」兜底；新会话绑到同一个账号时可能少报一条，但比每请求一条
+/// 把时间线淹掉要好。
 const SESSION_GAP: Duration = Duration::from_secs(5 * 60);
 
 /// 上一次「本次对话由账号 X 提供」通知：(时刻, 账号 id, 模型)
@@ -1841,7 +1953,7 @@ fn billing_candidates(accounts: &[crate::accounts::Account], selected: &[String]
 /// 判据与 [`choose_account`] 的候选集**逐句对齐**：取勾选的扣费备选
 /// （未勾选 = 全部）。入参是**已读好的**账号表 —— 它被调用在路由热路径上，
 /// 不能顺手读盘，更不能有网络副作用（`choose_account` 会顺手补积分、续签、
-/// 写粘滞，绝不能拿它来「试算」）。
+/// 写会话绑定，绝不能拿它来「试算」）。
 ///
 /// 为什么必须问这一句：把一个候选 ban 到空，下一轮 `choose_account` 会返回
 /// `None`，反代只能给客户端回 503 —— 对话直接起不来；而**留在原位原样透传**，
@@ -1856,26 +1968,26 @@ fn has_spare_candidate(
         .any(|a| !tried.iter().any(|t| t == &a.id))
 }
 
-/// 选出一个该用的账号。
+/// 选出一个该用的账号（会话级绑定）。
 ///
 /// `model` 是本轮请求要用的模型：限流冷却按 **账号 × 模型** 记账，选号必须知道模型是谁。
 ///
 /// 候选集 = 设置里勾选的扣费账号（未勾选的不允许扣费；全不勾 = 全部可用），
 /// 再做两层过滤：
 /// - **禁用（严格）**：`ban` 里的账号是本轮请求已试败的限流账号，直接剔除；剔完为空返回 None；
-/// - **冷却（软）**：对本模型仍在限流窗口内的账号优先跳过，全员冷却则照常用。
+/// - **冷却（软）**：只影响新会话 / 改绑 / 临时绕行时的排序。已绑定的账号即使对本模型
+///   正在冷却也照用——否则「一个会话只选一个」会被一次 429 打破；若该路径启用了
+///   限流重试，换号也只是同一请求内的临时绕行，不改绑。
 ///
-/// 过滤完**直接纯排序**（[`pick_index`]：积分过期时刻最早者优先），
-/// 没有任何会话粘滞/归属记忆——冷却只记「账号 × 模型」，换模型后全员自然回到
-/// 候选集；继续用出事的模型则被冷却的账号自动出局，剩下的人照常排序。
+/// 新会话按积分从多到少选一次并绑定；同一会话后续请求都用绑定账号，只有积分确定
+/// 用完、账号被删除 / 取消勾选时才改绑。选号规则见 [`pick_for_session`]，
+/// 是否改绑见 [`should_rebind`]。
 ///
-/// 选中的账号与该「会话 × 模型」上次选的不同时写一条 `route_start` 事件（见
-/// [`sticky_put`]，那份记录只服务动态，不影响选号）。
 /// 单机模式下，选中的账号若触发了续签会就地保存账号列表；绑了池则不会 ——
 /// 那一份凭证在上面的整池同步里已经落过盘了。
 async fn choose_account(
     dir: &PathBuf,
-    conv: Option<&str>,
+    session: Option<&str>,
     ban: &[String],
     model: Option<&str>,
 ) -> Option<crate::accounts::Account> {
@@ -1899,15 +2011,14 @@ async fn choose_account(
     if accounts.is_empty() {
         return None;
     }
-    let usable = available_candidates(&accounts, |a| cooling(&a.id, model));
-
-    // 过滤完直接纯排序：候选集已经把「本轮请求不可用」的账号剔干净了——
-    // 出事模型被冷却的账号不在里面（换模型则全员在），排序规则见 `pick_index`。
 
     // 1) 积分事实只看台账（账户管理页显示的就是它）。
     //    读数缺失/过期就用同一次拉取刷新 —— 拉回来的东西**写进台账**，
     //    不再往 accounts.json 里塞第二份会各自漂移的副本。
-    let ids: Vec<String> = usable.iter().map(|a| a.id.clone()).collect();
+    //
+    //    刷新范围是**全部未 ban 的候选**（含冷却中的账号）：绑定账号可能正在冷却，
+    //    但本轮仍要用它，不能因为冷却就跳过它的读数、把「积分是否用完」判成未知。
+    let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
     // 采集（打接口）在锁外，记账一次性完成 —— 理由见 `commands::fetch_samples`。
     // 这一步是「顺手补拉过期读数」：拉回来的东西写进唯一那本台账，
     // 不再往 accounts.json 里塞第二份会各自漂移的副本。
@@ -1918,9 +2029,9 @@ async fn choose_account(
     // 「按旧快照路由、界面显示新数」的老问题。
     let store = ledger::store(dir);
     let snaps: Vec<Option<ledger::CreditFact>> =
-        usable.iter().map(|a| store.fact_of(&a.id)).collect();
+        accounts.iter().map(|a| store.fact_of(&a.id)).collect();
     let mut readings: Vec<ledger::Reading> = Vec::new();
-    for (i, acct) in usable.iter().enumerate() {
+    for (i, acct) in accounts.iter().enumerate() {
         // 快照还新鲜就不打这一趟接口（`None` = 从没读到过，同样要拉）
         if !snapshot_stale(snaps[i].as_ref().map(|f| f.at.as_str())) {
             continue;
@@ -1941,15 +2052,26 @@ async fn choose_account(
         }
     }
     // 排序依据一律取自**唯一那本台账**（刚补拉过的账号已经是新值）；
-    // 从没读到过的账号用 `CreditFact::default()`（两栏都是 `None`），`pick_index`
-    // 会把它排到最后。顺序必须与 `ids` 严格一一对应，所以不能 `filter_map` 掉。
-    let infos: Vec<ledger::CreditFact> = usable
+    // 从没读到过的账号用 `CreditFact::default()`（两栏都是 `None`），排序时排在
+    // 已知有余量的账号之后。顺序必须与 `ids` 严格一一对应，所以不能 `filter_map` 掉。
+    let infos: Vec<ledger::CreditFact> = accounts
         .iter()
         .map(|a| store.fact_of(&a.id).unwrap_or_default())
         .collect();
 
-    let idx = pick_index(&ids, &infos)?;
-    let mut account = usable[idx].clone();
+    let bound = session.and_then(session_bound_account);
+    let bound_name = bound
+        .as_deref()
+        .and_then(|b| all.iter().find(|a| a.id == b).map(|a| a.name.clone()));
+    let bound_banned = bound.as_deref().is_some_and(|b| ban.iter().any(|x| x == b));
+    let bound_exhausted = bound
+        .as_deref()
+        .and_then(|b| ids.iter().position(|id| id == b))
+        .is_some_and(|i| is_exhausted(&infos[i]));
+    let cold: Vec<bool> = accounts.iter().map(|a| cooling(&a.id, model)).collect();
+    let idx = pick_for_session(&ids, &infos, &cold, bound.as_deref())?;
+    let mut account = accounts[idx].clone();
+    let rebind = should_rebind(bound.as_deref(), &ids, &infos, bound_banned);
     // 单机模式下选中的账号临期就先续签（绑了池的恒为「没动」：那一份在上面整池同步好了）。
     // 失败不阻断，仍用旧 token 试
     if commands::ensure_fresh_token(dir, &mut account).await.unwrap_or(false) {
@@ -1982,19 +2104,47 @@ async fn choose_account(
             );
         }
     }
-    if let Some(conv) = conv {
-        // 记录「该会话 × 模型上次选了谁」，仅供动态判变化（见 `sticky_put`）；
-        // 换到新账号就写一条「开始使用」，同一组合的后续请求不刷屏。
-        if sticky_put(conv, model, account.id.clone()) {
-            // 该会话第一次走上代理，或被切到了新账号 —— 记一条「开始使用」事件
-            stealth::journal_append(
+    if let Some(session) = session {
+        let short = || session.chars().take(8).collect::<String>();
+        if rebind {
+            // 新会话 / 原绑定失效（积分用完、账号被删除或取消勾选）→ 绑定本次选中的账号。
+            // `bind_session` 返回旧绑定：同一账号重复绑定不算变化，不刷屏。
+            let prev = bind_session(session, &account.id);
+            if prev.as_deref() != Some(account.id.as_str()) {
+                let text = match (&bound, prev.as_deref()) {
+                    (None, _) => format!(
+                        "开始使用账号「{}」服务会话 {}（按剩余积分选出，当前扣费备选 {} 个）",
+                        account.name,
+                        short(),
+                        accounts.len()
+                    ),
+                    (Some(_), _) => {
+                        let reason = if bound_exhausted {
+                            "积分已用完"
+                        } else {
+                            "已不在扣费备选（删除或取消勾选）"
+                        };
+                        format!(
+                            "会话 {} 换用账号「{}」：原绑定账号「{}」{}",
+                            short(),
+                            account.name,
+                            bound_name.as_deref().unwrap_or("未知"),
+                            reason
+                        )
+                    }
+                };
+                stealth::journal_append(dir, "route_start", &text);
+            }
+        } else if bound_banned && bound.as_deref() != Some(account.id.as_str()) {
+            // 绑定账号本轮 429 被 ban → 临时绕行。绑定保持不变，下一轮请求仍先回到它。
+            stealth::debug_append(
                 dir,
-                "route_start",
+                "session_detour",
                 &format!(
-                    "开始使用账号「{}」服务会话 {}（当前扣费备选 {} 个）",
-                    account.name,
-                    &conv.chars().take(8).collect::<String>(),
-                    usable.len()
+                    "会话 {} 的绑定账号「{}」本轮限流被排除，临时改用账号「{}」；会话绑定不变",
+                    short(),
+                    bound_name.as_deref().unwrap_or("未知"),
+                    account.name
                 ),
             );
         }
@@ -2273,37 +2423,6 @@ mod tests {
     }
 
     #[test]
-    fn available_candidates_skips_cooling_unless_all_cooling() {
-        let mk = |id: &str| crate::accounts::Account {
-            id: id.into(),
-            name: id.into(),
-            phone: None,
-            email: None,
-            token: "tok".into(),
-            refresh_token: None,
-            expires_at: None,
-            rt_expires_at: None,
-            created_at: String::new(),
-            checked_today: None,
-            cosy_uid: None,
-            invalidated_at: None,
-            renew_blocked_until: None,
-            last: None,
-        };
-        let all = vec![mk("a"), mk("b"), mk("c")];
-        let ids = |v: &[crate::accounts::Account]| -> Vec<String> {
-            v.iter().map(|a| a.id.clone()).collect()
-        };
-        // 无人冷却 → 原样返回
-        assert_eq!(ids(&available_candidates(&all, |a| a.id == "x")).len(), 3);
-        // b 在冷却 → 跳过 b
-        let got = ids(&available_candidates(&all, |a| a.id == "b"));
-        assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
-        // 全员冷却 → 软过滤退回全部：让上游裁决也比代理直接 503 有信息量
-        assert_eq!(ids(&available_candidates(&all, |_| true)).len(), 3);
-    }
-
-    #[test]
     fn failover_only_for_free_models() {
         // 请求体缺 model / 非法 JSON → 视为未知，不触发切换
         assert_eq!(body_model(b"{}"), None);
@@ -2356,49 +2475,46 @@ mod tests {
     }
 
     #[test]
-    fn sticky_put_reports_account_change() {
-        // 这份记录只服务接管动态的判变化：换到新账号 → true（写一条「开始使用」），
-        // 同一组合的后续请求 → false（不刷屏）。选号本身是纯排序，不看它。
-        let conv = "conv-abc";
-        let m = Some("qmodel_38max");
-        assert!(sticky_put(conv, m, "acct-1".into()), "首次记录 = 换到新账号");
-        assert!(!sticky_put(conv, m, "acct-1".into()), "同一账号不刷屏");
-        assert!(sticky_put(conv, m, "acct-2".into()), "换成别的账号要报变化");
-    }
-
-    /// 回归：记录与限流冷却同为「会话 × 模型」粒度。以前的实现只有会话一个维度，
-    /// 于是辅助小模型（0 积分那些）吃一次 429 换号，就把整段对话连同主模型一起搬走。
-    ///
-    /// 模型名只是占位：两边的差异（粒度）才是被测对象，名字取什么不影响结论。
-    #[test]
-    fn sticky_put_is_scoped_per_model() {
-        let conv = "conv-multi";
-        let main = Some("qmodel_main");
-        let side = Some("qmodel_side");
-        sticky_put(conv, main, "acct-main".into());
-        sticky_put(conv, side, "acct-side".into());
-        // 非对话请求（模型未知）用空串占位，也是一个独立维度
-        assert!(sticky_put(conv, None, "acct-other".into()));
-        assert!(
-            !sticky_put(conv, side, "acct-side".into()),
-            "占位维度的写入不该覆盖同一个会话里具体模型的记录"
+    fn session_binding_reports_previous_account() {
+        let s = "test-session-bind";
+        assert_eq!(bind_session(s, "acct-1"), None, "新会话没有旧绑定");
+        assert_eq!(session_bound_account(s).as_deref(), Some("acct-1"));
+        assert_eq!(
+            bind_session(s, "acct-2").as_deref(),
+            Some("acct-1"),
+            "改绑要能拿到旧账号，供接管动态判变化"
         );
+        assert_eq!(session_bound_account(s).as_deref(), Some("acct-2"));
     }
 
     #[test]
-    fn sticky_put_prunes_expired_entries() {
-        let conv = "conv-expire";
-        let m = Some("qmodel_38max");
-        sticky_put(conv, m, "acct-1".into());
-        // 把记录时刻拨回 TTL 之前
-        if let Ok(mut map) = sticky().lock() {
-            if let Some((at, _)) = map.get_mut(&sticky_key(conv, m)) {
-                *at = Instant::now() - STICKY_TTL - Duration::from_secs(1);
+    fn session_bindings_are_independent() {
+        // 键只有一个维度：会话。模型不参与（用户要的是「一个会话只选一个账号」）。
+        let (a, b) = ("test-session-a", "test-session-b");
+        bind_session(a, "acct-a");
+        bind_session(b, "acct-b");
+        assert_eq!(session_bound_account(a).as_deref(), Some("acct-a"));
+        assert_eq!(session_bound_account(b).as_deref(), Some("acct-b"));
+    }
+
+    #[test]
+    fn session_binding_prunes_expired_entries() {
+        let s = "test-session-expire";
+        bind_session(s, "acct-1");
+        // 把活跃时刻拨回 TTL 之前
+        if let Ok(mut map) = session_bindings().lock() {
+            if let Some((at, _)) = map.get_mut(s) {
+                *at = SystemTime::now() - SESSION_TTL - Duration::from_secs(1);
             }
         }
         assert!(
-            sticky_put(conv, m, "acct-1".into()),
-            "过期记录视为「换到新账号」：隔了半小时再报一次开始使用是合理的"
+            session_bound_account(s).is_none(),
+            "过期绑定视为未绑定：停了一周以上再回来，按新会话重新选"
+        );
+        assert_eq!(
+            bind_session(s, "acct-2"),
+            None,
+            "过期项被清掉后，新绑定同样没有旧值"
         );
     }
 
@@ -2818,79 +2934,134 @@ mod tests {
         assert!(out.contains("切换其他模型继续使用"), "{out:?}");
     }
 
-    /// 测试用：只填「过期时间 + 剩余积分」两栏，其余留空
-    /// （`at` 是读数时刻，路由排序不看它）。
-    fn credit_fact(expiry_ms: Option<i64>, credits: Option<f64>) -> ledger::CreditFact {
+    /// 测试用：只填「剩余积分」；到期时间与新的路由排序无关。
+    fn credit_fact(credits: Option<f64>) -> ledger::CreditFact {
         ledger::CreditFact {
             credits,
-            at: String::new(),
-            earliest_expiry_ms: expiry_ms,
-            packages: vec![],
+            ..Default::default()
         }
     }
 
-    /// 本地时区下某个「年月日 时点」的毫秒时间戳。
-    ///
-    /// 测试数据必须**跨自然日**才不会退化成「同一天」，而「同一天」又是按本地时区
-    /// 算的 —— 所以用本地时区构造，换机器 / 换 CI 时区都不会跑偏。
-    fn local_ms(y: i32, m: u32, d: u32, h: u32) -> i64 {
-        use chrono::TimeZone;
-        chrono::Local
-            .with_ymd_and_hms(y, m, d, h, 0, 0)
-            .single()
-            .expect("本地时间应唯一")
-            .timestamp_millis()
+    fn id_list(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn routing_prefers_earliest_expiry() {
-        let ids = vec!["a".into(), "b".into(), "c".into(), "d".into()];
-        let infos = vec![
-            credit_fact(Some(local_ms(2026, 3, 12, 9)), Some(100.0)),
-            credit_fact(Some(local_ms(2026, 3, 11, 9)), Some(10.0)), // 到期更早 → 胜出
-            credit_fact(None, Some(99999.0)),                        // 未知 → 靠后
-            credit_fact(Some(local_ms(2026, 3, 10, 9)), Some(0.0)),  // 积分为 0 → 跳过
+    fn new_session_picks_most_credits() {
+        let ids = id_list(&["a", "b", "c", "d"]);
+        let infos = [
+            credit_fact(Some(100.0)),
+            credit_fact(Some(9999.0)), // 积分最多 → 胜出
+            credit_fact(Some(0.0)),    // 用完 → 跳过
+            credit_fact(None),         // 未知 → 排在已知有余量的之后
         ];
-        assert_eq!(pick_index(&ids, &infos), Some(1));
+        assert_eq!(pick_for_session(&ids, &infos, &[false; 4], None), Some(1));
 
-        // 同一天到期、只差几小时：毫秒级直接比，早的赢 —— 与各自积分多少无关
-        let ids2 = vec!["a".into(), "b".into()];
-        let infos2 = vec![
-            credit_fact(Some(local_ms(2026, 3, 10, 15)), Some(4772.45)),
-            credit_fact(Some(local_ms(2026, 3, 10, 21)), Some(4872.03)),
-        ];
+        // 并列时保持列表原顺序，结果稳定可复现
         assert_eq!(
-            pick_index(&ids2, &infos2),
-            Some(0),
-            "同一天也应按过期时刻先后的毫秒值比，15 点到期的先用掉"
+            pick_for_session(
+                &id_list(&["a", "b"]),
+                &[credit_fact(Some(900.0)), credit_fact(Some(900.0))],
+                &[false, false],
+                None
+            ),
+            Some(0)
         );
     }
 
     #[test]
-    fn identical_expiry_keeps_list_order() {
-        // 严格并列（同一毫秒）没有可比较的键 → 保持列表原顺序，结果稳定可复现
-        let ids = vec!["a".into(), "b".into()];
-        let ms = local_ms(2026, 3, 10, 9);
-        let infos = vec![credit_fact(Some(ms), Some(100.0)), credit_fact(Some(ms), Some(9000.0))];
-        assert_eq!(pick_index(&ids, &infos), Some(0), "平序时先到先得");
+    fn session_sticks_to_bound_account_even_if_others_have_more() {
+        let ids = id_list(&["a", "b"]);
+        let infos = [credit_fact(Some(100.0)), credit_fact(Some(9999.0))];
+        assert_eq!(
+            pick_for_session(&ids, &infos, &[false, false], Some("a")),
+            Some(0),
+            "同一会话只认绑定账号：别的账号积分再多也不换"
+        );
+        assert!(!should_rebind(Some("a"), &ids, &infos, false));
+    }
+
+    #[test]
+    fn session_keeps_bound_when_credits_are_unknown() {
+        let ids = id_list(&["a", "b"]);
+        let infos = [credit_fact(None), credit_fact(Some(9999.0))];
+        assert_eq!(
+            pick_for_session(&ids, &infos, &[false, false], Some("a")),
+            Some(0),
+            "积分未知不等于用完，不能凭「不知道」换号"
+        );
+        assert!(!should_rebind(Some("a"), &ids, &infos, false));
+    }
+
+    #[test]
+    fn session_rebinds_only_when_bound_is_exhausted() {
+        let ids = id_list(&["a", "b"]);
+        let infos = [credit_fact(Some(0.0)), credit_fact(Some(50.0))];
+        assert_eq!(
+            pick_for_session(&ids, &infos, &[false, false], Some("a")),
+            Some(1),
+            "绑定账号积分用完 → 按积分重新选"
+        );
+        assert!(should_rebind(Some("a"), &ids, &infos, false));
+    }
+
+    #[test]
+    fn session_uses_bound_account_even_if_it_is_cooling() {
+        // 冷却只影响「新会话/改绑」的排序；已绑定账号照用，否则一次 429 就会破坏
+        // 「一个会话只选一个」。
+        let ids = id_list(&["a", "b"]);
+        let infos = [credit_fact(Some(100.0)), credit_fact(Some(9999.0))];
+        assert_eq!(
+            pick_for_session(&ids, &infos, &[true, false], Some("a")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn new_session_skips_cooling_accounts() {
+        let ids = id_list(&["a", "b"]);
+        let infos = [credit_fact(Some(9999.0)), credit_fact(Some(100.0))];
+        // a 冷却中 → 在剩下的账号里选积分最多的 b
+        assert_eq!(pick_for_session(&ids, &infos, &[true, false], None), Some(1));
+        // 全员冷却 → 软过滤退回全部（让上游裁决也比代理直接 503 有信息量）
+        assert_eq!(pick_for_session(&ids, &infos, &[true, true], None), Some(0));
+    }
+
+    #[test]
+    fn banned_bound_is_temporary_detour_without_rebind() {
+        // 429 重试：绑定账号已被 ban 剔除，只在剩余候选里按积分选一个临时绕行
+        let ids = id_list(&["b", "c"]);
+        let infos = [credit_fact(Some(100.0)), credit_fact(Some(200.0))];
+        assert_eq!(
+            pick_for_session(&ids, &infos, &[false, false], Some("a")),
+            Some(1)
+        );
+        assert!(
+            !should_rebind(Some("a"), &ids, &infos, true),
+            "本轮限流绕行不改绑，下一轮仍先回原账号"
+        );
+        // 同一个「不在候选里」的场景，若不是本轮 ban（账号被删除/取消勾选）→ 改绑
+        assert!(should_rebind(Some("a"), &ids, &infos, false));
     }
 
     #[test]
     fn routing_falls_back_to_first_when_everyone_is_empty() {
         // 未知积分（可能还有余量）应优先于已知为 0 的账号
-        let ids = vec!["a".into(), "b".into()];
-        let infos = vec![
-            credit_fact(Some(100), Some(0.0)),
-            ledger::CreditFact::default(),
-        ];
+        let ids = id_list(&["a", "b"]);
+        let infos = [credit_fact(Some(0.0)), credit_fact(None)];
         assert_eq!(pick_index(&ids, &infos), Some(1));
         // 全员已知为 0 → 谁都不入选，退化为第一个（让上游报错，比代理 503 更有信息量）
-        let ids2 = vec!["a".into(), "b".into()];
-        let infos2 = vec![
-            credit_fact(Some(100), Some(0.0)),
-            credit_fact(Some(200), Some(0.0)),
-        ];
-        assert_eq!(pick_index(&ids2, &infos2), Some(0));
+        let infos2 = [credit_fact(Some(0.0)), credit_fact(Some(0.0))];
+        assert_eq!(pick_index(&ids, &infos2), Some(0));
         assert_eq!(pick_index(&[], &[]), None, "没有账号就没有下标");
+    }
+
+    #[test]
+    fn body_session_reads_metadata_context() {
+        let body = br#"{"model":"x","metadata":{"context":{"request_id":"r","session_id":"sess-1"}}}"#;
+        assert_eq!(body_session(body).as_deref(), Some("sess-1"));
+        assert_eq!(body_session(br#"{"metadata":{"context":{}}}"#), None);
+        assert_eq!(body_session(br#"{"metadata":{"context":{"session_id":"  "}}}"#), None);
+        assert_eq!(body_session(b"not json"), None);
     }
 }
