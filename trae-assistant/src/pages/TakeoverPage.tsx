@@ -485,7 +485,7 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
           <div className="hero-row">
             <span
               className="field-label"
-              title="没勾选的账号一律不参与扣费；在勾选的账号里，积分到期最早的最先被使用"
+              title="没勾选的账号一律不参与扣费；在勾选的账号里，积分到期最早的最先被使用，同一天到期时先烧待过期积分少的"
             >
               参与扣费
             </span>

@@ -59,8 +59,8 @@ pub struct Account {
 /// 由 `checkin::parse_ent_usage` 按官方 `hHe()` 汇总出「剩余可用积分」与「最快到期时间」。
 /// ⚠️ 这不是 `checkin_credits/status` 里的 `credits`——那个是**签到奖励**，两回事。
 ///
-/// 「智能接管」按「**到期最早优先 → 无到期数据靠后 → 积分多者优先**」挑账号
-/// （见 `proxy::pick_index`）：先消耗快到期的额度，避免浪费。
+/// 「智能接管」按「**到期最早优先 → 无到期数据靠后 → 同日则待过期积分少者优先**」
+/// 挑账号（见 `proxy::pick_index`）：先消耗快到期的额度，避免浪费。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct CreditSnapshot {
     /// 剩余可用积分；未知为 `None`
