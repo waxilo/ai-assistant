@@ -826,7 +826,13 @@ pub async fn unbind() -> Result<BrokerStatus, String> {
     // 磁盘上仍留着它的话，重启会重新绑上同一池，并把刚删掉的云端副本再收养回来 ——
     // 用户看到的症状是「解绑没生效」，而界面上那一刻确实显示了解绑。
     set_uuid(None).map_err(|e| {
-        crate::scheduler::log_event(&dir, &format!("凭证池解绑落盘失败：{e}"));
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("凭证池解绑落盘失败：{e}"),
+        );
         e
     })?;
     mutate(|s| {
@@ -957,17 +963,23 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             Err(e) if e.dead => {
                 blocked += 1;
                 dead_lines.push(format!("{}（{e}）", acct.name));
-                crate::scheduler::log_event(
+                crate::logs::push(
                     dir,
-                    &format!("这条链已死，跳过它（不拖停整池）：{}（{e}）", acct.name),
+                    crate::logs::CAT_RENEW,
+                    &acct.name,
+                    false,
+                    format!("这条链已死，跳过它（不拖停整池）：{e}"),
                 );
             }
             Err(e) => {
                 failed += 1;
                 fail_lines.push(format!("{}（{e}）", acct.name));
-                crate::scheduler::log_event(
+                crate::logs::push(
                     dir,
-                    &format!("整池续签失败：{}（{e}）", acct.name),
+                    crate::logs::CAT_RENEW,
+                    &acct.name,
+                    false,
+                    format!("整池续签失败：{e}"),
                 );
             }
         }

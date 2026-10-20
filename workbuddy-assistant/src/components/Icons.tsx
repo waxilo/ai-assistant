@@ -19,6 +19,7 @@ function Svg({
       strokeWidth={1.75}
       strokeLinecap="round"
       strokeLinejoin="round"
+      aria-hidden="true"
     >
       {children}
     </svg>
@@ -57,6 +58,13 @@ export const IconList = (p: IconProps) => (
   </Svg>
 );
 
+/** 折叠区的展开指示：默认朝右，展开时由页面旋转 90°。 */
+export const IconChevron = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="m9 18 6-6-6-6" />
+  </Svg>
+);
+
 export const IconGear = (p: IconProps) => (
   <Svg {...p}>
     <circle cx="12" cy="12" r="3" />
@@ -69,6 +77,16 @@ export const IconUserPlus = (p: IconProps) => (
     <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
     <circle cx="9" cy="7" r="4" />
     <path d="M19 8v6M22 11h-6" />
+  </Svg>
+);
+
+/** 多账号：侧栏「账号签到」与账号总数汇总卡 */
+export const IconUsers = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+    <circle cx="9" cy="7" r="4" />
+    <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
   </Svg>
 );
 
@@ -225,6 +243,22 @@ export const IconInfo = (p: IconProps) => (
   <Svg {...p}>
     <circle cx="12" cy="12" r="10" />
     <path d="M12 16v-4M12 8h.01" />
+  </Svg>
+);
+
+/** 感叹号圆：用于「悬浮查看规则」的说明入口（与信息图标语义不同，别混用）。 */
+export const IconAlertCircle = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 8v4M12 16h.01" />
+  </Svg>
+);
+
+/** 搜索（筛选框内嵌） */
+export const IconSearch = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.5-3.5" />
   </Svg>
 );
 

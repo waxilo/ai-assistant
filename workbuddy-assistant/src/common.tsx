@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Account, CheckinLog } from "./types";
+import type { Account, LogEntry } from "./types";
 import { IconUser } from "./components/Icons";
 
 /**
@@ -187,19 +187,29 @@ export function StatusDot({ tone, label }: { tone: DotTone; label: string }) {
   );
 }
 
-/** 签到日志的一条结果 → 状态圆点（与账号页「状态」列同一套视觉，只是文案不同） */
-export function logStatus(log: CheckinLog): { tone: DotTone; label: string } {
-  // 同 signState：`already` 必须优先于 `success`（已签时二者都为 true）
-  if (log.already) return { tone: "done", label: "今日已签" };
-  if (log.success) return { tone: "done", label: "成功" };
-  if (log.inactive) return { tone: "inactive", label: "活动未开" };
-  return { tone: "fail", label: "失败" };
+/**
+ * 日志的一条结果 → 状态圆点。
+ *
+ * 文案按**类别**微调，而不是一律「成功 / 失败」：通知的成败叫「已发送 / 失败」，
+ * 接管动作叫「完成 / 异常」—— 同一个绿点，说的是不同的事。
+ */
+export function logStatus(l: LogEntry): { tone: DotTone; label: string } {
+  if (!l.success) {
+    return { tone: "fail", label: l.category === "takeover" ? "异常" : "失败" };
+  }
+  if (l.category === "notify") return { tone: "done", label: "已发送" };
+  if (l.category === "takeover") return { tone: "done", label: "完成" };
+  // 签到「今日已签到」也是成功，但说「已签」比「成功」更准确
+  if (l.category === "checkin" && l.message.includes("已签到")) {
+    return { tone: "done", label: "已签" };
+  }
+  return { tone: "done", label: "成功" };
 }
 
 /**
  * 账号单元格：头像 + 名称 + 手机号。
  *
- * 账号页与签到日志页共用，「同一个人在两处长得一样」由它保证；日志页此前只用
+ * 账号页与日志管理页共用，「同一个人在两处长得一样」由它保证；日志页此前只用
  * 一行文字拼接，名称本身就是手机号时会显示成 `191****2883（191****2883）`。
  */
 export function AccountCell({
@@ -224,7 +234,7 @@ export function AccountCell({
   );
 }
 
-/** 空态：图标 + 主文案 +（可选）补充说明。账号页与签到日志页共用。 */
+/** 空态：图标 + 主文案 +（可选）补充说明。账号页与日志管理页共用。 */
 export function EmptyState({
   icon,
   title,

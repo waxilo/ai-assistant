@@ -18,7 +18,7 @@ pub struct CheckinRecord {
     /// ⚠️ 它**不是**「当前余额」—— 当前余额只存在于积分台账里（见 [`Account::credits`]），
     /// 因为只有台账同时知道「读到了多少」和「什么时候读到的」。
     ///
-    /// 两个出口：签到时间线（`logs::log_from_record` 把同一份值落进 `logs.json`）；
+    /// 两个出口：签到时间线（`logs::push` 把签到结果连同这条消息写进统一日志流）；
     /// 账户列表在台账还没有该账号读数时兜底（刚升级上来、首次采样还没跑）。
     /// **写点只有签到本身** —— 刷新不再回填它，否则会给这条记录的时刻配上不属于它的读数。
     #[serde(default)]
@@ -387,7 +387,12 @@ pub fn load_settings(dir: &Path) -> Settings {
         return Settings::default();
     }
     let s = fs::read_to_string(&f).unwrap_or_default();
-    serde_json::from_str(&s).unwrap_or_default()
+    let mut settings: Settings = serde_json::from_str(&s).unwrap_or_default();
+    // 国际版已不再支持：老配置里的 *.ai 默认域一律退回内置国内域
+    if crate::oauth::is_foreign_host(&settings.default_base_url) {
+        settings.default_base_url = default_base_url();
+    }
+    settings
 }
 
 pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {

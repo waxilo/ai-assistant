@@ -131,9 +131,15 @@ fn save_state(dir: &Path, st: &ScheduleState) {
     // 临时文件时一并收到 0600，不需要 rename 之后再补一次。
     //
     // 失败**必须留痕**（修 4）：定时任务最坏的失败模式就是静默不生效，而这份状态是
-    // 「今天到底跑过没有」的唯一本地证据（见 [`log_event`]）。
+    // 「今天到底跑过没有」的唯一本地证据（见 `crate::logs`）。
     if let Err(e) = accounts::write_atomic(&state_file(dir), &json) {
-        log_event(dir, &format!("定时任务状态落盘失败：{e}"));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("定时任务状态落盘失败：{e}"),
+        );
     }
 }
 
@@ -309,9 +315,12 @@ pub fn spawn(app: AppHandle) {
             if state.today_target.as_ref() != Some(&target) {
                 state.today_target = Some(target.clone());
                 save_state(&dir, &state);
-                log_event(
+                crate::logs::push(
                     &dir,
-                    &format!(
+                    crate::logs::CAT_CHECKIN,
+                    "系统",
+                    true,
+                    format!(
                         "今日签到目标已定：{}（设定 {}，随机时间窗 {} 分钟）",
                         target.at, settings.schedule_time, settings.schedule_window_minutes
                     ),
@@ -331,7 +340,7 @@ pub fn spawn(app: AppHandle) {
                 if settings.notify_enabled && settings.notify_on_schedule {
                     state.notified_target = Some(target.clone());
                     save_state(&dir, &state);
-                    let outcome = match tauri::async_runtime::block_on(notify::send(
+                    let (sent, outcome) = match tauri::async_runtime::block_on(notify::send(
                         &settings.notify_webhook,
                         &notify::target_preview(
                             &at,
@@ -339,10 +348,10 @@ pub fn spawn(app: AppHandle) {
                             settings.schedule_window_minutes,
                         ),
                     )) {
-                        Ok(resp) => format!("今日签到时刻预告已发送（{at}）：{resp}"),
-                        Err(e) => format!("今日签到时刻预告发送失败（{at}）：{e}"),
+                        Ok(resp) => (true, format!("今日签到时刻预告已发送（{at}）：{resp}")),
+                        Err(e) => (false, format!("今日签到时刻预告发送失败（{at}）：{e}")),
                     };
-                    log_event(&dir, &outcome);
+                    crate::logs::push(&dir, crate::logs::CAT_NOTIFY, "系统", sent, outcome);
                 }
             }
             if !due_at(now, &target.at, state.last_run_date.as_deref()) {
@@ -353,9 +362,12 @@ pub fn spawn(app: AppHandle) {
             state.last_run_date = Some(today.clone());
             save_state(&dir, &state);
             let actual = now.format("%H:%M").to_string();
-            log_event(
+            crate::logs::push(
                 &dir,
-                &format!(
+                crate::logs::CAT_CHECKIN,
+                "系统",
+                true,
+                format!(
                     "触发定时签到（设定 {}，今日随机目标 {}，实际 {}）",
                     settings.schedule_time, target.at, actual
                 ),
@@ -383,19 +395,37 @@ fn maybe_auto_refresh(app: &AppHandle, dir: &Path) {
     match tauri::async_runtime::block_on(commands::auto_refresh_all(app)) {
         Ok(report) => {
             if !report.refreshed.is_empty() {
-                log_event(dir, &format!("自动续签完成：{}", report.refreshed.join("、")));
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_RENEW,
+                    "系统",
+                    true,
+                    format!("自动续签完成：{}", report.refreshed.join("、")),
+                );
                 let _ = app.emit(
                     REFRESH_EVENT,
                     serde_json::json!({ "count": report.refreshed.len() }),
                 );
             }
             for f in &report.failed {
-                log_event(dir, &format!("自动续签失败：{f}"));
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_RENEW,
+                    "系统",
+                    false,
+                    format!("自动续签失败：{f}"),
+                );
             }
             // 分开记是因为**人的动作不同**：失败等下一轮自动重试，死链只能重登一次。
             // 混在一句「续签失败」里，用户会等一个永远不会来的好转。
             for d in &report.dead {
-                log_event(dir, &format!("自动续签放弃（这条链已死，要重新登录才能自动续）：{d}"));
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_RENEW,
+                    "系统",
+                    false,
+                    format!("自动续签放弃（这条链已死，要重新登录才能自动续）：{d}"),
+                );
             }
             // ── 告警：日志是给「会去翻文件的人」看的，推送是给「此刻不在应用前的人」看的。
             // 两类分开推、各占自己的冷却：死链只有重新登录能救（结论不会自己变，一天一次），
@@ -429,7 +459,13 @@ fn maybe_auto_refresh(app: &AppHandle, dir: &Path) {
             }
         }
         Err(e) => {
-            log_event(dir, &format!("自动续签异常：{e}"));
+            crate::logs::push(
+                dir,
+                crate::logs::CAT_RENEW,
+                "系统",
+                false,
+                format!("自动续签异常：{e}"),
+            );
             // 整轮异常意味着**一个账号都没续**：比逐账号失败更严重，必须推出去
             crate::alerts::notify(
                 dir,
@@ -527,7 +563,13 @@ fn maybe_seal_briefing(app: &AppHandle, dir: &Path, settings: &Settings, at_star
         return;
     }
     let Ok(data_dir) = commands::try_data_dir(app) else {
-        log_event(dir, "积分简报跳过：数据目录不可用");
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            "积分简报跳过：数据目录不可用",
+        );
         return;
     };
     let accounts = accounts::load_accounts(&data_dir);
@@ -566,7 +608,13 @@ fn maybe_seal_briefing(app: &AppHandle, dir: &Path, settings: &Settings, at_star
 
     let sealed = commands::seal_hours(&data_dir, &accounts, &today, hour, &now_s);
     if !sealed.is_empty() {
-        log_event(dir, &format!("积分简报：固化 {} 个小时条目", sealed.len()));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            true,
+            format!("积分简报：固化 {} 个小时条目", sealed.len()),
+        );
         let _ = app.emit(
             BRIEFING_EVENT,
             serde_json::json!({ "hours": sealed.len() }),
@@ -591,47 +639,16 @@ fn maybe_seal_briefing(app: &AppHandle, dir: &Path, settings: &Settings, at_star
     if !(settings.notify_enabled && settings.notify_on_briefing) {
         return;
     }
-    let outcome = match tauri::async_runtime::block_on(notify::send(
+    let (sent, outcome) = match tauri::async_runtime::block_on(notify::send(
         &settings.notify_webhook,
         &briefing::message(day),
     )) {
-        Ok(resp) => format!("简报通知已发送（{}）：{resp}", day.date),
-        Err(e) => format!("简报通知发送失败（{}）：{e}", day.date),
+        Ok(resp) => (true, format!("简报通知已发送（{}）：{resp}", day.date)),
+        Err(e) => (false, format!("简报通知发送失败（{}）：{e}", day.date)),
     };
-    log_event(dir, &outcome);
+    crate::logs::push(dir, crate::logs::CAT_NOTIFY, "系统", sent, outcome);
 }
 
-/// 调度日志（`scheduler.log`）：只记「触发 / 通知结果 / 异常」这类有排查价值的事件。
-///
-/// 定时任务最大的失败模式是**静默不生效**（应用没开、时刻写错、webhook 被墙），
-/// 所以留一份可查的记录；逐 tick 的判定不写进来，避免日志噪音与无限增长。
-pub(crate) fn log_event(dir: &Path, msg: &str) {
-    const MAX_LINES: usize = 200;
-
-    let target = dir.join("scheduler.log");
-    let old = fs::read_to_string(&target).unwrap_or_default();
-    let mut lines: Vec<&str> = old.lines().collect();
-    if lines.len() >= MAX_LINES {
-        lines.drain(0..lines.len() - MAX_LINES + 1);
-    }
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    body.push_str(&format!(
-        "[{}] {}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        msg
-    ));
-
-    if fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    // 原子写：这份日志是「整个截断重写」的（只留最后 200 行），
-    // 直接 `fs::write` 一旦在中途崩溃会把**历史**一起抹掉 —— 排查时正好最需要它。
-    // 日志自己写失败没有别的通道可报，只能放弃（这里 `let _ =` 是有意的）。
-    let _ = accounts::write_atomic(&target, &body);
-}
 
 /// 执行一次「全部签到」并推送结果。
 ///
@@ -671,7 +688,7 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
                 "签到完成：{} 个账号，成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}",
                 views.len()
             );
-            log_event(dir, &msg);
+            crate::logs::push(dir, crate::logs::CAT_CHECKIN, "系统", true, msg);
             let _ = app.emit(
                 EVENT,
                 serde_json::json!({ "stage": "done", "count": views.len() }),
@@ -679,15 +696,21 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
             if notify_on {
                 let body = format!("{}\n{trigger}", notify::summary_message(&views));
                 // 通知失败只记日志，绝不影响签到结果
-                let outcome = match notify::send(&settings.notify_webhook, &body).await {
-                    Ok(resp) => format!("通知已发送：{resp}"),
-                    Err(e) => format!("通知发送失败：{e}"),
+                let (sent, outcome) = match notify::send(&settings.notify_webhook, &body).await {
+                    Ok(resp) => (true, format!("通知已发送：{resp}")),
+                    Err(e) => (false, format!("通知发送失败：{e}")),
                 };
-                log_event(dir, &outcome);
+                crate::logs::push(dir, crate::logs::CAT_NOTIFY, "系统", sent, outcome);
             }
         }
         Err(e) => {
-            log_event(dir, &format!("签到异常：{e}"));
+            crate::logs::push(
+                dir,
+                crate::logs::CAT_CHECKIN,
+                "系统",
+                false,
+                format!("签到异常：{e}"),
+            );
             let _ = app.emit(EVENT, serde_json::json!({ "stage": "error", "message": e }));
             if notify_on {
                 let _ = notify::send(
@@ -1009,26 +1032,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn log_event_appends_and_caps_length() {
-        let dir = std::env::temp_dir().join(format!("wba-log-{}", uuid::Uuid::new_v4()));
-        for i in 0..5 {
-            log_event(&dir, &format!("事件 {i}"));
-        }
-        let body = fs::read_to_string(dir.join("scheduler.log")).unwrap();
-        assert_eq!(body.lines().count(), 5);
-        assert!(body.contains("事件 4"));
-        assert!(body.contains("事件 0"), "未超上限时不应丢历史：{body}");
-
-        // 超过上限后只保留最后 MAX_LINES 行（避免日志无限增长）
-        for i in 0..205 {
-            log_event(&dir, &format!("填充 {i}"));
-        }
-        let body = fs::read_to_string(dir.join("scheduler.log")).unwrap();
-        let n = body.lines().count();
-        assert!((200..=201).contains(&n), "应被裁剪到 ~200 行，实际 {n}");
-        assert!(!body.contains("事件 0"), "最旧的记录应被裁掉");
-        assert!(body.contains("填充 204"), "最新记录应保留");
-        let _ = fs::remove_dir_all(&dir);
-    }
 }

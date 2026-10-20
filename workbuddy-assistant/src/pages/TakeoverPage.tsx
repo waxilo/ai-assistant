@@ -8,10 +8,21 @@ import {
   stealthStatus,
   freeModels,
 } from "../api";
-import { AccountCell } from "../common";
+import { AccountCell, formatCredits } from "../common";
 import type { ConfirmReq, Toast } from "../common";
-import { IconBolt, IconInfo, IconUser } from "../components/Icons";
-import { Row, Toggle } from "../components/SettingsControls";
+import {
+  IconAlertCircle,
+  IconAlertTriangle,
+  IconBolt,
+  IconChevron,
+  IconInfo,
+  IconRefresh,
+  IconShield,
+  IconTrash,
+  IconUsers,
+} from "../components/Icons";
+import { Row } from "../components/SettingsControls";
+import Switch from "../components/Switch";
 import { Dialog } from "../components/Dialog";
 import { displayDetail, groupJournal } from "../journal";
 
@@ -47,6 +58,26 @@ function eventKind(e: JournalEvent): {
 /** 全选归一：列表覆盖全部账号时存空（= 默认全选，新增账号自动可扣费） */
 function normalizeBilling(list: string[], allIds: string[]): string[] {
   return allIds.length > 0 && list.length === allIds.length ? [] : list;
+}
+
+/**
+ * 时间列只保留**必要的精度**：今天的事件给 `HH:MM:SS`，跨天的才带上 `MM-DD`。
+ * （后端 `at` 已是本地时间串，`at_ms` 用来判断是不是今天。）
+ */
+function shortTime(e: JournalEvent): string {
+  const hms = e.at.length >= 19 ? e.at.slice(11, 19) : e.at;
+  const isToday = new Date(e.at_ms).toDateString() === new Date().toDateString();
+  return isToday ? hms : `${e.at.slice(5, 10)} ${hms.slice(0, 5)}`;
+}
+
+/** 账号的积分摘要（扣费账号弹窗每行右侧）：余额 + 最早到期天数 */
+function creditMeta(a: Account): string {
+  const c = a.credits;
+  if (!c || c.credits == null) return "积分未知";
+  const now = Date.now();
+  const soon = c.packages.find((p) => p.expiry_ms != null && p.expiry_ms > now);
+  const days = soon ? Math.ceil((soon.expiry_ms! - now) / 86_400_000) : null;
+  return `${formatCredits(c.credits)} 积分${days != null ? ` · ${days} 天后过期` : ""}`;
 }
 
 /**
@@ -146,7 +177,6 @@ export function TakeoverPage({
     try {
       await clearTakeoverEvents();
       setEvents([]);
-      onToast({ kind: "ok", text: "接管动态已清空" });
     } catch (e) {
       onToast({ kind: "err", text: "清空失败：" + String(e) });
     }
@@ -205,8 +235,8 @@ export function TakeoverPage({
     const ok = await askConfirm({
       title: `${action}并重启 WorkBuddy`,
       body:
-        `${action}需要重启 WorkBuddy 与长驻 CLI host，才能安全清除旧端点。` +
-        "代理会在整个切换过程中保持可用，不会留下死端口。现在继续吗？（请先保存未提交的输入）",
+        `${action}需要重启 WorkBuddy，才能安全清除旧端点。` +
+        "重启期间代理保持可用，不会留下死端口。请先保存未提交的输入，现在继续吗？",
       okText: action,
     });
     if (!ok) return; // 取消：开关状态不动
@@ -216,7 +246,6 @@ export function TakeoverPage({
       const saved = await applySettings(snapshot({ proxy_enabled: next }));
       onSettings(saved);
       setProxyOn(next);
-      onToast({ kind: "ok", text: `已${action}，WorkBuddy 已安全重启` });
       await refreshStealth();
     } catch (e) {
       setErr(String(e));
@@ -232,7 +261,6 @@ export function TakeoverPage({
     try {
       const saved = await saveSettings(snapshot({ proxy_port: port }));
       onSettings(saved);
-      onToast({ kind: "ok", text: "端口已保存" });
     } catch (e) {
       onToast({ kind: "err", text: "端口保存失败：" + String(e) });
     }
@@ -241,6 +269,10 @@ export function TakeoverPage({
   /** 弹框「保存」：草稿落库立即生效（纯账号池调整，不需要重启） */
   const doSaveBilling = async () => {
     if (draft == null) return;
+    if (draft.length === 0) {
+      onToast({ kind: "info", text: "至少保留一个账号" });
+      return;
+    }
     const next = normalizeBilling(draft, allIds);
     setBusy(true);
     setErr("");
@@ -252,7 +284,6 @@ export function TakeoverPage({
       setBilling(next);
       setDraft(null);
       setPickerOpen(false);
-      onToast({ kind: "ok", text: "扣费账号已生效" });
     } catch (e) {
       onToast({ kind: "err", text: "保存失败：" + String(e) });
     } finally {
@@ -276,7 +307,6 @@ export function TakeoverPage({
       setMdlDraft(null);
       setMdlFailover(null);
       setMdlOpen(false);
-      onToast({ kind: "ok", text: "限流切换设置已生效" });
     } catch (e) {
       onToast({ kind: "err", text: "保存限流设置失败：" + String(e) });
     } finally {
@@ -284,24 +314,16 @@ export function TakeoverPage({
     }
   };
 
-  /** 扣费账号弹框草稿里勾/去勾（基准：草稿为空视为「当前全选」） */
+  /** 扣费账号弹框草稿里勾/去勾（打开时已把「空 = 全部」展开成显式全选） */
   const toggleDraft = (id: string) =>
     setDraft((list) => {
-      const base = list == null ? effective : list.length === 0 ? allIds : list;
+      const base = list ?? effective;
       return base.includes(id)
         ? base.filter((x) => x !== id)
         : [...base, id];
     });
 
   const live = stealth?.installed && stealth.alive;
-
-  /** 扣费账号摘要（控制条上的那颗胶囊按钮） */
-  const billingSummary =
-    accounts.length === 0
-      ? "暂无账号"
-      : billing.length === 0
-      ? `全部 ${accounts.length} 个（默认）`
-      : `已选 ${billing.length} · 未选 ${accounts.length - billing.length}`;
 
   /**
    * 限流切换摘要（控制条上的胶囊按钮）：免费模型恒生效，付费模型按勾选数。
@@ -342,120 +364,169 @@ export function TakeoverPage({
     );
   }, [accounts, query]);
 
-  const draftEffective =
-    draft == null ? effective : draft.length === 0 ? allIds : draft;
+  const draftEffective = draft ?? effective;
 
   return (
-    <section className="panel-page tk-page">
-      <p className="set-intro">
-        <IconInfo size={14} />
-        <span>
-          开启后 WorkBuddy 的对话请求由本地代理转发，扣费按「积分最早到期优先」分配；
-          同一天到期时先烧待过期积分少的（消耗后只会更少，不会来回切换），用完再换下一个；
-          下方记录每一次开关、路由与异常。
-        </span>
-      </p>
-
-      {/* ── 紧凑控制条：开关 + 状态 + 扣费账号 / 限流切换（弹窗入口）+ 端口 ── */}
-      <div className={`card tk-bar ${live ? "live" : ""}`}>
-        <label
-          className="switch"
-          title="开启后 WorkBuddy 的对话请求将由本地代理分流扣费"
-        >
-          <input
-            type="checkbox"
+    <section className="panel-page takeover-page">
+      {/* ── 控制区：一个开关 + 一个端口 + 哪些账号参与扣费 / 哪些模型触发换号 ── */}
+      <section className={`card hero${live ? " live" : ""}`}>
+        <div className="hero-top">
+          <div className="hero-copy">
+            <span className="hero-icon">
+              <IconShield size={19} />
+            </span>
+            <div className="hero-text">
+              <div className="hero-title">
+                <h2>接管 WorkBuddy 请求</h2>
+                {/* 常驻一句规则说明会把标题区撑成一段文字；收进悬浮层，只有要核对时展开 */}
+                <span
+                  className="rule-hint"
+                  role="note"
+                  tabIndex={0}
+                  aria-label="选号规则：优先使用最早到期的积分；同一天到期时待过期积分少者优先；关闭接管即恢复官方直连"
+                >
+                  <IconAlertCircle size={16} />
+                  <span className="rule-hint-pop" role="tooltip">
+                    <strong>选号规则</strong>
+                    <span>优先使用最早到期的积分账号；同一天到期时，待过期积分少的优先。</span>
+                    <span>剩余积分为 0 的账号不参与。</span>
+                    <span>关闭接管即恢复官方直连。</span>
+                  </span>
+                </span>
+              </div>
+            </div>
+          </div>
+          <Switch
+            size="lg"
             checked={proxyOn}
             disabled={busy}
-            onChange={(e) => void doToggle(e.target.checked)}
+            title={
+              proxyOn
+                ? "关闭接管会恢复官方直连，并重启 WorkBuddy"
+                : "开启接管会重启 WorkBuddy"
+            }
+            onChange={(v) => void doToggle(v)}
           />
-          <span className="track">
-            <span className="thumb" />
-          </span>
-        </label>
-        <div className="tk-bar-text" title={stealth?.note}>
-          <strong>{proxyOn ? "接管已开启" : "接管已关闭"}</strong>
-          <span className={`tk-bar-sub ${live ? "ok" : ""}`}>{stateText}</span>
         </div>
-        <span className="spacer" />
-        <button
-          className="tk-accts"
-          title="勾选的账号才允许被扣费，未勾选的会被排除；点击细选"
-          onClick={() => {
-            setDraft(billing);
-            setQuery("");
-            setPickerOpen(true);
-          }}
-        >
-          <span className="ta-label">扣费账号</span>
-          <span className="ta-value">{billingSummary}</span>
-          <span className="ta-edit">选择</span>
-        </button>
-        <button
-          className="tk-accts"
-          title="0 积分模型默认享受 429 无感换号；付费模型在此勾选后同样生效"
-          onClick={openModelPicker}
-        >
-          <span className="ta-label">限流切换</span>
-          <span className="ta-value">{modelSummary}</span>
-          <span className="ta-edit">选择</span>
-        </button>
-        <label
-          className="tk-port"
-          title={proxyOn ? "接管开启期间不允许修改端口；请先关闭接管" : "代理监听端口"}
-        >
-          端口
-          <input
-            type="number"
-            value={proxyPort}
-            min={1024}
-            max={65535}
-            disabled={proxyOn || busy}
-            onChange={(e) => setProxyPort(e.target.value)}
-            onBlur={() => void onPortBlur()}
-          />
-        </label>
-      </div>
 
-      {err && <p className="form-err">{err}</p>}
+        <div className="hero-settings">
+          <div className="hero-field">
+            <span className="field-label">端口</span>
+            <input
+              className="port-input"
+              type="number"
+              min={1024}
+              max={65535}
+              inputMode="numeric"
+              value={proxyPort}
+              disabled={proxyOn || busy}
+              title={proxyOn ? "开启接管时端口不可改，先关闭接管" : "本地反代监听端口"}
+              onChange={(e) => setProxyPort(e.target.value)}
+              onBlur={() => void onPortBlur()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+            />
+          </div>
 
-      {/* ── 接管动态：铺满剩余空间，列表内部滚动（滚动条隐藏） ── */}
-      <div className="card tk-feed">
+          {accounts.length > 0 && (
+            <div className="hero-field">
+              <span
+                className="field-label"
+                title="未勾选的账号不参与扣费"
+              >
+                参与扣费
+              </span>
+              <button
+                className="billing-trigger"
+                disabled={busy}
+                title="选择参与扣费的账号"
+                onClick={() => {
+                  setDraft(effective);
+                  setQuery("");
+                  setPickerOpen(true);
+                }}
+              >
+                <IconUsers size={14} />
+                {billing.length === 0
+                  ? `全部账号（${accounts.length}）`
+                  : `已选 ${billing.length} / ${accounts.length}`}
+                <IconChevron size={13} className="billing-chevron" />
+              </button>
+            </div>
+          )}
+
+          <div className="hero-field">
+            <span
+              className="field-label"
+              title="免费模型默认生效，付费模型可勾选"
+            >
+              限流切换
+            </span>
+            <button
+              className="billing-trigger"
+              disabled={busy}
+              title="选择触发限流时参与换号的模型"
+              onClick={openModelPicker}
+            >
+              <IconBolt size={14} />
+              {modelSummary}
+              <IconChevron size={13} className="billing-chevron" />
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {err ? (
+        <p className="note danger">
+          <IconAlertTriangle size={14} />
+          <span>{err}</span>
+        </p>
+      ) : stealth?.installed && !live ? (
+        <p className="note warn" title={stealth.note}>
+          <IconAlertTriangle size={14} />
+          <span>
+            {stateText}
+            {stealth.note ? `：${stealth.note}` : ""}
+          </span>
+        </p>
+      ) : null}
+
+      {/* ── 接管动态：谁在什么时候用了哪个账号 / 有没有被限流换号 / 代理有没有报错 ── */}
+      <section className="card feed-card">
         <div className="card-head">
           <h3>接管动态</h3>
-          <span className="card-head-sub">
-            开启 / 关闭 / 每个会话用哪个账号 / 异常。开启接管时自动重置，本轮记录不会丢
-          </span>
           <span className="spacer" />
           <button
-            className="btn small ghost"
+            className="icon-btn"
             disabled={feedBusy}
-            title="重新拉取接管状态与动态"
+            title="刷新接管动态"
             onClick={() => void doRefreshFeed()}
           >
-            {feedBusy ? "刷新中…" : "刷新"}
+            <IconRefresh size={15} className={feedBusy ? "spin" : ""} />
           </button>
-          <button
-            className="btn small ghost"
-            disabled={events.length === 0}
-            title="删除全部接管事件记录，不可恢复"
-            onClick={() => void doClearEvents()}
-          >
-            清空
-          </button>
+          {events.length > 0 && (
+            <button
+              className="icon-btn icon-danger"
+              title="清空接管动态"
+              onClick={() => void doClearEvents()}
+            >
+              <IconTrash size={15} />
+            </button>
+          )}
         </div>
+
         {events.length === 0 ? (
-          <p className="hint">
-            暂无事件。开启接管并产生对话后，这里会记录每一次账号启用与开关动作。
-          </p>
+          <div className="feed-empty">暂无动态</div>
         ) : (
-          <ul className="evt-list">
+          <ul className="feed">
             {rows.map(({ e, count, account }, i) => {
               const k = eventKind(e);
               // 正文取最新那条的原文（只抹掉看不懂的会话号）：一眼看得出用的是哪个号、用了几次
               return (
                 <li
                   key={`${e.at_ms}-${i}`}
-                  className={`evt evt-${k.cls}`}
+                  className={`feed-item k-${k.cls}`}
                   title={
                     account && count > 1
                       ? `账号「${account}」本次接管共服务 ${count} 个会话`
@@ -464,36 +535,58 @@ export function TakeoverPage({
                       : undefined
                   }
                 >
-                  <span className="e-at">{e.at}</span>
-                  <span className={`e-tag tag-${k.cls}`}>{k.label}</span>
-                  {count > 1 && <span className="e-count">×{count}</span>}
-                  <span className="e-detail">{displayDetail(e)}</span>
+                  <span className="feed-dot" />
+                  <span className="feed-time">{shortTime(e)}</span>
+                  <span className="feed-label">{k.label}</span>
+                  {count > 1 && <span className="feed-count">×{count}</span>}
+                  <span className="feed-detail">{displayDetail(e)}</span>
                 </li>
               );
             })}
           </ul>
         )}
-      </div>
+      </section>
 
       {/* ── 扣费账号选择弹框（草稿制：点「保存」才生效） ── */}
       {pickerOpen && (
         <Dialog
           size="md"
-          icon={<IconUser size={16} />}
-          title="选择扣费账号"
-          label="选择扣费账号"
+          icon={<IconUsers size={16} />}
+          title="参与扣费"
+          subtitle="未勾选的账号不参与扣费；全选时以后新增的账号也会自动参与。"
+          label="选择参与扣费的账号"
+          fixedBodyHeight={390}
           onClose={() => {
             setDraft(null);
             setPickerOpen(false);
           }}
           tools={
-            <button
-              className="btn small"
-              onClick={() => setDraft(allIds)}
-              disabled={accounts.length === 0}
-            >
-              全部勾选
-            </button>
+            <div className="billing-tools">
+              <label className="billing-all">
+                <input
+                  type="checkbox"
+                  checked={
+                    accounts.length > 0 &&
+                    draftEffective.length === accounts.length
+                  }
+                  ref={(el) => {
+                    if (el)
+                      el.indeterminate =
+                        draftEffective.length > 0 &&
+                        draftEffective.length < accounts.length;
+                  }}
+                  onChange={() =>
+                    setDraft(
+                      draftEffective.length === accounts.length ? [] : allIds
+                    )
+                  }
+                />
+                全选
+              </label>
+              <span className="billing-count">
+                已选 {draftEffective.length} / {accounts.length}
+              </span>
+            </div>
           }
           footer={
             <>
@@ -516,16 +609,6 @@ export function TakeoverPage({
             </>
           }
         >
-          <p className="note">
-            <IconInfo size={14} />
-            <span>
-              勾选的账号才允许被扣费（每条请求按积分最早到期优先排序；同一天到期时先烧积分少的，
-              消耗后只会更少，不会来回切换），未勾选的账号会被排除；默认全部勾选（智能轮换）。
-              点「保存」立即生效，无需重启。
-            </span>
-          </p>
-          {/* 一个普通的文本输入框：`.modal input` 已经给了外观，
-              上下间距由 `.modal-body > * + *` 统一负责，不再需要专属 class */}
           <input
             type="text"
             placeholder="按用户名或手机号过滤…"
@@ -537,33 +620,25 @@ export function TakeoverPage({
           ) : filteredAccounts.length === 0 ? (
             <p className="empty">没有匹配「{query}」的账号。</p>
           ) : (
-            <ul className="pick-list">
+            <div className="billing-list">
               {filteredAccounts.map((a) => {
                 const picked = draftEffective.includes(a.id);
                 return (
-                  <li
+                  <label
                     key={a.id}
-                    className={"pick-item" + (picked ? " picked" : "")}
-                    onClick={() => toggleDraft(a.id)}
+                    className={"billing-row" + (picked ? " picked" : "")}
                   >
                     <input
                       type="checkbox"
                       checked={picked}
                       onChange={() => toggleDraft(a.id)}
-                      onClick={(e) => e.stopPropagation()}
                     />
-                    {/* 用全应用统一的账号单元格（头像 + 名称 + 手机号）——
-                        此前这里是手拼的两段文字，与表格里的账号列长得不一样 */}
                     <AccountCell name={a.name} phone={a.phone} />
-                    <span className="pick-tail">
-                      <span className="pick-state">
-                        {picked ? "可扣费" : "已排除"}
-                      </span>
-                    </span>
-                  </li>
+                    <span className="billing-meta">{creditMeta(a)}</span>
+                  </label>
                 );
               })}
-            </ul>
+            </div>
           )}
         </Dialog>
       )}
@@ -575,6 +650,7 @@ export function TakeoverPage({
           icon={<IconBolt size={16} />}
           title="限流切换"
           label="限流切换"
+          fixedBodyHeight={460}
           onClose={closeModelPicker}
           tools={
             <button
@@ -603,17 +679,14 @@ export function TakeoverPage({
           <p className="note">
             <IconInfo size={14} />
             <span>
-              选中的模型触发限流（429）时，代理会将该账号冷却 10 分钟、自动换备用账号重发同一请求，
-              对话完全无感；备用账号按「积分最早到期」挑选（先消耗快过期的额度），冷却结束后自动回到候选。
-              0 积分（免费）模型默认全部生效、不可取消；付费模型勾选后同样生效。
-              列表从网关动态拉取（缓存 1 小时），腾讯增删模型后点「刷新」即可同步。
+              触发限流（429）时自动换备用账号重发同一请求，对话无感；免费模型默认生效。
             </span>
           </p>
           <Row
             title="限流时在同一会话内换号"
-            desc="关掉后 429 原样透传给客户端，不冷却、不换号——同一会话自始至终只用一个账号。风控视角下「一个会话中途换凭证」是极高异常值，代价是这种情况要等上游自己解除限流。"
+            desc="关掉后 429 原样透传，不冷却、不换号。"
             ctrl={
-              <Toggle
+              <Switch
                 checked={mdlFailover ?? rlFailover}
                 onChange={setMdlFailover}
                 title="会话内不换号 = 调用凭证稳定"
@@ -623,14 +696,14 @@ export function TakeoverPage({
           {fm && (
             <p className="modal-meta">
               {fm.source === "fetched"
-                ? "来源：刚从网关拉取"
+                ? "来源：网关"
                 : fm.source === "cache"
-                ? "来源：缓存（1 小时内有效）"
-                : "来源：内置兜底列表（网关拉取失败，可点「刷新」重试）"}
+                ? "来源：缓存"
+                : "来源：内置列表"}
             </p>
           )}
           {fm == null ? (
-            <p className="empty">加载中…（从网关拉取模型列表）</p>
+            <p className="empty">加载中…</p>
           ) : fm.models.length === 0 ? (
             <p className="empty">暂未发现模型。</p>
           ) : (
@@ -647,7 +720,7 @@ export function TakeoverPage({
                     title={
                       m.free
                         ? "0 积分免费模型，恒享受限流切换，不可取消"
-                        : "勾选后该付费模型也享受 429 无感换号"
+                        : "勾选后同样自动换号"
                     }
                     onClick={() => {
                       if (!m.free) toggleDraftModel(m.id);

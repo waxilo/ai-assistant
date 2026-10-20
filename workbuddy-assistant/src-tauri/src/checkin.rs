@@ -47,7 +47,7 @@ fn classify(http_ok: bool, code: Option<i64>, message: &str) -> Outcome {
 }
 
 /// 从 JWT 的 iss 字段推断签发方 origin（端口到 host 映射）
-fn token_issuer_origin(token: &str) -> Option<String> {
+pub(crate) fn token_issuer_origin(token: &str) -> Option<String> {
     let part = token.split('.').nth(1)?;
     let mut padded = part.replace('-', "+").replace('_', "/");
     while padded.len() % 4 != 0 {
@@ -59,16 +59,13 @@ fn token_issuer_origin(token: &str) -> Option<String> {
     Some(iss.to_string())
 }
 
-/// 把 iss（如 https://www.workbuddy.ai/...）映射到签到 API host
+/// 把 iss（如 https://www.workbuddy.cn/...）映射到签到 API host。
+/// 只认国内官方域；国际版 `*.ai` 不再适配，返回 None 让调用方退回国内默认域。
 fn host_for_iss(iss: &str) -> Option<&'static str> {
-    if iss.contains("workbuddy.ai") {
-        Some("https://www.workbuddy.ai")
-    } else if iss.contains("workbuddy.cn") {
+    if iss.contains("workbuddy.cn") {
         Some("https://www.workbuddy.cn")
     } else if iss.contains("codebuddy.cn") {
         Some("https://www.codebuddy.cn")
-    } else if iss.contains("codebuddy.ai") {
-        Some("https://www.codebuddy.ai")
     } else {
         None
     }
@@ -99,11 +96,15 @@ fn candidate_hosts(token: &str, account_base: Option<&str>, default_base: &str) 
     }
     if let Some(b) = account_base {
         let b = normalize_host(b);
-        if !hosts.contains(&b) {
+        if !crate::oauth::is_foreign_host(&b) && !hosts.contains(&b) {
             hosts.push(b);
         }
     }
-    let d = normalize_host(default_base);
+    let d = if crate::oauth::is_foreign_host(default_base) {
+        "https://www.workbuddy.cn".to_string()
+    } else {
+        normalize_host(default_base)
+    };
     if !hosts.contains(&d) {
         hosts.push(d);
     }

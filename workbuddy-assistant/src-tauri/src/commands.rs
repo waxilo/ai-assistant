@@ -4,7 +4,7 @@ use crate::briefing;
 use crate::broker;
 use crate::checkin;
 use crate::ledger;
-use crate::logs::{self, CheckinLog};
+use crate::logs;
 use crate::notify;
 use crate::oauth;
 use crate::refresh;
@@ -210,7 +210,13 @@ pub(crate) async fn sync_pool_if_bound(dir: &Path) {
     // 绑池时整池续签**只有这一条路**（本地逐账号续签在绑池分岔里是被取消的）。
     // 旧写法把结果整个吞掉：这一跳失败等于「本机几十小时没人续签」，而那种沉默刚付过代价。
     if let Err(e) = crate::broker::sync(dir, false).await {
-        crate::scheduler::log_event(dir, &format!("凭证池整池同步失败：{e}"));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("凭证池整池同步失败：{e}"),
+        );
         crate::alerts::notify(
             dir,
             "pool-sync",
@@ -360,6 +366,8 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // 国际版已不再支持：导入时直接丢掉 *.ai 的 host，避免落到账号配置里
+        let host = it.host.filter(|h| !crate::oauth::is_foreign_host(h));
         let found = accounts.iter_mut().find(|a| {
             a.token == token || phone.is_some() && a.phone.as_deref() == phone.as_deref()
         });
@@ -386,7 +394,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     }
                 }
                 if a.base_url.is_none() {
-                    a.base_url = it.host.clone().filter(|s| !s.trim().is_empty());
+                    a.base_url = host.clone().filter(|s| !s.trim().is_empty());
                 }
                 // 导入 = 重新同步：丢弃本地缓存的签到结果，避免陈旧的「今天失败」记录
                 // 在状态列直接显示「签到失败」（真实状态由导入后的 refreshAll 以服务端为准重写）
@@ -411,7 +419,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     refresh_token: it.refresh_token.filter(|s| !s.trim().is_empty()),
                     expires_at: it.expires_at,
                     rt_expires_at: it.rt_expires_at,
-                    base_url: it.host.filter(|s| !s.trim().is_empty()),
+                    base_url: host.filter(|s| !s.trim().is_empty()),
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     last: None,
                     checked_today: None,
@@ -508,6 +516,16 @@ mod import_tests {
         assert_eq!((r.added, r.updated), (0, 0));
         assert_eq!(accs.len(), 1);
     }
+
+    #[test]
+    fn drops_foreign_host_when_importing() {
+        let mut accs = vec![];
+        let mut it = item("t1", None);
+        it.host = Some("https://www.workbuddy.ai".into());
+        merge_import(&mut accs, vec![it]);
+        assert_eq!(accs.len(), 1);
+        assert!(accs[0].base_url.is_none(), "国际版域不应落进账号配置");
+    }
 }
 
 #[tauri::command]
@@ -520,8 +538,6 @@ pub fn remove_account(app: AppHandle, id: String) -> Result<(), String> {
         return Err("账号不存在".into());
     }
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
-    // 一并清理该账号的签到日志，避免留下无归属的孤儿记录
-    let _ = logs::clear_logs(&dir, Some(&id));
     Ok(())
 }
 
@@ -583,10 +599,34 @@ pub async fn checkin_one(app: AppHandle, id: String) -> Result<accounts::Account
     let settings = accounts::load_settings(&dir);
     // 临期先续签。
     // 失败不阻断：仍用旧 token 试一次，由签到结果给出明确提示
-    let _ = ensure_fresh_token(&mut accounts[idx]).await;
+    let renewed = ensure_fresh_token(&mut accounts[idx]).await;
+    if let Ok(true) = renewed {
+        logs::push(
+            &dir,
+            logs::CAT_RENEW,
+            &accounts[idx].name,
+            true,
+            "续签：临期自动续签完成",
+        );
+    }
+    if let Err(e) = &renewed {
+        logs::push(
+            &dir,
+            logs::CAT_RENEW,
+            &accounts[idx].name,
+            false,
+            format!("续签失败：{e}"),
+        );
+    }
     let rec = checkin::do_checkin(&accounts[idx], &settings.default_base_url).await;
     accounts[idx].last = Some(rec.clone());
-    let _ = logs::append_log(&dir, logs::log_from_record(&accounts[idx], &rec));
+    logs::push(
+        &dir,
+        logs::CAT_CHECKIN,
+        &accounts[idx].name,
+        rec.success,
+        format!("签到：{}", rec.message),
+    );
     // 刚读到的余额也写进台账（与批量签到同一条路径、同一份数据来源）。
     // 只报这一个账号：其余账号的 `last` 是它们各自上一次签到留下的，此刻没有新读数
     record_checkin_credits(&dir, &accounts, std::slice::from_ref(&id));
@@ -665,7 +705,13 @@ pub async fn refresh_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
     }
     // 台账落盘失败不影响刷新结果（它只是统计，丢了下次采样会重新累积）
     if let Err(e) = ledger::store(&dir).apply(&readings, &now, ledger::Mode::Normal) {
-        crate::scheduler::log_event(&dir, &format!("积分台账落盘失败：{e}"));
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("积分台账落盘失败：{e}"),
+        );
     }
     // 积分读数从刚写好的台账配上账号一起返回（界面口径与台账同源）；
     // 落盘只写账号本身 —— 积分是台账的投影，不进 accounts.json
@@ -708,7 +754,13 @@ pub async fn refresh_account_credits(
     };
     // 台账落盘失败不影响返回值（它只是统计，丢了下次采样会重新累积）
     if let Err(e) = ledger::store(&dir).apply(std::slice::from_ref(&reading), &now, ledger::Mode::Normal) {
-        crate::scheduler::log_event(&dir, &format!("积分台账落盘失败：{e}"));
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("积分台账落盘失败：{e}"),
+        );
     }
     let views = accounts::view_accounts(vec![accounts[i].clone()], &dir);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
@@ -744,10 +796,34 @@ pub(crate) async fn checkin_all_inner(
             tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
         }
         // 临期先续签：失败了也不阻断，仍用旧 token 试一次，由签到结果给出明确提示
-        let _ = ensure_fresh_token(&mut accounts[i]).await;
+        let renewed = ensure_fresh_token(&mut accounts[i]).await;
+        if let Ok(true) = renewed {
+            logs::push(
+                &dir,
+                logs::CAT_RENEW,
+                &accounts[i].name,
+                true,
+                "续签：临期自动续签完成",
+            );
+        }
+        if let Err(e) = &renewed {
+            logs::push(
+                &dir,
+                logs::CAT_RENEW,
+                &accounts[i].name,
+                false,
+                format!("续签失败：{e}"),
+            );
+        }
         let rec = checkin::do_checkin(&accounts[i], &settings.default_base_url).await;
         accounts[i].last = Some(rec.clone());
-        let _ = logs::append_log(&dir, logs::log_from_record(&accounts[i], &rec));
+        logs::push(
+            &dir,
+            logs::CAT_CHECKIN,
+            &accounts[i].name,
+            rec.success,
+            format!("签到：{}", rec.message),
+        );
     }
     // 签到顺手把刚读到的余额写进台账 —— 那是「积分事实」的唯一来源，
     // 账户管理与积分简报都读它，所以这里不用、也不许另存一份。
@@ -805,7 +881,13 @@ pub async fn broker_sync_now(app: AppHandle) -> Result<broker::SyncReport, Strin
         return Err("本机未绑定云端凭证池 —— 先「上传本机账号」或「绑定云端凭证池」".into());
     }
     let report = broker::sync(&dir, true).await?;
-    crate::scheduler::log_event(&dir, &format!("手动整池同步：{}", report.message));
+    crate::logs::push(
+        &dir,
+        crate::logs::CAT_SYSTEM,
+        "系统",
+        report.failed == 0,
+        format!("手动整池同步：{}", report.message),
+    );
     Ok(report)
 }
 
@@ -819,7 +901,7 @@ pub fn discover_local_accounts() -> Result<Vec<LocalAccount>, String> {
 
 /// 「无感登录」第一步：申请 state + 授权链接（不重启应用、不打断当前 WorkBuddy）。
 ///
-/// `host` 省略时默认国内版 `https://www.workbuddy.cn`；国际版传 `https://www.workbuddy.ai`。
+/// `host` 省略时默认国内版 `https://www.workbuddy.cn`；国际版已不再支持。
 #[tauri::command]
 pub async fn oauth_start(host: Option<String>) -> Result<oauth::OAuthStart, String> {
     oauth::start(host).await
@@ -1147,28 +1229,22 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
         .map_err(|e| format!("读取开机自启动状态失败：{e}"))
 }
 
-/// 查询签到日志：默认倒序（最新在前），最多 200 条；可按账号筛选
+/// 「日志管理」的唯一数据源：应用日志 + 接管动态，统一按时间倒序。
 #[tauri::command]
-pub fn get_checkin_logs(
-    app: AppHandle,
-    limit: Option<usize>,
-    account_id: Option<String>,
-) -> Result<Vec<CheckinLog>, String> {
-    let mut logs = logs::load_logs(&data_dir(&app));
-    if let Some(id) = account_id {
-        logs.retain(|l| l.account_id == id);
-    }
-    logs.reverse();
-    if let Some(n) = limit {
-        logs.truncate(n);
-    }
-    Ok(logs)
+pub fn get_logs(app: AppHandle) -> Result<Vec<logs::LogEntry>, String> {
+    Ok(logs::unified(&data_dir(&app)))
 }
 
-/// 清空签到日志：`account_id` 为空则清空全部，否则只清该账号的日志
+/// 清空**全部**日志（应用日志 + 接管动态）。
+///
+/// 两路在界面上是同一张流水，只清一半会让用户按下「清空」后还剩一半记录 ——
+/// 那比按钮不生效更难理解。
 #[tauri::command]
-pub fn clear_checkin_logs(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
-    logs::clear_logs(&data_dir(&app), account_id.as_deref()).map_err(|e| e.to_string())
+pub fn clear_logs(app: AppHandle) -> Result<(), String> {
+    let dir = data_dir(&app);
+    logs::clear(&dir);
+    crate::stealth::journal_clear(&dir);
+    Ok(())
 }
 
 // ── 积分简报 ───────────────────────────────────────────────────
@@ -1231,7 +1307,13 @@ pub(crate) fn apply_samples(
     };
     // 落盘失败不回滚：内存里的值是对的，下一次任意写入都会再落一遍
     if let Err(e) = ledger::store(&dir).apply(readings, at, mode) {
-        crate::scheduler::log_event(&dir, &format!("积分台账落盘失败：{e}"));
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("积分台账落盘失败：{e}"),
+        );
     }
 }
 

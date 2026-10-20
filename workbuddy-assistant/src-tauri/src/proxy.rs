@@ -1521,9 +1521,12 @@ async fn choose_account(
         // 应用一重启就会读回那枚死票，症状是过几天「这个账号要重新登录」，
         // 而原因藏在几周前的一次写盘失败里。走与调度日志同一个通道，便于对照时间线。
         if let Err(e) = accounts::save_accounts(dir, &merged) {
-            crate::scheduler::log_event(
+            crate::logs::push(
                 dir.as_path(),
-                &format!("反代续签结果落盘失败：{}（{e}）", account.name),
+                crate::logs::CAT_RENEW,
+                &account.name,
+                false,
+                format!("反代续签结果落盘失败：{e}"),
             );
             // 日志只有翻文件的人才看得见，而这里丢的是**一条不可逆的凭证轮换**：
             // 现在不吭声，过几天这个账号变成「需要重新登录」，没人会把它关联到这次写盘失败。

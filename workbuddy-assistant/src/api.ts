@@ -5,7 +5,7 @@ import type {
   LocalAccount,
   OAuthStart,
   OAuthPoll,
-  CheckinLog,
+  LogEntry,
   DayEntry,
   ImportItem,
   ImportReport,
@@ -22,7 +22,7 @@ import type {
 export const listAccounts = () => invoke<Account[]>("list_accounts");
 
 /**
- * 批量导入账号（「导入本机账号」与「登录新账号」共用）。
+ * 批量导入账号（「添加账号」的本机读取与浏览器登录共用）。
  * 已存在的账号（手机号或 token 相同）会被合并补全凭证，不会产生重复条目。
  */
 export const importAccounts = (items: ImportItem[]) =>
@@ -107,15 +107,10 @@ export const setAutostart = (enabled: boolean) =>
 
 export const appVersion = () => invoke<string>("app_version");
 
-export const getCheckinLogs = (limit?: number, accountId?: string) =>
-  invoke<CheckinLog[]>("get_checkin_logs", {
-    limit: limit ?? null,
-    accountId: accountId ?? null,
-  });
+export const getLogs = () => invoke<LogEntry[]>("get_logs");
 
-/** 清空签到日志：不传 accountId 则清空全部 */
-export const clearCheckinLogs = (accountId?: string) =>
-  invoke<void>("clear_checkin_logs", { accountId: accountId ?? null });
+/** 清空全部日志（应用日志 + 接管动态），不可恢复 */
+export const clearLogs = () => invoke<void>("clear_logs");
 
 /**
  * 诊断 WorkBuddy 的全局网络配置（**只读**，不会改动任何文件）。

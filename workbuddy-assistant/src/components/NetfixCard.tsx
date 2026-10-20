@@ -31,6 +31,9 @@ export function NetfixCard({
   const [netSteps, setNetSteps] = useState<NetStep[] | null>(null);
   const [netBackups, setNetBackups] = useState<string[]>([]);
   const [netBusy, setNetBusy] = useState<"diag" | "restore" | null>(null);
+  /** `ok` 是「检查过、正常」的状态说明，不算残留 */
+  const residualCount =
+    netReport?.issues.filter((i) => i.level !== "ok").length ?? 0;
 
   const doDiagnose = async () => {
     setNetBusy("diag");
@@ -50,8 +53,7 @@ export function NetfixCard({
     const ok = await askConfirm({
       title: "一键恢复网络配置",
       body:
-        "会依次：安全关闭智能接管并重启 WorkBuddy/CLI host、备份并清除全局调试端点、" +
-        "取消 launchd 全局环境变量，最后复检。被改动的文件都会先备份。继续？",
+        "会安全关闭智能接管、备份并清除全局调试残留配置，最后复检。继续？",
       okText: "恢复",
       danger: true,
     });
@@ -65,11 +67,12 @@ export function NetfixCard({
       setNetSteps(rep.steps);
       setNetBackups(rep.backups);
       const failed = rep.steps.filter((s) => !s.ok).length;
-      onToast(
-        failed
-          ? { kind: "err", text: `恢复完成，但有 ${failed} 步失败，见下方详情` }
-          : { kind: "ok", text: "已恢复：残留配置已清除" }
-      );
+      if (failed) {
+        onToast({
+          kind: "err",
+          text: `恢复完成，但有 ${failed} 步失败，见下方详情`,
+        });
+      }
     } catch (e) {
       onToast({ kind: "err", text: "恢复失败：" + String(e) });
     } finally {
@@ -87,24 +90,17 @@ export function NetfixCard({
     <div className="set-card card">
       <div className="set-card-head">
         <span className="set-card-icon">
-          <IconActivity size={20} />
+          <IconActivity size={19} />
         </span>
         <div>
           <div className="set-card-title">网络急救</div>
-          <div className="set-card-sub">
-            排查并清除影响整个 WorkBuddy 的全局网络残留配置
-          </div>
         </div>
       </div>
 
       <div className="set-group">
         <Row
           title="网络链路诊断"
-          desc={
-            "调试「自定义服务端点」时，如果把地址写进了 WorkBuddy 的全局配置" +
-            "（~/.workbuddy/settings.json 的 env，或 launchd 全局环境变量），" +
-            "受影响的会是整个 WorkBuddy，典型表现是「502 连接被拒绝」。"
-          }
+          desc="清除影响整个 WorkBuddy 的全局端点残留；典型表现是「502 连接被拒绝」。"
           ctrl={
             <>
               <button
@@ -136,102 +132,105 @@ export function NetfixCard({
           }
         />
 
-        {netReport && (
-          <div className="netfix-body">
-            {netReport.healthy && netReport.issues.length === 0 ? (
-              <div className="status-banner ok">
-                <IconCircleCheck size={18} />
-                <div>
-                  <strong>网络链路正常</strong>
-                  <span>未发现残留端点配置，WorkBuddy 的网络链路是干净的。</span>
-                </div>
-              </div>
-            ) : (
-              <>
-                <div className="status-banner warn">
-                  <IconAlertTriangle size={18} />
+        {/* 固定高度内容槽：诊断结果与恢复详情的增减只在槽内滚动，卡片本身不跳高度 */}
+        <div className="netfix-scroll">
+          {netReport ? (
+            <div className="netfix-body">
+              {residualCount === 0 ? (
+                <div className="status-banner ok">
+                  <IconCircleCheck size={18} />
                   <div>
-                    <strong>发现 {netReport.issues.length} 项配置残留</strong>
-                    <span>以下项可能影响 WorkBuddy 网络连接，建议点「一键恢复」清除。</span>
+                    <strong>网络链路正常</strong>
+                    <span>未发现残留端点配置。</span>
                   </div>
                 </div>
-                <ul className="net-list">
-                  {netReport.issues.map((it) => (
-                    <li key={it.id} className={`net-item ${it.level}`}>
-                      <div className="net-head">
-                        <span
-                          className={`badge ${
-                            it.level === "block"
-                              ? "badge-err"
+              ) : (
+                <>
+                  <div className="status-banner warn">
+                    <IconAlertTriangle size={18} />
+                    <div>
+                      <strong>发现 {residualCount} 项配置残留</strong>
+                      <span>建议点「一键恢复」清除。</span>
+                    </div>
+                  </div>
+                  <ul className="net-list">
+                    {netReport.issues.map((it) => (
+                      <li
+                        key={it.id}
+                        className={`net-item ${it.level}`}
+                        title={it.value}
+                      >
+                        <div className="net-head">
+                          <span
+                            className={`badge ${
+                              it.level === "block"
+                                ? "badge-err"
+                                : it.level === "ok"
+                                ? "badge-ok"
+                                : "badge-already"
+                            }`}
+                          >
+                            {it.level === "block"
+                              ? "会断网"
                               : it.level === "ok"
-                              ? "badge-ok"
-                              : "badge-already"
-                          }`}
-                        >
-                          {it.level === "block"
-                            ? "会断网"
-                            : it.level === "ok"
-                            ? "正常"
-                            : "残留"}
-                        </span>
-                        <span className="net-scope">{it.scope}</span>
-                        <span className="net-target">{it.target}</span>
-                      </div>
-                      <div className="net-value">{it.value}</div>
-                      <div className="net-note">
-                        {it.note}
-                        {!it.fixable && "（此项只报告，需要你手动处理）"}
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-                {netReport.issues.some((i) => i.fixable && i.level !== "ok") && (
-                  <p className="hint">
-                    「一键恢复」会清除上表中标记为可自动处理的项；改动前一律先备份。
-                  </p>
-                )}
-              </>
-            )}
-          </div>
-        )}
+                              ? "正常"
+                              : "残留"}
+                          </span>
+                          <span className="net-scope">{it.scope}</span>
+                          <span className="net-target">{it.target}</span>
+                        </div>
+                        <div className="net-note">
+                          {it.note}
+                          {it.level !== "ok" && !it.fixable && "（此项需手动处理）"}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          ) : (
+            <p className="empty">诊断中…</p>
+          )}
 
-        {netSteps && (
-          <div className="netfix-body">
-            <div className="net-steps-title">恢复详情</div>
-            <ul className="net-steps">
-              {netSteps.map((s, i) => (
-                <li
-                  key={`${i}-${s.action}`}
-                  className={`net-step ${s.ok ? "ok" : "bad"}`}
-                >
-                  <span className="mark">{s.ok ? "✓" : "✕"}</span>
-                  <span>
-                    <strong>{s.action}</strong>：{s.detail}
-                  </span>
-                </li>
-              ))}
-            </ul>
-            {netBackups.length > 0 && (
-              <div className="net-backups">
-                <span>已备份：</span>
-                {netBackups.map((b) => (
-                  <button
-                    key={b}
-                    className="link-btn"
-                    title={b}
-                    onClick={() =>
-                      void revealPath(b).catch((e) =>
-                        onToast({ kind: "err", text: String(e) })
-                      )
-                    }
+          {netSteps && (
+            <div className="netfix-body">
+              <div className="net-steps-title">恢复详情</div>
+              <ul className="net-steps">
+                {netSteps.map((s, i) => (
+                  <li
+                    key={`${i}-${s.action}`}
+                    className={`net-step ${s.ok ? "ok" : "bad"}`}
                   >
-                    {baseName(b)}
-                  </button>
+                    <span className="mark">{s.ok ? "✓" : "✕"}</span>
+                    <span>
+                      <strong>{s.action}</strong>：{s.detail}
+                    </span>
+                  </li>
                 ))}
-              </div>
-            )}
-          </div>
-        )}
+              </ul>
+              {netBackups.length > 0 && (
+                <div className="net-backups">
+                  <span>已备份：</span>
+                  {netBackups.map((b) => (
+                    <button
+                      key={b}
+                      className="link-btn"
+                      title={b}
+                      onClick={() =>
+                        void revealPath(b).catch((e) =>
+                          onToast({ kind: "err", text: String(e) })
+                        )
+                      }
+                    >
+                      {baseName(b)}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

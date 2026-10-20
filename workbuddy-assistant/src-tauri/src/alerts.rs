@@ -110,7 +110,13 @@ fn claim(dir: &Path, key: &str, now_ms: i64, cooldown_ms: i64) -> bool {
     st.alerts.insert(key.to_string(), now_ms);
     if let Err(e) = write_state(dir, &st) {
         // 落盘失败只影响「重启之后」的去重，本进程的内存表已经占上名额了
-        crate::scheduler::log_event(dir, &format!("{CHANNEL}：记账落盘失败（{e}）"));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_NOTIFY,
+            CHANNEL,
+            false,
+            format!("告警记账落盘失败：{e}"),
+        );
     }
     true
 }
@@ -162,15 +168,21 @@ pub(crate) fn notify(dir: &Path, key: &str, cooldown_ms: i64, message: &str) {
     // （`commands::auto_refresh_all`），在那里 block_on 会把运行时卡住。
     tauri::async_runtime::spawn(async move {
         match crate::notify::send(&webhook, &body).await {
-            Ok(resp) => crate::scheduler::log_event(
+            Ok(resp) => crate::logs::push(
                 &data_dir,
-                &format!("{CHANNEL}：告警已推送：{resp}"),
+                crate::logs::CAT_NOTIFY,
+                CHANNEL,
+                true,
+                format!("告警已推送：{resp}"),
             ),
             Err(e) => {
                 // 告警自己送不出去是要紧事：这正是用户唯一能知道「链断了」的通道
-                crate::scheduler::log_event(
+                crate::logs::push(
                     &data_dir,
-                    &format!("{CHANNEL}：告警推送失败（{e}）｜正文：{body}"),
+                    crate::logs::CAT_NOTIFY,
+                    CHANNEL,
+                    false,
+                    format!("告警推送失败（{e}）｜正文：{body}"),
                 );
             }
         }

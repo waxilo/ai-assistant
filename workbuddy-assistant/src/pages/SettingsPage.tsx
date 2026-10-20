@@ -8,13 +8,11 @@ import {
   IconCalendar,
   IconShield,
   IconBell,
-  IconCheck,
-  IconAlertTriangle,
-  IconInfo,
   IconDownload,
   IconType,
 } from "../components/Icons";
-import { Row, Toggle } from "../components/SettingsControls";
+import { Row } from "../components/SettingsControls";
+import Switch from "../components/Switch";
 import { NetfixCard } from "../components/NetfixCard";
 
 /**
@@ -81,8 +79,6 @@ export function SettingsPage({
     String(settings.manual_stagger_max_seconds)
   );
   const [testing, setTesting] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [err, setErr] = useState("");
   // 开机自启动是「操作系统状态」，不属于 settings.json，改一次立即生效
   const [autostart, setAutostartOn] = useState<boolean | null>(null);
@@ -112,7 +108,6 @@ export function SettingsPage({
     setAutostartOn(next); // 乐观更新，失败再回滚
     try {
       setAutostartOn(await setAutostart(next));
-      onToast({ kind: "ok", text: next ? "已设置开机自启动" : "已关闭开机自启动" });
     } catch (e) {
       setAutostartOn(!next);
       onToast({ kind: "err", text: String(e) });
@@ -126,18 +121,14 @@ export function SettingsPage({
   const patch = (updates: Partial<Settings>) => {
     const next = { ...draftRef.current, ...updates };
     draftRef.current = next;
-    setSaved(false);
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(async () => {
-      setSaving(true);
       try {
         await onSave(next);
         setErr("");
-        setSaved(true);
       } catch (e) {
         setErr(String(e));
       } finally {
-        setSaving(false);
         saveTimer.current = null;
       }
     }, 400);
@@ -159,15 +150,83 @@ export function SettingsPage({
 
   // 下载进度：percent 为 null = 总量未知 / 不在下载阶段（两者都不画条）
   const dl = downloadProgress(updateStatus);
+  /**
+   * 更新状态行：后台轮询到的版本也放进这一行。
+   * 卡片高度必须与「有没有点过检查」无关，所以版本信息不另起一行。
+   */
+  const updMsg = updateStatus?.message ?? "";
+  const updTone =
+    updateStatus?.status === "error"
+      ? " err"
+      : updateStatus?.status === "updated" ||
+        updateStatus?.status === "no-update"
+      ? " ok"
+      : "";
 
   return (
     <section className="panel-page">
-      <p className="set-intro">
-        <IconInfo size={14} />
-        <span>
-          定时签到、多账号风控、通知、应用更新与网络急救。智能接管相关配置请在「智能接管」页调整。
-        </span>
-      </p>
+      {/* 应用更新 */}
+      <div className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconDownload size={19} />
+          </span>
+          <div>
+            <div className="set-card-title">应用更新</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title={
+              updateVersion
+                ? `当前版本 v${version} → v${updateVersion}`
+                : version
+                ? `当前版本 v${version}`
+                : "当前版本"
+            }
+            ctrl={
+              <button
+                className={`btn small${updateVersion ? " primary" : ""}`}
+                disabled={updateBusy}
+                onClick={() => void doUpdate()}
+              >
+                {updateBusy ? "检查中…" : updateVersion ? "立即更新" : "检查更新"}
+              </button>
+            }
+          />
+          {/* 固定高度的状态槽：没有状态时也占着这一行，
+              检查中 / 已是最新 / 下载中 / 失败都只在原地换字，不把卡片顶高。 */}
+          <div className="upd-line" aria-live="polite">
+            <span
+              className={`upd-status${updTone}`}
+              title={updMsg || undefined}
+            >
+              {updMsg}
+            </span>
+            {dl && (
+              <>
+                {/* 只有拿得到百分比才画条：总量未知时进度条没有可信的长度，
+                    与其摆一条会自己动的不确定态，不如干脆不画（下面照实报字节数）。 */}
+                {dl.percent !== null && (
+                  <div className="upd-progress-wrap">
+                    <div
+                      className="upd-progress-bar"
+                      style={{ width: `${dl.percent}%` }}
+                    />
+                  </div>
+                )}
+                {(dl.percent !== null || dl.downloaded > 0) && (
+                  <span className="upd-progress-text">
+                    {dl.percent === null
+                      ? `已下载 ${formatBytes(dl.downloaded)}`
+                      : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
 
       {/* 界面外观 */}
       <div className="set-card card">
@@ -177,13 +236,12 @@ export function SettingsPage({
           </span>
           <div>
             <div className="set-card-title">界面外观</div>
-            <div className="set-card-sub">界面使用的字体，改动即时生效</div>
           </div>
         </div>
         <div className="set-group">
           <Row
             title="界面字体"
-            desc="选择常用字体之一；此项为本机偏好，重新安装应用不受影响。"
+            desc="本机偏好，重新安装不受影响。"
             ctrl={
               <select
                 value={fontKey}
@@ -212,7 +270,6 @@ export function SettingsPage({
           </span>
           <div>
             <div className="set-card-title">签到自动化</div>
-            <div className="set-card-sub">控制账号在何时自动完成签到</div>
           </div>
         </div>
         <div className="set-group">
@@ -220,7 +277,7 @@ export function SettingsPage({
             title="启动应用时自动签到"
             desc="打开应用时自动为全部账号签到一次"
             ctrl={
-              <Toggle
+              <Switch
                 checked={auto}
                 onChange={(v) => {
                   setAuto(v);
@@ -234,7 +291,7 @@ export function SettingsPage({
             title="每天定时签到"
             desc="在指定时刻为全部账号自动签到"
             ctrl={
-              <Toggle
+              <Switch
                 checked={schedOn}
                 onChange={(v) => {
                   setSchedOn(v);
@@ -243,71 +300,65 @@ export function SettingsPage({
               />
             }
           />
-          {schedOn && (
-            <Row
-              sub
-              title="签到时刻"
-              desc="24 小时制，作为时间窗的起点。应用运行期间触发；错过时刻后 30 分钟内打开会自动补签。"
-              ctrl={
+          {/* 这一行常驻、关掉开关时只禁用：条件挂载会让整张卡片忽高忽低 */}
+          <Row
+            sub
+            title="签到时刻"
+            desc="应用运行期间触发；错过后 30 分钟内打开会自动补签。"
+            ctrl={
+              <input
+                type="time"
+                value={schedTime}
+                disabled={!schedOn}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setSchedTime(v);
+                  patch({ schedule_time: v.trim() });
+                }}
+              />
+            }
+          />
+          <Row
+            sub
+            title="随机时间窗"
+            desc="在该时刻后随机一分钟触发，当天固定不变；填 0 则精确到设定时刻。"
+            ctrl={
+              <>
                 <input
-                  type="time"
-                  value={schedTime}
+                  type="number"
+                  value={schedWindow}
+                  min={0}
+                  max={720}
+                  disabled={!schedOn}
                   onChange={(e) => {
                     const v = e.target.value;
-                    setSchedTime(v);
-                    patch({ schedule_time: v.trim() });
+                    setSchedWindow(v);
+                    // 空串按 0（=关闭随机）处理，别用 || 落到默认值上把随机又打开
+                    const n = Math.min(720, Math.max(0, Number(v) || 0));
+                    patch({ schedule_window_minutes: n });
                   }}
                 />
-              }
-            />
-          )}
-          {schedOn && (
-            <Row
-              sub
-              title="随机时间窗"
-              desc="在该时刻之后的这段时间内随机挑一分钟触发，当天挑定后不再变，并推送一条通知告知今天的实际时刻。固定在同一分钟触发是脚本最好认的特征；填 0 则精确到设定时刻。"
-              ctrl={
-                <>
-                  <input
-                    type="number"
-                    value={schedWindow}
-                    min={0}
-                    max={720}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setSchedWindow(v);
-                      // 空串按 0（=关闭随机）处理，别用 || 落到默认值上把随机又打开
-                      const n = Math.min(720, Math.max(0, Number(v) || 0));
-                      patch({ schedule_window_minutes: n });
-                    }}
-                  />
-                  <span className="set-suffix">分钟</span>
-                </>
-              }
-            />
-          )}
+                <span className="set-suffix">分钟</span>
+              </>
+            }
+          />
           <Row
             title="开机自启动"
-            desc="登录系统时自动运行本应用（操作系统级设置）"
+            desc={
+              autostart === null
+                ? "当前平台不支持此设置。"
+                : schedOn && !autostart
+                ? "定时签到需要应用保持运行。"
+                : "登录系统时自动运行本应用。"
+            }
             ctrl={
-              <Toggle
+              <Switch
                 checked={autostart === true}
                 disabled={autoBusy || autostart === null}
                 onChange={(v) => void toggleAutostart(v)}
               />
             }
           />
-          {autostart === null ? (
-            <p className="hint set-foot">未能读取开机自启动状态（该平台可能不支持）。</p>
-          ) : (
-            schedOn &&
-            !autostart && (
-              <p className="hint set-foot warn">
-                <IconAlertTriangle size={13} />
-                建议同时开启「开机自启动」，否则应用不运行时定时签到不会发生。
-              </p>
-            )
-          )}
         </div>
       </div>
 
@@ -319,15 +370,14 @@ export function SettingsPage({
           </span>
           <div>
             <div className="set-card-title">多账号风控</div>
-            <div className="set-card-sub">批量签到时打散请求节奏，降低触发风控的概率</div>
           </div>
         </div>
         <div className="set-group">
           <Row
             title="账号间随机间隔"
-            desc="批量签到时，每个账号之间随机等待一段时间再发下一个，避免同 IP 瞬时连发。"
+            desc="批量签到时，账号之间随机等待，避免瞬时连发。"
             ctrl={
-              <Toggle
+              <Switch
                 checked={staggerOn}
                 onChange={(v) => {
                   setStaggerOn(v);
@@ -336,34 +386,33 @@ export function SettingsPage({
               />
             }
           />
-          {staggerOn && (
-            <Row
-              sub
-              title="间隔上限"
-              desc="每个账号之间的随机等待不超过该秒数（2～600）。单账号签到不受影响。"
-              ctrl={
-                <>
-                  <input
-                    type="number"
-                    value={staggerMax}
-                    min={2}
-                    max={600}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setStaggerMax(v);
-                      patch({ stagger_max_seconds: Number(v) || 45 });
-                    }}
-                  />
-                  <span className="set-suffix">秒</span>
-                </>
-              }
-            />
-          )}
+          <Row
+            sub
+            title="间隔上限"
+            desc="单次随机等待的上限（2～600 秒）。"
+            ctrl={
+              <>
+                <input
+                  type="number"
+                  value={staggerMax}
+                  min={2}
+                  max={600}
+                  disabled={!staggerOn}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setStaggerMax(v);
+                    patch({ stagger_max_seconds: Number(v) || 45 });
+                  }}
+                />
+                <span className="set-suffix">秒</span>
+              </>
+            }
+          />
           <Row
             title="随机打乱签到顺序"
-            desc="每次批量签到都随机决定先后。固定按列表顺序连发，等于把「同一批账号」直接写进请求序列；打乱只影响发请求的次序，列表顺序不变。"
+            desc="每次批量签到随机决定先后，避免固定请求序列。"
             ctrl={
-              <Toggle
+              <Switch
                 checked={shuffle}
                 onChange={(v) => {
                   setShuffle(v);
@@ -374,9 +423,9 @@ export function SettingsPage({
           />
           <Row
             title="手动「全部签到」也加间隔"
-            desc="手动点击同样不该瞬时连发——过去手动路径是全程唯一没有节流的入口，风控看到的恰好就是那几秒内完成的一串签到。"
+            desc="手动批量签到时同样随机等待。"
             ctrl={
-              <Toggle
+              <Switch
                 checked={manualStagger}
                 onChange={(v) => {
                   setManualStagger(v);
@@ -385,29 +434,28 @@ export function SettingsPage({
               />
             }
           />
-          {manualStagger && (
-            <Row
-              sub
-              title="手动间隔上限"
-              desc="手动签到时账号之间的随机等待不超过该秒数（2～600）。比自动签到短得多，避免点一次要等太久。"
-              ctrl={
-                <>
-                  <input
-                    type="number"
-                    value={manualMax}
-                    min={2}
-                    max={600}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setManualMax(v);
-                      patch({ manual_stagger_max_seconds: Number(v) || 8 });
-                    }}
-                  />
-                  <span className="set-suffix">秒</span>
-                </>
-              }
-            />
-          )}
+          <Row
+            sub
+            title="手动间隔上限"
+            desc="手动签到的随机等待上限（2～600 秒）。"
+            ctrl={
+              <>
+                <input
+                  type="number"
+                  value={manualMax}
+                  min={2}
+                  max={600}
+                  disabled={!manualStagger}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setManualMax(v);
+                    patch({ manual_stagger_max_seconds: Number(v) || 8 });
+                  }}
+                />
+                <span className="set-suffix">秒</span>
+              </>
+            }
+          />
         </div>
       </div>
 
@@ -419,15 +467,14 @@ export function SettingsPage({
           </span>
           <div>
             <div className="set-card-title">签到与简报通知</div>
-            <div className="set-card-sub">签到结果、积分简报与续签失败告警都通过同一个 webhook 推送</div>
           </div>
         </div>
         <div className="set-group">
           <Row
             title="开启 webhook 通知"
-            desc="关闭后不再推送任何通知，包括续签失败告警"
+            desc="关闭后不再推送任何通知。"
             ctrl={
-              <Toggle
+              <Switch
                 checked={notifyOn}
                 onChange={(v) => {
                   setNotifyOn(v);
@@ -436,138 +483,73 @@ export function SettingsPage({
               />
             }
           />
-          {notifyOn && (
-            <div className="set-expand">
-              <label className="set-field">
-                推送地址（Webhook）
+          <Row
+            sub
+            title="推送地址（Webhook）"
+            desc="支持任何接受 POST 的地址。"
+            ctrl={
+              <>
                 <input
+                  className="set-input"
                   value={webhook}
                   placeholder="https://…/hook/<key>"
+                  disabled={!notifyOn}
                   onChange={(e) => {
                     const v = e.target.value;
                     setWebhook(v);
                     patch({ notify_webhook: v.trim() });
                   }}
                 />
-              </label>
-              <div className="opt-row">
                 <button
                   className="btn small"
-                  disabled={testing || !webhook.trim()}
+                  disabled={!notifyOn || testing || !webhook.trim()}
                   onClick={() => void doTest()}
                 >
                   {testing ? "发送中…" : "测试推送"}
                 </button>
-                <span className="hint inline">点一下会给这个地址发一条测试消息</span>
-              </div>
-              <Row
-                bare
-                title="定时签到后推送"
-                ctrl={
-                  <Toggle
-                    checked={notifySched}
-                    onChange={(v) => {
-                      setNotifySched(v);
-                      patch({ notify_on_schedule: v });
-                    }}
-                  />
-                }
-              />
-              <Row
-                bare
-                title="手动「全部签到」后推送"
-                ctrl={
-                  <Toggle
-                    checked={notifyManual}
-                    onChange={(v) => {
-                      setNotifyManual(v);
-                      patch({ notify_on_manual: v });
-                    }}
-                  />
-                }
-              />
-              <Row
-                bare
-                title="积分简报生成后推送"
-                desc="每天 24:00（跨零点那一刻）推一条当天汇总；应用当时没在运行，会在下次启动时补推。简报本身的开关在「积分简报」页。"
-                ctrl={
-                  <Toggle
-                    checked={notifyReport}
-                    onChange={(v) => {
-                      setNotifyReport(v);
-                      patch({ notify_on_briefing: v });
-                    }}
-                  />
-                }
-              />
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 应用更新 */}
-      <div className="set-card card">
-        <div className="set-card-head">
-          <span className="set-card-icon">
-            <IconDownload size={20} />
-          </span>
-          <div>
-            <div className="set-card-title">应用更新</div>
-            <div className="set-card-sub">检查并安装来自 GitHub Release 的新版本</div>
-          </div>
-        </div>
-        <div className="set-group">
-          <Row
-            title={version ? `当前版本 v${version}` : "当前版本"}
-            desc={
-              updateVersion
-                ? `后台已发现新版本 v${updateVersion}，点右侧按钮立即更新。`
-                : "应用会自动检查更新，发现新版本会在侧边栏「设置」上点亮一颗小红点。"
-            }
-            ctrl={
-              <button
-                className={`btn small${updateVersion ? " primary" : ""}`}
-                disabled={updateBusy}
-                onClick={() => void doUpdate()}
-              >
-                {updateBusy ? "检查中…" : updateVersion ? "立即更新" : "检查更新"}
-              </button>
+              </>
             }
           />
-          {updateStatus && (
-            <div className="upd-row">
-              <div
-                className={`upd-status ${
-                  updateStatus.status === "error"
-                    ? "err"
-                    : updateStatus.status === "updated"
-                    ? "ok"
-                    : ""
-                }`}
-              >
-                {updateStatus.message}
-              </div>
-              {dl && (
-                <>
-                  {/* 只有拿得到百分比才画条：总量未知时进度条没有可信的长度，
-                      与其摆一条会自己动的不确定态，不如干脆不画（下面照实报字节数）。 */}
-                  {dl.percent !== null && (
-                    <div className="upd-progress-wrap">
-                      <div
-                        className="upd-progress-bar"
-                        style={{ width: `${dl.percent}%` }}
-                      />
-                    </div>
-                  )}
-                  <div className="upd-progress-text">
-                    {dl.percent === null
-                      ? `已下载 ${formatBytes(dl.downloaded)}`
-                      : `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)} · ${dl.percent}%`}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
+          <Row
+            title="定时签到后推送"
+            ctrl={
+              <Switch
+                checked={notifySched}
+                disabled={!notifyOn}
+                onChange={(v) => {
+                  setNotifySched(v);
+                  patch({ notify_on_schedule: v });
+                }}
+              />
+            }
+          />
+          <Row
+            title="手动「全部签到」后推送"
+            ctrl={
+              <Switch
+                checked={notifyManual}
+                disabled={!notifyOn}
+                onChange={(v) => {
+                  setNotifyManual(v);
+                  patch({ notify_on_manual: v });
+                }}
+              />
+            }
+          />
+          <Row
+            title="积分简报生成后推送"
+            desc="每天零点推一条当天汇总；应用未运行则下次启动补推。"
+            ctrl={
+              <Switch
+                checked={notifyReport}
+                disabled={!notifyOn}
+                onChange={(v) => {
+                  setNotifyReport(v);
+                  patch({ notify_on_briefing: v });
+                }}
+              />
+            }
+          />
         </div>
       </div>
 
@@ -579,21 +561,6 @@ export function SettingsPage({
       />
 
       {err && <p className="form-err">{err}</p>}
-      {(saving || saved) && (
-        <div className="set-autosave">
-          {saving ? (
-            <>
-              <span className="spin-dot" />
-              保存中…
-            </>
-          ) : (
-            <>
-              <IconCheck size={14} />
-              修改已自动保存
-            </>
-          )}
-        </div>
-      )}
     </section>
   );
 }

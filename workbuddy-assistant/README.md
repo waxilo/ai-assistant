@@ -2,7 +2,7 @@
 
 一个用 **Tauri v2 + Rust + React** 实现的 WorkBuddy 桌面助手（当前功能：多账号签到），支持：
 
-- **多账号管理**：账号条目**只读展示**（名称 + 手机号 + 凭证有效期 + 剩余积分），不做手工录入与编辑 —— 凭证一律来自「登录新账号」或「导入本机账号」，避免粘贴错 token。删除账号时会一并清理它的签到日志。
+- **多账号管理**：账号条目**只读展示**（名称 + 手机号 + 凭证有效期 + 剩余积分），不做手工录入与编辑 —— 凭证一律来自「添加账号」（本机读取或浏览器登录），避免粘贴错 token。
 - **后台常驻（系统托盘）**：点窗口关闭按钮 = 隐藏到系统托盘，**进程不退出**（定时签到、token 续签、本地反代持续生效）；托盘菜单提供「显示主窗口 / 退出」，macOS 点 Dock 图标也会唤回主窗口。智能接管**实际在监听**时，托盘图标右下角显示绿点、悬浮提示带 `127.0.0.1:端口`；停止接管后自动恢复原图标。再点一次应用图标不会另开一份（单实例守卫，Windows 上尤其明显），而是唤回已有窗口。真正退出请走托盘菜单「退出」（退出时会自动关闭智能接管）。
 - **账号导入 / 导出（跨机器迁移）**：「导出」把全部账号（含 token / refresh_token / 有效期）写成 JSON 文件（落盘权限 0600）；「导入」选择该文件后按「手机号或 token」合并补全，**不会产生重复条目**。导出文件含登录凭证，请妥善保管。
 - **一键签到**：单个账号签到，或「全部签到」批量领取每日积分。
@@ -14,14 +14,14 @@
 - **账号获取（两条通道，无手工录入）**：
   - **导入本机账号**：直接读 WorkBuddy 写在本机的 `CodeBuddyExtension/Data/Public/auth/*.info`，**不需要应用运行、也不需要调试端口**，并且一次就能拿到 token + 昵称 + 手机号 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
   - **登录新账号**：走官方 OAuth state 轮询（`/v2/plugin/auth/state` → 浏览器扫码 → `/v2/plugin/auth/token`），**不重启、不打断当前 WorkBuddy、不改动本机登录文件**，能主动签发**任意新账号**的凭证与昵称/手机号。
-- **智能 host 推断**：根据 JWT 的 `iss` 字段自动判断该用 `workbuddy.cn` / `workbuddy.ai` / `codebuddy.cn` / `codebuddy.ai`。默认 Base URL 为内置常量，**界面不提供修改入口**（改错会让签到打到错误的域）。
+- **智能 host 推断**：根据 JWT 的 `iss` 字段判断该用 `workbuddy.cn` / `codebuddy.cn`；**只支持国内版**，国际版 `*.ai` 已移除。默认 Base URL 为内置常量，**界面不提供修改入口**（改错会让签到打到错误的域）。
 - **GitHub Release 自动更新**：内置 `tauri-plugin-updater`，点击「检查更新」即可从 Release 拉取并安装新版本。
 - **积分日报（按天 + 逐小时）**：按**自然日**统计积分消耗与新增，每天一条，展开可见**每小时**明细（总览柱状图 + 逐账号列表）。
   口径是资源包**累计量**的差值（`CapacityUsed` / `CapacitySize`），不是「抓余额算涨跌」——
   所以同一天「先消耗后签到」不会互相抵消，**多个客户端同时消耗也都能统计到**。
   采样时增量就落进「采样时刻所属的小时」，因此小时之和恒等于当天合计、相邻两天可直接相加。
   数据在应用数据目录的 `credit_ledger.json`（台账 + 60 天小时桶）与 `credit_reports.json`（日报，最近 400 条），均 0600。
-- **签到日志（按账号查看）**：每次签到结果（账号 / 时间 / 结果 / 积分 / 详情）落库到应用数据目录的 `checkin_logs.json`（权限 0600，保留最近 2000 条）。入口在**每个账号条目上的「日志」按钮**，面板按时间倒序简单列出该账号记录，可一键清空。
+- **日志管理**：签到 / 续签 / 通知 / 接管 / 系统五类事件并成一条按时间倒序的统一流水（`app-logs.jsonl` 落盘跨重启，接管动态 `takeover-journal.jsonl` 读取侧合并）。按来源筛选 + 报错横切筛选 + 关键字搜索，每 5 秒轮询；账号条目「日志」按钮跳入并按账号名预填。
 - 跨平台：macOS（`.app` / `.dmg`）与 Windows（`.msi`）。
 
 > 签到逻辑参考自 `workbuddy-checkin` 与 `WorkDaddy` 的 `checkin-result.js`：
@@ -49,22 +49,21 @@ WorkBuddyAssistant/
 │   ├── tauri.conf.json     # 含 updater 配置（endpoint + pubkey）
 │   ├── capabilities/default.json
 │   ├── build.rs
-│   ├── icons/              # 图标套件（由 scripts/make-icon.mjs + tauri icon 生成）
+│   ├── icons/              # 图标套件（唯一源 icon-source.svg，tauri icon 生成）
 │   └── src/
 │       ├── main.rs / lib.rs
 │       ├── accounts.rs     # 多账号 JSON 存储（含 phone；文件权限 0600）
 │       ├── auth_file.rs    # 读本机 WorkBuddy 登录文件（含昵称/手机号）
 │       ├── checkin.rs      # 签到 HTTP 逻辑 + host/iss 推断 + 结果判定 + 剩余积分查询
-│       ├── oauth.rs        # 「登录新账号」无感登录（OAuth state 轮询，纯 HTTP）
+│       ├── oauth.rs        # 「浏览器登录」无感登录（OAuth state 轮询，纯 HTTP）
 │       ├── refresh.rs      # token 续签（refresh token → 新 access token）
 │       ├── notify.rs       # 签到结果推送 webhook（GET ?message=，浏览器 UA + 3 次重试）
 │       ├── scheduler.rs    # 定时自动签到 + 自动续签扫描（后台线程，到点即触发 + 30 分钟补跑 + scheduler.log）
 │       ├── proxy.rs        # 智能接管反代（127.0.0.1 专用透传 + 优先扣费账号/粘滞/最旧积分路由 + /v2 改写）
 │       ├── stealth.rs      # 接管 Fuse：端点装卸、租约、接管事件日志（takeover-journal.jsonl）
 │       ├── netfix.rs       # 网络急救：诊断（含接管事件交叉判定）+ 一键恢复 + 自动备份
-│       ├── logs.rs         # 签到日志存储（JSON，权限 0600，保留最近 2000 条）
+│       ├── logs.rs         # 统一日志流（app-logs.jsonl，五类事件 + 接管动态合并）
 │       └── commands.rs     # Tauri 命令
-├── scripts/make-icon.mjs   # 纯 Node 生成图标源 PNG
 ├── scripts/build-dmg.sh    # 纯 hdiutil 打 dmg（本机缺 create-dmg 模板时的兜底）
 └── .github/workflows/release.yml  # 跨平台自动构建 + 发布 + 更新签名
 ```
@@ -98,13 +97,16 @@ cd src-tauri && cargo test -- --ignored --nocapture
 
 ```bash
 npm install
-node scripts/make-icon.mjs          # 生成图标源 PNG
-npx tauri icon src-tauri/icons/icon-source.png   # 生成各平台图标套件
+npx tauri icon src-tauri/icons/icon-source.svg   # 生成各平台图标套件
 npm run tauri build                 # 产出 src-tauri/target/release/bundle/
 npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不依赖 create-dmg）
 ```
 
 > macOS 首次构建若提示「无法验证开发者」，在「系统设置 → 隐私与安全性」中点「仍要打开」。
+>
+> **图标只有一个源：`src-tauri/icons/icon-source.svg`**。`tauri icon` 用它生成各平台套件，
+> 应用内侧栏品牌标记也直接 import 同一份文件。造型是 WorkBuddy 官方飞鸟 + 助手配色：
+> 深青底、白鸟（官方原版是亮绿底）。改图标只改这一个 SVG，再重跑上面的 `tauri icon`。
 >
 > `tauri build` 结尾若报 **`A public key has been found, but no private key`**：因为
 > `tauri.conf.json` 里已配置 `updater.pubkey`（占位符也算「已配置」）且 `createUpdaterArtifacts=true`，
@@ -161,7 +163,7 @@ GitHub Actions 会在 macOS / Windows 两个 runner 上分别构建、用私钥�
 
 ## 添加账号
 
-工具栏有两个入口：**登录新账号**（加新号）/ **导入本机账号**（读本机已登录的）。
+工具栏只有一个入口「**添加账号**」：弹窗内可切「本机账号」/「浏览器登录」。
 没有「+ 添加账号」——不支持手工粘贴 token，账号条目也不可编辑。
 
 ### 1. 导入本机账号（最省事）
@@ -185,12 +187,12 @@ WorkBuddy 登录成功后会自己把账号与凭证写到本机：
 > 只读，不写回、不外传。这条通道的可行性来自对 WorkDaddy 实现的核对——它切换账号、
 > 签到也全部基于这个文件，而不是从运行中的应用里抓包。
 
-### 2. 登录新账号
+### 2. 浏览器登录
 
-点工具栏「**登录新账号**」（独立入口，不再塞在导入弹窗里）。它走官方的 OAuth state 轮询，
+点工具栏「**添加账号**」，在弹窗里切到「浏览器登录」。它走官方的 OAuth state 轮询，
 **不重启、不打断当前 WorkBuddy，也不改动本机登录文件**，是加第二个 / 第三个账号最省事的路子：
 
-1. 选好**接口域**（国内版 `www.workbuddy.cn` / 国际版 `www.workbuddy.ai` / CodeBuddy 两个域）。
+1. 选择**接口域**（只支持国内版：`www.workbuddy.cn` / `www.codebuddy.cn`）。
    默认会自动跟随你「当前登录」账号所属的域。
 2. 点「打开授权页并开始」→ 本工具请求
    `POST {host}/v2/plugin/auth/state?platform=workbuddy` 拿到 `state`，
@@ -202,7 +204,7 @@ WorkBuddy 登录成功后会自己把账号与凭证写到本机：
    把**昵称 / 手机号 / uid** 一并显示出来；点「添加为账号」入库，或连点「再登一个」继续加号。
 
 > 10 分钟未完成授权会自动判定超时，重新点一次即可。
-> 各区域 host 不能混用——授权与签到都必须打到账号自己所属的域。
+> 国际版 `*.ai` 已不再支持，任何国外域都会退回国内默认域。
 
 ---
 
@@ -220,7 +222,7 @@ WorkBuddy 登录成功后会自己把账号与凭证写到本机：
 - 条目上**没有手动「续签」按钮**——续签完全自动（后台扫描 + 签到前兜底），条目只读。
 - 条目会显示凭证有效期（已过期标红，7 天内提示）。
 - 续签失败**不阻断**签到，仍用旧 token 试一次，由签到结果给出明确提示；
-  若 refresh token 本身已失效，重新「导入本机账号」或「登录新账号」即可。
+  若 refresh token 本身已失效，重新「添加账号」导入或登录一次即可。
 
 ### 为什么不做「浏览器本地存储扫描」与「调试端口抓包」
 
@@ -234,7 +236,7 @@ WorkBuddy 登录成功后会自己把账号与凭证写到本机：
 - **调试端口抓包（CDP）**：需要以 `--remote-debugging-port` 重启 WorkBuddy
   （会关掉正在使用的对话窗口），而且只能拿到**当前登录那一个**账号的 token。
   相比之下「导入本机账号」不重启、不打断、还能一次拿全元信息，
-  「登录新账号」还能主动签发任意新账号——CDP 已无不可替代的用途。
+  「浏览器登录」还能主动签发任意新账号——CDP 已无不可替代的用途。
 
 ---
 
@@ -320,20 +322,20 @@ WorkBuddy 登录成功后会自己把账号与凭证写到本机：
 | 命令 | 说明 |
 | --- | --- |
 | `list_accounts` | 列出全部账号 |
-| `import_accounts` | 批量导入账号（「导入本机账号」/「登录新账号」共用）：已存在账号按手机号或 token 识别后**合并补全**凭证，不会重复添加 |
+| `import_accounts` | 批量导入账号（「添加账号」两条通道共用）：已存在账号按手机号或 token 识别后**合并补全**凭证，不会重复添加 |
 | `export_accounts` / `import_accounts_file` | 账号跨机器迁移：导出全部账号为 JSON（0600 权限落盘）/ 从导出文件导入（同一套合并逻辑） |
-| `remove_account` | 删除账号（同时清理该账号的签到日志） |
+| `remove_account` | 删除账号 |
 | `checkin_one` | 对单个账号签到 |
 | `checkin_all` | 批量签到全部账号 |
 | `discover_local_accounts` | 读取本机 WorkBuddy 登录文件（含昵称/手机号/有效期） |
-| `oauth_start` | 登录新账号第一步：申请 state + 授权链接（不重启应用） |
-| `oauth_poll` | 登录新账号第二步：轮询授权结果；`done=false` 表示仍在等用户授权 |
+| `oauth_start` | 浏览器登录第一步：申请 state + 授权链接（不重启应用） |
+| `oauth_poll` | 浏览器登录第二步：轮询授权结果；`done=false` 表示仍在等用户授权 |
 | `open_external` | 用系统默认浏览器打开链接（授权页） |
 | `get_settings` / `save_settings` | 读写全局设置（保存时校验定时时刻与 webhook） |
 | `test_notify` | 向 webhook 发一条测试通知，返回推送服务原始响应 |
 | `get_autostart` / `set_autostart` | 读取 / 设置开机自启动（直接操作系统登录项，失败会返回原因） |
-| `get_checkin_logs` | 查询签到日志（倒序、可按账号 id 筛选、最多 300 条） |
-| `clear_checkin_logs` | 清空签到日志（传 `accountId` 则只清该账号） |
+| `get_logs` | 日志管理数据源：应用日志 + 接管动态合并成统一流水（倒序） |
+| `clear_logs` | 清空全部日志（应用日志 + 接管动态，不可恢复） |
 | `refresh_all` | 一键刷新：重拉并持久化全部账号的积分快照 / 签到状态 / 积分余量 |
 | `stealth_status` / `stealth_stop` | 读取接管状态（端点是否装上 / 心跳）与立即停止接管（含安全重启） |
 | `proxy_routes` | 最近代理路由记录（账号 / 路径 / 是否流式） |

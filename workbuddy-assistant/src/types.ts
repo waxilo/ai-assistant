@@ -261,20 +261,21 @@ export interface CreditRow extends CreditFact {
   id: string;
 }
 
-export interface CheckinLog {
-  id: string;
-  account_id: string;
-  account_name: string;
-  account_phone: string | null;
+export type LogCategory = "checkin" | "renew" | "notify" | "takeover" | "system";
+
+/**
+ * 「日志管理」里的一条。应用日志来自 `logs.rs`（持久化），接管类来自
+ * `takeover-journal.jsonl` —— 后端 `logs::unified` 已把两路并好并按时间倒序。
+ */
+export interface LogEntry {
   at: string;
-  success: boolean;
-  already: boolean;
-  inactive: boolean;
-  code: number | null;
+  /** 毫秒时间戳：跨来源排序用 */
+  at_ms: number;
+  category: LogCategory;
+  /** 账号名；系统 / 接管类为空串 */
+  account: string;
   message: string;
-  host: string | null;
-  credit: number | null;
-  balance: number | null;
+  success: boolean;
 }
 
 /** 「网络急救」里的一个可疑点 */

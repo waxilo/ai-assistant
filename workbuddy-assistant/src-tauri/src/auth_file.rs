@@ -25,8 +25,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// 官方固定文件名：只有这两份才是 WorkBuddy 真正读取的「当前登录」
-const CANONICAL_FILES: &[&str] = &["workbuddy-desktop.info", "workbuddy-desktop-ai.info"];
+/// 国内版官方固定文件名：只有它才是 WorkBuddy 真正读取的「当前登录」。
+/// 国际版的 `workbuddy-desktop-ai.info` 不在此列 —— 它整个会被丢弃（见 [`is_international`]）。
+const CANONICAL_FILES: &[&str] = &["workbuddy-desktop.info"];
 
 /// 判定 token 下限长度，避免把占位串当作凭证
 const MIN_TOKEN_LEN: usize = 20;
@@ -123,10 +124,15 @@ fn num_at(root: &Value, path: &[&str]) -> Option<i64> {
         .or_else(|| cur.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
 }
 
-/// 把 auth.domain（如 `www.workbuddy.cn`）规整成 origin
+/// 把 auth.domain（如 `www.workbuddy.cn`）规整成 origin。
+/// 国际版 `*.ai` 已不再支持，返回 None（调用方退回国内默认域）。
 fn origin_from_domain(domain: &str) -> Option<String> {
     let d = domain.trim().trim_end_matches('/');
     if d.is_empty() {
+        return None;
+    }
+    let lower = d.to_ascii_lowercase();
+    if lower.contains("workbuddy.ai") || lower.contains("codebuddy.ai") {
         return None;
     }
     if d.starts_with("http://") || d.starts_with("https://") {
@@ -150,6 +156,25 @@ fn num_pick(root: &Value, dir: &str, keys: &[&str]) -> Option<i64> {
 // 解析
 // ---------------------------------------------------------------------------
 
+/// 国际版识别：命中任意一条即整条丢弃 —— 本助手只保留国内版一套部署。
+/// 三个互不依赖的信号：官方 `-ai` 文件名、auth.domain 非 `.cn` 域、token iss 非 CN 网关。
+fn is_international(name: &str, json: &Value, token: &str) -> bool {
+    if name.starts_with("workbuddy-desktop-ai") {
+        return true;
+    }
+    if let Some(d) = pick(json, "auth", &["domain", "issuer"]) {
+        if !d.to_ascii_lowercase().contains(".cn") {
+            return true;
+        }
+    }
+    if let Some(iss) = checkin::token_issuer_origin(token) {
+        if !(iss.contains("workbuddy.cn") || iss.contains("codebuddy.cn")) {
+            return true;
+        }
+    }
+    false
+}
+
 fn parse_json(name: &str, path: &Path, json: &Value) -> Option<LocalAccount> {
     if !json.is_object() {
         return None;
@@ -157,6 +182,9 @@ fn parse_json(name: &str, path: &Path, json: &Value) -> Option<LocalAccount> {
 
     let token = pick(json, "auth", &["accessToken", "access_token", "token"])?;
     if token.len() < MIN_TOKEN_LEN {
+        return None;
+    }
+    if is_international(name, json, &token) {
         return None;
     }
 
@@ -195,7 +223,8 @@ fn parse_file(path: &Path) -> Option<LocalAccount> {
 
 /// 扫描本机 WorkBuddy 登录文件，返回可直接导入的账号列表。
 ///
-/// 同一账号可能同时存在 CN 与 AI 两份文件，按 uid 去重并保留「当前登录」优先的那份；
+/// 国际版账号（`-ai` 文件 / `*.ai` 域 / 非 CN 网关 iss）整条丢弃，只回国内版；
+/// 同一账号的多份快照（官方落盘的带时间戳备份）按 uid 去重，保留「当前登录」优先的那份；
 /// 未过期的排在前面。
 pub fn discover_local_accounts() -> Vec<LocalAccount> {
     let mut found: Vec<LocalAccount> = Vec::new();
@@ -237,6 +266,7 @@ pub fn discover_local_accounts() -> Vec<LocalAccount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use serde_json::json;
 
     fn sample(access_token: &str) -> Value {
@@ -281,14 +311,14 @@ mod tests {
             "auth": {
                 "access_token": "b".repeat(48),
                 "expires_at": "1794410008517",
-                "domain": "www.workbuddy.ai"
+                "domain": "www.codebuddy.cn"
             }
         });
-        let acc = parse_json("workbuddy-desktop-ai.info", Path::new("x.info"), &json).unwrap();
+        let acc = parse_json("workbuddy-desktop-cn.info", Path::new("x.info"), &json).unwrap();
 
         assert_eq!(acc.phone.as_deref(), Some("13800000000"));
         assert_eq!(acc.expires_at, Some(1794410008517));
-        assert_eq!(acc.host.as_deref(), Some("https://www.workbuddy.ai"));
+        assert_eq!(acc.host.as_deref(), Some("https://www.codebuddy.cn"));
     }
 
     #[test]
@@ -300,6 +330,36 @@ mod tests {
         assert!(parse_json("a.info", Path::new("a.info"), &no_token).is_none());
         // 非对象
         assert!(parse_json("a.info", Path::new("a.info"), &json!([1, 2, 3])).is_none());
+    }
+
+    #[test]
+    fn drops_international_accounts() {
+        let token = "a".repeat(64);
+        // 官方 -ai 文件名（含带时间戳的快照变体）
+        let json = sample(&token);
+        assert!(parse_json("workbuddy-desktop-ai.info", Path::new("x"), &json).is_none());
+        assert!(parse_json(
+            "workbuddy-desktop-ai.2026-09-17T10-05-04-510Z.50672.x.info",
+            Path::new("x"),
+            &json
+        )
+        .is_none());
+        // auth.domain 指向国际域
+        let mut ai_domain = sample(&token);
+        ai_domain["auth"]["domain"] = json!("www.workbuddy.ai");
+        assert!(parse_json("someone.info", Path::new("x"), &ai_domain).is_none());
+        // token iss 指向非 CN 网关（domain 字段缺失也得拦住）
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"https://gateway.workbuddy.ai/v1"}"#);
+        let jwt = format!("{}.{}.{}", "x", payload, "y");
+        let iss_ai = json!({
+            "account": { "uid": "u-ai", "nickname": "overseas" },
+            "auth": { "accessToken": jwt }
+        });
+        assert!(iss_ai["auth"]["accessToken"].as_str().unwrap().len() >= MIN_TOKEN_LEN);
+        assert!(parse_json("someone.info", Path::new("x"), &iss_ai).is_none());
+        // 对照：国内域照常解析
+        assert!(parse_json("workbuddy-desktop.info", Path::new("x"), &sample(&token)).is_some());
     }
 
     #[test]
@@ -322,9 +382,12 @@ mod tests {
             Some("https://www.workbuddy.cn")
         );
         assert_eq!(
-            origin_from_domain("https://www.workbuddy.ai/").as_deref(),
-            Some("https://www.workbuddy.ai")
+            origin_from_domain("https://www.codebuddy.cn/").as_deref(),
+            Some("https://www.codebuddy.cn")
         );
+        // 国际版已移除：*.ai 不再产出 host
+        assert_eq!(origin_from_domain("https://www.workbuddy.ai/"), None);
+        assert_eq!(origin_from_domain("www.codebuddy.ai"), None);
         assert_eq!(origin_from_domain("   "), None);
     }
 

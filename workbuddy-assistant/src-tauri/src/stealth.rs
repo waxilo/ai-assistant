@@ -527,15 +527,22 @@ fn merge_install_restart(events: Vec<JournalEvent>) -> Vec<JournalEvent> {
 }
 
 /// 清空接管动态（不可恢复）：把事件日志文件截断为空。
+pub fn journal_clear(data_dir: &Path) {
+    // 与追加共用一把锁：否则「清空」和并发写入可能交叉，留下半条记录
+    let _guard = lock_journal();
+    let path = journal_path(data_dir);
+    if path.exists() {
+        if let Err(e) = fs::write(&path, "") {
+            eprintln!("[接管动态] 清空失败：{e}");
+        }
+    }
+}
+
+/// 清空接管动态（不可恢复）：把事件日志文件截断为空。
 #[tauri::command]
 pub fn takeover_events_clear(app: tauri::AppHandle) -> Result<(), String> {
     let dir = crate::commands::try_data_dir(&app)?;
-    // 与追加共用一把锁：否则「清空」和并发写入可能交叉，留下半条记录
-    let _guard = lock_journal();
-    let path = journal_path(&dir);
-    if path.exists() {
-        fs::write(&path, "").map_err(|e| format!("清空接管动态失败：{e}"))?;
-    }
+    journal_clear(&dir);
     Ok(())
 }
 

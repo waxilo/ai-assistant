@@ -12,10 +12,12 @@ import {
   needsRelogin,
   type SignState,
 } from "../common";
-import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, useCredits, seedCredits } from "../credits";
+import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, soonestExpiringTotal, useCredits, seedCredits } from "../credits";
 import { refreshAccountCredits } from "../api";
 import { Dialog } from "../components/Dialog";
 import {
+  IconBolt,
+  IconCircleCheck,
   IconCloud,
   IconFile,
   IconLink,
@@ -24,8 +26,10 @@ import {
   IconUnlink,
   IconUpload,
   IconUser,
+  IconUsers,
   IconRefresh,
   IconSwap,
+  IconClock,
 } from "../components/Icons";
 
 /** 账号签到状态 → 状态圆点文案（圆点本身的视觉由 common 的 StatusDot 统一提供） */
@@ -41,7 +45,7 @@ const STATUS_LABEL: Record<SignState, string> = {
  * 首页：账号列表 + 签到操作。
  *
  * 账号**没有**「添加 / 编辑」入口：条目只是给用户看的，凭证一律来自
- * 页头「登录新账号」（OAuth）或「导入本机账号」（本机登录文件），避免手工粘贴 token 出错。
+ * 页头「添加账号」（本机登录文件或 OAuth），避免手工粘贴 token 出错。
  */
 export function AccountsPage({
   accounts,
@@ -96,47 +100,77 @@ export function AccountsPage({
   if (loading)
     return (
       <section className="panel-page">
-        <p className="empty">加载中…</p>
+        <div className="card">
+          <p className="empty">加载中…</p>
+        </div>
       </section>
     );
   if (accounts.length === 0)
     return (
       <section className="panel-page">
         {poolBar}
-        <EmptyState
-          icon={<IconUser size={26} />}
-          title="还没有账号"
-          hint="点页头「登录新账号」用系统浏览器扫码登录，或点「导入本机账号」直接读取 WorkBuddy 写在本机的登录信息（自动带上昵称与手机号）。如果别的机器上已经有一池，也可以直接从上面「绑定云端凭证池」。"
-        />
+        <div className="card">
+          <EmptyState
+            icon={<IconUser size={26} />}
+            title="还没有账号"
+            hint="从页头「添加账号」接入，也可以绑定云端凭证池。"
+          />
+        </div>
       </section>
     );
 
   const total = accounts.length;
   const done = accounts.filter((a) => signState(a, false) === "done").length;
-  const pending = total - done;
   const credits = totalCredits(book, accounts);
+  // 「即将过期」= 最近一个到期日到期的所有资源包剩余积分之和（与行内天数同一判据）
+  const expiringSoon = soonestExpiringTotal(book, accounts);
 
   return (
     <>
-    <section className="panel-page">
+    <section className="panel-page accounts-page">
       {poolBar}
 
       <div className="summary">
-        <div className="sum-card card">
-          <span className="sum-label">账号总数</span>
-          <span className="sum-num">{total}</span>
+        <div className="card sum-card">
+          <span className="sum-icon">
+            <IconUsers size={17} />
+          </span>
+          <div className="sum-label">账号总数</div>
+          <div className="sum-num">{total}</div>
         </div>
-        <div className="sum-card card">
-          <span className="sum-label">今日已签到</span>
-          <span className="sum-num ok">{done}</span>
+        <div className="card sum-card tone-ok">
+          <span className="sum-icon">
+            <IconCircleCheck size={17} />
+          </span>
+          <div className="sum-label">今日已签到</div>
+          <div className="sum-num ok">{done}</div>
         </div>
-        <div className="sum-card card">
-          <span className="sum-label">待签到</span>
-          <span className="sum-num">{pending}</span>
+        <div
+          className="card sum-card tone-warn"
+          title={
+            expiringSoon === null
+              ? "没有尚未到期的资源包"
+              : `最近一日到期的资源包剩余积分合计（${
+                  expiringSoon.daysUntil === 0
+                    ? "今天"
+                    : `${expiringSoon.daysUntil} 天后`
+                }）`
+          }
+        >
+          <span className="sum-icon">
+            <IconClock size={17} />
+          </span>
+          <div className="sum-label">即将过期</div>
+          <div className="sum-num warn">
+            {formatCredits(expiringSoon?.total ?? null)}
+          </div>
         </div>
-        <div className="sum-card card">
-          <span className="sum-label">总积分</span>
-          <span className="sum-num">{formatCredits(credits)}</span>
+        <div className="card sum-card feature">
+          <span className="sum-icon">
+            <IconBolt size={17} />
+          </span>
+          <div className="sum-label">总积分</div>
+          <div className="sum-num">{formatCredits(credits)}</div>
         </div>
       </div>
 
@@ -145,11 +179,10 @@ export function AccountsPage({
           <thead>
             <tr>
               <th>账号</th>
-              <th className="num">剩余积分</th>
-              <th className="num">积分过期</th>
+              <th className="num">积分</th>
               {/* 次要列：窄窗口下收起（见 responsive.css）。
                   滚动条已全局隐藏，横向溢出就是静默截断，所以窄窗必须真的不溢出；
-                  Token 过期在签到日志 / 弹窗里都有，是这一行里最该让位的一列。 */}
+                  Token 过期在日志管理 / 弹窗里都有，是这一行里最该让位的一列。 */}
               <th className="col-secondary">Token 过期</th>
               <th>状态</th>
               <th className="col-actions">操作</th>
@@ -172,46 +205,50 @@ export function AccountsPage({
                   </td>
                   <td className="num">
                     {bal != null ? (
-                      <span className={"ac-balance" + (low ? " low" : "")}>
+                      <span
+                        className={"ac-credits clickable" + (low ? " low" : "")}
+                        title="查看资源包"
+                        onClick={() => setPkgAccount(a)}
+                      >
                         {formatCredits(bal)}
                       </span>
                     ) : (
                       <span className="muted">—</span>
                     )}
-                  </td>
-                  <td className="ac-cell-expiry num">
+                    {/* 积分与过期合在一列：到期时间就是「智能接管先扣谁」的第一排序键。
+                        整行可点，打开逐资源包列表。 */}
                     {soon ? (
                       <span
-                        className="ac-expiry clk"
-                        title="点开看逐资源包列表；智能接管优先使用到期最早的积分"
+                        className="sub clickable"
+                        title="查看资源包"
                         onClick={() => setPkgAccount(a)}
                       >
                         {`${soon.daysUntil} 天后过期 ${formatCredits(soon.remaining)}`}
                       </span>
                     ) : e.text === "—" ? (
                       <span
-                        className="muted clk"
-                        title="没有到期的额度信息，可点击查看资源包列表"
+                        className="sub clickable"
+                        title="查看资源包"
                         onClick={() => setPkgAccount(a)}
                       >
                         查看资源包
                       </span>
                     ) : (
                       <span
-                        className={"ac-expiry clk" + (e.expired ? " expired" : "")}
-                        title="点开看逐资源包列表；智能接管优先使用到期最早的积分"
+                        className={"sub clickable" + (e.expired ? " bad" : "")}
+                        title="查看资源包"
                         onClick={() => setPkgAccount(a)}
                       >
                         {e.text}
                       </span>
                     )}
                   </td>
-                  <td className="ac-cell-expiry col-secondary">
+                  <td className="col-secondary">
                     {needsRelogin(a.rt_expires_at) ? (
                       // 链死了：显示时间只会让人以为「等它自动续上就好」，而它已经续不动了
                       <span
-                        className="ac-expiry expired"
-                        title="refresh token 已过有效期，自动续签换不出新凭证，只能重新登录这个账号"
+                        className="sub bad"
+                        title="登录已失效，需重新登录"
                       >
                         需重新登录
                       </span>
@@ -219,7 +256,7 @@ export function AccountsPage({
                       <span className="muted">—</span>
                     ) : (
                       <span
-                        className={"ac-expiry" + (tok.expired ? " expired" : "")}
+                        className={"sub" + (tok.expired ? " bad" : "")}
                         title={tok.expired ? `已于 ${tok.at} 过期` : `${tok.at} 过期`}
                       >
                         {tok.text}
@@ -229,34 +266,36 @@ export function AccountsPage({
                   <td>
                     <StatusDot tone={st} label={STATUS_LABEL[st]} />
                   </td>
-                  <td className="ac-cell-actions">
-                    <button
-                      className="btn small primary"
-                      disabled={busy}
-                      onClick={() => onCheckinOne(a.id)}
-                    >
-                      {busy ? (
-                        <>
-                          <IconRefresh size={14} className="spin" /> 签到中
-                        </>
-                      ) : (
-                        "签到"
-                      )}
-                    </button>
-                    <button
-                      className="icon-btn"
-                      title="查看签到日志"
-                      onClick={() => onOpenLogs(a.id)}
-                    >
-                      <IconFile size={16} />
-                    </button>
-                    <button
-                      className="icon-btn icon-danger"
-                      title="删除账号"
-                      onClick={() => onRemove(a)}
-                    >
-                      <IconTrash size={16} />
-                    </button>
+                  <td className="col-actions">
+                    <div className="ac-cell-actions">
+                      <button
+                        className="btn small primary"
+                        disabled={busy}
+                        onClick={() => onCheckinOne(a.id)}
+                      >
+                        {busy ? (
+                          <>
+                            <IconRefresh size={14} className="spin" /> 签到中
+                          </>
+                        ) : (
+                          "签到"
+                        )}
+                      </button>
+                      <button
+                        className="icon-btn"
+                        title="查看签到日志"
+                        onClick={() => onOpenLogs(a.id)}
+                      >
+                        <IconFile size={16} />
+                      </button>
+                      <button
+                        className="icon-btn icon-danger"
+                        title="删除账号"
+                        onClick={() => onRemove(a)}
+                      >
+                        <IconTrash size={16} />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );
@@ -324,11 +363,13 @@ function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>
     : "";
 
   return (
-    <div>
+    <div className="pkg-list-body">
       <div className="pkg-dialog-bar">
-        <span className="note" style={{ margin: 0 }}>
-          {note}
-        </span>
+        {note && (
+          <span className={`note pkg-note${err ? " danger" : ""}`}>
+            <span>{note}</span>
+          </span>
+        )}
         <button
           className="btn small"
           disabled={refreshing}
@@ -340,9 +381,7 @@ function PkgListAccount({ book, account }: { book: ReturnType<typeof useCredits>
         </button>
       </div>
       {packs.length === 0 ? (
-        <p className="note" style={{ margin: 0 }}>
-          这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
-        </p>
+        <p className="note pkg-empty">暂无可用的资源包数据。</p>
       ) : (
         <div className="table-wrap">
           <table className="data-table">
@@ -402,7 +441,7 @@ function CopyChip({ uuid }: { uuid: string }) {
   return (
     <button
       type="button"
-      className={`chip mono${state === "ok" ? " chip-ok" : ""}`}
+      className={`pool-chip${state === "ok" ? " ok" : ""}`}
       title={`点一下复制完整 uuid：${uuid}`}
       onClick={async () => setState((await copyText(uuid)) ? "ok" : "err")}
     >
@@ -443,18 +482,20 @@ function PoolBar({
     // 错误优先：出过错的绑定状态比「已绑定」更该被看见
     if (status?.error) return status.error;
     if (bound) {
-      return `本机这 ${accountCount} 个账号与云端共用，续签仍在本机执行${syncNote(status)}`;
+      return `本机 ${accountCount} 个账号与云端共用${syncNote(status)}`;
     }
     if (accountCount === 0) {
-      return "本机还没有账号。别的机器上已有的话，直接绑定它那串 uuid 即可把账号接过来。";
+      return "绑定别的机器上的池即可接入账号。";
     }
-    return `把本机这 ${accountCount} 个账号放到云端，其他机器绑定同一串 uuid 就能共用（续签始终在本机执行）`;
+    return `上传本机 ${accountCount} 个账号，供其他机器绑定共用`;
   })();
 
   return (
     <div className="pool-bar card">
       <span className="pool-bar-title">
-        <IconCloud size={15} />
+        <span className="pool-bar-icon">
+          <IconCloud size={16} />
+        </span>
         云端凭证池
       </span>
       <span className={`pool-bar-note${status?.error ? " err" : ""}`} title={note}>
@@ -468,7 +509,7 @@ function PoolBar({
               className="btn small"
               disabled={busy}
               onClick={onSync}
-              title="双向同步一轮：云端更新的票与账号拉到本机，本机更新的票与账号回写云端（绕过两分钟节流；闸在别的机器手里会跳过）"
+              title="与云端双向同步"
             >
               <IconSwap size={13} />
               同步
@@ -477,7 +518,7 @@ function PoolBar({
               className="btn small danger"
               disabled={busy}
               onClick={onUnbind}
-              title="摘掉本机绑定（云端那一池保留，其他机器不受影响）；本机与云端重复的凭证会从本机移除"
+              title="摘掉本机绑定，云端那一池保留"
             >
               <IconUnlink size={13} />
               解绑
@@ -492,7 +533,7 @@ function PoolBar({
               title={
                 accountCount === 0
                   ? "本机还没有账号可上传"
-                  : "在云端新建一池并把本机账号放进去，之后会给你一串 uuid"
+                  : "新建一池并上传本机账号"
               }
             >
               <IconUpload size={13} />

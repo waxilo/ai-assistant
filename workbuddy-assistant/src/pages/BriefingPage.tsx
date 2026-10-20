@@ -12,8 +12,16 @@ import { AccountCell, EmptyState, formatCredits } from "../common";
 import { latestAt, totalCredits, useCredits } from "../credits";
 import type { ConfirmReq, Toast } from "../common";
 import { Dialog } from "../components/Dialog";
-import { Toggle } from "../components/SettingsControls";
-import { IconActivity, IconClock, IconInfo, IconTrash } from "../components/Icons";
+import Switch from "../components/Switch";
+import {
+  IconActivity,
+  IconBolt,
+  IconCircleCheck,
+  IconClock,
+  IconInfo,
+  IconList,
+  IconTrash,
+} from "../components/Icons";
 
 /** 小时写成 `09:00`：补零之后整列数字才对得齐 */
 const hh = (h: number) => `${String(h).padStart(2, "0")}:00`;
@@ -120,9 +128,7 @@ export function BriefingPage({
       const ok = await askConfirm({
         title: "开启积分简报",
         body:
-          "开启后会清空已有的简报历史（时条目与台账里的小时明细），从此刻重新开始累积。\n\n" +
-          "清掉的只是「明细」：账号的累计积分不受影响，之后每小时会结算一条时条目，" +
-          "日条目由当天时条目相加得出。",
+          "开启后会清空已有的简报历史，从此刻重新开始累积。账号累计积分不受影响。",
         okText: "开启并重新开始",
       });
       if (!ok) return;
@@ -138,10 +144,6 @@ export function BriefingPage({
       onSettings(saved);
       setOn(next);
       void refresh();
-      onToast({
-        kind: "ok",
-        text: next ? "简报已开启，从现在起按小时结算" : "简报已关闭，不再生成新条目",
-      });
     } catch (e) {
       setOn(!next);
       onToast({ kind: "err", text: "操作失败：" + String(e) });
@@ -154,8 +156,7 @@ export function BriefingPage({
     const ok = await askConfirm({
       title: "清空积分简报",
       body:
-        "确认清空全部简报历史？时条目会与台账里的小时明细一起清掉 —— " +
-        "只清条目的活，下一次结算会把它们原样重建出来。账号的累计积分不受影响。",
+        "确认清空全部简报历史？此操作不可恢复，账号累计积分不受影响。",
       okText: "清空",
       danger: true,
     });
@@ -164,7 +165,6 @@ export function BriefingPage({
       await clearCreditBriefing();
       setDays([]);
       setOpenDate(null);
-      onToast({ kind: "ok", text: "简报已清空" });
     } catch (e) {
       onToast({ kind: "err", text: "清空失败：" + String(e) });
     }
@@ -172,20 +172,9 @@ export function BriefingPage({
 
   return (
     <section className="panel-page">
-      <p className="set-intro">
-        <IconInfo size={14} />
-        <span>
-          后台<b>每小时</b>结算一条时条目：整点前采一次样，整点一过就把这一个小时
-          固化成一条记录。<b>日条目是当天时条目之和</b>，所以「日 = 时」永远对得上。
-          消耗与新增都按资源包的<b>累计量</b>取差值，多个客户端同时消耗也都算得进来。
-          应用没运行的时段不会采样，那几格是空的；恢复运行后的第一次采样会把这段
-          攒下的量整块记进恢复后的那个小时。
-        </span>
-      </p>
-
-      <div className="card logs-toolbar">
+      <div className="card bp-toolbar">
         <label className="bp-toggle" title="开启后每小时结算一条时条目；关闭则停止生成">
-          <Toggle
+          <Switch
             checked={on}
             disabled={toggleBusy}
             onChange={(v) => void doToggle(v)}
@@ -219,15 +208,8 @@ export function BriefingPage({
         </button>
       </div>
 
-      {!on && (
-        <p className="set-intro">
-          <IconInfo size={14} />
-          <span>
-            简报已关闭，不会再结算新的条目；已有的记录仍保留，你随时可以重新开启。
-            重新开启时会清掉旧历史并<b>从此刻重新开始</b>，避免把关闭这段时间的量
-            算进开启后的第一个小时。
-          </span>
-        </p>
+      {!on && days.length > 0 && (
+        <p className="hint">简报已关闭，已有记录仍保留。</p>
       )}
 
       {loading ? (
@@ -238,37 +220,57 @@ export function BriefingPage({
           title={on ? "还没有简报" : "简报未开启"}
           hint={
             on
-              ? "已经开启，正在按小时累积。整点过后就会出现第一条时条目 —— 应用保持运行才会采样，跑满一小时即可看到。"
-              : "用上方的开关开启：开启后从此刻重新开始累积，每小时结算一条时条目。"
+              ? "整点后出现第一条时条目；应用需保持运行。"
+              : "用上方开关开启，从此刻开始累积。"
           }
         />
       ) : (
         <>
           <div className="summary">
-            <div className="sum-card card hoverable">
-              <span className="sum-label">
-                最近一天消耗{latest ? `（${latest.date}）` : ""}
+            <div
+              className="sum-card card feature"
+              title={latest ? `${latest.date} 的消耗合计` : undefined}
+            >
+              <span className="sum-icon">
+                <IconActivity size={17} />
               </span>
+              <span className="sum-label">最近一天消耗</span>
               <span className="sum-num bp-consumed">
                 {formatCredits(latest?.consumed ?? null)}
               </span>
             </div>
-            <div className="sum-card card hoverable">
-              <span className="sum-label">
-                最近一天新增{latest ? `（${latest.date}）` : ""}
+            <div className="sum-card card tone-ok">
+              <span className="sum-icon">
+                <IconBolt size={17} />
+              </span>
+              <span
+                className="sum-label"
+                title={latest ? latest.date : undefined}
+              >
+                最近一天新增
               </span>
               <span className="sum-num ok">
                 {formatCredits(latest?.gained ?? null)}
               </span>
             </div>
-            <div className="sum-card card hoverable">
-              <span className="sum-label">累计消耗（{days.length} 天）</span>
+            <div className="sum-card card">
+              <span className="sum-icon">
+                <IconList size={17} />
+              </span>
+              <span className="sum-label" title={`最近 ${days.length} 天累计`}>
+                累计消耗
+              </span>
               <span className="sum-num bp-consumed">
                 {formatCredits(lifetime.consumed)}
               </span>
             </div>
-            <div className="sum-card card hoverable">
-              <span className="sum-label">累计新增（{days.length} 天）</span>
+            <div className="sum-card card tone-ok">
+              <span className="sum-icon">
+                <IconCircleCheck size={17} />
+              </span>
+              <span className="sum-label" title={`最近 ${days.length} 天累计`}>
+                累计新增
+              </span>
               <span className="sum-num ok">{formatCredits(lifetime.gained)}</span>
             </div>
           </div>
@@ -378,9 +380,7 @@ function DayHours({
         );
       })}
       <p className="brief-hint">
-        只统计应用运行期间；没有采样的时段不会出现在这里。整行都可以点开，看这一小时
-        <b>每个账号</b>的扣费与余额。带「起点基准」的那条是<b>开启简报那一刻</b>
-        的余额读数（消耗与新增都从那一刻开始算），下一小时那条就能和它对着看。
+        只统计应用运行期间；点整行查看每个账号的明细。「起点基准」是开启简报那一刻的余额读数。
       </p>
     </div>
   );
@@ -416,6 +416,7 @@ function HourDialog({
           : `${entry.date} ${hh(entry.hour)} – ${next}`
       }
       label={`${entry.date} ${hh(entry.hour)} 扣费明细`}
+      fixedBodyHeight={360}
       onClose={onClose}
       footer={
         <button className="btn" onClick={onClose}>
@@ -426,17 +427,9 @@ function HourDialog({
       <p className="note">
         <IconInfo size={14} />
         {entry.baseline ? (
-          <span>
-            这条是<b>开启简报那一刻</b>的起点基准：消耗与新增都从这一刻开始统计，
-            所以都是 0；下面列的是当时各账号读到的余额。下一小时那条可以和它对着看。
-          </span>
+          <span>开启简报那一刻的余额读数，消耗与新增从这一刻起算。</span>
         ) : (
-          <span>
-            消耗与新增都取自资源包的<b>累计量</b>差值（消耗量 / 授予量各自独立），
-            所以这段时间里哪怕换了客户端、或者先花后得，也都不会被抹平。
-            有变化的按扣费降序排在前面；这一小时采到余额的其它账号也列在下面
-            （扣费与新增显示 —），这样「剩余」覆盖的是<b>全部账号</b>。
-          </span>
+          <span>按扣费降序排列；显示 — 的账号本小时无变化，仅记录余额。</span>
         )}
       </p>
 

@@ -89,8 +89,41 @@ export function soonestExpiry(book: CreditBook, id: string) {
   const now = Date.now();
   const pkgs = packagesOf(book, id).filter((p) => p.expiry_ms != null && p.expiry_ms > now);
   if (pkgs.length === 0) return null;
-  const p = pkgs[0];
+  const p = pkgs.reduce((a, b) => (b.expiry_ms! < a.expiry_ms! ? b : a));
   return { daysUntil: Math.ceil((p.expiry_ms! - now) / 86_400_000), remaining: p.remaining };
+}
+
+/**
+ * 「即将过期」汇总：全部账号里最近一个到期日（按天向上取整，与行内「N 天后过期」
+ * 同一条判据）当天到期的所有资源包剩余积分之和。
+ *
+ * 没有任何未过期资源包 → `null`（界面显示「—」，不把「不知道」写成 0）。
+ */
+export function soonestExpiringTotal(
+  book: CreditBook,
+  accounts: Account[]
+): { total: number; daysUntil: number } | null {
+  const now = Date.now();
+  const daysOf = (ms: number) => Math.ceil((ms - now) / 86_400_000);
+
+  let soonest = Infinity;
+  for (const a of accounts) {
+    for (const p of packagesOf(book, a.id)) {
+      if (p.expiry_ms == null || p.expiry_ms <= now) continue;
+      if (p.expiry_ms < soonest) soonest = p.expiry_ms;
+    }
+  }
+  if (!isFinite(soonest)) return null;
+
+  const daysUntil = daysOf(soonest);
+  let total = 0;
+  for (const a of accounts) {
+    for (const p of packagesOf(book, a.id)) {
+      if (p.expiry_ms == null || p.expiry_ms <= now) continue;
+      if (daysOf(p.expiry_ms) === daysUntil) total += p.remaining;
+    }
+  }
+  return { total: Math.round(total * 100) / 100, daysUntil };
 }
 
 /**

@@ -13,8 +13,8 @@
 //! 相比「导入本机账号」（[`crate::auth_file`]）：那条通道只能拿到本机**已经登录过**的账号，
 //! 而这条能主动签发**任意新账号**的凭证；代价是需要用户在浏览器里完成一次授权。
 //!
-//! host 必须打到账号自己所属的域（国内 `www.workbuddy.cn`，国际 `www.workbuddy.ai`），
-//! 不能混用——这也是 WorkDaddy 用 `auth.domain` 区分 apiHost 的原因。
+//! host 只支持国内官方域（`www.workbuddy.cn` / `www.codebuddy.cn`），
+//! 不提供国际版（`*.ai`）适配；无法识别的域一律退回 `www.workbuddy.cn`。
 
 use serde::Serialize;
 use serde_json::Value;
@@ -29,6 +29,12 @@ const OAUTH_TIMEOUT_SECS: u64 = 600;
 /// 出结果后再保留一段，避免前端收尾时的重复轮询直接报「请求不存在」
 const RESULT_RETENTION_SECS: u64 = 300;
 const DEFAULT_HOST: &str = "https://www.workbuddy.cn";
+
+/// 国外域（`*.ai`）：已不再支持。调用方遇到时应退回国内默认域。
+pub fn is_foreign_host(input: &str) -> bool {
+    let raw = input.trim().to_ascii_lowercase();
+    raw.contains("workbuddy.ai") || raw.contains("codebuddy.ai")
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct OAuthStart {
@@ -104,12 +110,13 @@ fn sweep(map: &mut HashMap<String, Pending>) {
     });
 }
 
-/// 把用户输入/账号 base_url 归一化成官方 API host。
+/// 把用户输入/账号 base_url 归一化成国内官方 API host。
 ///
-/// 只认四个官方域；无法识别时退回国内版 `www.workbuddy.cn`。
+/// 只认国内官方域（WorkBuddy / CodeBuddy CN）；国际版 `*.ai` 与任何未知域
+/// 一律退回 `www.workbuddy.cn`。
 pub fn normalize_host(input: Option<&str>) -> String {
     let raw = input.unwrap_or("").trim().trim_end_matches('/').to_lowercase();
-    if raw.is_empty() {
+    if raw.is_empty() || is_foreign_host(&raw) {
         return DEFAULT_HOST.to_string();
     }
     let bare = raw
@@ -120,9 +127,7 @@ pub fn normalize_host(input: Option<&str>) -> String {
         .unwrap_or("")
         .trim_start_matches("www.");
     let domain = match bare {
-        "workbuddy.ai" => "workbuddy.ai",
         "codebuddy.cn" => "codebuddy.cn",
-        "codebuddy.ai" => "codebuddy.ai",
         _ => "workbuddy.cn",
     };
     format!("https://www.{domain}")
@@ -461,15 +466,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn normalizes_hosts_to_official_domains() {
+    fn normalizes_hosts_to_domestic_domains() {
         assert_eq!(normalize_host(None), "https://www.workbuddy.cn");
         assert_eq!(normalize_host(Some("")), "https://www.workbuddy.cn");
         assert_eq!(normalize_host(Some("workbuddy.cn")), "https://www.workbuddy.cn");
-        assert_eq!(normalize_host(Some("www.workbuddy.ai")), "https://www.workbuddy.ai");
+        // 国际版已不再支持：任何 *.ai 都退回国内版
+        assert_eq!(normalize_host(Some("www.workbuddy.ai")), "https://www.workbuddy.cn");
         assert_eq!(
             normalize_host(Some("https://www.workbuddy.ai/")),
-            "https://www.workbuddy.ai"
+            "https://www.workbuddy.cn"
         );
+        assert_eq!(normalize_host(Some("codebuddy.ai")), "https://www.workbuddy.cn");
         assert_eq!(normalize_host(Some("codebuddy.cn")), "https://www.codebuddy.cn");
         // 未知域一律退回国内版，避免把请求打到任意 host
         assert_eq!(normalize_host(Some("evil.example.com")), "https://www.workbuddy.cn");
@@ -602,7 +609,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn smoke_real_oauth_state_and_waiting_poll() {
-        for host in ["https://www.workbuddy.cn", "https://www.workbuddy.ai"] {
+        for host in ["https://www.workbuddy.cn", "https://www.codebuddy.cn"] {
             let s = start(Some(host.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("[{host}] auth/state 失败: {e}"));

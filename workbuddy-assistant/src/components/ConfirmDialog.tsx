@@ -54,7 +54,7 @@ export function ConfirmDialog({
         </>
       }
     >
-      {req.body && <p className="modal-text">{req.body}</p>}
+      {req.body && <p className="confirm-body">{req.body}</p>}
     </Dialog>
   );
 }
