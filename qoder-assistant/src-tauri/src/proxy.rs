@@ -18,11 +18,15 @@
 //!    `metadata.context.session_id` 兜底。没有会话标识的请求（模型清单、遥测等）
 //!    不属于任何对话，按单次请求的积分排序选号。
 //! 2. **限流无感切换**：免费模型（清单与免费判定见 [`crate::models`] —— 三层来源：
-//!    Qoder 官方目录 / 落盘快照 / 本机痕迹，**绝不退回写死的模型名**）触发限流（429）时，把
+//!    Qoder 官方目录 / 落盘快照 / 本机痕迹，**绝不退回写死的模型名**）触发限流时，把
 //!    **「该账号 × 该模型」**冷却到上游给出的重置时刻，换下一个账号重发同一请求
-//!    （上限 2 次切换）。付费模型的 429 原样透传。冷却的粒度与时间节点见
-//!    `RateKey` / `limit_until_ms`。这种切换只是**同一请求内的临时绕行**：会话绑定
-//!    仍是原账号，下一轮请求照旧先回到它——「一个会话只选一个」不因限流而改变。
+//!    （上限 2 次切换）。付费模型原样透传。限流有两种到达方式：HTTP 429，以及 Qoder
+//!    对话网关更常见的 **HTTP 200 + SSE 错误帧**（`{"statusCodeValue":…,"body":"{…code…}"}`，
+//!    今日额度用完的内层码是 110）。两种都在写响应头之前识别，识别不到内层错误就会
+//!    表现为「客户端弹限流、代理却当成功透传」——这正是 2026-10-20 的故障。冷却的粒度与
+//!    时间节点见 `RateKey` / `limit_until_ms`；额度码没给时刻时冷却到次日零点。这种切换
+//!    只是**同一请求内的临时绕行**：会话绑定仍是原账号，下一轮请求照旧先回到它——「一个
+//!    会话只选一个」不因限流而改变。
 //! 3. **续签兜底**：选中的账号若凭证临近过期（<48h）会先自动续签。
 //! 4. **转发**：路径与查询串原样保留，替换 `Authorization` 为选中账号的 token，
 //!    去掉逐跳头（Host / Content-Length 等）后透传其余请求头。
@@ -180,6 +184,13 @@ const RATE_LIMIT_MIN: Duration = Duration::from_secs(30);
 /// 冷却时长上限：解析结果再离谱也不能把账号锁死超过一天
 const RATE_LIMIT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// SSE 错误帧预读：最多缓存这么多字节去找一个完整的错误帧。
+/// 实测错误帧只有几百字节；正常首帧也不会到这个量级，超了就直接原样透传。
+const SSE_PEEK_MAX: usize = 64 * 1024;
+/// SSE 错误帧预读的等待上限。今日额度错误在响应头之后立刻到达；
+/// 等不到就说明这是正常流，不能再扣着不转发。
+const SSE_PEEK_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// 限流冷却的存储键：**账号 × 模型**。
 ///
 /// 键必须带模型。实测（2026-09-14，**WorkBuddy 时代**的抓包，模型名是那套网关的）：
@@ -202,14 +213,19 @@ enum LimitSource {
     RetryAfter,
     /// `X-RateLimit-Reset` 一类响应头
     ResetHeader,
+    /// 额度类错误没给时刻 → 按「次日零点」推算（今日额度用完就等明天）
+    DailyReset,
     /// 上游没给 → 兜底时长
     Fallback,
 }
 
 impl LimitSource {
-    /// 这个时刻是不是上游真给的（否则是兜底算的，日志要说明）
+    /// 这个时刻是不是上游真给的（否则是本地推算/兜底，日志要说明）
     fn from_upstream(self) -> bool {
-        self != LimitSource::Fallback
+        matches!(
+            self,
+            LimitSource::Body | LimitSource::RetryAfter | LimitSource::ResetHeader
+        )
     }
 }
 
@@ -281,10 +297,15 @@ fn set_cooldown(
 /// 日志里那半句「冷却 …」：带解禁时刻与来源的可读说明
 fn cooldown_note(entry: CooldownEntry) -> String {
     let mins = ((entry.until_ms - now_ms()).max(0) as f64 / 60_000.0).ceil() as i64;
-    if entry.source.from_upstream() {
-        format!("至 {}（约 {mins} 分钟）", until_text(entry.until_ms))
-    } else {
-        format!("（上游未给重置时刻，按兜底 {mins} 分钟）")
+    match entry.source {
+        LimitSource::DailyReset => {
+            format!(
+                "至 {}（今日额度已用尽，按次日重置）",
+                until_text(entry.until_ms)
+            )
+        }
+        s if s.from_upstream() => format!("至 {}（约 {mins} 分钟）", until_text(entry.until_ms)),
+        _ => format!("（上游未给重置时刻，按兜底 {mins} 分钟）"),
     }
 }
 
@@ -299,6 +320,21 @@ fn until_text(until_ms: i64) -> String {
     } else {
         local.format("%m-%d %H:%M").to_string()
     }
+}
+
+/// 「今日额度已用尽」类错误（内层码 110 / 114…）没给重置时刻时的冷却终点：本机次日零点。
+///
+/// 这类额度按自然日恢复，用 10 分钟兜底只会让同一账号在当天被反复选中、反复撞墙。
+fn next_local_midnight_ms(now: i64) -> Option<i64> {
+    let today = chrono::DateTime::from_timestamp_millis(now)?
+        .with_timezone(&chrono::Local)
+        .date_naive();
+    today
+        .succ_opt()?
+        .and_hms_opt(0, 0, 0)?
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|d| d.timestamp_millis())
 }
 
 /// 解析 429 里的「重置时刻」，返回 (unix 毫秒, 来源)。
@@ -1140,7 +1176,14 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
     let bare = normalize_target(&req.target);
     let path = bare;
     let is_chat = is_inference_path(bare);
-    let model = if is_chat { body_model(body) } else { None };
+    // Qoder 自家的对话入口同样是模型请求：限流换号、模型冷却、会话通知都必须覆盖它。
+    // 之前只有 `is_chat`，于是 `agent_chat_generation` 的模型永远「未知」、限流切换整个失效。
+    let is_model_req = is_chat || is_chat_generation(&bare);
+    let model = if is_model_req {
+        request_model(&req, body)
+    } else {
+        None
+    };
     let url = upstream_url(&host, path);
 
     // 3. 选账号并透传；0 积分免费模型限流（429）发生在流式输出开始前，响应头还没写给
@@ -1186,7 +1229,7 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         // 没有备选就**留在原位**原样透传（见下面 Keep 的注释）——绝不能把它 ban 掉：
         // 下一轮 `choose_account` 会因候选为空返回 `None`，反代只能给客户端回 503，
         // 对话直接起不来 —— 比「这次不换号」糟得多。
-        let resign_needed = (is_chat || is_chat_generation(&bare))
+        let resign_needed = is_model_req
             && auth_in.as_deref().is_some_and(cosy::is_cosy_authorization);
         let can_resign = cosy_id.is_some();
         if resign_needed && !can_resign {
@@ -1225,7 +1268,7 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         // 走到这里 = 这一轮**确定要发给上游**。对客通知「这轮对话扣的是哪个账号」
         // 必须是可当场核验的事实：签不出请求的那一轮上面已经换人或已如实说明，
         // 这里报出的名字才是真正服务这次请求的账号。
-        if is_chat || is_chat_generation(&bare) {
+        if is_model_req {
             if !(resign_needed && !can_resign)
                 && should_announce_session(&account, model.as_deref())
             {
@@ -1388,17 +1431,17 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
         // 这里不会退回任何写死的模型名。
         // 拿不到签名身份（没有账号 / uid 取不到）时**只是不走网络那层**，
         // 缓存与本机痕迹照给 —— 热路径上不该因为一次网络失败就没有清单。
-        let free_set = if is_chat {
+        let free_set = if is_model_req {
             ensure_free_models(&dir, cosy_id.as_ref())
         } else {
             HashSet::new()
         };
 
         match upstream {
-            Ok(resp) => {
-                // 是不是「该走限流无感切换」的响应：会话内聊天 + 命中启用切换的模型 + 上游 429。
+            Ok(mut resp) => {
+                // 是不是「该走限流无感切换」的响应：模型请求 + 命中启用切换的模型 + 上游 429。
                 // 先算一次，下面两条路径共用——防御优先那条也得先认出这是限流。
-                let rate_limited = is_chat
+                let rate_limited = is_model_req
                     && resp.status() == 429
                     && is_rate_limited_model(
                         model.as_deref(),
@@ -1473,7 +1516,118 @@ fn handle_conn(mut stream: impl Read + Write, app: tauri::AppHandle) {
                     return;
                 }
 
-                stream_response(&mut stream, resp, &dir, &account, &host, &path);
+                // ── Qoder 对话网关的限流不在状态行上 ──
+                //
+                // `agent_chat_generation` 先回 200 + `text/event-stream`，再把错误封进一帧
+                // `{"statusCodeValue":429,"body":"{\"code\":110,…}"}`（SDK 的 `V_` 就是在这里
+                // 抛「Qoder API error」）。只看 `resp.status()` 会把它当成功流原样放过，
+                // 客户端弹「今日对话次数已达上限」而代理毫不知情——2026-10-20 的故障。
+                //
+                // 预读只发生在**写响应头之前**：认出错误就复用上面的冷却/换号逻辑；
+                // 认不出就把预读的字节原样接回流式转发，正常响应一个字都不改。
+                let mut prefix: Vec<u8> = Vec::new();
+                if is_model_req
+                    && resp.status().as_u16() == 200
+                    && is_event_stream(&resp)
+                    && !is_content_encoded(&resp)
+                    && is_rate_limited_model(
+                        model.as_deref(),
+                        &free_set,
+                        &settings.rate_limit_models,
+                    )
+                {
+                    let (peeked, limit) = tauri::async_runtime::block_on(peek_sse_limit(&mut resp));
+                    prefix = peeked;
+                    if let Some(limit) = limit {
+                        let detail = sse_limit_detail(&limit);
+                        let model_name = model.as_deref().unwrap_or("未知");
+                        stealth::debug_append(
+                            &dir,
+                            "proxy_upstream_status",
+                            &format!(
+                                "上游用 SSE 错误帧返回{}（{detail}，模型 {model_name}）：{host}{path}",
+                                limit.kind.label()
+                            ),
+                        );
+
+                        if !settings.failover_on_rate_limit {
+                            stealth::journal_append(
+                                &dir,
+                                "failover",
+                                &format!(
+                                    "账号「{}」的模型「{model_name}」触发{}（{detail}）：已按「会话内不换号」原样透传，该会话不会被切到其它账号",
+                                    account.name,
+                                    limit.kind.label()
+                                ),
+                            );
+                            stream_response(
+                                &mut stream,
+                                &prefix,
+                                resp,
+                                &dir,
+                                &account,
+                                &host,
+                                &path,
+                            );
+                            return;
+                        }
+
+                        // 重置时刻只可能写在错误帧的内层 body 文案里；额度类错误没写时刻时，
+                        // 按自然日冷却到次日零点（用 10 分钟兜底只会当天反复撞墙）。
+                        let (until_ms, source) = limit_until_ms(&[], &limit.body, now_ms())
+                            .unwrap_or_else(|| {
+                                let now = now_ms();
+                                match limit.kind {
+                                    LimitKind::Quota => (
+                                        next_local_midnight_ms(now).unwrap_or(
+                                            now + RATE_LIMIT_FALLBACK.as_millis() as i64,
+                                        ),
+                                        LimitSource::DailyReset,
+                                    ),
+                                    LimitKind::Rate => (
+                                        now + RATE_LIMIT_FALLBACK.as_millis() as i64,
+                                        LimitSource::Fallback,
+                                    ),
+                                }
+                            });
+                        let note =
+                            cooldown_note(set_cooldown(&account.id, model_name, until_ms, source));
+                        let mut tried = ban.clone();
+                        tried.push(account.id.clone());
+                        if ban.len() + 1 < FAILOVER_MAX_TRIES
+                            && has_spare_candidate(
+                                &accounts::load_accounts(&dir),
+                                &settings.billing_account_ids,
+                                &tried,
+                            )
+                        {
+                            ban = tried;
+                            stealth::journal_append(
+                                &dir,
+                                "failover",
+                                &format!(
+                                    "账号「{}」的模型「{model_name}」触发{}（{detail}），该账号 × 该模型冷却{note}，已无感切换备用账号继续服务",
+                                    account.name,
+                                    limit.kind.label()
+                                ),
+                            );
+                            continue;
+                        }
+                        stealth::journal_append(
+                            &dir,
+                            "failover",
+                            &format!(
+                                "账号「{}」的模型「{model_name}」触发{}（{detail}），该账号 × 该模型冷却{note}，已无更多备用账号，限流响应原样透传",
+                                account.name,
+                                limit.kind.label()
+                            ),
+                        );
+                        stream_response(&mut stream, &prefix, resp, &dir, &account, &host, &path);
+                        return;
+                    }
+                }
+
+                stream_response(&mut stream, &prefix, resp, &dir, &account, &host, &path);
                 return;
             }
             Err(e) => {
@@ -1526,13 +1680,13 @@ fn is_inference_path(bare: &str) -> bool {
 /// 是不是「对话生成」端点 —— Qoder 自家的流式推理入口。
 ///
 /// 与 [`is_inference_path`] **不是**一回事，别合并：
-/// - `is_inference_path` 认的是 OpenAI 风格的 `/…/completions`，服务的是**限流换号**那套
-///   （要读响应体、要按模型冷却）。
+/// - `is_inference_path` 认的是 OpenAI 风格的 `/…/completions`。
 /// - 对话生成走 `/algo/api/v2/service/pro/sse/agent_chat_generation`（**SSE 包裹**），
-///   路径形态完全不同，2026-09-19 实测。它需要的是「扣费账号」证据埋点，不是那套重试。
+///   路径形态完全不同，2026-09-19 实测。
 ///
-/// 把两者混在一起，会让「读响应体」的重试逻辑落到流式响应上 —— 那是另一个量级的风险，
-/// 所以这里刻意分开。
+/// 两者都是模型请求（扣费账号、模型冷却、限流换号都要覆盖）。区别只在**限流的到达方式**：
+/// OpenAI 路径通常是 HTTP 429，而对话生成把错误封在 HTTP 200 的 SSE 帧里
+/// （`{"statusCodeValue":…,"body":"{…}"}`，见 [`peek_sse_limit`]）。
 fn is_chat_generation(bare: &str) -> bool {
     let p = bare.split('?').next().unwrap_or(bare);
     p.ends_with("/agent_chat_generation")
@@ -1574,6 +1728,18 @@ fn body_model(body: &[u8]) -> Option<String> {
         .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)))
 }
 
+/// 本次请求用的模型：正文 `model` 优先，其次请求头 `X-Model-Key`。
+///
+/// Qoder 的对话入口 `agent_chat_generation` **正文里没有 model 字段**，模型只写在
+/// `X-Model-Key` 头里（实测 `dfmodel`，正好是模型清单里的 id）。只读正文的后果是模型
+/// 永远「未知」→ 限流冷却按模型匹配不上 → 限流切换整个不生效。
+fn request_model(req: &Request, body: &[u8]) -> Option<String> {
+    body_model(body)
+        .or_else(|| header_value(req, "x-model-key").map(str::to_string))
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+}
+
 /// 免费模型集，供路由判定限流切换。
 ///
 /// 清单来自 [`crate::models`] —— **与接管页看到的是同一份**（三层来源：Qoder 官方目录 /
@@ -1604,6 +1770,238 @@ fn is_rate_limited_model(
     enabled: &[String],
 ) -> bool {
     is_free_model(model, free) || model.is_some_and(|m| enabled.iter().any(|e| e == m))
+}
+
+/// 限流 / 额度用完两类错误的区别，决定日志措辞与「没给重置时刻」时的冷却终点。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LimitKind {
+    /// 频率/用量限制，过一段时间自然恢复
+    Rate,
+    /// 额度（积分/每日次数）用完，通常按自然日恢复
+    Quota,
+}
+
+impl LimitKind {
+    fn label(self) -> &'static str {
+        match self {
+            LimitKind::Rate => "限流",
+            LimitKind::Quota => "额度用完",
+        }
+    }
+}
+
+/// SSE 错误帧里识别出的限流。
+struct SseLimit {
+    kind: LimitKind,
+    /// 内层业务码（110 / 113 / 114 …）；解析不到为 None
+    code: Option<u32>,
+    /// 外层 `statusCodeValue`
+    status: u16,
+    /// 内层 `body` 文本，用于解析重置时刻
+    body: Vec<u8>,
+}
+
+fn sse_limit_detail(limit: &SseLimit) -> String {
+    match limit.code {
+        Some(code) => format!("SSE 错误帧 code={code}"),
+        None => format!("SSE 错误帧 statusCodeValue={}", limit.status),
+    }
+}
+
+/// 响应是不是 SSE 流（`text/event-stream`，可能带 charset）
+fn is_event_stream(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
+/// 上游是否压缩了响应体。压缩后的字节没法按 SSE 解析，预读会白等到超时——
+/// 这种情况直接跳过预读，按原样流转发（客户端自己带的 `Accept-Encoding` 我们需要原样透传）。
+fn is_content_encoded(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("identity")
+        })
+}
+
+/// 预读 SSE 首部，找「HTTP 200 里夹带的错误帧」。
+///
+/// Qoder 对话网关的限流不是 429：先回 200 + `text/event-stream`，再把错误封成一帧
+/// `{"statusCodeValue":<非200>,"statusCode":…,"body":"{\"code\":110,…}"}`。客户端 SDK
+/// 的 `V_` 正是在这里抛「Qoder API error」，而只看状态行的代理会把它当成功流放过。
+///
+/// 返回 `(已读字节, 识别出的限流)`。**已读字节必须原样转发**——它们可能包含控制帧或
+/// 错误帧本身；限流识别只做旁路判断，绝不改写正常流。SKIP 控制帧（`[DONE]`、
+/// `[NOT_EXCEED_QUOTA]` 等）继续往后找；遇到第一个正常内容帧就停，避免扣住流。
+async fn peek_sse_limit(resp: &mut reqwest::Response) -> (Vec<u8>, Option<SseLimit>) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut scanned = 0usize;
+    let deadline = tokio::time::Instant::now() + SSE_PEEK_TIMEOUT;
+    loop {
+        while let Some((end, next)) = sse_event_end(buf.get(scanned..).unwrap_or_default()) {
+            match classify_sse_event(&buf[scanned..scanned + end]) {
+                SseEvent::Limit(limit) => return (buf, Some(limit)),
+                SseEvent::Control => scanned += next,
+                SseEvent::Content => return (buf, None),
+            }
+        }
+        if buf.len() >= SSE_PEEK_MAX {
+            return (buf, None);
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return (buf, None);
+        }
+        match tokio::time::timeout(left, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
+            // 流直接结束：末帧可能少一个空行，仍按一帧解析，别漏掉“说完就断”的错误。
+            Ok(Ok(None)) => {
+                if scanned < buf.len() {
+                    if let SseEvent::Limit(limit) = classify_sse_event(&buf[scanned..]) {
+                        return (buf, Some(limit));
+                    }
+                }
+                return (buf, None);
+            }
+            _ => return (buf, None),
+        }
+    }
+}
+
+/// 下一个完整 SSE 事件块的 `(块长度, 下一块起点)`。支持 LF 与 CRLF 两种分隔。
+fn sse_event_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buf, b"\n\n").map(|i| (i, i + 2));
+    let crlf = find_subslice(buf, b"\r\n\r\n").map(|i| (i, i + 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+enum SseEvent {
+    Limit(SseLimit),
+    /// 没有数据或 SDK 会忽略的控制帧，可继续往后看
+    Control,
+    /// 正常内容，停止预读
+    Content,
+}
+
+fn classify_sse_event(block: &[u8]) -> SseEvent {
+    let text = String::from_utf8_lossy(block)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut event = "message";
+    let mut data: Vec<&str> = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event = value,
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    let data = data.join("\n");
+    if data.trim().is_empty() || is_sse_control(&data) {
+        return SseEvent::Control;
+    }
+    // SDK 对 `finish` 事件不抛错，哪怕它的 statusCodeValue 不是 200。
+    if event == "finish" {
+        return SseEvent::Content;
+    }
+    match embedded_sse_limit(&data) {
+        Some(limit) => SseEvent::Limit(limit),
+        None => SseEvent::Content,
+    }
+}
+
+/// 从一帧 SSE data 里认出 SDK 的错误通道。非限流类错误（500、鉴权…）返回 None：
+/// 代理没有能力替它们换号，原样透传才是对的。
+fn embedded_sse_limit(data: &str) -> Option<SseLimit> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let obj = v.as_object()?;
+    let status = obj.get("statusCodeValue").and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })?;
+    if status == 200 || status > u16::MAX as u64 {
+        return None;
+    }
+    let status = status as u16;
+    let body = match obj.get("body")? {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let code = inner_error_code(&body);
+    let kind = if code.is_some_and(is_quota_code) {
+        LimitKind::Quota
+    } else if status == 429 || matches!(code, Some(113 | 429)) {
+        LimitKind::Rate
+    } else {
+        return None;
+    };
+    Some(SseLimit {
+        kind,
+        code,
+        status,
+        body: body.into_bytes(),
+    })
+}
+
+/// 内层错误码。网关把码放在 `code`，偶尔多包一层 `error` / `data` / `body`。
+fn inner_error_code(body: &str) -> Option<u32> {
+    fn as_code(v: &serde_json::Value) -> Option<u32> {
+        match v {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    }
+    fn walk(v: &serde_json::Value) -> Option<u32> {
+        let obj = v.as_object()?;
+        if let Some(code) = obj.get("code").and_then(as_code) {
+            return Some(code);
+        }
+        ["error", "data", "body"]
+            .iter()
+            .filter_map(|k| obj.get(*k))
+            .find_map(walk)
+    }
+    serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .as_ref()
+        .and_then(walk)
+}
+
+/// 额度用完类业务码（取自 Qoder SDK 的 quota 集合）：110 今日次数用完、114 免费试用、
+/// 115 免费额度、116/117/118/122 各类积分、119 免费模型额度。112 是旧版「个人积分用完」。
+fn is_quota_code(code: u32) -> bool {
+    matches!(code, 110 | 112 | 114 | 115 | 116 | 117 | 118 | 119 | 122)
+}
+
+/// SDK 会忽略的控制帧（`V_` 里的 `grA`）
+fn is_sse_control(data: &str) -> bool {
+    let t = data.trim();
+    t == "[DONE]"
+        || t == "[NOT_EXCEED_QUOTA]"
+        || t.starts_with("[EXCEED_QUOTA]")
+        || t.starts_with("[NOTIFICATIONS]")
 }
 
 // 模型清单的类型、解析与三层来源都搬去了 [`crate::models`]（那边有完整说明）。
@@ -1733,10 +2131,14 @@ fn write_chunk_end(stream: &mut impl Write) -> std::io::Result<()> {
 
 /// 边收边转：上游出一个 chunk 就往下游写一个。
 ///
+/// `prefix` 是限流预读时已经从上游读走的字节（正常流通常为空）。必须先原样写出，
+/// 否则会丢掉流首的控制帧/内容帧。
+///
 /// 中途出错只能断开 —— chunked 没有「出错补报」机制，但对端看到流被截断
 /// 至少比拿到一个空响应要好。
 fn stream_response(
     stream: &mut impl Write,
+    prefix: &[u8],
     mut resp: reqwest::Response,
     dir: &std::path::Path,
     account: &accounts::Account,
@@ -1774,8 +2176,11 @@ fn stream_response(
     if write_head(stream, status, &ctype, &headers).is_err() {
         return;
     }
+    if !prefix.is_empty() && write_chunk(stream, prefix).is_err() {
+        return;
+    }
 
-    let mut bytes = 0usize;
+    let mut bytes = prefix.len();
     let mut read_error: Option<String> = None;
     tauri::async_runtime::block_on(async {
         loop {
@@ -2447,6 +2852,235 @@ mod tests {
         assert!(!is_rate_limited_model(None, &set, &enabled));
     }
 
+    /// 回归（2026-10-20）：Qoder 对话请求的模型只在 `X-Model-Key` 头里，正文没有。
+    /// 只读正文 ⇒ 模型永远「未知」⇒ 限流冷却按模型匹配不上，切换整个失效。
+    #[test]
+    fn model_is_read_from_x_model_key_when_body_has_none() {
+        let raw = b"POST /algo/api/v2/service/pro/sse/agent_chat_generation HTTP/1.1\r\n\
+                    Host: x\r\nX-Model-Key: dfmodel\r\nContent-Type: application/json\r\n\
+                    Content-Length: 2\r\n\r\n{}";
+        let req = parse_request(raw).unwrap();
+        assert_eq!(request_model(&req, b"{}").as_deref(), Some("dfmodel"));
+        // 正文里有 model 时正文优先（OpenAI 风格路径）
+        assert_eq!(
+            request_model(&req, br#"{"model":"qmodel_38max"}"#).as_deref(),
+            Some("qmodel_38max")
+        );
+        // 空头不算数
+        let raw = b"POST /x HTTP/1.1\r\nHost: x\r\nX-Model-Key:   \r\n\r\n{}";
+        assert_eq!(request_model(&parse_request(raw).unwrap(), b"{}"), None);
+
+        // 对话路径本身必须被认成模型请求
+        assert!(is_chat_generation(
+            "/algo/api/v2/service/pro/sse/agent_chat_generation?requestId=1"
+        ));
+        assert!(!is_inference_path(
+            "/algo/api/v2/service/pro/sse/agent_chat_generation"
+        ));
+    }
+
+    /// SDK 的错误通道长这样：HTTP 200 的 SSE 里夹一帧
+    /// `{"statusCodeValue":429,"body":"{\"code\":110,…}"}`。代理必须在写响应头前认出来。
+    #[test]
+    fn recognizes_rate_limiting_frames_tunneled_inside_sse() {
+        let daily = r#"data: {"statusCodeValue":429,"statusCode":"TOO_MANY_REQUESTS","body":"{\"code\":110,\"msg\":\"Billing daily count exceeded\"}"}"#;
+        match classify_sse_event(daily.as_bytes()) {
+            SseEvent::Limit(limit) => {
+                assert_eq!(limit.kind, LimitKind::Quota);
+                assert_eq!(limit.code, Some(110));
+                assert_eq!(limit.status, 429);
+                assert!(
+                    String::from_utf8_lossy(&limit.body).contains("code"),
+                    "内层 body 要留给重置时刻解析"
+                );
+            }
+            _ => panic!("今日额度错误帧没被识别"),
+        }
+
+        // CRLF + event 字段
+        let crlf = format!("event: message\r\n{daily}");
+        assert!(matches!(
+            classify_sse_event(crlf.as_bytes()),
+            SseEvent::Limit(SseLimit {
+                kind: LimitKind::Quota,
+                code: Some(110),
+                ..
+            })
+        ));
+
+        // 频率限制（113）与不带业务码的外层 429 都算限流
+        let rate = r#"data: {"statusCodeValue":429,"body":"{\"code\":113,\"message\":\"rate limited\"}"}"#;
+        assert!(matches!(
+            classify_sse_event(rate.as_bytes()),
+            SseEvent::Limit(SseLimit {
+                kind: LimitKind::Rate,
+                code: Some(113),
+                ..
+            })
+        ));
+        let bare429 = r#"data: {"statusCodeValue":429,"body":"busy"}"#;
+        assert!(matches!(
+            classify_sse_event(bare429.as_bytes()),
+            SseEvent::Limit(SseLimit {
+                kind: LimitKind::Rate,
+                code: None,
+                ..
+            })
+        ));
+
+        // 非限流类错误不换号（代理没有能力替 500 / 鉴权错误换账号）
+        let server_err = r#"data: {"statusCodeValue":500,"body":"{\"code\":10500}"}"#;
+        assert!(matches!(classify_sse_event(server_err.as_bytes()), SseEvent::Content));
+
+        // SDK 对 finish 事件不抛错；控制帧与正常内容也都不能被误判
+        let finish = r#"event: finish
+data: {"statusCodeValue":110,"body":"{\"code\":110}"}"#;
+        assert!(matches!(classify_sse_event(finish.as_bytes()), SseEvent::Content));
+        assert!(matches!(
+            classify_sse_event(b"data: [NOT_EXCEED_QUOTA]"),
+            SseEvent::Control
+        ));
+        assert!(matches!(classify_sse_event(b"data: [DONE]"), SseEvent::Control));
+        assert!(matches!(
+            classify_sse_event(br#"data: {"hello":1}"#),
+            SseEvent::Content
+        ));
+
+        // 事件边界：LF / CRLF 都要认，半帧不能当成完整帧
+        assert_eq!(sse_event_end(b"data: a\n\ndata: b\n\n"), Some((7, 9)));
+        assert_eq!(sse_event_end(b"data: a\r\n\r\n"), Some((7, 11)));
+        assert_eq!(sse_event_end(b"data: part"), None);
+    }
+
+    /// 额度错误没给重置时刻时，冷却到**次日零点**；给了时刻就按上游的来。
+    #[test]
+    fn quota_errors_cool_until_next_local_midnight() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 10, 20, 23, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let expected = chrono::Local
+            .with_ymd_and_hms(2026, 10, 21, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(next_local_midnight_ms(now), Some(expected));
+
+        let note = cooldown_note(CooldownEntry {
+            until_ms: expected,
+            source: LimitSource::DailyReset,
+        });
+        assert!(note.contains("次日重置"), "日志要说清是自然日恢复：{note}");
+
+        // 内层 body 带文案时刻时优先于「次日零点」
+        let body = r#"{"code":110,"msg":"今日额度已用尽，将在 2026-10-21 00:00:00 UTC+8 重置"}"#;
+        let (ms, source) = limit_until_ms(&[], body.as_bytes(), now).unwrap();
+        assert_eq!(source, LimitSource::Body);
+        let east8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(
+            chrono::DateTime::from_timestamp_millis(ms)
+                .unwrap()
+                .with_timezone(&east8)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            "2026-10-21 00:00:00"
+        );
+    }
+
+    /// 端到端：mock 上游在 200 SSE 里先给控制帧、再给额度错误帧。
+    /// `peek_sse_limit` 要跨过控制帧找到错误帧，且把读走的前缀一字不差转给下游。
+    #[test]
+    fn detects_and_forwards_a_tunneled_sse_limit_end_to_end() {
+        let up = TcpListener::bind("127.0.0.1:0").unwrap();
+        let up_port = up.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = up.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf); // 读掉请求头，读多少算多少
+                let head = "HTTP/1.1 200 OK\r\n\
+                            Content-Type: text/event-stream\r\n\
+                            Transfer-Encoding: chunked\r\n\r\n";
+                let _ = s.write_all(head.as_bytes());
+                let frames = [
+                    "data: [NOT_EXCEED_QUOTA]\n\n",
+                    "data: {\"statusCodeValue\":429,\"statusCode\":\"TOO_MANY_REQUESTS\",\"body\":\"{\\\"code\\\":110,\\\"msg\\\":\\\"Billing daily count exceeded\\\"}\"}\n\n",
+                ];
+                for frame in frames {
+                    let _ = s.write_all(format!("{:X}\r\n{frame}\r\n", frame.len()).as_bytes());
+                }
+                let _ = s.write_all(b"0\r\n\r\n");
+                let _ = s.flush();
+            }
+        });
+
+        let mut resp = tauri::async_runtime::block_on(async {
+            CLIENT
+                .post(format!("http://127.0.0.1:{up_port}/agent_chat_generation"))
+                .send()
+                .await
+        })
+        .expect("请求 mock 上游失败");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(is_event_stream(&resp), "内容类型要认成 SSE");
+
+        let (prefix, limit) = tauri::async_runtime::block_on(peek_sse_limit(&mut resp));
+        let limit = limit.expect("HTTP 200 里的额度错误没被识别");
+        assert_eq!(limit.kind, LimitKind::Quota);
+        assert_eq!(limit.code, Some(110));
+        let prefix_text = String::from_utf8_lossy(&prefix);
+        assert!(prefix_text.contains("[NOT_EXCEED_QUOTA]"), "控制帧也要留在前缀里");
+        assert!(
+            prefix_text.contains(r#"\"code\":110"#),
+            "错误帧要留在前缀里：{prefix_text}"
+        );
+
+        // 前缀必须原样转发：下游看到的 SSE 与上游一致，仍以终止帧收尾
+        let down = TcpListener::bind("127.0.0.1:0").unwrap();
+        let down_port = down.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(("127.0.0.1", down_port)).unwrap();
+        let mut server = down.accept().unwrap().0;
+        let acct = accounts::Account {
+            id: "acct-sse".into(),
+            name: "SSE".into(),
+            phone: None,
+            email: None,
+            token: "t".into(),
+            refresh_token: None,
+            expires_at: None,
+            rt_expires_at: None,
+            created_at: String::new(),
+            checked_today: None,
+            cosy_uid: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
+            last: None,
+        };
+        stream_response(
+            &mut server,
+            &prefix,
+            resp,
+            std::path::Path::new("/tmp"),
+            &acct,
+            "mock.host",
+            "/agent_chat_generation",
+        );
+        drop(server);
+
+        let mut out = String::new();
+        let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = client.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "状态行：{out:?}");
+        assert!(out.contains("Content-Type: text/event-stream"));
+        assert!(out.contains("[NOT_EXCEED_QUOTA]"), "前缀不能丢：{out:?}");
+        assert!(
+            out.contains(r#"\"code\":110"#),
+            "错误帧必须原样到达客户端：{out:?}"
+        );
+        assert!(out.ends_with("0\r\n\r\n"), "必须以终止帧收尾：{out:?}");
+    }
+
     /// 路径**原样透传**，代理不替网关发明路由。
     ///
     /// 这条替代了原来的 `rewrites_bare_chat_path_to_v2`：`/v2/chat/completions` 在 Qoder
@@ -2801,6 +3435,7 @@ mod tests {
         };
         stream_response(
             &mut server,
+            &[],
             resp,
             std::path::Path::new("/tmp"),
             &acct,

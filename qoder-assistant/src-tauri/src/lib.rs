@@ -125,8 +125,8 @@ pub fn run() {
             commands::test_notify,
             commands::get_autostart,
             commands::set_autostart,
-            commands::get_checkin_logs,
-            commands::clear_checkin_logs,
+            commands::get_logs,
+            commands::clear_logs,
             // 积分简报：日条目 = 当天时条目之和（现算），口径见 briefing 模块。
             // 条目只由后台每小时结算一次，这里没有「手动生成一条」的入口。
             commands::credit_briefing,

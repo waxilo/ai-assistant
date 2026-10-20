@@ -1785,28 +1785,19 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
         .map_err(|e| format!("读取开机自启动状态失败：{e}"))
 }
 
-/// 查询签到日志：默认倒序（最新在前），最多 200 条；可按账号筛选
+/// 统一日志流：签到 + 调度器 + 接管动态三个来源合流后的投影（新的在前）。
+/// 分类、失败标记等口径见 [`logs::unified`]。
 #[tauri::command]
-pub fn get_checkin_logs(
-    app: AppHandle,
-    limit: Option<usize>,
-    account_id: Option<String>,
-) -> Result<Vec<CheckinLog>, String> {
-    let mut logs = logs::load_logs(&data_dir(&app));
-    if let Some(id) = account_id {
-        logs.retain(|l| l.account_id == id);
-    }
-    logs.reverse();
-    if let Some(n) = limit {
-        logs.truncate(n);
-    }
-    Ok(logs)
+pub fn get_logs(app: AppHandle) -> Result<Vec<logs::LogEntry>, String> {
+    Ok(logs::unified(&data_dir(&app)))
 }
 
-/// 清空签到日志：`account_id` 为空则清空全部，否则只清该账号的日志
+/// 清空日志：签到日志、调度器日志、接管动态一起清（不可恢复）。
+/// 调试日志（takeover-debug.log）故意不清 —— 它是排查材料。
 #[tauri::command]
-pub fn clear_checkin_logs(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
-    logs::clear_logs(&data_dir(&app), account_id.as_deref()).map_err(|e| e.to_string())
+pub fn clear_logs(app: AppHandle) -> Result<(), String> {
+    logs::clear_unified(&data_dir(&app));
+    Ok(())
 }
 
 // ── 积分简报 ───────────────────────────────────────────────────

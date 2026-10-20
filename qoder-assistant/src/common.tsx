@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Account, CheckinLog } from "./types";
+import type { Account, LogEntry } from "./types";
 import { IconUser } from "./components/Icons";
 
 /**
@@ -204,19 +204,22 @@ export function StatusDot({ tone, label }: { tone: DotTone; label: string }) {
   );
 }
 
-/** 签到日志的一条结果 → 状态圆点（与账号页「状态」列同一套视觉，只是文案不同） */
-export function logStatus(log: CheckinLog): { tone: DotTone; label: string } {
-  // 同 signState：`already` 必须优先于 `success`（已签时二者都为 true）
-  if (log.already) return { tone: "done", label: "今日已签" };
-  if (log.success) return { tone: "done", label: "成功" };
-  if (log.inactive) return { tone: "inactive", label: "活动未开" };
-  return { tone: "fail", label: "失败" };
+/** 日志流一条的结果 → 状态圆点（与账号页「状态」列同一套视觉，只是文案不同） */
+export function logStatus(log: LogEntry): { tone: DotTone; label: string } {
+  if (log.category === "checkin") {
+    // 同 signState：`already` 必须优先于 `success`（已签时二者都为 true）
+    if (log.already) return { tone: "done", label: "今日已签" };
+    if (log.success) return { tone: "done", label: "成功" };
+    if (log.inactive) return { tone: "inactive", label: "活动未开" };
+    return { tone: "fail", label: "失败" };
+  }
+  return log.success ? { tone: "done", label: "成功" } : { tone: "fail", label: "失败" };
 }
 
 /**
  * 账号单元格：头像 + 名称 + 展示标识（手机号 / 邮箱，由 [`accountIdent`] 选好）。
  *
- * 账号页与签到日志页共用，「同一个人在两处长得一样」由它保证；日志页此前只用
+ * 账号页与日志管理页共用，「同一个人在两处长得一样」由它保证；日志页此前只用
  * 一行文字拼接，名称本身就是手机号时会显示成 `191****2883（191****2883）`。
  */
 export function AccountCell({
@@ -248,7 +251,7 @@ export function AccountCell({
   );
 }
 
-/** 空态：图标 + 主文案 +（可选）补充说明。账号页与签到日志页共用。 */
+/** 空态：图标 + 主文案 +（可选）补充说明。账号页与日志管理页共用。 */
 export function EmptyState({
   icon,
   title,
@@ -267,7 +270,7 @@ export function EmptyState({
   );
 }
 
-/// 积分过期时间展示：毫秒时间戳 → 「MM-DD HH:mm」；已过期的标 expired。
+/// 绝对时刻展示：毫秒时间戳 → 「MM-DD HH:mm」；已过期的标 expired。
 /// 返回 { text, expired }，UI 用 expired 加样式。null/非法返回「—」。
 export function expiryInfo(
   ms?: number | null
@@ -288,19 +291,6 @@ export function needsRelogin(rtExpiresAt?: number | null): boolean {
   return rtExpiresAt != null && rtExpiresAt <= Date.now();
 }
 
-/// 积分过期倒计时：毫秒时间戳 → 「还有 N 天后过期」，看起来更直观。
-/// 已过期的返回「已过期」并标 expired。null/非法返回「—」。
-export function expiryCountdown(
-  ms?: number | null
-): { text: string; expired: boolean } {
-  if (ms == null) return { text: "—", expired: false };
-  const d = new Date(ms);
-  if (isNaN(d.getTime())) return { text: "—", expired: false };
-  const days = Math.ceil((ms - Date.now()) / 86_400_000);
-  if (days <= 0) return { text: "已过期", expired: true };
-  return { text: `还有 ${days} 天后过期`, expired: false };
-}
-
 /// 凭证（token）过期倒计时：「N 天后过期」；不足 1 天改报「N 小时后过期」
 /// （自动续签的窗口就在最后一天里，天数粒度看不出它在不在干活）；
 /// 已过期 → 「已过期」。`at` = 原绝对时刻（`MM-DD HH:mm`，悬停展示）；null/非法 → 「—」。
@@ -318,31 +308,5 @@ export function tokenCountdown(
         : `${Math.ceil(diff / 3_600_000)} 小时后过期`,
     expired: false,
     at: info.text,
-  };
-}
-
-/** 资源包到期的三种状态（界面文案由 [`packageExpiry`] 统一给） */
-export type ExpiryTone = "dated" | "never" | "unknown";
-
-/**
- * 资源包到期展示 —— 三态**唯一**的文案出口。
- *
- * `YYYY-MM-DD` / 「不过期」/ 「未知」都从这儿出，页面不再各自 `new Date(ms)`：
- * 上一版就是在页面里直接渲染时间戳，把服务端表示「永不过期」的
- * `9999-12-31` 哨兵原样印了出来。哨兵现在在后端就被归一了
- *（`ledger::normalize_expiry`），这里再把剩下两种「没有日期」的情形说人话。
- */
-export function packageExpiry(p: {
-  expiry_ms: number | null;
-  never_expires: boolean;
-}): { text: string; tone: ExpiryTone } {
-  if (p.never_expires) return { text: "不过期", tone: "never" };
-  if (p.expiry_ms == null) return { text: "未知", tone: "unknown" };
-  const d = new Date(p.expiry_ms);
-  if (isNaN(d.getTime())) return { text: "未知", tone: "unknown" };
-  const q = (n: number) => String(n).padStart(2, "0");
-  return {
-    text: `${d.getFullYear()}-${q(d.getMonth() + 1)}-${q(d.getDate())}`,
-    tone: "dated",
   };
 }

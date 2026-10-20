@@ -10,10 +10,20 @@ import {
   freeModels,
   openAppManagement,
 } from "../api";
-import { AccountCell, accountIdent } from "../common";
+import { AccountCell, accountIdent, formatCredits } from "../common";
 import type { ConfirmReq, Toast } from "../common";
-import { IconBolt, IconInfo, IconUser } from "../components/Icons";
+import {
+  IconAlertTriangle,
+  IconBolt,
+  IconFile,
+  IconInfo,
+  IconRefresh,
+  IconShield,
+  IconTrash,
+  IconUser,
+} from "../components/Icons";
 import { Row, Toggle } from "../components/SettingsControls";
+import Switch from "../components/Switch";
 import { Dialog } from "../components/Dialog";
 
 /**
@@ -58,15 +68,35 @@ function normalizeBilling(list: string[], pool: string[]): string[] {
 }
 
 /**
+ * 时间列只保留**必要的精度**：今天的事件给 `HH:MM:SS`，跨天的才带上 `MM-DD`。
+ * 后端 `at` 已是本地时间串，`at_ms` 用来判断是不是今天。
+ */
+function shortTime(e: JournalEvent): string {
+  const hms = e.at.length >= 19 ? e.at.slice(11, 19) : e.at;
+  const isToday = new Date(e.at_ms).toDateString() === new Date().toDateString();
+  return isToday ? hms : `${e.at.slice(5, 10)} ${hms.slice(0, 5)}`;
+}
+
+/**
+ * 账号的积分摘要（弹窗每行右侧）。积分来自台账快照，与账号页显示的是同一个数 ——
+ * 选号时不必再切回账号页去对。
+ */
+function creditMeta(a: Account): string {
+  const snap = a.credits;
+  if (!snap) return "积分未知";
+  return snap.credits === null ? "积分未知" : `积分 ${formatCredits(snap.credits)}`;
+}
+
+/**
  * 模型清单来源的展示文案，与后端那三层一一对应。
  *
  * 用表而不是嵌套三元：来源现在有四档，三元链会写成连自己都数不清的缩进。
  */
 const SOURCE_LABEL: Record<ModelReport["source"], string> = {
-  fetched: "刚从 Qoder 模型目录拉取",
-  cache: "落盘快照（上次成功拉取的结果）",
-  local: "本机 Qoder 的记录（只含这台机器用过的模型）",
-  empty: "三层都没拿到",
+  fetched: "在线清单",
+  cache: "缓存清单",
+  local: "仅本机用过的模型",
+  empty: "暂不可用",
 };
 
 /**
@@ -77,14 +107,14 @@ const SOURCE_LABEL: Record<ModelReport["source"], string> = {
  * 而实际上少得多（本机记录只含用过的模型）。
  */
 const SOURCE_SHORT: Partial<Record<ModelReport["source"], string>> = {
-  cache: "快照",
-  local: "本机记录",
+  cache: "缓存",
+  local: "本机",
 };
 
 /**
- * 「智能接管」页：顶部一条紧凑控制条（开关 + 状态 + 扣费账号 / 限流切换两颗摘要胶囊 + 端口），
- * 下方「接管动态」铺满剩余空间（列表内部滚动、滚动条隐藏）。
- * 多选类配置一律收进弹框、不在页面上直接铺开，避免把事件流挤没：
+ * 「智能接管」页：顶部一张主控制卡（大开关 + 端口 + 两颗弹窗入口），
+ * 下方是接管动态时间轴。机制说明收进标题旁的悬浮层，首屏只留控件与状态。
+ * 多选类配置一律收进弹框、不在页面上直接铺开：
  * 开关拨动立即应用；端口仅在关闭时可改（失焦即存）；
  * 扣费账号、限流切换模型在各自弹框里点「保存」才落库生效。
  */
@@ -123,7 +153,6 @@ export function TakeoverPage({
   const [pickerOpen, setPickerOpen] = useState(false);
   // 弹框草稿：打开时复制当前生效值，点「保存」才落库生效
   const [draft, setDraft] = useState<string[] | null>(null);
-  const [query, setQuery] = useState("");
   const [stealth, setStealth] = useState<StealthStatus | null>(null);
   const [events, setEvents] = useState<JournalEvent[]>([]);
   const [busy, setBusy] = useState(false);
@@ -296,11 +325,8 @@ export function TakeoverPage({
     const ok = await askConfirm({
       title: action,
       body: next
-        ? "接管开启后，Qoder 的下一次对话将按备选账号扣费。" +
-          "端点写进客户端产物，Qoder 的下一次对话就会读到它 —— " +
-          "无需重启，正在进行的这轮会话仍走旧端点。现在开启吗？"
-        : "接管关闭后，Qoder 的下一次对话恢复直连官方。" +
-          "注入会从客户端产物里摘掉，下一次对话起生效 —— 无需重启。现在关闭吗？",
+        ? "开启后，Qoder 的下一次对话起按备选账号扣费。现在开启吗？"
+        : "关闭后，Qoder 的下一次对话起恢复官方直连。现在关闭吗？",
       okText: action,
     });
     if (!ok) return; // 取消：开关状态不动
@@ -344,9 +370,26 @@ export function TakeoverPage({
     }
   };
 
+  /** 打开扣费账号弹窗：草稿复制当前生效池，「取消」原样丢弃 */
+  const openBilling = () => {
+    setDraft([...effective]);
+    setPickerOpen(true);
+  };
+
+  /** 关掉扣费账号弹窗（点遮罩 / 取消 / 右上角 × 共用） */
+  const closeBilling = () => {
+    setDraft(null);
+    setPickerOpen(false);
+  };
+
   /** 弹框「保存」：草稿落库立即生效（纯账号池调整，不需要重启） */
   const doSaveBilling = async () => {
     if (draft == null) return;
+    // 空池在设置里代表「全选」，无法表达「一个都不用」——所以这里必须拦住
+    if (draft.length === 0) {
+      onToast({ kind: "err", text: "至少保留一个账号参与扣费" });
+      return;
+    }
     const next = normalizeBilling(draft, accountIds);
     setBusy(true);
     setErr("");
@@ -387,10 +430,10 @@ export function TakeoverPage({
     }
   };
 
-  /** 扣费账号弹框草稿里勾/去勾（基准：草稿为空视为「全部账号」） */
+  /** 扣费账号弹框草稿里勾/去勾（基准：当前草稿；没开过弹窗时以生效池为准） */
   const toggleDraft = (id: string) =>
     setDraft((list) => {
-      const base = list == null ? effective : list.length === 0 ? accountIds : list;
+      const base = list ?? effective;
       return base.includes(id)
         ? base.filter((x) => x !== id)
         : [...base, id];
@@ -398,22 +441,12 @@ export function TakeoverPage({
 
   const live = stealth?.installed && stealth.alive;
 
-  /** 扣费账号摘要（控制条上的那颗胶囊按钮）。数字的口径见 `effective` */
-  const billingSummary =
-    accounts.length === 0
-      ? "暂无账号"
-      : billing.length === 0
-      ? `全部 ${accounts.length} 个（默认）`
-      : `已选 ${effective.length} · 未选 ${
-          accounts.length - effective.length
-        }`;
-
   /**
-   * 限流切换摘要（控制条上的胶囊按钮）：免费模型恒生效，付费模型按勾选数。
+   * 限流切换摘要（控制条上的按钮）：免费模型恒生效，付费模型按勾选数。
    * 关掉「限流时换号」时补一个后缀——那是一个会改变 429 行为的关键状态，
    * 不该只藏在弹窗里。
    *
-   * 另外把**清单来源**也缀上去（`fetched` 除外，那是正常态）：胶囊上那几个数字
+   * 另外把**清单来源**也缀上去（`fetched` 除外，那是正常态）：按钮上那几个数字
    * 在「刚拉到」和「只有本机记录」两种情况下长得一模一样，而后者少得多。
    */
   const freeCount = fm?.models.filter((m) => m.free).length ?? 0;
@@ -433,14 +466,14 @@ export function TakeoverPage({
    * 「哪一次对话开始生效」只陈述机制（下一次会话重读产物），不替客户端下结论。
    */
   const stateText = switching
-    ? "处理中：正在写入端点（最长约几秒，请稍候）"
+    ? "正在生效…"
     : live
-    ? "配置已就绪：端点已写入，本地反代正在监听（Qoder 的下一次对话起走这里）"
+    ? "已开启 · 下一次对话生效"
     : stealth?.installed
-    ? "状态异常：关闭开关即可把配置还原成直连"
+    ? "状态异常，请关闭后重新开启"
     : proxyOn
-    ? "应用中：正在写入端点（Qoder 的下一次对话起被读到）"
-    : "开启后会把端点写进客户端产物，按备选账号分流扣费（下一次对话起生效）";
+    ? "正在生效…"
+    : "开启后按备选账号扣费";
 
   /**
    * 连续相同（类型 + 内容都一样）的事件聚合为一条，附重复次数。
@@ -460,50 +493,137 @@ export function TakeoverPage({
     return out;
   }, [events]);
 
-  /** 弹框内按用户名 / 手机号 / 邮箱过滤 */
-  const filteredAccounts = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return accounts;
-    return accounts.filter(
-      (a) =>
-        a.name.toLowerCase().includes(q) ||
-        (a.phone ?? "").includes(q) ||
-        (a.email ?? "").toLowerCase().includes(q)
-    );
-  }, [accounts, query]);
+  // 弹窗里实际勾选的账号；打开那一刻从生效池复制，之后只改草稿
+  const draftSel = draft ?? effective;
+  const allPicked = accounts.length > 0 && draftSel.length === accounts.length;
+  const somePicked = draftSel.length > 0 && !allPicked;
+  // 摘要与 trae 同口径：全选时报总数，细选时报「已选 / 总数」
+  const billingValue =
+    billing.length === 0
+      ? `全部 ${accounts.length}`
+      : `已选 ${effective.length} / ${accounts.length}`;
 
-  const draftEffective =
-    draft == null ? effective : draft.length === 0 ? accountIds : draft;
+  const isMac = /Mac/.test(navigator.userAgent);
 
   return (
-    <section className="panel-page tk-page">
-      <p className="set-intro">
-        <IconInfo size={14} />
-        <span>
-          开启后 Qoder 的对话请求由本地代理转发：每个会话按「剩余积分最多」选一个账号并绑定，
-          只有它积分用完（或被删除/取消勾选）才换人；
-          下方记录每一次开关、路由与异常。
-          <b>改动在下一次对话生效，无需重启</b>：Qoder 每次会话都新起一个 worker 线程、
-          从磁盘重读那份产物 —— 所以开关接管后，<b>正在进行的那轮会话</b>仍走旧端点，
-          下一次对话起就是新的（2026-09-24 活体标记实验裁决）。
-          <b>本机 TLS</b>：端点被客户端强制成 https，所以反代会用一张只签给 127.0.0.1 的
-          自签证书终止 TLS；这张 CA 随注入一起写进产物，<b>不改系统信任库、不需要管理员</b>。
-          <b>官方客户端更新会覆盖注入</b>，本应用每次心跳都会复查文件指纹并自动重打；
-          重打同样在下一次对话起生效 —— 更新后若发现对话不再走本应用，
-          把上面开关关掉再开一次即可。
-          想恢复原样也在上面关掉开关（注入会被逐字节剥离）。
-          {/*
-            「App 管理」是 macOS 专有授权：写官方客户端的产物要它放行，而本应用是
-            **固定自签证书**签的 —— 系统只拦截、**永远不弹授权框**（只往 tccd 记一条
-            拒绝）。这一步绕不过去，那就别让用户再去搜「在哪」。
-            非 macOS 不显示：那张面板只存在于 macOS。
-          */}
-          {/Mac/.test(navigator.userAgent) && (
-            <>
-              {" "}
-              <b>macOS 首次开启要手动授权一次</b>
-              ：「App 管理」只拦截、<b>不会弹授权框</b>（本应用用固定自签证书签名），
-              去「系统设置 → 隐私与安全性 → App 管理」把本应用打开，再重启本应用即可。
+    <section className="panel-page">
+      {/* ── 主控制卡：一个开关 + 一个端口 + 两个弹窗入口。纯配置，不在页面上铺列表 ── */}
+      <section className={`card hero${live ? " live" : ""}`}>
+        <div className="hero-top">
+          <div className="hero-copy">
+            <span className="hero-icon">
+              <IconShield size={19} />
+            </span>
+            <div className="hero-text">
+              <div className="hero-title">
+                <h2>接管 Qoder 请求</h2>
+                {/* 常驻一整段机制说明会把标题区撑成文档；收进悬浮层，要核对时再展开 */}
+                <span
+                  className="rule-hint"
+                  role="note"
+                  tabIndex={0}
+                  aria-label="选号规则：每个会话绑定一个账号；新会话按剩余积分从多到少选；触发限流时临时换号"
+                >
+                  <IconInfo size={16} />
+                  <span className="rule-hint-pop" role="tooltip">
+                    <strong>选号与生效规则</strong>
+                    <span>每个会话固定一个账号；新会话按剩余积分从多到少选。</span>
+                    <span>触发限流时临时换号重试，不改变当前会话。</span>
+                    <span>改动在下一次对话生效，无需重启。</span>
+                  </span>
+                </span>
+              </div>
+              <span className={`hero-sub${live ? " ok" : ""}`} title={stealth?.note}>
+                {stateText}
+              </span>
+            </div>
+          </div>
+          <Switch
+            size="lg"
+            checked={proxyOn}
+            disabled={busy}
+            title={
+              proxyOn
+                ? "关闭接管：Qoder 的下一次对话起恢复官方直连（无需重启）"
+                : "开启接管：Qoder 的下一次对话起按备选账号扣费（无需重启）"
+            }
+            onChange={(v) => void doToggle(v)}
+          />
+        </div>
+
+        <div className="hero-settings">
+          <div className="hero-field">
+            <span className="field-label">端口</span>
+            <input
+              className="port-input"
+              type="number"
+              inputMode="numeric"
+              min={1024}
+              max={65535}
+              value={proxyPort}
+              disabled={proxyOn || busy}
+              title={
+                proxyOn
+                  ? "接管开启期间不允许修改端口；请先关闭接管"
+                  : "本地反代监听端口"
+              }
+              onChange={(e) => setPortDraft(e.target.value)}
+              onBlur={() => void onPortBlur()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+            />
+          </div>
+
+          {accounts.length > 0 && (
+            <div className="hero-field">
+              <span
+                className="field-label"
+                title="未勾选的账号不参与扣费；新会话按剩余积分从多到少选"
+              >
+                参与扣费
+              </span>
+              <button
+                className="billing-trigger"
+                disabled={busy}
+                title="选择参与扣费的账号"
+                onClick={openBilling}
+              >
+                <IconUser size={14} />
+                {billingValue}
+                <span className="billing-caret" />
+              </button>
+            </div>
+          )}
+
+          <div className="hero-field">
+            <span
+              className="field-label"
+              title="0 积分模型默认享受 429 无感换号；付费模型勾选后同样生效"
+            >
+              限流切换
+            </span>
+            <button
+              className="billing-trigger"
+              disabled={busy}
+              title="选择触发限流时自动换号重试的模型"
+              onClick={openModelPicker}
+            >
+              <IconBolt size={14} />
+              {modelSummary}
+              <span className="billing-caret" />
+            </button>
+          </div>
+        </div>
+
+        {/* 「App 管理」是 macOS 专有授权：写官方客户端的产物要它放行，而本应用是
+            **固定自签证书**签的 —— 系统只拦截、**永远不弹授权框**。
+            非 macOS 不显示：那张面板只存在于 macOS。 */}
+        {isMac && (
+          <p className="hero-note">
+            <IconAlertTriangle size={14} />
+            <span>
+              macOS 首次开启需授权：到「系统设置 → 隐私与安全性 → App 管理」打开本应用，再重启。
               <button
                 type="button"
                 className="link-btn"
@@ -515,165 +635,108 @@ export function TakeoverPage({
               >
                 打开「App 管理」设置
               </button>
-            </>
-          )}
-        </span>
-      </p>
-
-      {/* ── 紧凑控制条：开关 + 状态 + 扣费账号 / 限流切换（弹窗入口）+ 端口 ── */}
-      <div className={`card tk-bar ${live ? "live" : ""}`}>
-        <label
-          className="switch"
-          title="开启后 Qoder 的对话请求将由本地代理分流扣费"
-        >
-          <input
-            type="checkbox"
-            checked={proxyOn}
-            disabled={busy}
-            onChange={(e) => void doToggle(e.target.checked)}
-          />
-          <span className="track">
-            <span className="thumb" />
-          </span>
-        </label>
-        <div className="tk-bar-text" title={stealth?.note}>
-          <strong>{proxyOn ? "接管已开启" : "接管已关闭"}</strong>
-          <span className={`tk-bar-sub ${live ? "ok" : ""}`}>{stateText}</span>
-        </div>
-        <span className="spacer" />
-        <button
-          className="tk-accts"
-          title="全部账号默认可扣费；点击细选"
-          onClick={() => {
-            setDraft(billing);
-            setQuery("");
-            setPickerOpen(true);
-          }}
-        >
-          <span className="ta-label">扣费账号</span>
-          <span className="ta-value">{billingSummary}</span>
-          <span className="ta-edit">选择</span>
-        </button>
-        <button
-          className="tk-accts"
-          title="0 积分模型默认享受 429 无感换号；付费模型在此勾选后同样生效"
-          onClick={openModelPicker}
-        >
-          <span className="ta-label">限流切换</span>
-          <span className="ta-value">{modelSummary}</span>
-          <span className="ta-edit">选择</span>
-        </button>
-        <label
-          className="tk-field"
-          title={proxyOn ? "接管开启期间不允许修改端口；请先关闭接管" : "代理监听端口"}
-        >
-          端口
-          <input
-            type="number"
-            value={proxyPort}
-            min={1024}
-            max={65535}
-            disabled={proxyOn || busy}
-            onChange={(e) => setPortDraft(e.target.value)}
-            onBlur={() => void onPortBlur()}
-          />
-        </label>
-      </div>
+            </span>
+          </p>
+        )}
+      </section>
 
       {err && <p className="form-err">{err}</p>}
 
-      {/* ── 接管动态：铺满剩余空间，列表内部滚动（滚动条隐藏） ── */}
-      <div className="card tk-feed">
+      {/* ── 接管动态：只说用户需要知道的（开关动作、每次对话的账号、异常） ── */}
+      <section className="card">
         <div className="card-head">
           <h3>接管动态</h3>
-          <span className="card-head-sub">
-            只说你需要知道的：开关动作、每次对话用的哪个账号、异常。请求级细节在调试日志里
-          </span>
           <span className="spacer" />
           <button
-            className="btn small ghost"
-            title="在文件管理器里定位调试日志（每个请求的路径、鉴权、上游状态都记在里面）"
+            className="icon-btn"
+            title="查看调试日志：每个请求的路径、鉴权、上游状态都记在里面"
             onClick={() => void doRevealLog()}
           >
-            查看日志
+            <IconFile size={15} />
           </button>
           <button
-            className="btn small ghost"
+            className="icon-btn"
             disabled={feedBusy}
             title="重新拉取接管状态与动态"
             onClick={() => void doRefreshFeed()}
           >
-            {feedBusy ? "刷新中…" : "刷新"}
+            <IconRefresh size={15} />
           </button>
           <button
-            className="btn small ghost"
+            className="icon-btn icon-danger"
             disabled={events.length === 0}
             title="清空界面上的通知（调试日志不受影响）"
             onClick={() => void doClearEvents()}
           >
-            清空
+            <IconTrash size={15} />
           </button>
         </div>
+
         {events.length === 0 ? (
-          <p className="hint">
-            暂无通知。开启接管并对话后，这里会出现「本次对话由账号 X 提供」这类记录；
-            要查某个请求具体怎么被处理的，点「查看日志」。
-          </p>
+          <div className="feed-empty">暂无动态。开启接管并对话后，这里会显示每次对话使用的账号。</div>
         ) : (
-          <ul className="evt-list">
+          <ul className="feed">
             {groupedEvents.map(({ e, count }, i) => {
               const k = eventKind(e);
               return (
                 <li
                   key={`${e.at_ms}-${i}`}
-                  className={`evt evt-${k.cls}`}
+                  className={`feed-item k-${k.cls}`}
                   title={count > 1 ? `相同事件连续出现 ${count} 次` : undefined}
                 >
-                  <span className="e-at">{e.at}</span>
-                  <span className={`e-tag tag-${k.cls}`}>{k.label}</span>
-                  {count > 1 && <span className="e-count">×{count}</span>}
-                  <span className="e-detail">{e.detail}</span>
+                  <span className="feed-dot" />
+                  <span className="feed-time">{shortTime(e)}</span>
+                  <span className="feed-label">{k.label}</span>
+                  {count > 1 && <span className="feed-count">×{count}</span>}
+                  <span className="feed-detail">{e.detail}</span>
                 </li>
               );
             })}
           </ul>
         )}
-      </div>
+      </section>
 
-      {/* ── 扣费账号选择弹框（草稿制：点「保存」才生效） ── */}
+      {/* ── 扣费账号弹框（草稿制：点「保存」才生效） ── */}
       {pickerOpen && (
         <Dialog
           size="md"
           icon={<IconUser size={16} />}
-          title="选择扣费账号"
-          label="选择扣费账号"
-          onClose={() => {
-            setDraft(null);
-            setPickerOpen(false);
-          }}
+          title="参与扣费"
+          subtitle="未勾选的账号不参与扣费；全选则新账号自动参与。"
+          label="选择参与扣费的账号"
+          onClose={closeBilling}
           tools={
-            <button
-              className="btn small"
-              onClick={() => setDraft(accountIds)}
-              disabled={accounts.length === 0}
-            >
-              全部勾选
-            </button>
+            <div className="billing-tools">
+              <label className="billing-all">
+                <input
+                  type="checkbox"
+                  checked={allPicked}
+                  disabled={accounts.length === 0}
+                  ref={(el) => {
+                    if (el) el.indeterminate = somePicked;
+                  }}
+                  onChange={() =>
+                    setDraft(allPicked ? [] : accountIds)
+                  }
+                />
+                全选
+              </label>
+              <span className="billing-count">
+                已选 {draftSel.length} / {accounts.length}
+              </span>
+            </div>
           }
           footer={
             <>
-              <button
-                className="btn"
-                onClick={() => {
-                  setDraft(null);
-                  setPickerOpen(false);
-                }}
-              >
+              <button className="btn" onClick={closeBilling}>
                 取消
               </button>
               <button
                 className="btn primary"
-                disabled={busy || draft == null}
+                disabled={busy || draft == null || draftSel.length === 0}
+                title={
+                  draftSel.length === 0 ? "至少保留一个账号参与扣费" : undefined
+                }
                 onClick={() => void doSaveBilling()}
               >
                 {busy ? "保存中…" : "保存"}
@@ -681,58 +744,35 @@ export function TakeoverPage({
             </>
           }
         >
-          <p className="note">
-            <IconInfo size={14} />
-            <span>
-              勾选的账号才允许被扣费（每个会话绑定一个账号；新会话按剩余积分从多到少选），未勾选的账号会被排除；
-              默认全部勾选（智能轮换）。点「保存」立即生效，无需重启。
-            </span>
-          </p>
-          {/* 一个普通的文本输入框：`.modal input` 已经给了外观，
-              上下间距由 `.modal-body > * + *` 统一负责，不再需要专属 class */}
-          <input
-            type="text"
-            placeholder="按用户名或手机号过滤…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
           {accounts.length === 0 ? (
             <p className="empty">
               还没有账号。先到「账号签到」页登录或导入。
             </p>
-          ) : filteredAccounts.length === 0 ? (
-            <p className="empty">没有匹配「{query}」的账号。</p>
           ) : (
-            <ul className="pick-list">
-              {filteredAccounts.map((a) => {
-                const picked = draftEffective.includes(a.id);
+            <div className="billing-list">
+              {accounts.map((a) => {
+                const picked = draftSel.includes(a.id);
                 return (
-                  <li
+                  <label
                     key={a.id}
-                    className={"pick-item" + (picked ? " picked" : "")}
-                    onClick={() => toggleDraft(a.id)}
+                    className={"billing-row" + (picked ? " picked" : "")}
                   >
                     <input
                       type="checkbox"
                       checked={picked}
                       onChange={() => toggleDraft(a.id)}
-                      onClick={(e) => e.stopPropagation()}
                     />
                     {/* 用全应用统一的账号单元格（头像 + 名称 + 展示标识）——
-                        此前这里是手拼的两段文字，与表格里的账号列长得不一样 */}
+                        与表格里的账号列长得一样，才不用在名单里重新认人 */}
                     <AccountCell
                       name={a.name}
                       ident={accountIdent(a.phone, a.email)}
                     />
-                    <span className="pick-tail">
-                      <span className="pick-state">
-                        {picked ? "可扣费" : "已排除"}
-                      </span>
-                    </span>
-                  </li>
+                    <span className="billing-meta">{creditMeta(a)}</span>
+                  </label>
                 );
               })}
-            </ul>
+            </div>
           )}
         </Dialog>
       )}
@@ -743,7 +783,9 @@ export function TakeoverPage({
           size="md"
           icon={<IconBolt size={16} />}
           title="限流切换"
+          subtitle="选中模型触发限流时自动换号重试，不改变当前会话。"
           label="限流切换"
+          fixedBodyHeight={420}
           onClose={closeModelPicker}
           tools={
             <button
@@ -769,21 +811,9 @@ export function TakeoverPage({
             </>
           }
         >
-          <p className="note">
-            <IconInfo size={14} />
-            <span>
-              选中的模型触发限流（429）时，代理会将该账号冷却、自动换备用账号重发同一请求，
-              对话完全无感；备用账号按剩余积分最多选，而且只是本次请求的临时绕行——
-              会话绑定仍是原账号，下一轮请求先回它。
-              0 积分（免费）模型默认全部生效、不可取消；付费模型勾选后同样生效。
-              清单的来源依次是：Qoder 模型目录（联网，缓存 1 小时）→ 落盘快照 →
-              本机 Qoder 的记录。第 1 层拉不到时自动退到后两层 ——
-              那不是这台机器的网络问题，点「刷新」可强制重拉。
-            </span>
-          </p>
           <Row
-            title="限流时临时换号重试（会话绑定不变）"
-            desc="关掉后 429 原样透传给客户端，不冷却、不换号——同一会话自始至终只用一个账号。开着时也只在本轮请求内临时绕行，不改变会话绑定的账号。"
+            title="限流时临时换号重试"
+            desc="关闭后限流响应原样透传，不冷却、不换号。"
             ctrl={
               <Toggle
                 checked={mdlFailover ?? rlFailover}
@@ -792,21 +822,16 @@ export function TakeoverPage({
               />
             }
           />
+          <p className="note">
+            <IconInfo size={14} />
+            <span>免费模型默认生效且不可取消；付费模型需勾选。</span>
+          </p>
           {fm && <p className="modal-meta">来源：{SOURCE_LABEL[fm.source]}</p>}
-          {/* 第 1 层为什么没结果，与「来源」分开成一行：前者说的是「为什么不是刚拉到的」，
-              后者说的是「这份清单来自哪一层」，塞进同一行两个都读不清 */}
-          {fm?.note && (
-            <p className="tk-why">
-              <IconInfo size={13} />
-              <span>{fm.note}</span>
-            </p>
-          )}
           {fm == null ? (
             <p className="empty">加载中…</p>
           ) : fm.models.length === 0 ? (
             <p className="empty">
-              暂未发现模型：Qoder 模型目录、落盘快照、本机记录三层都没拿到。
-              确认 Qoder 已登录、且本机跑过一次对话，再点右上角「刷新」。
+              暂未获取到模型，请确认 Qoder 已登录并运行过对话，再点「刷新」。
             </p>
           ) : (
             <ul className="pick-list">
@@ -846,8 +871,6 @@ export function TakeoverPage({
                       {m.name && <div className="pick-sub mono">{m.id}</div>}
                     </span>
                     <span className="pick-tail">
-                      {/* 免费模型：一个胶囊说清「免费 + 默认生效」——
-                          旧实现是「免费」胶囊 + 「默认」两个元素，说的是同一件事 */}
                       {/* 倍率拿不到时说「倍率未知」，不说「付费」—— 本机痕迹那层给不出倍率，
                           谎称付费会让人以为这些模型是收费的 */}
                       <span

@@ -24,8 +24,9 @@ export interface CheckinRecord {
    * 这笔签到的积分**自己的到期时刻**（毫秒）；取不到为 `null`。
    *
    * 来自领取接口发放凭据里的 `expiresAt` —— 已领取的账号靠**幂等回放**同样能拿到，
-   * 所以「今日已领」不等于「拿不到到期时间」。它是「积分过期」列对免费号唯一的日期来源：
-   * `/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵（见 `ledger::note_grant`）。
+   * 所以「今日已领」不等于「拿不到到期时间」。它只描述这一笔签到积分，
+   * 不代表整仓余额何时作废（`/sash/api/v2/me/usage` 对免费号给的是「无期限」哨兵，
+   * 见 `ledger::note_grant`），因此只出现在签到日志里，账号页不再展示积分到期。
    */
   expires_at: number | null;
   at: string;
@@ -87,7 +88,7 @@ export interface Settings {
   notify_on_manual: boolean;
   /**
    * 智能接管总开关（Qoder 专用反代）：开启 = 监听 127.0.0.1 并把 Qoder
-   * 端点指向它，按积分过期时间优先路由；关闭 = 停止监听并摘掉端点。无鉴权 Key。
+   * 端点指向它，按剩余积分从多到少选号；关闭 = 停止监听并摘掉端点。无鉴权 Key。
    */
   proxy_enabled: boolean;
   /** 反代监听端口 */
@@ -275,7 +276,7 @@ export interface OAuthPoll {
  *
  * 前后端各只有一个出口 —— 后端 `ledger::Store`（进程内唯一台账）、前端
  * `src/credits.ts`（模块级唯一对象）。智能接管的路由排序与账户展示的
- * 「剩余 / 过期时间」读的都是它，因此天然同源。
+ * 「剩余积分」读的都是它，因此天然同源。
  */
 export interface CreditFact {
   /** 剩余积分（get-user-resource 汇总，取不到为 null） */
@@ -284,7 +285,7 @@ export interface CreditFact {
   at: string;
   /** 还有余量的资源包里最早的重置/过期时间（毫秒时间戳）；null = 未知 */
   earliest_expiry_ms: number | null;
-  /** 逐资源包明细（只含还有余量的包）；前端「资源包列表」弹窗展示用 */
+  /** 逐资源包明细（只含还有余量的包）；后端台账数据，前端当前不展示 */
   packages: CreditPackage[];
 }
 
@@ -293,7 +294,7 @@ export interface CreditFact {
  *
  * 聚合包（「附加额度」把每天领的 100 分合并成一格）只有一个 `expiry_ms`，
  * 而它是**最早一笔**的到期日；要回答「到底几笔、分别哪天到期」就得看这份明细。
- * 前端只在资源包弹窗里展开它。
+ * 前端当前不展示逐笔明细。
  */
 export interface CreditGrant {
   /** 这一笔自己的到期时刻（毫秒） */
@@ -311,7 +312,8 @@ export interface CreditGrant {
  * - 两者皆无 → 响应里根本没给到期信息（未知）
  *
  * 后端在**解析响应时**就已经把哨兵归一掉了（`ledger::normalize_expiry`），
- * 所以这里永远收不到 9999 年的假日期；界面只需要把三态分别说清楚。
+ * 所以这里永远收不到 9999 年的假日期。三态字段仍保留在台账投影里，
+ * 但账号页已不再展示到期（拿不到能代表整仓余额的逐笔明细）。
  *
  * `expiry_ms` 对聚合包是「**最早一笔**未过期的发放」的到期日（不是最晚那笔）——
  * 那才是「快作废的积分」是什么时候，见 `CreditGrant`。
@@ -339,29 +341,38 @@ export interface CreditRow extends CreditFact {
   id: string;
 }
 
+export type LogCategory = "checkin" | "renew" | "notify" | "takeover" | "system";
+
 /**
- * 一条签到日志 = [`CheckinRecord`] + 账号标识 + `id`。
+ * 「日志管理」里的一条 = 后端 `logs::unified` 把三路来源（签到日志、调度器日志、
+ * 接管动态）并好后的投影，按时间倒序。
  *
- * 旧版的 `code` / `host` 已随签到线重写删除（见 [`CheckinRecord`]）。
+ * 「报错」不是一个类别，而是横跨全部的成败筛选（`success == false`）。
+ *
+ * 富字段（credit/balance/campaign_key/expires_at）只有 `checkin` 类有值：
+ * 它们来自签到日志的原有落盘形态，其余来源（调度/接管）没有这些概念。
  */
-export interface CheckinLog {
-  id: string;
-  account_id: string;
-  account_name: string;
-  account_phone: string | null;
-  /** 邮箱；老日志没有这个字段就是 null */
-  account_email: string | null;
+export interface LogEntry {
+  /** `yyyy-MM-dd HH:mm:ss`（本地时间） */
   at: string;
+  /** 毫秒时间戳：跨来源排序与「今天与否」的判据 */
+  at_ms: number;
+  category: LogCategory;
+  /** 账号名；系统类为空串 */
+  account: string;
   success: boolean;
+  /** 仅 checkin：幂等成功态（今天已领过） */
   already: boolean;
+  /** 仅 checkin：当前没有可领取的活动 */
   inactive: boolean;
   message: string;
-  /** 本次领取到的额度 */
+  /** 仅 checkin：本次领取到的额度 */
   credit: number | null;
+  /** 仅 checkin：签到那一刻读到的剩余积分 */
   balance: number | null;
-  /** 领的是哪一场活动（`campaignKey`） */
+  /** 仅 checkin：领的是哪一场活动（`campaignKey`） */
   campaign_key: string | null;
-  /** 这笔积分的到期时刻（毫秒）；见 [`CheckinRecord.expires_at`] */
+  /** 仅 checkin：这笔积分的到期时刻（毫秒） */
   expires_at: number | null;
 }
 

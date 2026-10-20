@@ -129,9 +129,10 @@ fn with_status_dot(base: &Image<'static>) -> Image<'static> {
     }
     let mut px = base.rgba().to_vec();
     let side = w.min(h) as f32;
-    let radius = side * 0.21;
+    // 小号状态点：只贴住右下角，避免盖掉新图标里的眼睛 / 折角。
+    let radius = side * 0.16;
     let ring = (radius * 0.30).max(1.0);
-    let margin = side * 0.03;
+    let margin = side * 0.04;
     let cx = w as f32 - radius - margin;
     let cy = h as f32 - radius - margin;
     for y in 0..h {

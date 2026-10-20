@@ -2,7 +2,7 @@
 
 一个用 **Tauri v2 + Rust + React** 实现的 Qoder 桌面助手（当前功能：多账号签到），支持：
 
-- **多账号管理**：账号条目**只读展示**（名称 + 展示标识 + 凭证有效期 + 剩余积分），不做手工录入与编辑 —— 凭证一律来自「登录新账号」或「导入本机账号」，避免粘贴错 token。删除账号时会一并清理它的签到日志。
+- **多账号管理**：账号条目**只读展示**（名称 + 展示标识 + 凭证有效期 + 剩余积分），不做手工录入与编辑 —— 凭证一律来自页头「添加账号」弹窗（本机导入 / 浏览器登录两条通道），避免粘贴错 token。删除账号时会一并清理它的签到日志。
   - **展示标识**：手机号为主、邮箱兜底（规则与后端 `Account::identity` 同源，
     界面、签到日志、简报弹窗与推送明细四处一致）。
   - 手机号两条路都拿得到：**导入本机账号**读 `auth.v1.dat` 里的 `user.phone`；**登录新账号**走
@@ -21,7 +21,7 @@
 - **剩余积分展示**：账号条目显示「剩余积分」，取自主流官方接口 `POST {host}/v2/billing/meter/get-user-resource`（汇总各资源包的 `CycleCapacityRemain*`，与官方 Web 端「计划与用量」同口径，可能是小数）；该接口拿不到时退回 `checkin-status` 的 `total_credits`。注意签到响应里的 `credit` 是**本次获得**（单独显示为「本次 +N」），不是余额。
 - **token 自动续签**：导入 / 无感登录时会一并保存 `refreshToken` 与 `expiresAt`。应用启动及常驻期间**每 12 小时**扫描一次，**剩余有效期不足 48 小时即自动换新凭证**（签到前另有兜底判定）；续签失败不阻断签到（仍用旧 token 试一次）。
 - **智能接管（Qoder 专用反代）**：在 `127.0.0.1:8789`（可改端口；避开同机 workbuddy-assistant 占用的 8787）起一个 Qoder 专用反代，开启后自动把 Qoder 的对话请求接管到本地——只在**勾选的扣费备选账号**里选号（未勾选的不允许扣费，全不勾 = 全部可用；每个会话按「剩余积分最多」选一个账号并整段绑定，只有它积分用完才换）。开启 / 关闭 / 换端口**都只改磁盘、不碰客户端进程**（客户端每次会话重读产物，改动在**下一次对话**自然生效，详见下）。页面下方是**接管动态**：只列对客通知（开启 / 关闭接管、**这轮对话由哪个账号提供**、限流切换、异常），请求级细节落在调试日志、界面上「查看日志」一键定位。详见 [智能接管](#智能接管qoder-专用)。
-- **账号获取（两条通道，无手工录入）**：
+- **账号获取（两条通道，无手工录入；都收在页头「添加账号」弹窗里，选项卡切换）**：
   - **导入本机账号**：直接读 Qoder 写在本机的凭据文件 `auth.v1.dat`（Chromium `safeStorage` / **OSCrypt** 加密，**两个平台都能解**：Windows 走 DPAPI、macOS 走系统钥匙串），**不需要应用运行、也不需要调试端口**，一次就能拿到 token + 昵称 + 手机号 + 邮箱 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
   - **登录新账号**：走 Qoder **设备授权流**（`/device/selectAccounts` → 浏览器扫码 → 轮询 `/api/v1/deviceToken/poll`），**不重启、不打断当前 Qoder、不改动本机登录文件**，能主动签发**任意新账号**的凭证、昵称、手机号与邮箱（与「导入本机账号」互补：后者只能收编已经登录过的那个）。
 - **只支持国内版部署**（2026-10-16 起国际版支持整体移除）：登录 `qoder.cn` /
@@ -30,19 +30,19 @@
   别处只消费、不自己拼。存量 `accounts.json` 里 `region:"global"` 的国际版账号在
   **加载时直接丢弃**（不迁移、不提示）；跨机合并键里的「区域」一维随之退役
   （key 保留 `cn:` 前缀只为兼容服务端旧条目，见 [跨机认人](#跨机认人为什么不能只看-key)）。
-- **GitHub Release 自动更新**：内置 `tauri-plugin-updater`，点击「检查更新」即可从 Release 拉取并安装新版本。
+- **GitHub Release 自动更新**：内置 `tauri-plugin-updater`；启动 3 秒后及每 10 分钟自动检查一次，窗口重新可见时也会补查。发现新版本后侧边栏「设置」常驻黄点，直到装上才消失；设置页也可手动检查并安装。
 - **积分日报（按天 + 逐小时）**：按**自然日**统计积分消耗与新增，每天一条，展开可见**每小时**明细（总览柱状图 + 逐账号列表）。
   口径是资源包**累计量**的差值（`CapacityUsed` / `CapacitySize`），不是「抓余额算涨跌」——
   所以同一天「先消耗后签到」不会互相抵消，**多个客户端同时消耗也都能统计到**。
   采样时增量就落进「采样时刻所属的小时」，因此小时之和恒等于当天合计、相邻两天可直接相加。
   数据在应用数据目录的 `credit_ledger.json`（台账 + 60 天小时桶）与 `credit_reports.json`（日报，最近 400 条），均 0600。
-- **签到日志（按账号查看）**：每次签到结果（账号 / 时间 / 结果 / 积分 / 详情）落库到应用数据目录的 `checkin_logs.json`（权限 0600，保留最近 2000 条）。入口在**每个账号条目上的「日志」按钮**，面板按时间倒序简单列出该账号记录，可一键清空。「本次额度」那一格下面还会带一行 **`至 MM-DD HH:mm`** —— 那是这笔积分通过发放凭据拿到的真实到期时间（已领的账号由幂等回放取回）。
-- **资源包到期是「三态」**，界面上分别说：有到期日（`N 天后过期` / `已过期`）· 服务端明说不过期（`不过期`）· 响应里没给到期信息（未知，退回「查看资源包」）。
-  - 附加额度（签到送的那 100 Credits）的到期时间**不在额度接口里**：`qoderUsage.expiresAt` 是整个额度概览的到期（= 计划周期终点，免费号还是「无期限」哨兵），旧版把它同时当成两个槽位的到期，于是界面对免费号显示「不过期」。真实日期来自**发放凭据** —— 领取接口 `POST …/{campaignId}/claim` 响应里的 `expiresAt`（实测 `claimedAt + 30 天`，见 `qoder_api::ClaimReceipt`）。已领取的活动**幂等回放**（`replayed: true`）同样返回这张凭据，所以签到路径每天顺手把这一笔落进台账（`ledger::note_grant`），启动时再按 `checkin_logs.json` 把历史补一遍（幂等：按到期时刻去重）。
-  - 聚合包（「附加额度」把每天领的 100 分合成一格）的「到期」取**最早一笔未过期的发放**，不是最后一笔 —— 资源包弹窗（账号页「N 天后过期」点开）里同时逐笔列出量 + 到期日，几笔、各哪天作废一目了然；账号页与到期提醒用的就是这个值（接管路由已改为按剩余积分多少选号，不再看到期时间）。
-  - 之所以要专门记一笔：免费账号的 usage 响应里 `qoderUsage.expiresAt` 是 **`9999-12-31` 哨兵**（同一账号在 `/api/v2/user/plan` 里的 `end_date` 是 `0`，
-    同一个意思、两处两套写法），把它当普通时间戳透传下去，界面就会出现「到期 9999-12-31」和「2922776 天后过期 100」。
-    归一在**解析边界**做一次（`ledger::normalize_expiry` → `never_expires: bool`），投影旧台账时再走一遍，别在别处重判一次哨兵。
+- **日志管理（全部日志，一条流水）**：三个来源在后端并成一条按时间倒序的统一流 —— 签到日志（`checkin_logs.json`）、调度器日志（`scheduler.log`：续签 / 通知 / 系统）、接管动态（`takeover-journal.jsonl`）。页面上按**类别**筛选（全部 / 报错 / 签到 / 续签 / 通知 / 接管 / 系统，带条数），其中「报错」不是一个类别而是**横跨全部的成败筛选**（`success == false`）；另有关键字搜索与账号下拉，从账号条目的「日志」按钮跳进来默认锁定该账号。每 5 秒轮询（窗口隐藏时跳过）。「清空」三路一起清（不可恢复；接管调试日志故意不清，理由见智能接管一节）。签到行的富字段照旧：本次额度、这笔积分的真实到期（`至 MM-DD HH:mm`，来自发放凭据）、余额与当天的活动键。
+- **不展示积分到期**：Qoder 的额度接口给不出能代表整仓余额的逐笔到期明细 —— 免费账号的
+  `qoderUsage.expiresAt` 是「无期限」哨兵，签到发放凭据（`expiresAt`）只覆盖单笔签到积分。
+  账号页已移除「积分过期」列与资源包弹窗，接管选号弹窗也不再附到期日；
+  台账仍保留发放凭据里的单笔到期，只用于签到日志的 `至 MM-DD HH:mm`。
+  `ledger::normalize_expiry` 的哨兵归一保留（`9999-12-31` → `never_expires`），
+  避免它在任何下游被当成真日期。
 - 跨平台：macOS（`.app` / `.dmg`）与 Windows（`.msi`）。
 
 > 签到逻辑参考自 `qoder-checkin` 与 `WorkDaddy` 的 `checkin-result.js`：
@@ -70,7 +70,7 @@ QoderAssistant/
 │   ├── tauri.conf.json     # 含 updater 配置（endpoint + pubkey）
 │   ├── capabilities/default.json
 │   ├── build.rs
-│   ├── icons/              # 图标套件（由 scripts/make-icon.mjs + tauri icon 生成）
+│   ├── icons/              # 图标套件（唯一源 icon-source.svg，tauri icon 生成）
 │   └── src/
 │       ├── main.rs / lib.rs
 │       ├── accounts.rs     # 多账号 JSON 存储（含 phone / email；文件权限 0600）
@@ -86,9 +86,8 @@ QoderAssistant/
 │       ├── stealth.rs      # 接管 Fuse：端点装卸、租约、接管事件日志（takeover-journal.jsonl）
 │       ├── proc.rs         # 辅助进程的统一入口（唯一目的：Windows 上不弹黑色命令框）
 │       ├── netfix.rs       # 网络急救：诊断（配置文件 / launchd / shell 启动脚本 / worker 产物注入）+ 一键恢复 + 自动备份
-│       ├── logs.rs         # 签到日志存储（JSON，权限 0600，保留最近 2000 条）
+│       ├── logs.rs         # 签到日志存储（JSON，权限 0600，保留最近 2000 条）+ 统一日志流（三路并流的读取侧投影）
 │       └── commands.rs     # Tauri 命令
-├── scripts/make-icon.mjs   # 纯 Node 生成图标源 PNG
 ├── scripts/build-dmg.sh    # 纯 hdiutil 打 dmg（本机缺 create-dmg 模板时的兜底）
 └── .github/workflows/release.yml  # 跨平台自动构建 + 发布 + 更新签名
 ```
@@ -122,19 +121,16 @@ cd src-tauri && cargo test -- --ignored --nocapture
 
 ```bash
 npm install
-node scripts/make-icon.mjs          # 生成图标源 PNG
-npx tauri icon src-tauri/icons/icon-source.png   # 生成各平台图标套件
+npx tauri icon src-tauri/icons/icon-source.svg   # 生成各平台图标套件
 npm run tauri build                 # 产出 src-tauri/target/release/bundle/
 npm run build:dmg                   # 可选：纯 hdiutil 兜底打 dmg（不依赖 create-dmg）
 ```
 
-> **图标（字母 Q）有「两个出口、一套几何」，改一处必须同时改另一处**：
-> ① `scripts/make-icon.mjs` 画 1024 的源 PNG（`tauri icon` 吃它生成各平台套件）；
-> ② `src/components/Icons.tsx` 的 `IconQ` 是应用内侧栏那块蓝方块里的同一个字形。
-> 后者的每个数都从前者按 `12/270` 折算而来（换算表写在 `IconQ` 的注释里）。
-> 只改一边的后果是应用图标与应用内标记**长成两个东西**——不会报错，只有并排看才发现。
-> 调完记得**按 16/24/32/64 看一眼缩略图**（Dock 与列表里都是小尺寸），
-> 以及比一下「字形外接半径 ÷ 蓝方块半边长」这个比值（源 PNG 是 `0.6466`，`IconQ size=22` 在 34px 的 `.logo` 里是 `0.6462`）。
+> **图标只有一个源：`src-tauri/icons/icon-source.svg`**。
+> ① `npx tauri icon src-tauri/icons/icon-source.svg` 生成各平台图标套件；
+> ② `src/App.tsx` 直接 import 同一份 SVG 作为侧栏品牌标记。
+> 造型是 Qoder 官方 Q 标 + 助手配色：黑底、白色外形、助手蓝折角（官方原版折角是绿色）。
+> 改图标只改这一个 SVG，重跑上面的命令；不要再单独维护应用内标记。
 
 > macOS 首次构建若提示「无法验证开发者」，在「系统设置 → 隐私与安全性」中点「仍要打开」。
 >
@@ -732,7 +728,14 @@ center —— 所以本应用统一走 `QODERCN_SERVER_ENDPOINT`。（旧版本�
   （或被删除 / 取消勾选）才按当时的积分重新选一次。会话标识取 `X-Session-ID`
   （旧版客户端从正文 `metadata.context.session_id` 兜底）；没有会话标识的请求
   （模型清单、遥测等）按单次积分排序。积分快照缓存 10 分钟。
-  限流 429 的换号是**同一请求内的临时绕行**，不改变会话绑定，下一轮请求仍先回原账号。
+  限流引发的换号（HTTP 429，或下一段说的 SSE 错误帧）是**同一请求内的临时绕行**，
+  不改变会话绑定，下一轮请求仍先回原账号。
+- **限流有两种到达方式**（2026-10-20 实机定位）：OpenAI 风格路径是 HTTP 429；Qoder 的对话路径
+  `agent_chat_generation` 先回 `200 text/event-stream`，再把错误封进一帧
+  `{"statusCodeValue":429,"body":"{\"code\":110,…}"}`（110 = 今日次数用完，还有 114/115/116…
+  等额度类业务码）。模型 id 也不在正文里，而在 `X-Model-Key` 头（如 `dfmodel`）。
+  代理在写响应头前预读首个非控制事件：认出限流/额度错误就冷却「账号 × 模型」并换号重发；
+  额度错误没给重置时刻时冷却到次日零点。认不出就把预读字节原样接回流式转发，正常流一个字不改。
 - **`Authorization` 有两种形态，必须分开对待**（2026-09-19 实测；这一条曾让接管「看起来开了、
   却完全不能用」）：推理与用户信息走 `Bearer <token>` —— **换成选中扣费账号的凭证**，这就是接管的
   落点；而 `/algo/*`（模型清单、data policy）走 **`Signature <hmac>` 请求签名**，
@@ -846,8 +849,8 @@ center —— 所以本应用统一走 `QODERCN_SERVER_ENDPOINT`。（旧版本�
 | `apply_settings` | 原子应用设置；接管启停 / 换端口只改磁盘（改动在下一次对话生效）；任一步失败整体回滚 |
 | `test_notify` | 向 webhook 发一条测试通知，返回推送服务原始响应 |
 | `get_autostart` / `set_autostart` | 读取 / 设置开机自启动（直接操作系统登录项，失败会返回原因） |
-| `get_checkin_logs` | 查询签到日志（倒序、可按账号 id 筛选、最多 300 条） |
-| `clear_checkin_logs` | 清空签到日志（传 `accountId` 则只清该账号） |
+| `get_logs` | 统一日志流：签到 + 调度器 + 接管动态三路并好、按时间倒序（每路最多 500 条，见 `logs::unified`） |
+| `clear_logs` | 清空日志（三路一起清，不可恢复；接管调试日志不清） |
 | `credit_briefing` / `credit_briefing_clear` / `credit_briefing_enable` | 积分简报：读日条目（= 当天时条目之和，现算）/ 清空历史 / 开启（清历史 + 采一次样只对齐基线） |
 | `stealth_status` | 读取接管状态（端点是否装上 / 心跳 / 该做什么）。停止接管走 `apply_settings(proxy_enabled=false)` |
 | `takeover_events` / `takeover_events_clear` | 接管事件流（新的在前）/ 清空 |

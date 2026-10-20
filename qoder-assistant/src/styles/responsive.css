@@ -1,93 +1,42 @@
 /**
- * 响应式层：**全应用唯一允许写 `@media (max-width)` 的地方**。
+ * 响应式层：内容侧（卡片、表格、设置行）的窄窗规则集中在这里。
  *
- * 为什么单独成层：窗口能缩到 760×480（见 src-tauri/tauri.conf.json 的
- * `minWidth` / `minHeight`），而**默认窗口只有 980 宽** —— 也就是说「窄」才是常态，
- * 宽窗口反而是例外。此前两处窄窗规则分别散落在 ui.css 与 pages.css 里，各管一摊、
- * 互不知情，于是「缩到最小时页头标题被挤成竖排 / 表格静默溢出」这类问题只修掉一半。
- * 收拢到一层之后，加一档宽度只需要改这一个文件。
+ * 外壳自身的形变（侧栏收成图标轨、页头换行）留在 chrome.css —— 那属于组件
+ * 内部结构；本层只处理「窗口变窄后内容怎么重新排」。
  *
- * ── 断点取值的唯一依据（改侧栏宽度或内边距就要回来重算）────────────
- *   内容区可用宽 = 窗口宽 − 侧栏宽 − 2 × 内容区左右内边距
- *     全尺寸：侧栏 216 / 内边距 24 → 980 的窗口只剩 716
- *     紧凑态：侧栏  64 / 内边距 16 → 980 有 884，最小的 760 仍有 664
- *   页头那一排的固有宽度 ≈ 标题 122 + 胶囊 68 + 四个按钮 399 + 三段间距 24 ≈ 613。
- *   ⇒ 716 放不下 613 + 呼吸余量，而 664 放得下 —— 所以「64px 图标轨道」是
- *   「最小窗口下页头不换行」的必要条件，不是审美偏好。
- *
- * 三档各自只解决一类问题，不重叠：
- *   1080  侧栏收成图标轨道 + 页头胶囊收成圆点   —— 让出横向空间
- *    900  内外边距收紧 + 次要列收起 + 工具条换行  —— 让内容真的放得下
- *    820  页头按钮内边距再收一档                —— 最小窗口的兜底余量
+ * 四档各自只解决一类问题：
+ *   1180  页头与表格收紧一档                 —— 常规笔记本宽度
+ *    900  汇总 2×2、次要列收起、设置卡上下堆叠 —— 让内容真的放得下
+ *    820  账号表格与页头状态再收一档           —— minWidth 760 也不横向截断
+ *    620  汇总单列、弹窗贴边                  —— 更窄的缩放窗口
  */
 
-/* ── 1080：侧栏收成图标轨道；页头状态胶囊收成圆点 ──────────────── */
-@media (max-width: 1080px) {
-  .sidebar {
-    flex-basis: 64px;
-    padding: 14px 8px;
-    gap: 12px;
+/* ── 1180：页头与表格收紧 ─────────────────────────────────── */
+@media (max-width: 1180px) {
+  .pagebar-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 12px;
   }
-  .brand {
-    justify-content: center;
-    padding: 0;
+  .pagebar h2 {
+    font-size: 20px;
   }
-  /* 品牌名与版本号一起走：轨道里放不下，且图标本身已经能认出是谁 */
-  .brand-text {
-    display: none;
-  }
-  .nav-item {
-    justify-content: center;
-    gap: 0;
-    padding: 9px 0;
-  }
-  .nav-label {
-    display: none;
-  }
-  /* 选中态的强调条要跟着轨道内移 —— 原来的 left:-14px 是照 14px 侧栏内边距
-     算的，轨道里只剩 8px，照旧值会被裁掉一半 */
-  .nav-item::before {
-    left: -8px;
-  }
-  /* 未读圆点改挂右上角：轨道里已经没有「行尾」可贴 */
-  .nav-dot {
-    position: absolute;
-    top: 5px;
-    right: 7px;
-    margin-left: 0;
-  }
-  /* 胶囊只留圆点：文案收进 `title`（两枚胶囊本来就都带 title）。
-     这一档省下约 240px —— 它正是最小窗口下页头换行的直接原因。 */
-  .status-pill {
-    width: var(--pill-h);
-    padding: 0;
-    justify-content: center;
-  }
-  .status-pill .pill-text {
-    display: none;
+  .data-table thead th,
+  .data-table tbody td {
+    padding-left: 14px;
+    padding-right: 14px;
   }
 }
 
-/* ── 900：内外边距收紧 + 次要列收起 + 工具条换行 ───────────────── */
+/* ── 900：汇总 2×2 + 次要列收起 + 设置卡上下堆叠 ──────────── */
 @media (max-width: 900px) {
-  .pagebar {
-    gap: 8px;
-    padding: 0 16px;
-  }
-  /* 内容区左右内边距与页头对齐取同一个值：错开会让卡片左沿与标题左沿对不上 */
-  .content {
-    padding: calc(var(--pagebar-h) + 14px) 16px 20px;
-  }
-
-  /* 汇总卡 2×2：四列时每张只剩 150px 上下，「18380.76」这种数会顶到边框 */
+  /* 四列时每张只剩 150px 上下，「18380.76」这种数会顶到边框 */
   .summary {
     grid-template-columns: repeat(2, 1fr);
   }
 
-  /* 页面级信息栏（凭证池 / 今日权益）：中间那段是**说明 + 错误文案**
-     （「云端那一池已经不存在了…请重新上传或绑定」），被省略号吃掉就等于没提示。
-     所以窄窗下让它换行，动作组独占第二行并右对齐 ——
-     三行变两行是可预期的，省略错误不是。 */
+  /* 云端凭证池：中间那段是**说明 + 错误文案**，被省略号吃掉就等于没提示，
+     所以窄窗下让它换行，动作组独占第二行并右对齐 */
   .info-bar {
     flex-wrap: wrap;
     row-gap: 8px;
@@ -103,17 +52,15 @@
     justify-content: flex-end;
   }
 
-  /* 次要列让位：滚动条已全局隐藏，一旦横向溢出就是**静默截断**，
-     所以窄窗必须真的不溢出 —— 宁可少显示一列（两处信息在日志页 / 弹窗里都有）。
-     账号页收起「Token 过期」，日志页收起「剩余余额」。 */
+  /* 滚动条已全局隐藏，横向溢出就是**静默截断**，所以窄窗必须真的不溢出 ——
+     宁可少显示一列（账号页收起「Token 过期」，日志页收起「剩余余额」） */
   .col-secondary {
     display: none;
   }
-  .data-table thead th {
-    padding: 0 12px;
-  }
+  .data-table thead th,
   .data-table tbody td {
-    padding: 12px;
+    padding-left: 12px;
+    padding-right: 12px;
   }
   /* 账号名与展示标识在窄列里改为可省略：它们不参与布局决策，不该把表格撑宽 */
   .ac-name,
@@ -121,11 +68,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* 日志消息列原来的 160px 是宽窗口下的舒适值，窄窗下它是压垮表格的那一列 */
   .log-cell-msg {
     min-width: 120px;
   }
-  /* 工具条：筛选框 + 计数 + 按钮在 664px 里必然互相挤，允许换行 */
   .logs-toolbar {
     flex-wrap: wrap;
     row-gap: 10px;
@@ -134,8 +79,7 @@
     min-width: 140px;
   }
 
-  /* 设置卡原来是左右分栏（左：标题区，右：若干行），窄窗下右栏会被挤到无法阅读。
-     原先写在 pages.css 的 max-width:860px 里，收拢到这里统一取 900。 */
+  /* 设置卡原来是左右分栏，窄窗下右栏会被挤到无法阅读 */
   .set-card {
     flex-direction: column;
   }
@@ -143,21 +87,79 @@
     flex: 0 0 auto;
     border-right: none;
     border-bottom: 1px solid var(--border);
+    padding: 18px 20px;
+  }
+  .set-group {
+    padding: 4px 20px;
   }
   .set-row {
     align-items: flex-start;
     flex-direction: column;
+    gap: 12px;
+  }
+  .set-row-main {
+    flex: 0 0 auto;
+  }
+  .set-row-ctrl {
+    width: 100%;
+  }
+  .set-row-ctrl .set-input {
+    width: 100%;
   }
 }
 
-/* ── 820：最小窗口（minWidth = 760）的兜底余量 ─────────────────── */
+/* ── 820：账号表格与页头状态再收一档 ─────────────────────────
+   操作列全是 nowrap 按钮，列宽压不下去；760（minWidth）时整张表会横向溢出，
+   而滚动条已全局隐藏、溢出就是静默截断。这里把内边距、图标座与状态胶囊
+   各收一档；页头状态胶囊只留圆点（文案仍在 title 里），换取完整操作列。 */
 @media (max-width: 820px) {
-  /* 按钮内边距各收 4px：四个按钮省下 32px，是「标题 + 两枚圆点 + 四个按钮」
-     在 664px 内不换行的余量来源。文案本身不缩 —— 中文按钮少一个字就读不懂了。 */
-  .pagebar .btn {
-    padding: 8px 10px;
+  .status-pill {
+    width: 28px;
+    justify-content: center;
+    padding: 0;
   }
-  .pagebar {
-    gap: 6px;
+  .status-pill .pill-text {
+    display: none;
+  }
+  .data-table thead th,
+  .data-table tbody td {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .data-table .icon-btn {
+    width: 30px;
+    height: 30px;
+  }
+  .data-table .btn.small {
+    padding: 0 10px;
+  }
+  .ac-cell-actions {
+    gap: 4px;
+  }
+  .status-dot {
+    padding: 4px 8px;
+  }
+}
+
+/* ── 620：最小窗口的兜底 ─────────────────────────────────── */
+@media (max-width: 620px) {
+  .summary {
+    grid-template-columns: 1fr;
+  }
+  .stat-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .modal-mask {
+    padding: 14px;
+  }
+  .modal {
+    max-height: 92vh;
+  }
+  .brief-head {
+    gap: 10px;
+  }
+  /* 窄窗下指标只留数字：标签挤在同一行会把日期与指标拆得没法读 */
+  .brief-metric .bm-label {
+    display: none;
   }
 }

@@ -714,7 +714,7 @@ pub fn takeover_events(app: tauri::AppHandle) -> Vec<JournalEvent> {
 ///
 /// 抽成纯函数是为了能在单测里把「技术细节一个都不许漏到界面上」钉死 ——
 /// 这道过滤只在**读取侧**对升级前的旧 journal 生效；新写入的调试事件压根不进这个文件。
-fn visible_events(events: Vec<JournalEvent>) -> Vec<JournalEvent> {
+pub(crate) fn visible_events(events: Vec<JournalEvent>) -> Vec<JournalEvent> {
     let mut out: Vec<JournalEvent> = events
         .into_iter()
         .filter(|e| !DEBUG_ONLY_EVENTS.contains(&e.event.as_str()))
@@ -778,11 +778,15 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 #[tauri::command]
 pub fn takeover_events_clear(app: tauri::AppHandle) -> Result<(), String> {
     let dir = crate::commands::try_data_dir(&app)?;
-    // 与追加共用一把锁：否则「清空」和并发写入可能交叉，留下半条记录
+    journal_clear(&dir).map_err(|e| format!("清空接管动态失败：{e}"))
+}
+
+/// 截断 journal 文件（与追加共用一把锁）。调试日志故意不清，理由见 [`takeover_events_clear`]。
+pub(crate) fn journal_clear(dir: &Path) -> std::io::Result<()> {
     let _guard = lock_journal();
-    let path = journal_path(&dir);
+    let path = journal_path(dir);
     if path.exists() {
-        fs::write(&path, "").map_err(|e| format!("清空接管动态失败：{e}"))?;
+        fs::write(&path, "")?;
     }
     Ok(())
 }

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
+import brandIcon from "../src-tauri/icons/icon-source.svg";
 import type {
   Account,
   BrokerStatus,
@@ -39,8 +40,10 @@ import { BriefingPage } from "./pages/BriefingPage";
 import { LogsPage } from "./pages/LogsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import {
+  IconAlertTriangle,
   IconCheck,
-  IconQ,
+  IconCircleCheck,
+  IconInfo,
   IconSwap,
   IconActivity,
   IconList,
@@ -49,9 +52,8 @@ import {
   IconRefresh,
 } from "./components/Icons";
 import {
+  AddAccountModal,
   BrokerBindModal,
-  LocalAccountsModal,
-  OAuthModal,
   PoolIssuedModal,
 } from "./components/ImportModals";
 import { ConfirmDialog } from "./components/ConfirmDialog";
@@ -60,15 +62,14 @@ import { TitleBar } from "./components/TitleBar";
 /**
  * 应用外壳：左侧导航栏 + 右侧内容区。
  *
- * 页面（tab）承载常驻功能：账号签到 / 智能接管 / 签到日志 / 设置
+ * 页面（tab）承载常驻功能：账号签到 / 智能接管 / 日志管理 / 设置
  * （网络急救已作为一张卡并入设置页，见 NetfixCard）；
- * 弹窗只留给「做完即走」的任务流（登录新账号、导入本机账号、危险操作确认）。
+ * 弹窗只留给「做完即走」的任务流（添加账号、危险操作确认）。
  */
 type Page = "accounts" | "takeover" | "briefing" | "logs" | "settings";
 
 type Modal =
-  | { type: "local" }
-  | { type: "oauth" }
+  | { type: "addAccount" }
   | { type: "brokerLink" }
   /** 上传成功：摊开那一池的 uuid 等用户搬走（详情见 PoolIssuedModal） */
   | { type: "poolIssued"; uuid: string; message: string }
@@ -78,7 +79,7 @@ const NAV: { key: Page; label: string }[] = [
   { key: "accounts", label: "账号签到" },
   { key: "takeover", label: "智能接管" },
   { key: "briefing", label: "积分简报" },
-  { key: "logs", label: "签到日志" },
+  { key: "logs", label: "日志管理" },
   { key: "settings", label: "设置" },
 ];
 
@@ -94,16 +95,18 @@ const PAGE_TITLES: Record<Page, string> = {
   accounts: "账号签到",
   takeover: "智能接管",
   briefing: "积分简报",
-  logs: "签到日志",
+  logs: "日志管理",
   settings: "设置",
 };
 
 /**
- * 后台检查更新的节奏：启动后先等 8 秒（避开启动期的签到/续签抢网络），此后每 6 小时一次。
- * 定成常驻轮询是因为应用是「后台常驻」形态——没人会天天主动去点「检查更新」。
+ * 后台检查更新的节奏：启动后先等 3 秒，此后每 10 分钟一次；
+ * 窗口重新可见时若距上次检查超过 1 分钟，再补查一次。
+ * 应用是「后台常驻」形态，靠低频轮询会让新版本滞后半天。
  */
-const UPDATE_FIRST_DELAY_MS = 8_000;
-const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_FIRST_DELAY_MS = 3_000;
+const UPDATE_INTERVAL_MS = 10 * 60 * 1000;
+const UPDATE_REFOCUS_MIN_GAP_MS = 60_000;
 
 export default function App() {
   const [page, setPage] = useState<Page>("accounts");
@@ -116,7 +119,7 @@ export default function App() {
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [busyAll, setBusyAll] = useState(false);
   const [busyRefresh, setBusyRefresh] = useState(false);
-  /** 后台轮询发现的新版本（驱动侧边栏「设置」上的小红点） */
+  /** 后台轮询发现的新版本（驱动侧边栏「设置」上的黄点，装上才消失） */
   const [updateNotice, setUpdateNotice] = useState<UpdateNotice>(null);
   /**
    * 应用更新：**全局任务状态**。持在 App 而非设置页 —— 下载是整机动作，切页不能丢；
@@ -193,23 +196,18 @@ export default function App() {
     bindCredits();
   }, []);
 
-  // 后台轮询要判断「用户此刻在不在设置页」，但不能把 page 写进依赖（会让定时器反复重建）
-  const pageRef = useRef(page);
-  useEffect(() => {
-    pageRef.current = page;
-  }, [page]);
-
-  // 后台定时检查新版本，只为点亮侧边栏那颗小红点。
-  // 窗口被隐藏时 webview 仍在跑（点红按钮只是 hide、不销毁窗口），所以常驻期间定时器一直有效。
+  // 后台定时检查新版本，只为点亮侧边栏那颗黄点。
+  // 窗口被隐藏时 webview 仍在跑（点红按钮只是 hide、不销毁窗口），所以常驻期间定时器一直有效；
+  // 窗口重新可见时补查一次，免得「刚打开就看到旧版本」。
   useEffect(() => {
     let alive = true;
+    let lastCheck = 0;
     const run = async () => {
+      lastCheck = Date.now();
       try {
         const version = await probeUpdate();
         if (!alive) return;
-        setUpdateNotice((prev) =>
-          nextUpdateNotice(prev, version, pageRef.current === "settings")
-        );
+        setUpdateNotice((prev) => nextUpdateNotice(prev, version));
       } catch (e) {
         // 轮询失败一律静默：网络抖动、代理不通都是常态，不该弹提示打扰用户。
         // 想看明确报错就到设置页手动点「检查更新」。
@@ -218,10 +216,22 @@ export default function App() {
     };
     const first = window.setTimeout(run, UPDATE_FIRST_DELAY_MS);
     const timer = window.setInterval(run, UPDATE_INTERVAL_MS);
+    const recheck = () => {
+      if (
+        document.visibilityState === "visible" &&
+        Date.now() - lastCheck >= UPDATE_REFOCUS_MIN_GAP_MS
+      ) {
+        void run();
+      }
+    };
+    document.addEventListener("visibilitychange", recheck);
+    window.addEventListener("focus", recheck);
     return () => {
       alive = false;
       window.clearTimeout(first);
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", recheck);
+      window.removeEventListener("focus", recheck);
     };
   }, []);
 
@@ -229,17 +239,13 @@ export default function App() {
     setSettings(await getSettings());
   }, []);
 
-  /** 小红点：后台查到了新版本，且用户还没看过 */
-  const showUpdateDot = updateNotice !== null && !updateNotice.seen;
-
-  /** 用户进设置页就算看过这条提醒（设置页里仍写明有新版本，信息不丢） */
-  const markUpdateSeen = useCallback(() => {
-    setUpdateNotice((n) => (n && !n.seen ? { ...n, seen: true } : n));
-  }, []);
+  /** 黄点：查到了新版本且本机还没装上（不因查看设置页而熄灭） */
+  const showUpdateDot = updateNotice !== null;
 
   /**
    * 触发检查并安装 —— 实现与状态都在这一层，下载是整机动作，切页既不会中断也不会丢进度。
-   * 手动检查的结论同时回写 updateNotice：新版本点亮红点（用户已在看，算已读）、已是最新则清掉。
+   * 手动检查的结论同时回写 updateNotice：新版本点亮黄点，已是最新或装完则清掉。
+   * 检查结果只在设置页的更新卡里展示，不再另弹 toast（同一句话不重复说两遍）。
    */
   const runUpdate = useCallback(async () => {
     if (updateBusy) return;
@@ -247,14 +253,13 @@ export default function App() {
     setUpdateStatus({ status: "checking", message: "正在检查更新…" });
     await checkAndInstall((p) => {
       setUpdateStatus(p);
-      if (p.status === "error") showToast({ kind: "err", text: p.message });
-      if (p.status === "no-update") showToast({ kind: "info", text: p.message });
       if (p.status === "available")
-        setUpdateNotice({ version: p.version ?? "", seen: true });
-      else if (p.status === "no-update") setUpdateNotice(null);
+        setUpdateNotice({ version: p.version ?? "" });
+      else if (p.status === "no-update" || p.status === "updated")
+        setUpdateNotice(null);
     });
     setUpdateBusy(false);
-  }, [showToast, updateBusy]);
+  }, [updateBusy]);
 
   // 启动时若开启“自动签到”，则对全部账号执行一次
   useEffect(() => {
@@ -390,7 +395,7 @@ export default function App() {
     async (a: Account) => {
       const ok = await askConfirm({
         title: "删除账号",
-        body: `确认删除「${accountLabel(a.name, accountIdent(a.phone, a.email))}」？该账号的签到日志也会一并删除。`,
+        body: `确认删除「${accountLabel(a.name, accountIdent(a.phone, a.email))}」？该账号的签到记录也会一并删除。`,
         okText: "删除",
         danger: true,
       });
@@ -477,9 +482,9 @@ export default function App() {
   const runBrokerUnbind = useCallback(async () => {
     const ok = await askConfirm({
       title: "解除绑定？",
-      body: `解绑后本机回到单机运行：与云端那一池（${
+      body: `解绑后，与云端池（${
         brokerStatus?.uuid?.slice(0, 8) ?? ""
-      }…）重复的凭证会从本机移除，本机独有的账号保留；云端那一池保留，其他机器不受影响。`,
+      }…）重复的凭证会从本机移除；云端池与其他机器不受影响。`,
       okText: "解除绑定",
       danger: true,
     });
@@ -536,11 +541,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <span className="logo">
-            {/* 22 不是拍脑袋：`.logo` 是 34px 蓝方块，而 IconQ 的字形外接框 = 整个 svg 框。
-                应用图标里字形占蓝方块对边的 64.9%（270/416），要让应用内这块 34px 的方块
-                看起来是**同一个标记**，svg 就得给 0.649 × 17 ÷ (11.98/24) ≈ 22。
-                给 19 会让 Q 比应用图标小一圈，两个东西并排一眼能看出不是一套。 */}
-            <IconQ size={22} />
+            <img src={brandIcon} alt="" aria-hidden="true" />
           </span>
           <div className="brand-text">
             <span className="brand-name">Qoder 助手</span>
@@ -560,8 +561,6 @@ export default function App() {
                 setPage(n.key);
                 // 从导航进入日志页时不带账号预设（只有从账号条目跳转才带）
                 if (n.key === "logs") setLogsInitial(null);
-                // 进设置页 = 看到了更新提醒
-                if (n.key === "settings") markUpdateSeen();
               }}
             >
               <span className="nav-icon">{PAGE_ICON[n.key]}</span>
@@ -572,7 +571,7 @@ export default function App() {
               )}
               {n.key === "settings" && showUpdateDot && (
                 <span
-                  className="nav-dot err"
+                  className="nav-dot warn"
                   title={`有新版本 v${updateNotice?.version} 可更新`}
                 />
               )}
@@ -582,16 +581,24 @@ export default function App() {
 
         {/* ── 侧栏脚：应用更新进度条，整块靠底（margin-top:auto 在这里）── */}
         <div className="sidebar-foot">
-          {/* 全局更新状态：检查/下载/安装进行中时在侧边栏底部常驻，切页不丢进度。
-              error / no-update 已由 runUpdate 弹 toast，不在这里占位。 */}
-          {updateStatus &&
+          {/* 全局更新状态：检查/下载/安装/失败时在侧边栏底部常驻，切页不丢进度与错误。
+              设置页自己就有同一份进度，那里不重复画。 */}
+          {page !== "settings" &&
+            updateStatus &&
             (updateStatus.status === "checking" ||
               updateStatus.status === "downloading" ||
               updateStatus.status === "installing" ||
-              updateStatus.status === "updated") && (
+              updateStatus.status === "updated" ||
+              updateStatus.status === "error") && (
               <div className="sidebar-update">
                 <div className="sidebar-update-title">应用更新</div>
-                <div className="upd-status">{updateStatus.message}</div>
+                <div
+                  className={
+                    "upd-status" + (updateStatus.status === "error" ? " err" : "")
+                  }
+                >
+                  {updateStatus.message}
+                </div>
                 {(() => {
                   const dl = downloadProgress(updateStatus);
                   if (!dl) return null;
@@ -624,83 +631,73 @@ export default function App() {
             <span className="pagebar-icon">{PAGE_ICON[page]}</span>
             <h2>{PAGE_TITLES[page]}</h2>
           </div>
-          <span className="spacer" />
-          {page === "accounts" && (
-            <>
-              <div className="status-group">
-                {settings?.schedule_enabled && (
-                  <span
-                    className="status-pill"
-                    title={
-                      settings.schedule_window_minutes > 0
-                        ? `应用保持运行时才会触发；今天的时刻在 ${settings.schedule_time} 之后的 ${settings.schedule_window_minutes} 分钟内随机挑定，挑定后会推送一条通知告知；可在「设置」里修改`
-                        : "应用保持运行时才会触发；可在「设置」里修改"
-                    }
-                  >
-                    <i className="dot" />
-                    <span className="pill-text">
-                      {settings.schedule_window_minutes > 0
-                        ? `每日 ${settings.schedule_time} 起 ${settings.schedule_window_minutes} 分钟内随机签到`
-                        : `每日 ${settings.schedule_time} 自动签到`}
+          <div className="pagebar-right">
+            {page === "accounts" && (
+              <>
+                <div className="status-group">
+                  {settings?.schedule_enabled && (
+                    <span
+                      className="status-pill"
+                      title="应用运行时才会触发；可在「设置」修改"
+                    >
+                      <i className="dot" />
+                      <span className="pill-text">
+                        {settings.schedule_window_minutes > 0
+                          ? `${settings.schedule_time} 起 ${settings.schedule_window_minutes} 分钟内随机签到`
+                          : `${settings.schedule_time} 自动签到`}
+                      </span>
                     </span>
-                  </span>
-                )}
-                {settings?.stagger_checkin && settings.stagger_max_seconds > 0 && (
-                  <span
-                    className="status-pill warn"
-                    title="批量签到时账号之间随机间隔，降低同 IP 触发风控的概率"
-                  >
-                    <i className="dot" />
-                    <span className="pill-text">
-                      风控间隔 ≤{settings.stagger_max_seconds}s
-                    </span>
-                  </span>
-                )}
-              </div>
-              <div className="action-group">
-                <button
-                  className="btn ghost"
-                  title="用系统浏览器扫码登录新账号"
-                  onClick={() => setModal({ type: "oauth" })}
-                >
-                  <IconUserPlus size={15} />
-                  登录新账号
-                </button>
-                <button
-                  className="btn ghost"
-                  title="读取本机 Qoder 登录信息自动添加账号"
-                  onClick={() => setModal({ type: "local" })}
-                >
-                  导入本机账号
-                </button>
-                <button
-                  className="btn ghost"
-                  disabled={busyRefresh || accounts.length === 0}
-                  title="重拉全部账号的积分快照 / 签到状态 / 积分余量并持久化"
-                  onClick={runRefresh}
-                >
-                  {busyRefresh ? (
-                    <>
-                      <IconRefresh size={15} className="spin" />
-                      刷新中
-                    </>
-                  ) : (
-                    <>
-                      <IconRefresh size={15} />
-                      刷新
-                    </>
                   )}
-                </button>
-                <button
-                  className="btn primary"
-                  disabled={busyAll || accounts.length === 0}
-                  onClick={() => void runCheckinAll()}
-                >
-                  {busyAll ? "签到中…" : "全部签到"}
-                </button>
-              </div>
-            </>
-          )}
+                  {settings?.stagger_checkin && settings.stagger_max_seconds > 0 && (
+                    <span
+                      className="status-pill warn"
+                      title="批量签到时账号之间的随机间隔"
+                    >
+                      <i className="dot" />
+                      <span className="pill-text">
+                        风控间隔 ≤{settings.stagger_max_seconds}s
+                      </span>
+                    </span>
+                  )}
+                </div>
+                <div className="action-group">
+                  <button
+                    className="btn ghost"
+                    title="导入本机账号或扫码登录"
+                    onClick={() => setModal({ type: "addAccount" })}
+                  >
+                    <IconUserPlus size={15} />
+                    添加账号
+                  </button>
+                  <button
+                    className="btn ghost"
+                    disabled={busyRefresh || accounts.length === 0}
+                    title="重拉全部账号的积分与签到状态"
+                    onClick={runRefresh}
+                  >
+                    {busyRefresh ? (
+                      <>
+                        <IconRefresh size={15} className="spin" />
+                        刷新中
+                      </>
+                    ) : (
+                      <>
+                        <IconRefresh size={15} />
+                        刷新
+                      </>
+                    )}
+                  </button>
+                  <button
+                    className="btn primary"
+                    disabled={busyAll || accounts.length === 0}
+                    onClick={() => void runCheckinAll()}
+                  >
+                    {busyAll ? "签到中…" : "全部签到"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
           {/* 页头右侧只放「当前页面的只读状态」：有状态才显示，没状态就留空。
               日志页原先挂的是一句说明文案（「按账号筛选查看签到记录」），
               既不承载状态、又与账号页那组状态胶囊长得像，已移除。 */}
@@ -778,18 +775,24 @@ export default function App() {
       </div>
       </div>
 
-      {toast && <div className={`toast toast-${toast.kind}`}>{toast.text}</div>}
-
-      {modal?.type === "local" && (
-        <LocalAccountsModal
-          accounts={accounts}
-          onImport={importItems}
-          onClose={() => setModal(null)}
-          onToast={showToast}
-        />
+      {toast && (
+        <div className={`toast toast-${toast.kind}`}>
+          <span className="toast-icon">
+            {toast.kind === "ok" ? (
+              <IconCircleCheck size={16} />
+            ) : toast.kind === "err" ? (
+              <IconAlertTriangle size={16} />
+            ) : (
+              <IconInfo size={16} />
+            )}
+          </span>
+          {toast.text}
+        </div>
       )}
-      {modal?.type === "oauth" && (
-        <OAuthModal
+
+      {modal?.type === "addAccount" && (
+        <AddAccountModal
+          accounts={accounts}
           onImport={importItems}
           onClose={() => setModal(null)}
           onToast={showToast}

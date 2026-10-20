@@ -49,11 +49,7 @@ export function NetfixCard({
   const doRestore = async () => {
     const ok = await askConfirm({
       title: "一键恢复网络配置",
-      body:
-        "会依次：关闭智能接管、把被改过的客户端产物还原成官方原样、" +
-        "备份并清除全局调试端点、取消 launchd 全局环境变量，最后复检。" +
-        "不会重启任何客户端：产物还原后，Qoder 下一次对话重读产物即回到直连。" +
-        "被改动的文件都会先备份。继续？",
+      body: "将关闭智能接管并清理残留配置，改动前会先备份。继续？",
       okText: "恢复",
       danger: true,
     });
@@ -93,20 +89,13 @@ export function NetfixCard({
         </span>
         <div>
           <div className="set-card-title">网络急救</div>
-          <div className="set-card-sub">
-            排查并清除影响整个 Qoder 的全局网络残留配置
-          </div>
         </div>
       </div>
 
       <div className="set-group">
         <Row
           title="网络链路诊断"
-          desc={
-            "调试「自定义服务端点」时，如果把地址写进了 Qoder 的全局配置" +
-            "（~/.qoder/settings.json 的 env，或 launchd 全局环境变量），" +
-            "受影响的会是整个 Qoder，典型表现是「502 连接被拒绝」。"
-          }
+          desc="Qoder 连不上或提示 502 时，先在这里扫描并清理残留配置。"
           ctrl={
             <>
               <button
@@ -145,7 +134,7 @@ export function NetfixCard({
                 <IconCircleCheck size={18} />
                 <div>
                   <strong>网络链路正常</strong>
-                  <span>未发现残留端点配置，Qoder 的网络链路是干净的。</span>
+                  <span>未发现残留配置。</span>
                 </div>
               </div>
             ) : (
@@ -154,7 +143,7 @@ export function NetfixCard({
                   <IconAlertTriangle size={18} />
                   <div>
                     <strong>发现 {netReport.issues.length} 项配置残留</strong>
-                    <span>以下项可能影响 Qoder 网络连接，建议点「一键恢复」清除。</span>
+                    <span>建议点「一键恢复」清除。</span>
                   </div>
                 </div>
                 <ul className="net-list">
@@ -188,9 +177,7 @@ export function NetfixCard({
                   ))}
                 </ul>
                 {netReport.issues.some((i) => i.fixable && i.level !== "ok") && (
-                  <p className="hint">
-                    「一键恢复」会清除上表中标记为可自动处理的项；改动前一律先备份。
-                  </p>
+                  <p className="hint">恢复前会自动备份。</p>
                 )}
               </>
             )}

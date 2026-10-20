@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
 import type {
   Account,
   ImportItem,
@@ -19,49 +27,56 @@ import {
   IconAlertTriangle,
   IconClock,
   IconCloud,
-  IconFile,
   IconInfo,
   IconLink,
   IconUserPlus,
 } from "./Icons";
 
 /**
- * 账号导入的两条通道（都保留弹窗形态——它们是「做完即走」的任务流）：
- * - 导入本机账号：读 Qoder 写在本机的 `auth.v1.dat`（Chromium safeStorage 加密）；
- * - 登录新账号：官方 OAuth state 轮询，在系统浏览器完成登录。
+ * 「添加账号」弹窗：两条导入通道收进同一张弹窗，用分段选项卡切换（对齐 trae 助手）：
+ * - 本机账号：读 Qoder 写在本机的 `auth.v1.dat`（Chromium safeStorage 加密）；
+ * - 浏览器登录：官方设备授权轮询，在系统浏览器完成登录。
  *
+ * 页头因此只剩一个「添加账号」入口；两条通道的说明与能力原样保留。
  * 原来的「导出账号 / 从文件导入」已拆掉：它把 token 与 refresh token 原样写进文件，
  * 于是几台机器各持一份 refresh token 的副本 —— 而官方续签是单链轮换，
  * 谁先签就把别人踢下线。凭据只留在本机这一份，不进任何共享通路。
  */
 
 /**
- * 「导入本机账号」：直接读 Qoder 写在本机的凭据文件（`auth.v1.dat`，Chromium safeStorage 加密）。
+ * 本机账号选项卡的内容：直接读 Qoder 写在本机的凭据文件
+ * （`auth.v1.dat`，Chromium safeStorage 加密）。
  *
  * 这是最省事的一条路——不需要 Qoder 正在运行、不用改启动方式，
  * 而且一次就能拿到 token + 昵称 + 手机号 / 邮箱（导入时一并带上）。
- * 代价是它只能拿到**已经在本机登录过**的账号；要收新账号请用「登录新账号」。
+ * 代价是它只能拿到**已经在本机登录过**的账号；要收新账号请切「浏览器登录」。
  *
  * 只扫国内版那一套目录（`com.qodercn.app.stable`）；「读到了什么 / 为什么没读到」
  * 由后端写成一句人话一起带回来（[`LocalScan`] 的 `note`），界面原样摆出来。
  */
-export function LocalAccountsModal({
+function LocalTab({
   accounts,
+  importing,
+  setImporting,
   onImport,
-  onClose,
-  onToast,
+  onPendingChange,
+  ctl,
 }: {
   accounts: Account[];
-  onImport: (items: ImportItem[]) => Promise<ImportReport>;
-  onClose: () => void;
-  onToast: (t: Toast) => void;
+  importing: boolean;
+  setImporting: (v: boolean) => void;
+  /** 导入成功后由弹窗层关弹窗、弹 toast */
+  onImport: (items: ImportItem[]) => Promise<void>;
+  /** 待导入数上抛：footer 的「全部导入（N）」要用 */
+  onPendingChange: (n: number) => void;
+  /** 「重新读取 / 全部导入」按钮在弹窗 footer 上，动作经这个句柄回传 */
+  ctl: MutableRefObject<{ rescan: () => void; importAll: () => void } | null>;
 }) {
   const [list, setList] = useState<LocalAccount[]>([]);
   // 「读到了什么 / 为什么没读到」：后端把原因写成一句人话（见 LocalScan.note）。
   // 不写这句，用户最容易猜错的结论就是「我是不是没登录」。
   const [note, setNote] = useState("");
   const [loading, setLoading] = useState(true);
-  const [importing, setImporting] = useState(false);
 
   const scan = useCallback(async () => {
     setLoading(true);
@@ -96,6 +111,25 @@ export function LocalAccountsModal({
   // 已存在的账号会被跳过而不是重复添加
   const pending = list.filter((d) => !isAdded(d));
 
+  useEffect(() => {
+    onPendingChange(pending.length);
+  }, [pending.length, onPendingChange]);
+
+  useImperativeHandle(ctl, () => ({
+    rescan: () => void scan(),
+    importAll: () => {
+      void (async () => {
+        if (pending.length === 0) return;
+        setImporting(true);
+        try {
+          await onImport(pending.map(toItem));
+        } finally {
+          setImporting(false);
+        }
+      })();
+    },
+  }));
+
   const toItem = (d: LocalAccount): ImportItem => ({
     token: d.token,
     name: d.nickname || d.phone,
@@ -114,65 +148,17 @@ export function LocalAccountsModal({
     if (items.length === 0) return;
     setImporting(true);
     try {
-      const { added, updated } = await onImport(items);
-      if (added > 0 && updated > 0) {
-        onToast({ kind: "ok", text: `已导入 ${added} 个账号，更新 ${updated} 个已有账号的凭证` });
-        onClose();
-      } else if (added > 0) {
-        onToast({ kind: "ok", text: `已导入 ${added} 个账号` });
-        onClose();
-      } else if (updated > 0) {
-        onToast({ kind: "ok", text: `已更新 ${updated} 个账号的凭证（补全续签信息）` });
-        onClose();
-      } else {
-        onToast({ kind: "info", text: "没有需要导入的账号" });
-      }
-    } catch (e) {
-      onToast({ kind: "err", text: "导入失败：" + String(e) });
+      await onImport(items);
     } finally {
       setImporting(false);
     }
   };
 
   return (
-    <Dialog
-      size="lg"
-      icon={<IconFile size={16} />}
-      title="导入本机账号"
-      label="导入本机账号"
-      onClose={onClose}
-      tools={
-        <button
-          className="btn small"
-          disabled={loading}
-          onClick={() => void scan()}
-        >
-          重新读取
-        </button>
-      }
-      footer={
-        <>
-          <button className="btn ghost" onClick={onClose}>
-            关闭
-          </button>
-          <button
-            className="btn primary"
-            disabled={importing || pending.length === 0}
-            onClick={() => void doImport(pending.map(toItem))}
-          >
-            {importing ? "导入中…" : `全部导入（${pending.length}）`}
-          </button>
-        </>
-      }
-    >
+    <>
       <p className="note">
         <IconInfo size={14} />
-        <span>
-          Qoder 登录后会把账号与凭证写到本机的 <code>auth.v1.dat</code>（Chromium safeStorage
-          加密；macOS 的密钥在系统钥匙串里，首次读取若弹出授权，点「始终允许」以后就不再问）。
-          这里直接读取它，<b>不需要 Qoder 正在运行，也不用改启动方式</b>，
-          而且能一次拿到昵称与手机号 / 邮箱。仅读取、不外传。
-        </span>
+        <span>读取本机已登录的 Qoder 账号，不会改动登录文件。</span>
       </p>
 
       {/* 读取情况一行（读到 / 没读到都非空）。「没读到」的原因必须写在脸上，
@@ -182,9 +168,7 @@ export function LocalAccountsModal({
       {loading ? (
         <p className="empty">读取中…</p>
       ) : list.length === 0 ? (
-        <p className="empty">
-          本机没有可导入的账号（本工具只读，不会改动 Qoder 的登录文件）。
-        </p>
+        <p className="empty">本机没有可导入的账号。</p>
       ) : (
         <ul className="pick-list">
           {list.map((d) => {
@@ -226,27 +210,143 @@ export function LocalAccountsModal({
           })}
         </ul>
       )}
-    </Dialog>
+    </>
   );
 }
 
 /**
- * 「登录新账号」：官方设备授权流（无感登录）。
+ * 浏览器登录选项卡的内容：走官方设备授权流（无感登录）。
  *
- * 独立于「导入本机账号」——后者只能拿到**已经登录过**的账号，
+ * 独立于「本机账号」——后者只能拿到**已经登录过**的账号，
  * 这条通道能主动把新账号签发进来，且不重启、不打断当前 Qoder、不改本机登录文件。
+ *
+ * 轮询期服务端回 404 是**正常等待态**（用户还没点完），不是错误。
+ * 授权状态（phase / result）由弹窗层持有，footer 按钮要随阶段变化。
  */
-export function OAuthModal({
+function BrowserTab({
+  phase,
+  uri,
+  result,
+  err,
+  waited,
+}: {
+  phase: "idle" | "waiting" | "done" | "error";
+  uri: string;
+  result: OAuthPoll | null;
+  err: string;
+  waited: number;
+}) {
+  // 授权成功那条预览的展示标识（手机号 / 邮箱）
+  const doneIdent = result ? accountIdent(result.phone, result.email) : null;
+
+  return (
+    <>
+      <p className="note">
+        <IconInfo size={14} />
+        <span>用系统浏览器扫码登录，完成后会自动添加账号。</span>
+      </p>
+
+      {phase === "waiting" && (
+        <>
+          <p className="note info">
+            <IconClock size={14} />
+            <span>
+              请在浏览器中完成登录（10 分钟内有效），完成后会自动进入下一步。已等待 {waited}s。
+            </span>
+          </p>
+          {uri && (
+            <div className="oauth-uri">
+              <code>{uri}</code>
+              <button
+                className="btn small"
+                onClick={() => void openExternal(uri)}
+              >
+                重新打开
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      {phase === "done" && result?.token && (
+        <div className="pick-item static locked">
+          <div className="pick-main">
+            <div className="pick-name">
+              {result.nickname || result.uid?.slice(0, 8) || "新账号"}
+              {doneIdent && (
+                <span className="ac-ident">{maskPhone(doneIdent)}</span>
+              )}
+            </div>
+            <div className="ac-meta">
+              <code className="tok">{maskToken(result.token)}</code>
+              {result.uid && <span className="tag">uid {result.uid}</span>}
+            </div>
+          </div>
+          <span className="pick-tail">
+            <span className="pick-state ok">授权成功</span>
+          </span>
+        </div>
+      )}
+
+      {phase === "error" && (
+        <p className="note danger">
+          <IconAlertTriangle size={14} />
+          <span>授权失败：{err}</span>
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
+ * 「添加账号」：两条通道共用的一张弹窗。
+ *
+ * 「本机账号」选项卡打开即扫描本机登录态；「浏览器登录」选项卡走设备授权流。
+ * 两条通道的导入动作都汇到同一个 `runImport`：成功 toast 并关弹窗，失败留在弹窗里。
+ */
+export function AddAccountModal({
+  accounts,
   onImport,
   onClose,
   onToast,
 }: {
+  accounts: Account[];
   onImport: (items: ImportItem[]) => Promise<ImportReport>;
   onClose: () => void;
   onToast: (t: Toast) => void;
 }) {
+  const [tab, setTab] = useState<"local" | "browser">("local");
+
+  // —— 本机账号选项卡 ——
   const [importing, setImporting] = useState(false);
-  const doImport = async (items: ImportItem[]) => {
+  // 待导入数在 LocalTab 里算（判据是 token），这里只为 footer 的「全部导入」存一份
+  const [pendingCount, setPendingCount] = useState(0);
+  /** footer 上「重新读取 / 全部导入」的动作句柄，由 LocalTab 填充 */
+  const localCtl = useRef<{ rescan: () => void; importAll: () => void } | null>(null);
+
+  // —— 浏览器登录选项卡 ——
+  const [phase, setPhase] = useState<"idle" | "waiting" | "done" | "error">("idle");
+  const [uri, setUri] = useState("");
+  const [result, setResult] = useState<OAuthPoll | null>(null);
+  const [err, setErr] = useState("");
+  const [waited, setWaited] = useState(0);
+
+  const timer = useRef<number | null>(null);
+  const busy = useRef(false);
+
+  const stop = useCallback(() => {
+    if (timer.current !== null) {
+      window.clearInterval(timer.current);
+      timer.current = null;
+    }
+    busy.current = false;
+  }, []);
+  // 弹窗卸载（关闭）时必须停掉轮询：否则循环还在跑，
+  // 拿到的 token 会写进一个已经卸载的组件状态里（静默丢账号）
+  useEffect(() => stop, [stop]);
+
+  /** 两条通道共用的导入出口：成功 toast 并关弹窗，失败 toast 留在弹窗里 */
+  const runImport = async (items: ImportItem[]) => {
     if (items.length === 0) return;
     setImporting(true);
     try {
@@ -262,7 +362,6 @@ export function OAuthModal({
         onClose();
       } else {
         onToast({ kind: "info", text: "该账号已在列表中" });
-        onClose();
       }
     } catch (e) {
       onToast({ kind: "err", text: "导入失败：" + String(e) });
@@ -271,56 +370,7 @@ export function OAuthModal({
     }
   };
 
-  // 弹窗外壳由 OAuthPanel 自己渲染：底部按钮要随授权阶段（等待中 / 已授权 / 失败）
-  // 变化，而阶段状态就在面板里。为了把按钮塞进 footer 而把整套轮询状态提上来，
-  // 只会让这个组件变成两个都想管状态的容器。
-  return (
-    <OAuthPanel
-      importing={importing}
-      onImport={doImport}
-      onToast={onToast}
-      onClose={onClose}
-    />
-  );
-}
-
-/**
- * 「登录新账号」面板：走官方设备授权流，在系统浏览器里完成一次登录。
- *
- * 轮询期服务端回 404 是**正常等待态**（用户还没点完），不是错误。
- */
-function OAuthPanel({
-  importing,
-  onImport,
-  onToast,
-  onClose,
-}: {
-  importing: boolean;
-  onImport: (items: ImportItem[]) => Promise<void>;
-  onToast: (t: Toast) => void;
-  onClose: () => void;
-}) {
-  const [phase, setPhase] = useState<"idle" | "waiting" | "done" | "error">("idle");
-  const [uri, setUri] = useState("");
-  const [result, setResult] = useState<OAuthPoll | null>(null);
-  const [err, setErr] = useState("");
-  const [waited, setWaited] = useState(0);
-
-  // 授权成功那条预览的展示标识（手机号 / 邮箱）
-  const doneIdent = result ? accountIdent(result.phone, result.email) : null;
-
-  const timer = useRef<number | null>(null);
-  const busy = useRef(false);
-
-  const stop = useCallback(() => {
-    if (timer.current !== null) {
-      window.clearInterval(timer.current);
-      timer.current = null;
-    }
-    busy.current = false;
-  }, []);
-  useEffect(() => stop, [stop]);
-
+  /** 申请授权 → 打开系统浏览器 → 轮询回调 → 进入 done 态等用户确认 */
   const begin = async () => {
     stop();
     setResult(null);
@@ -377,7 +427,7 @@ function OAuthPanel({
     }
   };
 
-  const reset = () => {
+  const resetOAuth = () => {
     stop();
     setPhase("idle");
     setUri("");
@@ -386,27 +436,59 @@ function OAuthPanel({
     setWaited(0);
   };
 
+  const switchTab = (k: "local" | "browser") => {
+    setTab(k);
+    setErr("");
+  };
+
+  const browserBusy = phase === "waiting";
+
   return (
     <Dialog
       size="lg"
       icon={<IconUserPlus size={16} />}
-      title="登录新账号"
-      label="登录新账号"
+      title="添加账号"
+      label="添加账号"
+      fixedBodyHeight={320}
       onClose={onClose}
+      tools={
+        tab === "local" ? (
+          <button
+            className="btn small"
+            disabled={importing}
+            onClick={() => localCtl.current?.rescan()}
+          >
+            重新读取
+          </button>
+        ) : null
+      }
       footer={
-        phase === "done" && result?.token ? (
+        tab === "local" ? (
           <>
             <button className="btn ghost" onClick={onClose} disabled={importing}>
               关闭
             </button>
-            <button className="btn ghost" onClick={reset} disabled={importing}>
+            <button
+              className="btn primary"
+              disabled={importing || pendingCount === 0}
+              onClick={() => localCtl.current?.importAll()}
+            >
+              {importing ? "导入中…" : `全部导入（${pendingCount}）`}
+            </button>
+          </>
+        ) : phase === "done" && result?.token ? (
+          <>
+            <button className="btn ghost" onClick={onClose} disabled={importing}>
+              关闭
+            </button>
+            <button className="btn ghost" onClick={resetOAuth} disabled={importing}>
               再登一个
             </button>
             <button
               className="btn primary"
               disabled={importing}
               onClick={() =>
-                void onImport([
+                void runImport([
                   {
                     token: result.token as string,
                     name: result.nickname || result.phone,
@@ -425,7 +507,7 @@ function OAuthPanel({
             </button>
           </>
         ) : phase === "waiting" ? (
-          <button className="btn" onClick={reset}>
+          <button className="btn" onClick={resetOAuth}>
             取消
           </button>
         ) : (
@@ -443,75 +525,42 @@ function OAuthPanel({
         )
       }
     >
-      <p className="note">
-        <IconInfo size={14} />
-        <span>
-          走官方<b>设备授权流</b>：在<b>系统浏览器</b>里完成一次登录（扫码即可），
-          本工具轮询取得该账号的凭证 ——
-          <b>不重启、不打断当前 Qoder，也不改动本机登录文件</b>。
-          适合把第二个 / 第三个账号收进来。
-        </span>
-      </p>
+      <div className="seg">
+        {(
+          [
+            ["local", "本机账号"],
+            ["browser", "浏览器登录"],
+          ] as ["local" | "browser", string][]
+        ).map(([k, label]) => (
+          <button
+            key={k}
+            className={tab === k ? "active" : ""}
+            disabled={browserBusy}
+            onClick={() => switchTab(k)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
 
-      {phase === "idle" && (
-        <p className="note">
-          <IconInfo size={14} />
-          <span>
-            新账号只收进本应用的账号列表，
-            <b>不影响本机已经登录的那个 Qoder 客户端</b>。
-          </span>
-        </p>
+      {tab === "local" && (
+        <LocalTab
+          accounts={accounts}
+          importing={importing}
+          setImporting={setImporting}
+          onImport={runImport}
+          onPendingChange={setPendingCount}
+          ctl={localCtl}
+        />
       )}
-
-      {phase === "waiting" && (
-        <>
-          <p className="note info">
-            <IconClock size={14} />
-            <span>
-              请在弹出的浏览器窗口中完成登录 / 扫码…… 已等待 {waited}s（10 分钟内有效）。
-              完成后这个窗口会自己跳到下一步，不用你回来点任何东西。
-              浏览器那一页<b>不会</b>唤起 Qoder 客户端，跑完直接关掉即可。
-            </span>
-          </p>
-          {uri && (
-            <div className="oauth-uri">
-              <code>{uri}</code>
-              <button
-                className="btn small"
-                onClick={() => void openExternal(uri)}
-              >
-                重新打开
-              </button>
-            </div>
-          )}
-        </>
-      )}
-
-      {phase === "done" && result?.token && (
-        <div className="pick-item static locked">
-          <div className="pick-main">
-            <div className="pick-name">
-              {result.nickname || result.uid?.slice(0, 8) || "新账号"}
-              {doneIdent && (
-                <span className="ac-ident">{maskPhone(doneIdent)}</span>
-              )}
-            </div>
-            <div className="ac-meta">
-              <code className="tok">{maskToken(result.token)}</code>
-              {result.uid && <span className="tag">uid {result.uid}</span>}
-            </div>
-          </div>
-          <span className="pick-tail">
-            <span className="pick-state ok">授权成功</span>
-          </span>
-        </div>
-      )}
-
-      {phase === "error" && (
-        <p className="note danger">
-          <IconAlertTriangle size={14} />
-          <span>授权失败：{err}</span>
-        </p>
+      {tab === "browser" && (
+        <BrowserTab
+          phase={phase}
+          uri={uri}
+          result={result}
+          err={err}
+          waited={waited}
+        />
       )}
     </Dialog>
   );
@@ -562,7 +611,6 @@ export function BrokerBindModal({
       size="md"
       icon={<IconLink size={18} />}
       title="绑定云端凭证池"
-      subtitle="把在另一台机器上传的那一池接到本机"
       footer={
         <>
           <button className="btn ghost" onClick={onClose} disabled={busy}>
@@ -596,10 +644,7 @@ export function BrokerBindModal({
       </label>
       <p className="note">
         <IconInfo size={14} />
-        <span>
-          绑定后本机账号与那一池「取并集」：池里的并进来，本机独有的一个都不会删，
-          下一轮同步时再一起推上去。
-        </span>
+        <span>绑定后与云端账号合并，本机独有的不会删除。</span>
       </p>
       {err && (
         <p className="note danger">
@@ -668,10 +713,7 @@ export function PoolIssuedModal({
       <code className="pool-uuid">{uuid}</code>
       <p className="note warn">
         <IconAlertTriangle size={14} />
-        <span>
-          拿到这串 uuid 就等于拿到这一池账号的完整权限，所以请把它当密码保存 ——
-          别发进聊天群、别截图外传。
-        </span>
+        <span>这串 uuid 等于这一池账号的完整权限，请当密码保存，勿外传。</span>
       </p>
     </Dialog>
   );

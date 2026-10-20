@@ -10,7 +10,6 @@ import {
   IconBell,
   IconCheck,
   IconAlertTriangle,
-  IconInfo,
   IconDownload,
   IconType,
 } from "../components/Icons";
@@ -52,7 +51,7 @@ export function SettingsPage({
   updateBusy: boolean;
   /** 触发检查并安装（实现与状态都在 App 层） */
   onRunUpdate: () => void;
-  /** 后台轮询查到的版本号（就是点亮侧边栏红点的那条），这里用于打开页面就有提示 */
+  /** 后台轮询查到的版本号（就是点亮侧边栏黄点的那条），这里用于打开页面就有提示 */
   updateVersion: string | null;
 }) {
   const [auto, setAuto] = useState(settings.auto_checkin_on_start);
@@ -162,358 +161,14 @@ export function SettingsPage({
 
   return (
     <section className="panel-page">
-      <p className="set-intro">
-        <IconInfo size={14} />
-        <span>
-          定时签到、多账号风控、通知、应用更新与网络急救。智能接管相关配置请在「智能接管」页调整。
-        </span>
-      </p>
-
-      {/* 界面外观 */}
-      <div className="set-card card">
-        <div className="set-card-head">
-          <span className="set-card-icon">
-            <IconType size={20} />
-          </span>
-          <div>
-            <div className="set-card-title">界面外观</div>
-            <div className="set-card-sub">界面使用的字体，改动即时生效</div>
-          </div>
-        </div>
-        <div className="set-group">
-          <Row
-            title="界面字体"
-            desc="选择常用字体之一；此项为本机偏好，重新安装应用不受影响。"
-            ctrl={
-              <select
-                value={fontKey}
-                onChange={(e) => {
-                  const k = e.target.value;
-                  setFontKeyState(k);
-                  setFontKey(k); // 即时生效并落盘 localStorage
-                }}
-              >
-                {FONT_OPTIONS.map((o) => (
-                  <option key={o.key} value={o.key}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            }
-          />
-        </div>
-      </div>
-
-      {/* 签到自动化 */}
-      <div className="set-card card">
-        <div className="set-card-head">
-          <span className="set-card-icon">
-            <IconCalendar size={20} />
-          </span>
-          <div>
-            <div className="set-card-title">签到自动化</div>
-            <div className="set-card-sub">控制账号在何时自动完成签到</div>
-          </div>
-        </div>
-        <div className="set-group">
-          <Row
-            title="启动应用时自动签到"
-            desc="打开应用时自动为全部账号签到一次"
-            ctrl={
-              <Toggle
-                checked={auto}
-                onChange={(v) => {
-                  setAuto(v);
-                  patch({ auto_checkin_on_start: v });
-                }}
-                title="启动即签到"
-              />
-            }
-          />
-          <Row
-            title="每天定时签到"
-            desc="在指定时刻为全部账号自动签到"
-            ctrl={
-              <Toggle
-                checked={schedOn}
-                onChange={(v) => {
-                  setSchedOn(v);
-                  patch({ schedule_enabled: v });
-                }}
-              />
-            }
-          />
-          {schedOn && (
-            <Row
-              sub
-              title="签到时刻"
-              desc="24 小时制，作为时间窗的起点。应用运行期间触发；错过时刻后 30 分钟内打开会自动补签。"
-              ctrl={
-                <input
-                  type="time"
-                  value={schedTime}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setSchedTime(v);
-                    patch({ schedule_time: v.trim() });
-                  }}
-                />
-              }
-            />
-          )}
-          {schedOn && (
-            <Row
-              sub
-              title="随机时间窗"
-              desc="在该时刻之后的这段时间内随机挑一分钟触发，当天挑定后不再变，并推送一条通知告知今天的实际时刻。固定在同一分钟触发是脚本最好认的特征；填 0 则精确到设定时刻。"
-              ctrl={
-                <>
-                  <input
-                    type="number"
-                    value={schedWindow}
-                    min={0}
-                    max={720}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setSchedWindow(v);
-                      // 空串按 0（=关闭随机）处理，别用 || 落到默认值上把随机又打开
-                      const n = Math.min(720, Math.max(0, Number(v) || 0));
-                      patch({ schedule_window_minutes: n });
-                    }}
-                  />
-                  <span className="set-suffix">分钟</span>
-                </>
-              }
-            />
-          )}
-          <Row
-            title="开机自启动"
-            desc="登录系统时自动运行本应用（操作系统级设置）"
-            ctrl={
-              <Toggle
-                checked={autostart === true}
-                disabled={autoBusy || autostart === null}
-                onChange={(v) => void toggleAutostart(v)}
-              />
-            }
-          />
-          {autostart === null ? (
-            <p className="hint set-foot">未能读取开机自启动状态（该平台可能不支持）。</p>
-          ) : (
-            schedOn &&
-            !autostart && (
-              <p className="hint set-foot warn">
-                <IconAlertTriangle size={13} />
-                建议同时开启「开机自启动」，否则应用不运行时定时签到不会发生。
-              </p>
-            )
-          )}
-        </div>
-      </div>
-
-      {/* 多账号风控 */}
-      <div className="set-card card">
-        <div className="set-card-head">
-          <span className="set-card-icon">
-            <IconShield size={20} />
-          </span>
-          <div>
-            <div className="set-card-title">多账号风控</div>
-            <div className="set-card-sub">批量签到时打散请求节奏，降低触发风控的概率</div>
-          </div>
-        </div>
-        <div className="set-group">
-          <Row
-            title="账号间随机间隔"
-            desc="批量签到时，每个账号之间随机等待一段时间再发下一个，避免同 IP 瞬时连发。"
-            ctrl={
-              <Toggle
-                checked={staggerOn}
-                onChange={(v) => {
-                  setStaggerOn(v);
-                  patch({ stagger_checkin: v });
-                }}
-              />
-            }
-          />
-          {staggerOn && (
-            <Row
-              sub
-              title="间隔上限"
-              desc="每个账号之间的随机等待不超过该秒数（2～600）。单账号签到不受影响。"
-              ctrl={
-                <>
-                  <input
-                    type="number"
-                    value={staggerMax}
-                    min={2}
-                    max={600}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setStaggerMax(v);
-                      patch({ stagger_max_seconds: Number(v) || 45 });
-                    }}
-                  />
-                  <span className="set-suffix">秒</span>
-                </>
-              }
-            />
-          )}
-          <Row
-            title="随机打乱签到顺序"
-            desc="每次批量签到都随机决定先后。固定按列表顺序连发，等于把「同一批账号」直接写进请求序列；打乱只影响发请求的次序，列表顺序不变。"
-            ctrl={
-              <Toggle
-                checked={shuffle}
-                onChange={(v) => {
-                  setShuffle(v);
-                  patch({ shuffle_checkin_order: v });
-                }}
-              />
-            }
-          />
-          <Row
-            title="手动「全部签到」也加间隔"
-            desc="手动点击同样不该瞬时连发——过去手动路径是全程唯一没有节流的入口，风控看到的恰好就是那几秒内完成的一串签到。"
-            ctrl={
-              <Toggle
-                checked={manualStagger}
-                onChange={(v) => {
-                  setManualStagger(v);
-                  patch({ manual_stagger: v });
-                }}
-              />
-            }
-          />
-          {manualStagger && (
-            <Row
-              sub
-              title="手动间隔上限"
-              desc="手动签到时账号之间的随机等待不超过该秒数（2～600）。比自动签到短得多，避免点一次要等太久。"
-              ctrl={
-                <>
-                  <input
-                    type="number"
-                    value={manualMax}
-                    min={2}
-                    max={600}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setManualMax(v);
-                      patch({ manual_stagger_max_seconds: Number(v) || 8 });
-                    }}
-                  />
-                  <span className="set-suffix">秒</span>
-                </>
-              }
-            />
-          )}
-        </div>
-      </div>
-
-      {/* 签到与简报通知 */}
-      <div className="set-card card">
-        <div className="set-card-head">
-          <span className="set-card-icon">
-            <IconBell size={20} />
-          </span>
-          <div>
-            <div className="set-card-title">签到与简报通知</div>
-            <div className="set-card-sub">签到结果、积分简报与续签失败告警都通过同一个 webhook 推送</div>
-          </div>
-        </div>
-        <div className="set-group">
-          <Row
-            title="开启 webhook 通知"
-            desc="关闭后不再推送任何通知，包括续签失败告警"
-            ctrl={
-              <Toggle
-                checked={notifyOn}
-                onChange={(v) => {
-                  setNotifyOn(v);
-                  patch({ notify_enabled: v });
-                }}
-              />
-            }
-          />
-          {notifyOn && (
-            <div className="set-expand">
-              <label className="set-field">
-                推送地址（Webhook）
-                <input
-                  value={webhook}
-                  placeholder="https://…/hook/<key>"
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setWebhook(v);
-                    patch({ notify_webhook: v.trim() });
-                  }}
-                />
-              </label>
-              <div className="opt-row">
-                <button
-                  className="btn small"
-                  disabled={testing || !webhook.trim()}
-                  onClick={() => void doTest()}
-                >
-                  {testing ? "发送中…" : "测试推送"}
-                </button>
-                <span className="hint inline">点一下会给这个地址发一条测试消息</span>
-              </div>
-              <Row
-                bare
-                title="定时签到后推送"
-                ctrl={
-                  <Toggle
-                    checked={notifySched}
-                    onChange={(v) => {
-                      setNotifySched(v);
-                      patch({ notify_on_schedule: v });
-                    }}
-                  />
-                }
-              />
-              <Row
-                bare
-                title="手动「全部签到」后推送"
-                ctrl={
-                  <Toggle
-                    checked={notifyManual}
-                    onChange={(v) => {
-                      setNotifyManual(v);
-                      patch({ notify_on_manual: v });
-                    }}
-                  />
-                }
-              />
-              <Row
-                bare
-                title="积分简报生成后推送"
-                desc="每天 24:00（跨零点那一刻）推一条当天汇总；应用当时没在运行，会在下次启动时补推。简报本身的开关在「积分简报」页。"
-                ctrl={
-                  <Toggle
-                    checked={notifyReport}
-                    onChange={(v) => {
-                      setNotifyReport(v);
-                      patch({ notify_on_briefing: v });
-                    }}
-                  />
-                }
-              />
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 应用更新 */}
-      <div className="set-card card">
+      {/* 应用更新：放在第一张卡 —— 版本落后最先该被看见，配置类卡片都在它后面 */}
+      <div className={`set-card card${updateVersion ? " highlight" : ""}`}>
         <div className="set-card-head">
           <span className="set-card-icon">
             <IconDownload size={20} />
           </span>
           <div>
             <div className="set-card-title">应用更新</div>
-            <div className="set-card-sub">检查并安装来自 GitHub Release 的新版本</div>
           </div>
         </div>
         <div className="set-group">
@@ -521,8 +176,8 @@ export function SettingsPage({
             title={version ? `当前版本 v${version}` : "当前版本"}
             desc={
               updateVersion
-                ? `后台已发现新版本 v${updateVersion}，点右侧按钮立即更新。`
-                : "应用会自动检查更新，发现新版本会在侧边栏「设置」上点亮一颗小红点。"
+                ? `发现新版本 v${updateVersion}，点右侧按钮更新。`
+                : "有新版本时会在左侧「设置」上显示黄点。"
             }
             ctrl={
               <button
@@ -566,6 +221,337 @@ export function SettingsPage({
                   </div>
                 </>
               )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 界面外观 */}
+      <div className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconType size={20} />
+          </span>
+          <div>
+            <div className="set-card-title">界面外观</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title="界面字体"
+            desc="只影响本机界面显示。"
+            ctrl={
+              <select
+                value={fontKey}
+                onChange={(e) => {
+                  const k = e.target.value;
+                  setFontKeyState(k);
+                  setFontKey(k); // 即时生效并落盘 localStorage
+                }}
+              >
+                {FONT_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            }
+          />
+        </div>
+      </div>
+
+      {/* 签到自动化 */}
+      <div className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconCalendar size={20} />
+          </span>
+          <div>
+            <div className="set-card-title">签到自动化</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title="启动应用时自动签到"
+            desc="打开应用时自动为全部账号签到一次"
+            ctrl={
+              <Toggle
+                checked={auto}
+                onChange={(v) => {
+                  setAuto(v);
+                  patch({ auto_checkin_on_start: v });
+                }}
+                title="启动即签到"
+              />
+            }
+          />
+          <Row
+            title="每天定时签到"
+            desc="在指定时刻为全部账号自动签到"
+            ctrl={
+              <Toggle
+                checked={schedOn}
+                onChange={(v) => {
+                  setSchedOn(v);
+                  patch({ schedule_enabled: v });
+                }}
+              />
+            }
+          />
+          {schedOn && (
+            <Row
+              sub
+              title="签到时刻"
+              desc="24 小时制；应用运行时触发，错过 30 分钟内会自动补签。"
+              ctrl={
+                <input
+                  type="time"
+                  value={schedTime}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setSchedTime(v);
+                    patch({ schedule_time: v.trim() });
+                  }}
+                />
+              }
+            />
+          )}
+          {schedOn && (
+            <Row
+              sub
+              title="随机时间窗"
+              desc="在设定时刻后随机选择实际签到时间；0 = 不随机。"
+              ctrl={
+                <>
+                  <input
+                    type="number"
+                    value={schedWindow}
+                    min={0}
+                    max={720}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setSchedWindow(v);
+                      // 空串按 0（=关闭随机）处理，别用 || 落到默认值上把随机又打开
+                      const n = Math.min(720, Math.max(0, Number(v) || 0));
+                      patch({ schedule_window_minutes: n });
+                    }}
+                  />
+                  <span className="set-suffix">分钟</span>
+                </>
+              }
+            />
+          )}
+          <Row
+            title="开机自启动"
+            desc="登录系统时自动运行。"
+            ctrl={
+              <Toggle
+                checked={autostart === true}
+                disabled={autoBusy || autostart === null}
+                onChange={(v) => void toggleAutostart(v)}
+              />
+            }
+          />
+          {autostart === null ? (
+            <p className="hint set-foot">未能读取开机自启动状态（该平台可能不支持）。</p>
+          ) : (
+            schedOn &&
+            !autostart && (
+              <p className="hint set-foot warn">
+                <IconAlertTriangle size={13} />
+                建议同时开启「开机自启动」，否则应用不运行时定时签到不会发生。
+              </p>
+            )
+          )}
+        </div>
+      </div>
+
+      {/* 多账号风控 */}
+      <div className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconShield size={20} />
+          </span>
+          <div>
+            <div className="set-card-title">多账号风控</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title="账号间随机间隔"
+            desc="批量签到时，账号之间随机等待再发下一个。"
+            ctrl={
+              <Toggle
+                checked={staggerOn}
+                onChange={(v) => {
+                  setStaggerOn(v);
+                  patch({ stagger_checkin: v });
+                }}
+              />
+            }
+          />
+          {staggerOn && (
+            <Row
+              sub
+              title="间隔上限"
+              desc="随机等待不超过该秒数（2～600）。"
+              ctrl={
+                <>
+                  <input
+                    type="number"
+                    value={staggerMax}
+                    min={2}
+                    max={600}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setStaggerMax(v);
+                      patch({ stagger_max_seconds: Number(v) || 45 });
+                    }}
+                  />
+                  <span className="set-suffix">秒</span>
+                </>
+              }
+            />
+          )}
+          <Row
+            title="随机打乱签到顺序"
+            desc="每次批量签到随机决定顺序。"
+            ctrl={
+              <Toggle
+                checked={shuffle}
+                onChange={(v) => {
+                  setShuffle(v);
+                  patch({ shuffle_checkin_order: v });
+                }}
+              />
+            }
+          />
+          <Row
+            title="手动「全部签到」也加间隔"
+            desc="手动点击「全部签到」时也加入随机间隔。"
+            ctrl={
+              <Toggle
+                checked={manualStagger}
+                onChange={(v) => {
+                  setManualStagger(v);
+                  patch({ manual_stagger: v });
+                }}
+              />
+            }
+          />
+          {manualStagger && (
+            <Row
+              sub
+              title="手动间隔上限"
+              desc="手动签到时账号之间的随机等待上限（2～600 秒）。"
+              ctrl={
+                <>
+                  <input
+                    type="number"
+                    value={manualMax}
+                    min={2}
+                    max={600}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setManualMax(v);
+                      patch({ manual_stagger_max_seconds: Number(v) || 8 });
+                    }}
+                  />
+                  <span className="set-suffix">秒</span>
+                </>
+              }
+            />
+          )}
+        </div>
+      </div>
+
+      {/* 签到与简报通知 */}
+      <div className="set-card card">
+        <div className="set-card-head">
+          <span className="set-card-icon">
+            <IconBell size={20} />
+          </span>
+          <div>
+            <div className="set-card-title">签到与简报通知</div>
+          </div>
+        </div>
+        <div className="set-group">
+          <Row
+            title="开启 webhook 通知"
+            desc="关闭后不再推送任何通知，包括续签失败告警"
+            ctrl={
+              <Toggle
+                checked={notifyOn}
+                onChange={(v) => {
+                  setNotifyOn(v);
+                  patch({ notify_enabled: v });
+                }}
+              />
+            }
+          />
+          {notifyOn && (
+            <div className="set-expand">
+              <label className="set-field">
+                推送地址（Webhook）
+                <input
+                  value={webhook}
+                  placeholder="https://…/hook/<key>"
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setWebhook(v);
+                    patch({ notify_webhook: v.trim() });
+                  }}
+                />
+              </label>
+              <div className="opt-row">
+                <button
+                  className="btn small"
+                  disabled={testing || !webhook.trim()}
+                  onClick={() => void doTest()}
+                >
+                  {testing ? "发送中…" : "测试推送"}
+                </button>
+              </div>
+              <Row
+                bare
+                title="定时签到后推送"
+                ctrl={
+                  <Toggle
+                    checked={notifySched}
+                    onChange={(v) => {
+                      setNotifySched(v);
+                      patch({ notify_on_schedule: v });
+                    }}
+                  />
+                }
+              />
+              <Row
+                bare
+                title="手动「全部签到」后推送"
+                ctrl={
+                  <Toggle
+                    checked={notifyManual}
+                    onChange={(v) => {
+                      setNotifyManual(v);
+                      patch({ notify_on_manual: v });
+                    }}
+                  />
+                }
+              />
+              <Row
+                bare
+                title="积分简报生成后推送"
+                desc="每天零点推送当天汇总；应用未运行则下次启动补推。"
+                ctrl={
+                  <Toggle
+                    checked={notifyReport}
+                    onChange={(v) => {
+                      setNotifyReport(v);
+                      patch({ notify_on_briefing: v });
+                    }}
+                  />
+                }
+              />
             </div>
           )}
         </div>

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import Switch from "./Switch";
 
 /**
  * 设置类卡片内部的通用控件原子。
@@ -7,7 +8,7 @@ import type { ReactNode } from "react";
  * 两处各写一份必然漂移。
  */
 
-/** 开关控件：复用全局 .switch 样式（与智能接管页一致） */
+/** 设置行里的开关：统一走 Switch 组件，别在这一层再写一套开关 markup */
 export function Toggle({
   checked,
   disabled,
@@ -20,17 +21,7 @@ export function Toggle({
   title?: string;
 }) {
   return (
-    <label className="switch" title={title}>
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      <span className="track">
-        <span className="thumb" />
-      </span>
-    </label>
+    <Switch checked={checked} disabled={disabled} onChange={onChange} title={title} />
   );
 }
 

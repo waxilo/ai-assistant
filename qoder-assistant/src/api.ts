@@ -5,7 +5,7 @@ import type {
   LocalScan,
   OAuthStart,
   OAuthPoll,
-  CheckinLog,
+  LogEntry,
   DayEntry,
   ImportItem,
   ImportReport,
@@ -41,7 +41,7 @@ export const checkinAll = () => invoke<Account[]>("checkin_all");
 export const refreshAll = () => invoke<Account[]>("refresh_all");
 
 /**
- * 刷新**单个账号**的积分读数（资源包弹窗的刷新按钮用）：
+ * 刷新**单个账号**的积分读数：
  * 后端拉一次额度接口进台账，返回该账号的台账投影。
  */
 export const refreshAccountCredits = (id: string) =>
@@ -121,15 +121,11 @@ export const setAutostart = (enabled: boolean) =>
 
 export const appVersion = () => invoke<string>("app_version");
 
-export const getCheckinLogs = (limit?: number, accountId?: string) =>
-  invoke<CheckinLog[]>("get_checkin_logs", {
-    limit: limit ?? null,
-    accountId: accountId ?? null,
-  });
+/** 统一日志流：签到 + 调度器 + 接管动态，后端已并好、按时间倒序 */
+export const getLogs = () => invoke<LogEntry[]>("get_logs");
 
-/** 清空签到日志：不传 accountId 则清空全部 */
-export const clearCheckinLogs = (accountId?: string) =>
-  invoke<void>("clear_checkin_logs", { accountId: accountId ?? null });
+/** 清空日志（不可恢复）：签到日志、调度器日志、接管动态一起清 */
+export const clearLogs = () => invoke<void>("clear_logs");
 
 /**
  * 诊断 Qoder 的全局网络配置（**只读**，不会改动任何文件）。

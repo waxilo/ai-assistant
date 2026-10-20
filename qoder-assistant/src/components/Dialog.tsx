@@ -37,6 +37,7 @@ export function Dialog({
   footer,
   maskClassName,
   label,
+  fixedBodyHeight,
   children,
 }: {
   /** 关闭（点遮罩 / 按 Esc / 点右上角 ×） */
@@ -59,6 +60,8 @@ export function Dialog({
   maskClassName?: string;
   /** 无障碍名称：通常传标题文字 */
   label?: string;
+  /** 固定内容区高度（px）：分栏/分步内容切换时不让整个弹窗跳高 */
+  fixedBodyHeight?: number;
   children: ReactNode;
 }) {
   useEffect(() => {
@@ -109,7 +112,14 @@ export function Dialog({
 
         {/* 没有正文时不渲染 body：确认框允许只给标题，空 body 会在头尾之间
             留下一段 38px 的空白（看着像加载失败） */}
-        {children ? <div className="modal-body">{children}</div> : null}
+        {children ? (
+          <div
+            className="modal-body"
+            style={fixedBodyHeight ? { height: fixedBodyHeight } : undefined}
+          >
+            {children}
+          </div>
+        ) : null}
 
         {(tools || footer) && (
           <footer className="modal-foot">
