@@ -23,8 +23,8 @@
 //! ## 确认的消费端常量（逆向自 main.js `Fb()`）
 //! - SOLO 精简版 client_id：`en1oxy7wnw8j9n`
 //! - TRAE client_id：`ono9krqynydwx5`
-//! - 默认 ssoHost：国内 `https://www.trae.cn`，国际 `https://www.trae.ai`
-//! - 默认 apiHost：国内 `https://api.trae.cn`，国际 `https://api.trae.ai`
+//! - 默认 ssoHost：`https://www.trae.cn`
+//! - 默认 apiHost：`https://api.trae.cn`
 
 use serde::Serialize;
 use serde_json::Value;
@@ -55,13 +55,10 @@ const OAUTH_TIMEOUT_SECS: u64 = 600;
 /// 出结果后再保留一段，避免前端收尾时的重复轮询直接报「请求不存在」
 const RESULT_RETENTION_SECS: u64 = 300;
 
-const DEFAULT_HOST: &str = "https://api.trae.cn";
-
 #[derive(Serialize, Clone, Debug)]
 pub struct OAuthStart {
     pub login_id: String,
     pub verification_uri: String,
-    pub host: String,
     pub expires_in: u64,
 }
 
@@ -72,8 +69,6 @@ pub struct OAuthPoll {
     pub token: Option<String>,
     /// 续签用 refresh token（换 token 接口一并返回，落库后才能自动续期）
     pub refresh_token: Option<String>,
-    pub host: Option<String>,
-    pub region: Option<String>,
     pub uid: Option<String>,
     pub nickname: Option<String>,
     pub phone: Option<String>,
@@ -92,8 +87,6 @@ impl OAuthPoll {
             done: false,
             token: None,
             refresh_token: None,
-            host: None,
-            region: None,
             uid: None,
             nickname: None,
             phone: None,
@@ -118,7 +111,6 @@ struct Pending {
     callback: Arc<Mutex<Option<String>>>,
     code_verifier: String,
     client_id: String,
-    api_host: String,
     /// 授权与换 token 共用的设备身份（必须一致，否则服务端报 device not match）
     device_id: String,
     machine_id: String,
@@ -136,46 +128,6 @@ fn locks() -> std::sync::MutexGuard<'static, HashMap<String, Pending>> {
 fn sweep(map: &mut HashMap<String, Pending>) {
     let now = Instant::now();
     map.retain(|_, p| now < p.expires_at + Duration::from_secs(RESULT_RETENTION_SECS));
-}
-
-/// host → 国内/国际，返回 `(api_host, sso_host, region)`
-fn hosts(input: Option<&str>) -> (String, String, String) {
-    let raw = input.unwrap_or("").trim().to_lowercase();
-    let intl = raw.contains("trae.ai") || raw.contains("trae.com");
-    if intl {
-        (
-            "https://api.trae.ai".to_string(),
-            "https://www.trae.ai".to_string(),
-            "us".to_string(),
-        )
-    } else {
-        (
-            "https://api.trae.cn".to_string(),
-            "https://www.trae.cn".to_string(),
-            "cn".to_string(),
-        )
-    }
-}
-
-fn region_for_host(host: &str) -> Option<String> {
-    if host.contains("trae.ai") || host.contains("trae.com") {
-        Some("us".into())
-    } else if host.contains("trae.cn") {
-        Some("cn".into())
-    } else {
-        None
-    }
-}
-
-/// 账号上存的 `host`（可能是空串 / 裸域名 / 完整 URL）→ 规范化后的 api host。
-/// 缺省国内版。续签要用它拼 `ExchangeToken` 地址。
-pub fn normalize_api_host(host: &str) -> String {
-    let raw = host.trim().to_lowercase();
-    if raw.contains("trae.ai") || raw.contains("trae.com") {
-        "https://api.trae.ai".to_string()
-    } else {
-        "https://api.trae.cn".to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +321,6 @@ struct ExchangeResult {
     token: String,
     refresh_token: Option<String>,
     expires_at: Option<i64>,
-    apihost: String,
 }
 
 fn parse_exchange_resp(v: &Value) -> Option<ExchangeResult> {
@@ -384,10 +335,6 @@ fn parse_exchange_resp(v: &Value) -> Option<ExchangeResult> {
             if r.is_empty() { None } else { Some(r) }
         },
         expires_at: dig_ts(v, &["TokenExpireAt", "tokenExpireAt", "expiresAt", "expires_at"]),
-        apihost: {
-            let a = dig_str(v, &["apiHost", "api_host"]);
-            if a.is_empty() { DEFAULT_HOST.to_string() } else { a }
-        },
     })
 }
 
@@ -488,13 +435,13 @@ fn spawn_callback_server() -> Result<(u16, Arc<Mutex<Option<String>>>), String> 
 }
 
 fn build_authorization_url(
-    login_host: &str,
     port: u16,
     client_id: &str,
     code_challenge: &str,
     device_id: &str,
     machine_id: &str,
 ) -> String {
+    let login_host = crate::SSO_HOST;
     let login_trace_id = uuid::Uuid::new_v4().simple().to_string();
     let callback_url = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
     format!(
@@ -520,8 +467,7 @@ fn build_authorization_url(
 // ---------------------------------------------------------------------------
 
 /// 第一步：绑定回环回调、生成 PKCE、构造授权 URL。
-pub async fn start(host: Option<String>) -> Result<OAuthStart, String> {
-    let (api_host, login_host, _region) = hosts(host.as_deref());
+pub async fn start() -> Result<OAuthStart, String> {
     let (port, callback) = spawn_callback_server()?;
     let (code_verifier, code_challenge) = pkce();
     let client_id = CLIENT_ID_SOLO.to_string();
@@ -529,7 +475,7 @@ pub async fn start(host: Option<String>) -> Result<OAuthStart, String> {
 
     let login_id = format!("trae_{}", uuid::Uuid::new_v4().simple());
     let verification_uri = build_authorization_url(
-        &login_host, port, &client_id, &code_challenge, &device_id, &machine_id,
+        port, &client_id, &code_challenge, &device_id, &machine_id,
     );
 
     {
@@ -541,7 +487,6 @@ pub async fn start(host: Option<String>) -> Result<OAuthStart, String> {
                 callback,
                 code_verifier,
                 client_id,
-                api_host: api_host.clone(),
                 device_id,
                 machine_id,
                 expires_at: Instant::now() + Duration::from_secs(OAUTH_TIMEOUT_SECS),
@@ -553,7 +498,6 @@ pub async fn start(host: Option<String>) -> Result<OAuthStart, String> {
     Ok(OAuthStart {
         login_id,
         verification_uri,
-        host: api_host,
         expires_in: OAUTH_TIMEOUT_SECS,
     })
 }
@@ -567,14 +511,13 @@ fn cache_result(login_id: &str, r: &OAuthPoll) {
 
 /// 授权码 → Cloud-IDE-JWT
 async fn exchange_token(
-    api_host: &str,
     client_id: &str,
     code: &str,
     code_verifier: &str,
     device_id: &str,
     machine_id: &str,
 ) -> Result<ExchangeResult, String> {
-    let url = format!("{api_host}{EXCHANGE_TOKEN_PATH}");
+    let url = format!("{}{EXCHANGE_TOKEN_PATH}", crate::API_HOST);
     let body = serde_json::json!({
         "ClientID": client_id,
         "AuthCode": code,
@@ -628,8 +571,8 @@ async fn exchange_token(
 /// `Authorization` 全部 401，换成 `x-cloudide-token` 全部 200 —— 与 body、区域头、UA
 /// 都无关，**只由鉴权头决定**。官方客户端里也是这个写法：
 /// `headers: { "x-cloudide-token": token }`。
-pub async fn fetch_user_info(api_host: &str, token: &str) -> Option<UserInfo> {
-    let url = format!("{api_host}{GET_USER_INFO_PATH}");
+pub async fn fetch_user_info(token: &str) -> Option<UserInfo> {
+    let url = format!("{}{GET_USER_INFO_PATH}", crate::API_HOST);
     let resp = http()
         .ok()?
         .post(&url)
@@ -655,7 +598,6 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
                 p.callback.clone(),
                 p.code_verifier.clone(),
                 p.client_id.clone(),
-                p.api_host.clone(),
                 p.device_id.clone(),
                 p.machine_id.clone(),
                 p.expires_at,
@@ -663,7 +605,7 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
             )
         })
     };
-    let Some((callback, code_verifier, client_id, api_host, device_id, machine_id, expires_at, cached)) = snapshot else {
+    let Some((callback, code_verifier, client_id, device_id, machine_id, expires_at, cached)) = snapshot else {
         return Ok(OAuthPoll::failed("登录请求不存在或已过期，请重新发起"));
     };
     if let Some(r) = cached {
@@ -693,7 +635,7 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         return Ok(r);
     };
 
-    let ex = match exchange_token(&api_host, &client_id, &auth_code, &code_verifier, &device_id, &machine_id).await {
+    let ex = match exchange_token(&client_id, &auth_code, &code_verifier, &device_id, &machine_id).await {
         Ok(ex) => ex,
         Err(e) => {
             let r = OAuthPoll::failed(&e);
@@ -702,11 +644,7 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         }
     };
 
-    let info = if ex.apihost.is_empty() {
-        UserInfo::default()
-    } else {
-        fetch_user_info(&ex.apihost, &ex.token).await.unwrap_or_default()
-    };
+    let info = fetch_user_info(&ex.token).await.unwrap_or_default();
 
     // uid 优先用 GetUserInfo 的结果；该接口拿不到时（离线、限流）退回 JWT 载荷里的 `data.id`。
     // 这不是「锦上添花」——uid 同时是账号身份与签到头 `x-device-id` 的首选值
@@ -721,8 +659,6 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         done: true,
         token: Some(ex.token),
         refresh_token: ex.refresh_token,
-        host: Some(ex.apihost.clone()),
-        region: region_for_host(&ex.apihost),
         uid,
         nickname: info.nickname,
         phone: info.phone,
@@ -768,17 +704,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn host_selection_cn_vs_intl() {
-        let (api, sso, region) = hosts(Some("https://api.trae.ai"));
-        assert_eq!(api, "https://api.trae.ai");
-        assert_eq!(sso, "https://www.trae.ai");
-        assert_eq!(region, "us");
-        let (_, sso, region) = hosts(Some("https://www.trae.cn"));
-        assert_eq!(sso, "https://www.trae.cn");
-        assert_eq!(region, "cn");
-    }
-
-    #[test]
     fn url_decode_handles_pct_and_plus() {
         assert_eq!(url_decode("a%2Bb%20c"), "a+b c");
         assert_eq!(url_decode("a%3D1"), "a=1");
@@ -806,7 +731,7 @@ mod tests {
 
     #[test]
     fn builds_authorization_url_with_callback_and_pkce() {
-        let url = build_authorization_url("https://www.trae.cn", 51234, CLIENT_ID_SOLO, "abc", "DEV", "MAC");
+        let url = build_authorization_url(51234, CLIENT_ID_SOLO, "abc", "DEV", "MAC");
         assert!(url.starts_with("https://www.trae.cn/authorization"));
         assert!(url.contains("client_id=en1oxy7wnw8j9n"));
         assert!(url.contains("auth_callback_url=http://127.0.0.1:51234/authorize"));
@@ -830,7 +755,6 @@ mod tests {
         let nested = json!({"Result": {"Token": "t2", "apiHost": "https://api.trae.cn"}});
         let e = parse_exchange_resp(&nested).unwrap();
         assert_eq!(e.token, "t2");
-        assert_eq!(e.apihost, "https://api.trae.cn");
 
         assert!(parse_exchange_resp(&json!({"Code": 1})).is_none());
     }
@@ -901,7 +825,6 @@ mod tests {
                     callback: Arc::new(Mutex::new(None)),
                     code_verifier: "v".into(),
                     client_id: CLIENT_ID_SOLO.into(),
-                    api_host: "https://api.trae.cn".into(),
                     device_id: "d".into(),
                     machine_id: "m".into(),
                     expires_at: Instant::now() - Duration::from_secs(1),

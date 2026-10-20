@@ -76,6 +76,13 @@ export const IconList = (p: IconProps) => (
   </Svg>
 );
 
+/** 折叠区的展开指示：默认朝右，展开时由页面旋转 90°。 */
+export const IconChevron = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="m9 18 6-6-6-6" />
+  </Svg>
+);
+
 export const IconGear = (p: IconProps) => (
   <Svg {...p}>
     <circle cx="12" cy="12" r="3" />
@@ -168,6 +175,14 @@ export const IconInfo = (p: IconProps) => (
   </Svg>
 );
 
+/** 感叹号圆：用于「悬浮查看规则」的说明入口（与信息图标语义不同，别混用）。 */
+export const IconAlertCircle = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 8v4M12 16h.01" />
+  </Svg>
+);
+
 export const IconDownload = (p: IconProps) => (
   <Svg {...p}>
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -212,6 +227,14 @@ export const IconUnlink = (p: IconProps) => (
     <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
     <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
     <path d="M3 3l18 18" />
+  </Svg>
+);
+
+/** 搜索（日志筛选框内嵌） */
+export const IconSearch = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.5-3.5" />
   </Svg>
 );
 

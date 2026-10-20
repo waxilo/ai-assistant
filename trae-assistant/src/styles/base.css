@@ -1,10 +1,8 @@
 /**
- * 基础层：重置、页面底色、排版、焦点、动效关键帧、入场节奏。
+ * 基础层：重置、画布底色、排版、焦点、滚动条、动效关键帧、入场节奏。
  *
- * 底色是**纯白**（`--bg`），不带任何环境光渐变 —— 见下方 body 处的说明。
- * 动效词汇表集中在这里：所有关键帧只定义一次，页面与组件只引用动画名。
- * 旧版把 7 个 @keyframes 分散在 App.css 各处（navDotPulse / pageIn / fadeIn /
- * modalIn / indet …），命名各不相同、时长也各写一遍，是无意义的分叉。
+ * 画布是**中性浅灰**（`--bg`），不带任何彩色环境光 —— 品牌色只出现在强调件上。
+ * 白卡与浅灰画布之间的明度差，加上低透明度的环境阴影，构成整套界面的层次。
  */
 
 * {
@@ -26,55 +24,56 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
-  /* 纯白底（2026-09-16 用户要求「背景色改为白色」）。
-     这里**刻意不放任何环境光 / 渐变**：白底上的彩色渐变渲染出来就是用户看到的那片浅绿，
-     属于把品牌色铺满背景 —— 品牌色只该出现在强调件上。
-     毛玻璃仍然保留（见 `.sidebar` / `.pagebar` 的 backdrop-filter）：它真正起作用的地方是
-     内容滚动时从页头底下穿过，而不是靠背景色"透"出来。 */
   background-color: var(--bg);
   background-image: none;
+  color-scheme: light;
   /* 应用外壳是固定高度的两栏结构，滚动只发生在内容区 */
   overflow: hidden;
 }
 
 ::selection {
-  background: var(--primary-soft-2);
+  background: var(--primary-soft);
   color: var(--primary-d);
 }
 
-/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示。
-   注意这里**不设 border-radius** —— 它是全局选择器，设了就会在聚焦瞬间
-   把卡片（12px）/ 弹窗（16px）的圆角改掉，属于「看起来只是加了个描边」的隐性破相。 */
+/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示。 */
 :focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
 
-/* 滚动条：与整体圆角/低对比语言一致。
-   （旧版是「全站隐藏滚动条」，代价是长表格没有位置参照；这里改成细滚动条。） */
+/* 滚动条：细、圆、低对比。 */
 .content::-webkit-scrollbar,
 .modal::-webkit-scrollbar,
-.feed::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+.feed::-webkit-scrollbar,
+.table-wrap::-webkit-scrollbar,
+.brief-hours::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
 }
 .content::-webkit-scrollbar-thumb,
 .modal::-webkit-scrollbar-thumb,
-.feed::-webkit-scrollbar-thumb {
-  background: rgba(107, 116, 136, 0.28);
+.feed::-webkit-scrollbar-thumb,
+.table-wrap::-webkit-scrollbar-thumb,
+.brief-hours::-webkit-scrollbar-thumb {
+  background: rgba(93, 108, 100, 0.24);
   border: 3px solid transparent;
   border-radius: var(--radius-pill);
   background-clip: content-box;
 }
 .content::-webkit-scrollbar-thumb:hover,
 .modal::-webkit-scrollbar-thumb:hover,
-.feed::-webkit-scrollbar-thumb:hover {
-  background: rgba(107, 116, 136, 0.45);
+.feed::-webkit-scrollbar-thumb:hover,
+.table-wrap::-webkit-scrollbar-thumb:hover,
+.brief-hours::-webkit-scrollbar-thumb:hover {
+  background: rgba(93, 108, 100, 0.4);
   background-clip: content-box;
 }
 .content::-webkit-scrollbar-track,
 .modal::-webkit-scrollbar-track,
-.feed::-webkit-scrollbar-track {
+.feed::-webkit-scrollbar-track,
+.table-wrap::-webkit-scrollbar-track,
+.brief-hours::-webkit-scrollbar-track {
   background: transparent;
 }
 
@@ -91,20 +90,7 @@ body {
     box-shadow: 0 0 0 2px var(--primary-ring);
   }
   50% {
-    /* 尾帧必须**完全透明**，用 transparent 而不是某个色的 0 透明度版本 ——
-       否则一旦品牌色换了，这里就成了一个忘记跟上的硬编码色值 */
     box-shadow: 0 0 0 5px transparent;
-  }
-}
-@keyframes nav-dot-pulse {
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 1;
-  }
-  50% {
-    transform: scale(1.35);
-    opacity: 0.55;
   }
 }
 @keyframes toast-in {
@@ -121,7 +107,7 @@ body {
 @keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px);
   }
   to {
     opacity: 1;
@@ -137,11 +123,11 @@ body {
     opacity: 1;
   }
 }
-/* 弹窗落定：略带回弹，比线性缩放更有「落下来」的物理感 */
+/* 弹窗落定：略带回弹 */
 @keyframes dialog-in {
   from {
     opacity: 0;
-    transform: translateY(12px) scale(0.97);
+    transform: translateY(14px) scale(0.975);
   }
   to {
     opacity: 1;
@@ -158,9 +144,7 @@ body {
   }
 }
 
-/* 页面入场节奏：面板页的直接子块依次浮现。
-   刻意用 animation-delay 而不是把 JS 写进每个组件 —— 页面自己不用知道这事。
-   ⚠️ 只对块级容器生效，且页面根必须是 .panel-page（见 ui.css）。 */
+/* 页面入场节奏：面板页的直接子块依次浮现。 */
 .panel-page > * {
   animation: rise var(--dur-3) var(--ease-out) both;
 }
@@ -183,11 +167,7 @@ body {
   animation-delay: 200ms;
 }
 
-/**
- * 无障碍：尊重系统的「减少动态效果」。
- * 用一条近乎全局的规则把动画与过渡压到 0.01ms —— 比逐个去禁用可靠得多，
- * 新增动画也不会漏掉。
- */
+/* 无障碍：尊重系统的「减少动态效果」。 */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

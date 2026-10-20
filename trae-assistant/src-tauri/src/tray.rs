@@ -4,8 +4,8 @@
 //! - **左键单击**：切换主窗口 —— 窗口可见且已聚焦 ⇒ 隐藏；否则 ⇒ 显示并聚焦。
 //! - **右键单击**：弹出菜单（显示/隐藏主窗口、退出）。
 //!
-//! 图标使用内嵌的 `icons/tray.png`（绿色圆角方块 + 对勾），不依赖系统默认窗口图标，
-//! 避免在高 DPI / 小尺寸托盘下糊成一团。
+//! 图标使用内嵌的 `icons/tray.png`（与 `icon-source.svg` 同源的 Trae 助手图标），
+//! 不依赖系统默认窗口图标，避免在高 DPI / 小尺寸托盘下糊成一团。
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, Ordering},
@@ -120,9 +120,10 @@ fn with_status_dot(base: &Image<'static>) -> Image<'static> {
     }
     let mut px = base.rgba().to_vec();
     let side = w.min(h) as f32;
-    let radius = side * 0.21;
+    // 小号状态点：只贴住右下角，避免盖掉新图标里的眼睛 / 折角。
+    let radius = side * 0.16;
     let ring = (radius * 0.30).max(1.0);
-    let margin = side * 0.03;
+    let margin = side * 0.04;
     let cx = w as f32 - radius - margin;
     let cy = h as f32 - radius - margin;
     for y in 0..h {

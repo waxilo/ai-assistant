@@ -59,7 +59,7 @@ export function BrokerBindModal({
       size="md"
       icon={<IconLink size={18} />}
       title="绑定云端凭证池"
-      subtitle="把在另一台机器上传的那一池接到本机"
+      subtitle="把另一台机器上传的账号池接到本机"
       footer={
         <>
           <button className="btn ghost" onClick={onClose} disabled={busy}>
@@ -91,19 +91,11 @@ export function BrokerBindModal({
           }}
         />
       </label>
-      <p className="note">
-        <IconInfo size={14} />
-        <span>
-          绑定后本机账号与那一池「取并集」：池里的并进来，本机独有的一个都不会删，
-          下一轮同步时再一起推上去。
-        </span>
+      {/* 说明与错误共用同一个固定高度槽：出错只在原地换字，弹窗高度不变 */}
+      <p className={`note broker-note${err ? " danger" : ""}`}>
+        {err ? <IconAlertTriangle size={14} /> : <IconInfo size={14} />}
+        <span>{err || "绑定后两边账号合并，本机已有的账号不会丢失。"}</span>
       </p>
-      {err && (
-        <p className="note danger">
-          <IconAlertTriangle size={14} />
-          <span>{err}</span>
-        </p>
-      )}
     </Dialog>
   );
 }
@@ -145,7 +137,7 @@ export function PoolIssuedModal({
       tone="ok"
       icon={<IconCloud size={18} />}
       title="这一池的 uuid"
-      subtitle="复制到其他机器的「绑定云端凭证池」里"
+      subtitle="复制到其他机器的「绑定云端凭证池」中使用"
       tools={
         <button className="btn small" onClick={() => void copy()}>
           {copied ? "已复制" : "复制 uuid"}
@@ -165,10 +157,7 @@ export function PoolIssuedModal({
       <code className="pool-uuid">{uuid}</code>
       <p className="note warn">
         <IconAlertTriangle size={14} />
-        <span>
-          拿到这串 uuid 就等于拿到这一池账号的完整权限，所以请把它当密码保存 ——
-          别发进聊天群、别截图外传。
-        </span>
+        <span>这串 uuid 等同于账号密码，请妥善保存，不要外传。</span>
       </p>
     </Dialog>
   );

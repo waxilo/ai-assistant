@@ -1,0 +1,17 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E9EBF0"/>
+    </linearGradient>
+    <clipPath id="tileClip"><rect width="1024" height="1024" rx="230"/></clipPath>
+  </defs>
+  <g clip-path="url(#tileClip)">
+    <rect width="1024" height="1024" fill="url(#tile)"/>
+    <g transform="translate(220 308) scale(8)">
+      <path fill-rule="evenodd" d="M0 0H73V51H11V41H0Z M10 10H64V41H10Z" fill="#12D875"/>
+      <path d="M29 20.5 34.5 27 29 33.5 23.5 27Z" fill="#0A0B0D"/>
+      <path d="M50 20.5 55.5 27 50 33.5 44.5 27Z" fill="#0A0B0D"/>
+    </g>
+  </g>
+</svg>

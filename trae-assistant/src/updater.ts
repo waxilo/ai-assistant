@@ -59,25 +59,6 @@ export function downloadProgress(p: UpdateProgress | null): DownloadProgress | n
   };
 }
 
-/** 后台检查更新发现的新版本；seen = 用户已经看过（小红点随之熄灭） */
-export type UpdateNotice = { version: string; seen: boolean } | null;
-
-/**
- * 后台轮询结果 → 新的提醒状态。抽成纯函数是因为它有三条容易写错、又都影响体验的规则：
- * - 已是最新（version = null）→ 清空提醒；
- * - 同一版本再次查到 → 原样返回（连引用都不换），别把用户已经看过的提醒重新点亮；
- * - 冒出更新的版本 → 未读；但用户此刻就在设置页，则直接算已读，免得刚看完又被点一颗红点。
- */
-export function nextUpdateNotice(
-  prev: UpdateNotice,
-  version: string | null,
-  onSettingsPage: boolean
-): UpdateNotice {
-  if (!version) return null;
-  if (prev?.version === version) return prev;
-  return { version, seen: onSettingsPage };
-}
-
 /**
  * 只查询有没有新版本：不下载、不安装。
  *

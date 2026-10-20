@@ -363,11 +363,9 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         id: uuid::Uuid::new_v4().to_string(),
         name,
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
-        region: None,
         user_id: None,
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
-        host: None,
         expires_at: item_expiry(item),
         refresh_expires_at: item.rt_expires_at,
         device_id: None,
@@ -843,7 +841,13 @@ pub async fn unbind(dir: &Path) -> Result<BrokerStatus, String> {
     // 解绑这个动作**只有在落盘之后才算完成**：内存里摘掉 uuid 只影响本次运行，
     // 磁盘上仍留着它的话，重启会重新绑上同一池，并把刚删掉的云端副本再收养回来。
     set_uuid(None).map_err(|e| {
-        crate::logs::push("凭证池", false, format!("解绑落盘失败：{e}"));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "凭证池",
+            false,
+            format!("解绑落盘失败：{e}"),
+        );
         e
     })?;
     mutate(|s| {
@@ -1127,11 +1131,9 @@ mod tests {
             id: format!("id-{name}"),
             name: name.into(),
             phone: phone.map(str::to_string),
-            region: None,
             user_id: None,
             token: token.into(),
             refresh_token: None,
-            host: None,
             expires_at: None,
             refresh_expires_at: None,
             device_id: None,

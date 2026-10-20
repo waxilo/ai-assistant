@@ -15,12 +15,10 @@ pub struct Account {
     pub id: String,
     pub name: String,
     pub phone: Option<String>,
-    pub region: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
     pub token: String,
     pub refresh_token: Option<String>,
-    pub host: Option<String>,
     pub expires_at: Option<i64>,
     pub refresh_expires_at: Option<i64>,
     /// 设备标识（签到 API 的隐藏必填头 `X-Device-Id` / `X-Machine-Id` 来源）。
@@ -155,11 +153,9 @@ impl From<TraeLocalAccount> for Account {
                 .or_else(|| a.phone.clone())
                 .unwrap_or_else(|| "未命名账号".into()),
             phone: a.phone,
-            region: a.region,
             user_id: a.user_id,
             token: a.token,
             refresh_token: a.refresh_token,
-            host: a.host,
             expires_at: a.expires_at,
             refresh_expires_at: a.refresh_expires_at,
             device_id: a.device_id,
@@ -302,7 +298,13 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
         .unwrap_or_default();
     if list.iter_mut().any(normalize) {
         if let Err(e) = save_accounts(dir, &list) {
-            crate::logs::push("账号", false, format!("规范化回写失败：{e}"));
+            crate::logs::push(
+                dir,
+                crate::logs::CAT_SYSTEM,
+                "账号",
+                false,
+                format!("规范化回写失败：{e}"),
+            );
         }
     }
     list
@@ -374,7 +376,13 @@ pub fn save_accounts(dir: &Path, accounts: &[Account]) -> Result<(), String> {
 /// 「这个账号怎么突然要我重新登录」的形式出现，而那时已经查不到是哪次写盘失败了。
 pub(crate) fn save_accounts_noisy(dir: &Path, accounts: &[Account], scene: &str) {
     if let Err(e) = save_accounts(dir, accounts) {
-        crate::logs::push("账号数据", false, format!("{scene}：落盘失败（{e}）"));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "账号数据",
+            false,
+            format!("{scene}：落盘失败（{e}）"),
+        );
     }
 }
 
@@ -522,11 +530,9 @@ mod tests {
             id: String::new(),
             name: "浏览器登录账号".into(),
             phone: None,
-            region: Some("cn".into()),
             user_id: None,
             token: format!("eyJhbGciOiJSUzI1NiJ9.{payload}.sig"),
             refresh_token: None,
-            host: None,
             expires_at: None,
             refresh_expires_at: None,
             device_id: Some("e6fb29121995483988b3f6cff4b9ff1c".into()),
@@ -549,11 +555,9 @@ mod tests {
             id: "keep-me".into(),
             name: "n".into(),
             phone: None,
-            region: None,
             user_id: Some("2807498532739475".into()),
             token: "opaque".into(),
             refresh_token: None,
-            host: None,
             expires_at: None,
             refresh_expires_at: None,
             device_id: None,

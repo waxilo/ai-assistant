@@ -454,9 +454,6 @@ pub fn adopt_local_session(dir: &Path, account: &mut Account) -> Option<RenewOut
     if let Some(rt) = local.refresh_token.clone() {
         account.refresh_token = Some(rt);
     }
-    if let Some(h) = local.host.clone() {
-        account.host = Some(h);
-    }
     account.expires_at = local.expires_at;
     account.refresh_expires_at = local.refresh_expires_at;
     // 新票在手：活性/冷却标记一并清掉（可能正是靠「桌面端换的新票」才能救活一条死链）
@@ -492,7 +489,7 @@ async fn exchange_by_refresh_token(
     account: &mut Account,
     refresh_token: &str,
 ) -> Result<(), RenewError> {
-    let host = oauth::normalize_api_host(account.host.as_deref().unwrap_or_default());
+    let host = crate::API_HOST;
     let mut mismatch: Option<RenewError> = None;
     for c in candidates(dir, account) {
         match exchange_once(&host, account, refresh_token, &c).await {
@@ -712,6 +709,8 @@ fn persist(dir: &Path, account: &Account, renewed: bool) {
         }
     }
     crate::logs::push(
+        dir,
+        crate::logs::CAT_RENEW,
         &account.name,
         false,
         format!("续签结果落盘失败（重试一次仍失败）：{last}"),
@@ -877,7 +876,13 @@ fn sweep(app: &tauri::AppHandle) {
         // 口径把结果整个吞掉，而这条心跳失败的后果是「整池几十小时没人签」—— 那种沉默刚付过代价。
         // `force = false` 保留两分钟节流；被节流、闸在别人手里都是 `Ok(deferred)`，不记日志。
         if let Err(e) = tauri::async_runtime::block_on(crate::broker::sync(&dir, false)) {
-            crate::logs::push("凭证池", false, format!("续签心跳：整池同步失败：{e}"));
+            crate::logs::push(
+                &dir,
+                crate::logs::CAT_RENEW,
+                "凭证池",
+                false,
+                format!("续签心跳：整池同步失败：{e}"),
+            );
             crate::journal::append_dedup(
                 &dir,
                 "renew_heartbeat",
@@ -912,6 +917,8 @@ fn sweep(app: &tauri::AppHandle) {
         // 续签成功是**可自证**的：账号列表里那列到期时间被推远了就是它干的。
         if !out.renewed {
             crate::logs::push(
+                &dir,
+                crate::logs::CAT_RENEW,
                 &out.name,
                 false,
                 format!("自动续签未成功：{}", out.message),
@@ -938,11 +945,9 @@ mod tests {
             id: "a1".into(),
             name: "n".into(),
             phone: None,
-            region: None,
             user_id: Some("1".into()),
             token: token.into(),
             refresh_token: Some("rt".into()),
-            host: None,
             expires_at,
             refresh_expires_at: None,
             device_id: Some("dev".into()),

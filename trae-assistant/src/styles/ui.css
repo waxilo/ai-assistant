@@ -2,13 +2,14 @@
  * 通用 UI 层：页面容器、卡片、表格、状态原子、表单、弹窗/遮罩、开关、进度。
  *
  * 这一层是「同一个概念在任何页面都必须长得一样」的地方。页面只能组合这里的
- * 东西并用修饰类描述语义，不得再写一套边框/圆角/底色 —— 旧版 App.css 里
- * `.card` 与页面各写一份 padding、`.tag` 与 `.chip` 两套胶囊，就是这么来的。
+ * 东西并用修饰类描述语义，不得再写一套边框/圆角/底色。
  */
 
-/* ── 页面容器：四页共用同一宽度策略与纵向节奏 ───────────────── */
+/* ── 页面容器 ─────────────────────────────────────────────── */
 .panel-page {
   width: 100%;
+  max-width: 1240px;
+  margin: 0 auto;
   display: flex;
   flex-direction: column;
   gap: var(--gap);
@@ -16,68 +17,44 @@
 
 /* ── 卡片：全应用唯一的面板外观 ─────────────────────────────── */
 .card {
-  background: var(--card-glass);
-  backdrop-filter: blur(var(--blur-sm)) saturate(140%);
-  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(140%);
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-sm), var(--hl);
+  box-shadow: var(--shadow-sm);
   transition: box-shadow var(--dur-2) var(--ease-out),
-    border-color var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
+    border-color var(--dur-2) var(--ease-out),
+    transform var(--dur-2) var(--ease-out);
 }
-/* 可交互卡片（如概览卡）：hover 时轻微抬升 */
 .card.hoverable:hover {
-  box-shadow: var(--shadow), var(--hl);
+  box-shadow: var(--shadow);
   border-color: var(--border-strong);
-  transform: translateY(-1px);
+  transform: translateY(-2px);
 }
 
-/* 卡片内的横向表头：标题在左，操作用 .spacer 推到右 */
 .card-head {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 13px 18px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--border);
 }
 .card-head h3 {
   margin: 0;
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: 650;
+  letter-spacing: -0.01em;
 }
 .card-head-sub {
   font-size: var(--fs-cap);
   color: var(--muted);
 }
 
-/* 说明条：图标 + 一段正文。
-   正文必须整体包在一个元素里（调用方用 <span>）—— 容器是 flex，裸的 <b>/<i> 会
-   各自变成一个 flex item，把一句话拆成竖排的几列。 */
-.set-intro {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--fs-body);
-  line-height: 1.6;
-}
-.set-intro > span {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.set-intro svg {
-  flex: 0 0 auto;
-  color: var(--primary);
-  opacity: 0.7;
-}
-
-/* ── 空态：图标 + 主文案 +（可选）补充说明 ─────────────────── */
+/* ── 空态 ─────────────────────────────────────────────────── */
 .empty {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   color: var(--muted);
   font-size: var(--fs-md);
   line-height: 1.7;
@@ -86,39 +63,53 @@
   margin: 0;
   animation: fade-in var(--dur-3) var(--ease-out) both;
 }
-.empty svg {
-  color: var(--disabled);
+.empty > svg {
+  box-sizing: content-box;
+  width: 26px;
+  height: 26px;
+  padding: 17px;
+  border-radius: 20px;
+  background: var(--panel-2);
+  color: var(--muted-2);
+  margin-bottom: 4px;
 }
 .empty-sub {
   font-size: var(--fs-sm);
   color: var(--muted);
-  max-width: 420px;
+  max-width: 460px;
 }
 
-/* ── 概览：4 张汇总卡 ─────────────────────────────────────── */
+/* ── 概览：汇总卡 ─────────────────────────────────────────── */
 .summary {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 14px;
 }
-/* 汇总卡：组合 .card，这里只补内边距与内部排布 */
 .sum-card {
-  padding: 14px 16px;
+  position: relative;
+  overflow: hidden;
+  padding: 19px 20px 17px;
   display: flex;
   flex-direction: column;
   gap: 7px;
+  min-height: 112px;
 }
 .sum-label {
   font-size: var(--fs-sm);
   color: var(--muted);
+  letter-spacing: 0.01em;
 }
 .sum-num {
+  min-width: 0;
   font-size: var(--fs-stat);
-  font-weight: 650;
+  font-weight: 700;
   color: var(--text);
-  letter-spacing: -0.02em;
+  letter-spacing: -0.035em;
   font-variant-numeric: var(--tnum);
-  line-height: 1.15;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .sum-num.ok {
   color: var(--ok);
@@ -126,29 +117,194 @@
 .sum-num.warn {
   color: var(--warn);
 }
-/* 「不限量」角标：跟在总积分后面，说明合计只统计了有确切数值的账号 */
 .sum-plus {
   margin-left: 2px;
   font-size: var(--fs-md);
   color: var(--primary);
-  vertical-align: 3px;
+  vertical-align: 4px;
+}
+.sum-icon {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  background: var(--panel-2);
+  color: var(--muted);
+  box-shadow: var(--hl);
+}
+.sum-card.tone-ok .sum-icon {
+  background: var(--ok-soft);
+  color: var(--ok-d);
+}
+.sum-card.tone-warn .sum-icon {
+  background: var(--warn-soft);
+  color: var(--warn-d);
+}
+.sum-card.tone-err .sum-icon {
+  background: var(--err-soft);
+  color: var(--err);
+}
+/* 关键指标卡：唯一一张着色卡，作为页面视觉锚点 */
+.sum-card.feature {
+  background: linear-gradient(145deg, #0a8a5e 0%, #0ea872 48%, #19bd85 100%);
+  border-color: transparent;
+  box-shadow: var(--shadow-primary), var(--hl);
+}
+.sum-card.feature::after {
+  content: "";
+  position: absolute;
+  right: -46px;
+  bottom: -70px;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.22), transparent 68%);
+  pointer-events: none;
+}
+.sum-card.feature .sum-label {
+  color: rgba(255, 255, 255, 0.74);
+}
+.sum-card.feature .sum-num,
+.sum-card.feature .sum-plus {
+  color: #fff;
+}
+.sum-card.feature .sum-icon {
+  background: rgba(255, 255, 255, 0.17);
+  color: #fff;
+}
+.sum-card.feature.hoverable:hover {
+  border-color: transparent;
+  box-shadow: 0 20px 44px -18px rgba(14, 168, 114, 0.7), var(--hl);
+}
+.sum-card.hoverable {
+  cursor: pointer;
+}
+.sum-card.hoverable:focus-visible {
+  outline: 2px solid var(--primary-line);
+  outline-offset: 2px;
+}
+.sum-card.feature.hoverable:focus-visible {
+  outline-color: rgba(255, 255, 255, 0.75);
 }
 
-/* ── 数据表格：账号列表与签到日志共用同一套表头 / 行高 / Hover ── */
+/* ── 数据表格 ─────────────────────────────────────────────── */
 .table-wrap {
-  /* 与 .card 组合：卡片负责外观，这里负责横向滚动与裁切内圆角 */
   overflow: hidden auto;
 }
-/* 资源包弹窗顶栏：左侧说明文字（隐藏数 / 刷新失败），右侧「刷新」按钮 */
+/* 资源包弹窗：固定内容槽，行数变化只让表格内部滚动 */
+.pkg-list-body {
+  display: flex;
+  flex-direction: column;
+  height: clamp(200px, calc(86vh - 230px), 340px);
+  min-height: 0;
+}
 .pkg-dialog-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
+  flex: 0 0 auto;
+  height: 32px;
   margin-bottom: 10px;
+}
+.pkg-dialog-bar .note {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: calc(100% - 110px);
+  height: 32px;
+  margin: 0 auto 0 0;
+  padding: 0 12px;
+  align-items: center;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.pkg-dialog-bar .note > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .pkg-dialog-bar .note:empty {
   display: none;
+}
+.pkg-list-body .table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden auto;
+}
+.pkg-list-body > .pkg-empty {
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+}
+/* 全部资源包：账号行默认折叠，点开才列出逐包明细 */
+.pkg-acct-row {
+  cursor: pointer;
+}
+.pkg-acct-row td {
+  background: var(--panel-2);
+}
+.pkg-acct-row:focus-visible {
+  outline: 2px solid var(--primary-line);
+  outline-offset: -2px;
+}
+.data-table .pkg-acct-row:hover td {
+  background: var(--row-hover);
+}
+.pkg-acct {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pkg-acct > .ac-cell-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pkg-acct .ac-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  font-size: var(--fs-body);
+}
+.pkg-chevron {
+  flex: 0 0 auto;
+  color: var(--muted-2);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+.pkg-acct-row.open .pkg-chevron {
+  transform: rotate(90deg);
+}
+.pkg-acct-count {
+  flex: 0 0 auto;
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* 明细行：与账号名左对齐（20px 单元格内边距 + 14 箭头 + 10 间距 + 32 头像 + 12 间距） */
+.pkg-detail-row td {
+  background: var(--panel);
+}
+.pkg-detail-row td:first-child {
+  padding-left: 88px;
+}
+.data-table .pkg-detail-row:hover td {
+  background: var(--panel);
+}
+.pkg-detail-name {
+  color: var(--muted);
+}
+.pkg-table .pkg-none {
+  padding-left: 88px;
+  font-size: var(--fs-cap);
 }
 .data-table {
   width: 100%;
@@ -157,22 +313,22 @@
   font-size: var(--fs-cell);
 }
 .data-table thead th {
-  height: 44px;
-  padding: 0 18px;
+  height: 46px;
+  padding: 0 20px;
   text-align: left;
-  font-size: var(--fs-sm);
-  font-weight: 500;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
   color: var(--muted);
   background: var(--panel-2);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
-  /* 表头吸顶：表格长的时候不用滚回去看列名 */
   position: sticky;
   top: 0;
   z-index: 1;
 }
 .data-table tbody td {
-  padding: 14px 18px;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
@@ -185,7 +341,6 @@
 .data-table tbody tr:last-child td {
   border-bottom: none;
 }
-/* 数值列：右对齐 + 等宽数字 */
 .data-table .num {
   text-align: right;
   font-variant-numeric: var(--tnum);
@@ -195,7 +350,7 @@
   text-align: right;
 }
 
-/* 账号列（账号页 / 日志页共用）：头像 + 名称 + 手机号 */
+/* 账号单元格 */
 .ac-cell-name {
   display: flex;
   align-items: center;
@@ -203,16 +358,17 @@
 }
 .ac-avatar {
   flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
-  border-radius: var(--radius-sm);
+  width: 40px;
+  height: 40px;
+  border-radius: 13px;
   display: grid;
   place-items: center;
-  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  background: linear-gradient(150deg, #ffffff, var(--primary-soft));
+  border: 1px solid var(--primary-line);
   color: var(--primary-d);
   font-size: var(--fs-md);
-  font-weight: 600;
-  box-shadow: var(--hl);
+  font-weight: 650;
+  box-shadow: var(--shadow-xs), var(--hl);
 }
 .ac-id {
   display: flex;
@@ -221,23 +377,20 @@
   min-width: 0;
 }
 .ac-name {
-  font-size: var(--fs-md);
+  font-size: var(--fs-cell);
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
 }
-/* 手机号：弱化的次级信息 */
 .ac-phone {
-  font-size: var(--fs-cap);
+  font-size: var(--fs-xs);
   color: var(--muted);
   font-variant-numeric: var(--tnum);
 }
-
-/* 单元格里的第二行小字（积分到期 / token 到期等） */
 .sub {
   display: block;
   font-size: var(--fs-xs);
-  line-height: 1.35;
+  line-height: 1.4;
   color: var(--muted);
   font-variant-numeric: var(--tnum);
 }
@@ -248,24 +401,29 @@
   color: var(--err);
 }
 
-/* ── 状态圆点：全应用唯一的「状态」表达 ───────────────────── */
+/* ── 状态胶囊：全应用唯一的「状态」表达 ───────────────────── */
 .status-dot {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  font-size: var(--fs-sm);
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
   color: var(--muted);
   white-space: nowrap;
 }
 .status-dot .dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--muted);
+  background: var(--muted-2);
   flex: 0 0 auto;
 }
 .status-dot.done {
-  color: var(--ok);
+  background: var(--ok-soft);
+  color: var(--ok-d);
 }
 .status-dot.done .dot {
   background: var(--ok);
@@ -274,6 +432,7 @@
   background: var(--disabled);
 }
 .status-dot.fail {
+  background: var(--err-soft);
   color: var(--err);
 }
 .status-dot.fail .dot {
@@ -282,7 +441,10 @@
 .status-dot.inactive .dot {
   background: var(--muted-2);
 }
-/* 「进行中」的呼吸光环：唯一允许无限循环的动画（表达进行中） */
+.status-dot.signing {
+  background: var(--ok-soft);
+  color: var(--ok-d);
+}
 .status-dot.signing .dot {
   background: var(--primary);
   animation: pulse 1.2s ease-in-out infinite;
@@ -293,10 +455,11 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--fs-cap);
+  font-size: var(--fs-xs);
+  font-weight: 500;
   color: var(--primary-d);
   background: var(--primary-soft);
-  padding: 3px 10px;
+  padding: 4px 10px;
   border-radius: var(--radius-pill);
   white-space: nowrap;
 }
@@ -308,22 +471,18 @@
 }
 code {
   font-family: var(--font-mono);
-  font-size: var(--fs-cap);
+  font-size: var(--fs-xs);
   color: var(--text-2);
   background: var(--panel-2);
-  padding: 2px 6px;
-  border-radius: 5px;
+  border: 1px solid var(--border);
+  padding: 2px 7px;
+  border-radius: 7px;
 }
 
 /* ── 遮罩层 + 弹窗 ────────────────────────────────────────── */
-/* 弹窗打开时锁住内容区滚动（Dialog 组件给 body 挂这个状态类）。
-   注意锁的是 .content —— 本应用真正滚动的容器是它，body 本身从不滚动，
-   所以对 body 设 overflow 是无效操作。 */
 body.modal-open .content {
   overflow: hidden;
 }
-
-/* 遮罩：半透明压暗 + 轻微模糊（让弹窗与背景产生景深分离），并淡入 */
 .modal-mask {
   position: fixed;
   inset: 0;
@@ -331,15 +490,11 @@ body.modal-open .content {
   display: grid;
   place-items: center;
   padding: var(--page-pad);
-  background: rgba(18, 24, 38, 0.32);
-  backdrop-filter: blur(6px) saturate(120%);
-  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  background: var(--scrim);
+  backdrop-filter: blur(9px) saturate(115%);
+  -webkit-backdrop-filter: blur(9px) saturate(115%);
   animation: overlay-in var(--dur-2) var(--ease-out) both;
 }
-/* 弹窗本体：**三段式外壳**（head / body / foot），全应用所有弹窗共用。
-   头尾固定、**只有 body 滚动** —— 内容再长也不会把标题或操作按钮顶出视野
-   （旧实现是 `.modal` 整体滚动 + `.modal-actions` 用负偏移贴底，标题会跟着滚走）。
-   尺寸只有三档（tokens 里的 --modal-w-*）：sm 确认类 / md 默认 / lg 列表与表格。 */
 .modal {
   display: flex;
   flex-direction: column;
@@ -364,30 +519,28 @@ body.modal-open .content {
 .modal-lg {
   width: var(--modal-w-lg);
 }
-/* 旧用法兼容（参考项目前的遗留）：`.modal.wide` 曾是唯一的大档 */
 .modal.wide {
   width: var(--modal-w-lg);
 }
 
-/* ── 头部：图标座 + 标题 +（可选）副标题 + 关闭 ── */
 .modal-head {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 12px;
   flex: 0 0 auto;
-  padding: 16px var(--modal-pad) 14px;
+  padding: 22px var(--modal-pad) 15px;
   border-bottom: 1px solid var(--border);
 }
-/* 图标座：给每个弹窗一个「一眼认出这是什么」的锚点，同时承担语义色 */
 .modal-head-icon {
   flex: 0 0 auto;
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: var(--radius-sm);
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
   background: var(--primary-soft);
   color: var(--primary-d);
+  box-shadow: var(--hl);
 }
 .modal.tone-danger .modal-head-icon {
   background: var(--err-soft);
@@ -407,9 +560,9 @@ body.modal-open .content {
 }
 .modal-title h2 {
   margin: 0;
-  font-size: 16px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-size: 17px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
   color: var(--text);
 }
 .modal-sub {
@@ -418,36 +571,33 @@ body.modal-open .content {
   line-height: 1.6;
   color: var(--muted);
 }
-/* 关闭按钮：旧弹窗只能靠 Esc / 点遮罩关掉，界面上没有任何可见出口 */
 .modal-x {
   flex: 0 0 auto;
-  margin: -4px -4px 0 2px;
+  margin: -3px -4px 0 2px;
+  border-radius: var(--radius-pill);
 }
 
-/* ── 内容区：唯一滚动区 ── */
 .modal-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
-  padding: 18px var(--modal-pad) 20px;
+  padding: 18px var(--modal-pad) 22px;
 }
-/* 内容区统一纵向节奏：相邻块一律 12px */
 .modal-body > * + * {
-  margin-top: 12px;
+  margin-top: 14px;
 }
-/* 元信息（时间戳之类）是贴在上面那块后面的附注，间距要比常规块紧一档 */
 .modal-body > .modal-meta {
   margin-top: 10px;
 }
 
-/* ── 底部：左「工具位」右「操作位」 ── */
 .modal-foot {
   display: flex;
   align-items: center;
   gap: 10px;
   flex: 0 0 auto;
-  padding: 13px var(--modal-pad);
+  padding: 15px var(--modal-pad);
   border-top: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.72);
 }
 .modal-foot-tools {
   flex: 0 0 auto;
@@ -463,55 +613,67 @@ body.modal-open .content {
   margin: 0 0 14px;
   font-size: 17px;
   font-weight: 650;
-  letter-spacing: -0.01em;
 }
-/* 字段标签：只有**弹窗内**的表单需要「块级 + 次级色 + 下间距」。 */
 .modal label {
   display: block;
   font-size: var(--fs-body);
-  color: var(--muted);
+  font-weight: 500;
+  color: var(--text-2);
   margin-bottom: 12px;
 }
-/* 表单控件基础外观 —— **不含宽度**。宽度归容器决定。 */
+/* 表单控件基础外观 —— 不含宽度 */
 .modal input,
 .modal textarea,
 .modal select,
 .panel-page input,
 .panel-page textarea,
 .panel-page select {
-  margin-top: 6px;
-  padding: 9px 11px;
+  margin-top: 7px;
+  height: 40px;
+  padding: 0 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   font-size: var(--fs-body);
   font-family: inherit;
   color: var(--text);
   background: var(--field);
-  resize: vertical;
+  outline: none;
   transition: border-color var(--dur-1) var(--ease-out),
-    box-shadow var(--dur-1) var(--ease-out), background-color var(--dur-1) var(--ease-out);
+    box-shadow var(--dur-1) var(--ease-out),
+    background-color var(--dur-1) var(--ease-out);
+}
+.modal textarea,
+.panel-page textarea {
+  height: auto;
+  padding: 10px 12px;
+  resize: vertical;
 }
 .modal input,
 .modal textarea,
 .modal select {
   width: 100%;
 }
-/* 统一 select 下拉框：自定义箭头、一致背景、hover/focus 状态 */
 .modal select,
 .panel-page select {
   cursor: pointer;
   appearance: none;
   -webkit-appearance: none;
-  padding-right: 32px;
+  padding-right: 34px;
   background-color: var(--field);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23607085' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236d7a74' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 10px center;
+  background-position: right 11px center;
   background-size: 16px 16px;
 }
 .modal select:hover,
 .panel-page select:hover {
-  background-color: #ffffff;
+  background-color: var(--panel);
+  border-color: var(--border-hover);
+}
+.modal input:hover,
+.modal textarea:hover,
+.panel-page input:hover,
+.panel-page textarea:hover {
   border-color: var(--border-hover);
 }
 .modal input:focus,
@@ -522,13 +684,17 @@ body.modal-open .content {
 .panel-page select:focus {
   outline: none;
   border-color: var(--primary);
-  background-color: #ffffff;
-  box-shadow: 0 0 0 3px var(--primary-ring);
+  background-color: var(--panel);
+  box-shadow: 0 0 0 4px var(--primary-ring);
+}
+.modal input::placeholder,
+.panel-page input::placeholder {
+  color: var(--muted-2);
 }
 .hint {
   font-size: var(--fs-cap);
   color: var(--muted);
-  line-height: 1.6;
+  line-height: 1.7;
   margin: 0;
 }
 .form-err {
@@ -542,13 +708,6 @@ body.modal-open .content {
   gap: 10px;
   margin: 16px calc(var(--modal-pad) * -1) calc(var(--modal-pad) * -1);
   padding: 12px var(--modal-pad) 14px;
-  /* 弹窗内容超高时容器自身滚动；让操作按钮常驻底部，否则「保存」会被滚出视野。
-     ⚠️ 贴底要靠「负外边距 + bottom:0」这一对：负下边距把这个块拉到滚动容器的底边，
-     左右负边距让它铺满弹窗内边距之外的全宽。
-     早先写的是 `position:sticky; bottom: calc(var(--modal-pad) * -1)`（照抄来的做法），
-     在**内容没超高、容器根本不滚动**的弹窗里，那条负偏移不会把元素推出滚动口，
-     而是把它自己往下推 22px —— 于是按钮上方凭空多出一条 22px 的空白带
-     （2026-09-16 截图验证时发现，添加账号 / 删除确认两个弹窗都有）。 */
   position: sticky;
   bottom: 0;
   z-index: 1;
@@ -557,13 +716,11 @@ body.modal-open .content {
   -webkit-backdrop-filter: blur(var(--blur-sm));
   border-top: 1px solid var(--border);
 }
-/* 表单里的纵向字段组 */
 .form {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
-/* 弹窗内的分节标题 */
 .modal h3.sec {
   margin: 16px 0 4px;
   padding-top: 12px;
@@ -572,17 +729,15 @@ body.modal-open .content {
   color: var(--text);
 }
 
-/* ── 分段控件：弹窗里的「二选一」（扫描本机 / 浏览器登录）────── */
-/* 用一排按钮而不是原生 radio：选项只有 2 个、且是**互斥的路径选择**，
-   分段控件能同时表达「有哪些选项」与「现在在哪一个」。 */
+/* ── 分段控件 ─────────────────────────────────────────────── */
 .seg {
   display: inline-flex;
-  gap: 2px;
-  padding: 3px;
+  gap: 3px;
+  padding: 4px;
   margin: 0 0 14px;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 13px;
 }
 .seg button {
   border: none;
@@ -590,11 +745,13 @@ body.modal-open .content {
   color: var(--muted);
   font-family: inherit;
   font-size: var(--fs-body);
-  padding: 6px 14px;
-  border-radius: 6px;
+  font-weight: 500;
+  padding: 7px 16px;
+  border-radius: 9px;
   cursor: pointer;
   transition: background var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+    color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 .seg button:hover:not(:disabled) {
   color: var(--text);
@@ -610,8 +767,130 @@ body.modal-open .content {
   cursor: not-allowed;
 }
 
-/* 授权页地址：等宽、可截断，右侧一个「重新打开」按钮 ——
-   浏览器有时会拦截弹窗或用户误关标签，得能再要一次。 */
+/* ── 添加账号：自动扫描出的本机账号列表 ───────────────────── */
+.discover-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 8px;
+}
+/* 这里的 label 要压过 `.modal label`（display:block + margin-bottom:12px） */
+.modal .discover-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: var(--fs-cap);
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.modal .discover-all input,
+.modal .discover-row input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  box-shadow: none;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.discover-count {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-cap);
+  color: var(--muted);
+}
+.discover-list {
+  max-height: 292px;
+  overflow: hidden auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.modal .discover-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out);
+}
+.modal .discover-row:last-child {
+  border-bottom: none;
+}
+.modal .discover-row:hover {
+  background: var(--row-hover);
+}
+.modal .discover-row.picked {
+  background: var(--primary-soft-2);
+}
+.modal .discover-row .ac-cell-name {
+  flex: 1;
+  min-width: 0;
+}
+.discover-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 34px 20px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  text-align: center;
+}
+.discover-state strong {
+  color: var(--text);
+  font-size: var(--fs-cell);
+  font-weight: 600;
+}
+.discover-state span {
+  max-width: 360px;
+  font-size: var(--fs-cap);
+  line-height: 1.7;
+}
+.discover-state .btn {
+  margin-top: 4px;
+}
+
+/* 添加账号：固定高度的内容槽。
+   扫描中 / 空态 / 列表 / 浏览器登录 / 报错都装在同一块里，弹窗大小不随状态变。 */
+.add-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: clamp(180px, calc(86vh - 260px), 260px);
+  min-height: 0;
+  overflow: hidden auto;
+}
+.add-body label {
+  margin-bottom: 0;
+}
+.add-body .discover-head {
+  flex: 0 0 auto;
+  margin: 0;
+}
+.add-body .discover-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+.add-body .discover-state {
+  flex: 1 1 auto;
+  justify-content: center;
+}
+.add-body .form-err {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
 .oauth-uri {
   display: flex;
   align-items: center;
@@ -621,60 +900,71 @@ body.modal-open .content {
 .oauth-uri code {
   flex: 1;
   min-width: 0;
+  height: 34px;
+  display: flex;
+  align-items: center;
   font-size: var(--fs-cap);
   color: var(--muted);
-  padding: 6px 8px;
+  padding: 0 10px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* ── 自研确认框（替代 window.confirm）─────────────────────── */
+/* ── 自研确认框 ───────────────────────────────────────────── */
 .confirm-mask {
   z-index: 80;
 }
 .modal.confirm {
-  width: 380px;
+  width: 400px;
 }
 .confirm-body {
   margin: 0;
   font-size: var(--fs-body);
-  line-height: 1.7;
+  line-height: 1.75;
   color: var(--muted);
+  white-space: pre-line;
 }
 
 /* ── 拨动开关 ─────────────────────────────────────────────── */
-/* 一个按钮 + 一个滑块。三档尺寸：sm = 表格内，md = 常规设置行，lg = 整页唯一的主控件。 */
 .switch {
   position: relative;
   display: inline-block;
   flex: 0 0 auto;
-  width: 36px;
+  width: 34px;
   height: 20px;
   padding: 0;
   border: none;
   border-radius: var(--radius-pill);
   background: var(--track);
+  box-shadow: inset 0 1px 2px rgba(18, 32, 25, 0.08);
   cursor: pointer;
   transition: background var(--dur-2) var(--ease-out),
     box-shadow var(--dur-2) var(--ease-out);
 }
 .switch .knob {
   position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 14px;
-  height: 14px;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 3px rgba(18, 32, 25, 0.25);
   transition: transform var(--dur-2) var(--ease-spring);
 }
 .switch.on {
-  background: var(--ok);
+  background: linear-gradient(90deg, var(--primary), var(--primary-lite));
+  box-shadow: var(--shadow-primary);
 }
 .switch.on .knob {
-  transform: translateX(16px);
+  transform: translateX(14px);
+}
+.switch:hover:not(:disabled) {
+  box-shadow: 0 0 0 4px var(--primary-ring);
+}
+.switch.on:hover:not(:disabled) {
+  box-shadow: var(--shadow-primary), 0 0 0 4px var(--primary-ring);
 }
 .switch:disabled {
   opacity: 0.45;
@@ -685,27 +975,29 @@ body.modal-open .content {
   outline-offset: 2px;
 }
 .switch.md {
-  width: 44px;
+  width: 42px;
   height: 24px;
 }
 .switch.md .knob {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
 }
 .switch.md.on .knob {
-  transform: translateX(20px);
+  transform: translateX(18px);
 }
 .switch.lg {
-  width: 54px;
-  height: 30px;
+  width: 58px;
+  height: 34px;
 }
 .switch.lg .knob {
-  width: 24px;
-  height: 24px;
-  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.28);
+  top: 3px;
+  left: 3px;
+  width: 28px;
+  height: 28px;
+  box-shadow: 0 2px 6px rgba(18, 32, 25, 0.28);
 }
 .switch.lg.on {
-  box-shadow: 0 0 0 4px var(--ok-soft);
+  box-shadow: var(--shadow-primary), 0 0 0 5px var(--ok-soft);
 }
 .switch.lg.on .knob {
   transform: translateX(24px);
@@ -723,7 +1015,7 @@ body.modal-open .content {
   color: var(--text);
 }
 .upd-status.ok {
-  color: var(--ok);
+  color: var(--ok-d);
 }
 .upd-status.err {
   color: var(--err);
@@ -736,7 +1028,7 @@ body.modal-open .content {
 }
 .upd-progress-bar {
   height: 100%;
-  background: linear-gradient(90deg, var(--primary), #6d92ff);
+  background: linear-gradient(90deg, var(--primary), var(--primary-lite));
   border-radius: var(--radius-pill);
   transition: width var(--dur-2) var(--ease-out);
 }
@@ -747,21 +1039,50 @@ body.modal-open .content {
   font-variant-numeric: var(--tnum);
 }
 
-/* ── 说明条（弹窗 .note）：图标 + 一段正文 ───────────────────
-   正文必须整体包在一个元素里（调用方用 <span>）—— 容器是 flex，裸的 <b>/<i> 会
-   各自变成一个 flex item，把一句话拆成竖排的几列。 */
+/* 设置页：固定高度的更新状态槽。
+   空态也占位、进度条与文字挤在同一行 —— 点「检查更新」前后卡片高度不变。 */
+.upd-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  margin-top: 2px;
+  overflow: hidden;
+}
+.upd-line .upd-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.4;
+}
+.upd-line .upd-status:empty::before {
+  content: "\00a0";
+}
+.upd-line .upd-progress-wrap {
+  flex: 0 1 140px;
+  min-width: 56px;
+  height: 6px;
+}
+.upd-line .upd-progress-text {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ── 说明条（弹窗 .note）───────────────────────────────────── */
 .note {
   display: flex;
   align-items: flex-start;
-  gap: 7px;
+  gap: 8px;
   margin: 0;
-  padding: 10px 12px;
+  padding: 11px 13px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--panel-2);
   color: var(--muted);
   font-size: var(--fs-cap);
-  line-height: 1.65;
+  line-height: 1.7;
 }
 .note > span {
   flex: 1 1 auto;
@@ -771,16 +1092,15 @@ body.modal-open .content {
   flex: 0 0 auto;
   margin-top: 2px;
   color: var(--primary);
-  opacity: 0.7;
 }
 .note.info {
   border-color: var(--primary-line);
-  background: var(--primary-soft);
+  background: var(--primary-soft-2);
   color: var(--text-2);
 }
 .note.warn {
   border-color: var(--warn-line);
-  background: var(--warn-soft);
+  background: var(--warn-soft-2);
   color: var(--text-2);
 }
 .note.warn svg {
@@ -788,22 +1108,26 @@ body.modal-open .content {
 }
 .note.danger {
   border-color: var(--err-line);
-  background: var(--err-soft);
+  background: var(--err-soft-2);
   color: var(--text-2);
 }
 .note.danger svg {
   color: var(--err);
 }
+/* 绑定云端池：说明与错误共用一个固定高度槽，出错时不把弹窗顶高 */
+.broker-note {
+  height: 46px;
+  overflow: auto;
+}
 .note.ok {
   border-color: var(--ok-line);
-  background: var(--ok-soft);
+  background: var(--ok-soft-2);
   color: var(--text-2);
 }
 .note.ok svg {
   color: var(--ok-d);
 }
 
-/* 元信息行：时间戳、来源这类附注（报表明细弹窗里的「结算时刻」） */
 .modal-meta {
   margin: 0;
   font-size: var(--fs-micro);
@@ -811,16 +1135,15 @@ body.modal-open .content {
   font-variant-numeric: var(--tnum);
 }
 
-/* 汇总数字：弹窗里的 2–4 个关键数字并排。
-   刻意不用页面上那套 .sum-card —— 弹窗里再套卡片是双重边框，脏。 */
+/* ── 弹窗里的关键数字 ───────────────────────────────────────── */
 .stat-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
+  gap: 10px;
   margin: 0;
 }
 .stat {
-  padding: 9px 12px;
+  padding: 11px 13px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--panel-2);
@@ -832,35 +1155,38 @@ body.modal-open .content {
 }
 .stat-num {
   display: block;
-  margin-top: 2px;
+  margin-top: 3px;
   font-size: var(--fs-lg);
-  font-weight: 600;
+  font-weight: 650;
   font-variant-numeric: var(--tnum);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
 }
 
-/* ── 云端凭证池：账号页顶部那一栏 ───────────────────────────
-   三种形态各自只有一条出路（上传 / 绑定 → 复制 uuid / 解绑），
-   所以不做成「一个按钮在多种语义间切换」，而是把状态本身画出来。 */
+/* ── 云端凭证池 ───────────────────────────────────────────── */
 .pool-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px 16px;
+  gap: 12px;
+  padding: 13px 18px;
 }
 .pool-bar-title {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 9px;
   flex: none;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-body);
   font-weight: 600;
   color: var(--text);
 }
-.pool-bar-title svg {
-  color: var(--muted);
+.pool-bar-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  background: var(--primary-soft);
+  color: var(--primary-d);
 }
-/* 中间那段说明自己吃掉剩余宽度：右侧动作因此始终贴到卡片右边沿 */
 .pool-bar-note {
   flex: 1;
   min-width: 0;
@@ -880,16 +1206,12 @@ body.modal-open .content {
   flex: none;
   margin-left: auto;
 }
-
-/* 可点的 uuid 胶囊：点一下复制完整那串。
-   当前项目的 `.chip` 已被接管页「选择应用」占用，所以这枚独立命名 .pool-chip
-   （与参考项目的 .chip.mono 语义相同）。 */
 .pool-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 24px;
-  padding: 0 9px;
+  height: 30px;
+  padding: 0 10px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-pill);
   background: var(--panel-2);
@@ -901,24 +1223,22 @@ body.modal-open .content {
   letter-spacing: 0.02em;
   cursor: pointer;
   transition: background var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out);
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 .pool-chip:hover {
   background: var(--panel-3);
   border-color: var(--border-hover);
 }
-/* 已复制：从灰色拉出一档，一眼能看出「这一下真的生效了」 */
 .pool-chip.ok {
   background: var(--ok-soft);
   border-color: var(--ok-line);
   color: var(--ok-d);
 }
-
-/* 上传成功面板里那串 uuid：整行铺开、点击即全选 */
 .pool-uuid {
   display: block;
   margin: 0;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--panel-2);
@@ -934,15 +1254,13 @@ body.modal-open .content {
   .summary {
     grid-template-columns: repeat(2, 1fr);
   }
-
-  /* 凭证池那一栏：中间那段是**说明 + 错误文案**，被省略号吃掉就等于没提示，
-     所以窄窗下让它换行，动作组独占第二行并右对齐 */
   .pool-bar {
     flex-wrap: wrap;
     row-gap: 8px;
+    padding: 12px 16px;
   }
   .pool-bar-note {
-    flex: 1 1 auto;
+    flex: 1 1 100%;
     white-space: normal;
     overflow: visible;
     text-overflow: clip;
@@ -950,5 +1268,20 @@ body.modal-open .content {
   .pool-bar-actions {
     flex-basis: 100%;
     justify-content: flex-end;
+  }
+}
+
+@media (max-width: 620px) {
+  .summary {
+    grid-template-columns: 1fr;
+  }
+  .stat-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .modal-mask {
+    padding: 14px;
+  }
+  .modal {
+    max-height: 92vh;
   }
 }

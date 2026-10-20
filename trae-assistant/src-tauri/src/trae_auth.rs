@@ -9,7 +9,7 @@
 //! ```json
 //! { "userId": "...", "token": "<JWT>", "refreshToken": "...",
 //!   "expiredAt": 1726..., "refreshExpiredAt": 1738..., "host": "https://api.trae.cn",
-//!   "userRegion": { "region": "cn" }, "account": { "nickname": "...", "avatar": "...",
+//!   "account": { "nickname": "...", "avatar": "...",
 //!   "nonPlainTextMobile": "190******75" } }
 //! ```
 //!
@@ -58,10 +58,8 @@ pub struct TraeLocalAccount {
     pub user_id: Option<String>,
     pub token: String,
     pub refresh_token: Option<String>,
-    pub host: Option<String>,
     pub nickname: Option<String>,
     pub phone: Option<String>,
-    pub region: Option<String>,
     /// 设备标识：来自 storage.json 顶层 `telemetry.devDeviceId`，签到必填头 `X-Device-Id` 来源
     pub device_id: Option<String>,
     /// 机器标识：来自 storage.json 顶层 `telemetry.machineId`，签到必填头 `X-Machine-Id` 来源
@@ -200,10 +198,6 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
         return None; // 占位/失效
     }
     let account = data.get("account");
-    let region = data
-        .get("userRegion")
-        .and_then(|r| str_at(r, "region"))
-        .or_else(|| account.and_then(|a| str_at(a, "region")));
 
     // 设备/机器标识在 storage.json 顶层，以**点号平铺键**存在（不是嵌套对象）：
     // "telemetry.machineId" / "telemetry.devDeviceId"，是签到接口必填头 X-Machine-Id / X-Device-Id 的来源
@@ -214,13 +208,11 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
         user_id: str_at(&data, "userId"),
         token,
         refresh_token: str_at(&data, "refreshToken"),
-        host: str_at(&data, "host"),
         nickname: account.and_then(|a| str_at(a, "nickname")),
         phone: account.and_then(|a| {
             str_at(a, "nonPlainTextMobile")
                 .or_else(|| str_at(a, "mobile"))
         }),
-        region,
         device_id,
         machine_id,
         expires_at: num_at(&data, "expiredAt"),
@@ -411,12 +403,10 @@ mod tests {
         let list = discover_local_accounts();
         for a in &list {
             println!(
-                "uid={:?} nickname={:?} phone={:?} region={:?} host={:?} token_len={} refresh={}",
+                "uid={:?} nickname={:?} phone={:?} token_len={} refresh={}",
                 a.user_id,
                 a.nickname,
                 a.phone,
-                a.region,
-                a.host,
                 a.token.len(),
                 a.refresh_token.is_some(),
             );

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
+import brandIcon from "../src-tauri/icons/icon-source.svg";
 import {
   listAccounts,
   checkinStatus,
@@ -24,15 +25,17 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { TitleBar } from "./components/TitleBar";
 import { BrokerBindModal, PoolIssuedModal } from "./components/BrokerModals";
 import {
-  IconCheck,
   IconUsers,
   IconSwap,
   IconList,
   IconGear,
   IconUserPlus,
   IconRefresh,
-  IconClock,
   IconActivity,
+  IconDownload,
+  IconCircleCheck,
+  IconAlertTriangle,
+  IconInfo,
 } from "./components/Icons";
 import AccountsPage from "./pages/AccountsPage";
 import TakeoverPage from "./pages/TakeoverPage";
@@ -44,14 +47,12 @@ import {
   checkAndInstall,
   downloadProgress,
   formatBytes,
-  nextUpdateNotice,
   probeUpdate,
-  type UpdateNotice,
   type UpdateProgress,
 } from "./updater";
 
 /**
- * 应用外壳：左侧导航 + 悬浮玻璃页头 + 内容区。
+ * 应用外壳：左侧悬浮导航卡 + 固定页头 + 独立滚动的内容区。
  *
  * ## 为什么「切 tab 卡」——以及这里怎么解决
  *
@@ -64,7 +65,7 @@ import {
  *
  * 现在：**只渲染当前页**（其余页面根本不在 DOM 里，没有 reconcile、没有轮询、
  * 没有 layout），并把**跨页共享的数据上提到这里**（`accounts` / `statuses` /
- * `statusText`）—— 这样重新挂载一个页面时不会重新拉数据，「切回来」是零成本的。
+ * `brokerStatus`）—— 这样重新挂载一个页面时不会重新拉数据，「切回来」是零成本的。
  * 页面组件都用 `React.memo` 包了：toast 之类的外层状态变化不会再带着整页一起重渲染。
  *
  * ⚠️ 前端只能解决「重渲染 / 布局」这一半。真正把窗口卡住的是**后端**那条同步命令：
@@ -82,7 +83,7 @@ const NAV: { key: Page; label: string; Icon: (p: { size?: number }) => ReactNode
   { key: "accounts", label: "账号与签到", Icon: IconUsers },
   { key: "takeover", label: "智能接管", Icon: IconSwap },
   { key: "briefing", label: "积分简报", Icon: IconActivity },
-  { key: "logs", label: "签到日志", Icon: IconList },
+  { key: "logs", label: "日志管理", Icon: IconList },
   { key: "settings", label: "设置", Icon: IconGear },
 ];
 
@@ -90,7 +91,7 @@ const PAGE_TITLES: Record<Page, string> = {
   accounts: "账号与签到",
   takeover: "智能接管",
   briefing: "积分简报",
-  logs: "签到日志",
+  logs: "日志管理",
   settings: "设置",
 };
 
@@ -103,17 +104,17 @@ const PAGE_ICON: Record<Page, (p: { size?: number }) => ReactNode> = {
   settings: IconGear,
 };
 
-// 后台轮询新版本：启动延迟 + 间隔。只为点亮侧栏那颗小红点，不求实时，间隔放宽到 6 小时。
-// 首次延迟 8s，让首屏先渲染完再悄悄去问 GitHub。
-const UPDATE_FIRST_DELAY_MS = 8_000;
-const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// 后台轮询新版本：首次延迟 3s 让首屏先渲染完，之后每 5 分钟问一次
+//（GitHub 未认证接口限额 60 次/小时，这个频率远在限额内）。
+const UPDATE_FIRST_DELAY_MS = 3_000;
+const UPDATE_INTERVAL_MS = 5 * 60 * 1000;
 
 export default function App() {
   const [page, setPage] = useState<Page>("accounts");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [version, setVersion] = useState("");
-  /** 后台轮询发现的新版本（驱动侧边栏「设置」上的小红点） */
-  const [updateNotice, setUpdateNotice] = useState<UpdateNotice>(null);
+  /** 后台轮询发现的新版本（侧边栏「设置」上的黄点常驻，直到更新完成） */
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   /**
    * 应用更新：**全局任务状态**。持在 App 而非设置页 —— 下载是整机动作，切页不能丢；
    * 侧边栏底部常驻一条进行中的进度条（见 .sidebar-update），error / no-update 走 toast。
@@ -142,7 +143,6 @@ export default function App() {
   // ↓ 跨页共享数据（上提到这里，页面重新挂载时不重新拉取）
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [statuses, setStatuses] = useState<Record<string, AcctStatus>>({});
-  const [statusText, setStatusText] = useState("");
   /** 正在签到的账号 id；"all" 表示批量签到在跑 */
   const [busy, setBusy] = useState<{ ids: Set<string>; all: boolean; refresh: boolean }>({
     ids: new Set(),
@@ -188,16 +188,16 @@ export default function App() {
    * 所以结束时要重拉凭证池状态 —— 否则「上次同步 / 出错」那行横幅停在旧值上，
    * 用户点了刷新却看不到它到底去没去云端。
    */
-  const refreshStatus = useCallback(async () => {
-    setStatusText("查询中…");
+  const refreshStatus = useCallback(async (): Promise<string | null> => {
+    let err: string | null = null;
     try {
       const st = await checkinStatus();
       setStatuses(Object.fromEntries(st.map((s) => [s.id, s])));
-      setStatusText(st.length ? `已刷新 ${st.length} 个账号状态` : "未取到任何账号状态");
     } catch (e) {
-      setStatusText("查询失败: " + e);
+      err = String(e);
     }
     void refreshBroker();
+    return err;
   }, [refreshBroker]);
 
   const reloadAccounts = useCallback(async () => setAccounts(await listAccounts()), []);
@@ -208,7 +208,7 @@ export default function App() {
    * 后端走的是与 `refreshStatus` 完全同一套采集（见 `commands::account_status_entry`），
    * 只是范围收敛到一个账号 —— 弹窗只关心这一个账号的资源包，
    * 为它跑一遍全量会把每个账号都挨个打一遍接口。成功就把新状态并进表里，
-   * 失败返回错误文本（弹窗里就地展示，不动 statusText 那行全局提示）。
+   * 失败返回错误文本，由弹窗就地展示。
    */
   const refreshOneStatus = useCallback(async (id: string): Promise<string | null> => {
     try {
@@ -242,23 +242,14 @@ export default function App() {
     };
   }, [refreshStatus]);
 
-  // 后台轮询要判断「用户此刻在不在设置页」，但不能把 page 写进依赖（会让定时器反复重建）
-  const pageRef = useRef(page);
-  useEffect(() => {
-    pageRef.current = page;
-  }, [page]);
-
-  // 后台定时检查新版本，只为点亮侧边栏那颗小红点。
-  // 窗口被隐藏时 webview 仍在跑（点红按钮只是 hide、不销毁窗口），所以常驻期间定时器一直有效。
+  // 后台定时检查新版本。窗口被隐藏时 webview 仍在跑（点红按钮只是 hide、不销毁窗口），
+  // 所以常驻期间定时器一直有效。查到新版本就点亮黄点，查询失败则保留上一次结果。
   useEffect(() => {
     let alive = true;
     const run = async () => {
       try {
         const v = await probeUpdate();
-        if (!alive) return;
-        setUpdateNotice((prev) =>
-          nextUpdateNotice(prev, v, pageRef.current === "settings")
-        );
+        if (alive) setUpdateVersion(v);
       } catch (e) {
         // 轮询失败一律静默：网络抖动、代理不通都是常态，不该弹提示打扰用户。
         // 想看明确报错就到设置页手动点「检查更新」。
@@ -274,17 +265,9 @@ export default function App() {
     };
   }, []);
 
-  /** 小红点：后台查到了新版本，且用户还没看过 */
-  const showUpdateDot = updateNotice !== null && !updateNotice.seen;
-
-  /** 用户进设置页就算看过这条提醒（设置页里仍写明有新版本，信息不丢） */
-  const markUpdateSeen = useCallback(() => {
-    setUpdateNotice((n) => (n && !n.seen ? { ...n, seen: true } : n));
-  }, []);
-
   /**
    * 触发检查并安装 —— 实现与状态都在这一层，下载是整机动作，切页既不会中断也不会丢进度。
-   * 手动检查的结论同时回写 updateNotice：新版本点亮红点（用户已在看，算已读）、已是最新则清掉。
+   * 黄点只在「确认没有新版本」或「更新完成」时熄灭；更新失败保留，提醒用户还可以再试。
    */
   const runUpdate = useCallback(async () => {
     if (updateBusy) return;
@@ -294,9 +277,9 @@ export default function App() {
       setUpdateStatus(p);
       if (p.status === "error") showToast({ kind: "err", text: p.message });
       if (p.status === "no-update") showToast({ kind: "info", text: p.message });
-      if (p.status === "available")
-        setUpdateNotice({ version: p.version ?? "", seen: true });
-      else if (p.status === "no-update") setUpdateNotice(null);
+      if (p.status === "available") setUpdateVersion(p.version ?? null);
+      else if (p.status === "no-update" || p.status === "updated")
+        setUpdateVersion(null);
     });
     setUpdateBusy(false);
   }, [showToast, updateBusy]);
@@ -361,10 +344,11 @@ export default function App() {
 
   const runRefresh = useCallback(async () => {
     setBusy((s) => ({ ...s, refresh: true }));
-    await refreshStatus();
+    const err = await refreshStatus();
     await reloadAccounts().catch(() => {});
     setBusy((s) => ({ ...s, refresh: false }));
-  }, [refreshStatus, reloadAccounts]);
+    if (err) showToast({ kind: "err", text: "刷新失败：" + err });
+  }, [refreshStatus, reloadAccounts, showToast]);
 
   const removeOne = useCallback(
     async (a: Account) => {
@@ -449,9 +433,7 @@ export default function App() {
   const runBrokerUnbind = useCallback(async () => {
     const ok = await askConfirm({
       title: "解除本机绑定？",
-      body: `本机将摘掉凭证池绑定（${
-        brokerStatus?.uuid?.slice(0, 8) ?? ""
-      }…），云端那一池保留，其他绑定过同一 uuid 的机器不受影响。本机与云端一致的账号（已上传的那批）会从本机删除，token 在本机停用；重新绑定同一 uuid 可拉回云端那批。此操作不可恢复。`,
+      body: "本机将解除与云端凭证池的绑定，已上传的账号会从本机删除；云端与其他设备不受影响，重新绑定同一 uuid 可拉回。此操作不可恢复。",
       okText: "解除绑定",
       danger: true,
     });
@@ -499,79 +481,32 @@ export default function App() {
     }
   }, [reloadAccounts, refreshBroker, showToast]);
 
-  const checkedToday = useMemo(
-    () => accounts.filter((a) => statuses[a.id]?.checked_in).length,
-    [accounts, statuses]
-  );
-
-  /** 页头右侧：当前页的只读状态 + 该页的动作。有状态才显示，没状态就留空。 */
+  /** 页头右侧只放当前页的动作，状态一律交给页面内容表达 */
   const pagebarRight = () => {
-    if (page === "accounts") {
-      return (
-        <>
-          <div className="status-group">
-            {settings?.checkin_enabled && (
-              <span className="status-pill" title="应用保持运行时才会触发；可在「设置」里修改">
-                <i className="dot" />
-                每日 {settings.checkin_time || "10:00"} 自动签到
-              </span>
-            )}
-            {accounts.length > 0 && (
-              <span className="status-pill" title="来自服务端的今日真实签到状态">
-                <i className="dot" />
-                今日已签 {checkedToday}/{accounts.length}
-              </span>
-            )}
-          </div>
-          <span className="spacer" />
-          <div className="action-group">
-            <button className="btn ghost" title="扫描本机登录态或走浏览器授权登录" onClick={() => setAdding(true)}>
-              <IconUserPlus size={15} />
-              添加账号
-            </button>
-            <button
-              className="btn ghost"
-              disabled={busy.refresh || accounts.length === 0}
-              title="重打签到状态与积分（每个账号一次请求）"
-              onClick={() => void runRefresh()}
-            >
-              <IconRefresh size={15} className={busy.refresh ? "spin" : undefined} />
-              刷新状态
-            </button>
-            <button
-              className="btn primary"
-              disabled={busy.all || accounts.length === 0}
-              title="对全部账号依次签到"
-              onClick={() => void runCheckinAll()}
-            >
-              {busy.all ? "签到中…" : "全部签到"}
-            </button>
-          </div>
-        </>
-      );
-    }
-    if (page === "takeover") {
-      return (
-        <div className="status-group">
-          <span className={`status-pill${settings?.takeover_enabled ? "" : " warn"}`}>
-            <i className="dot" />
-            {settings?.takeover_enabled ? "接管生效中" : "未接管，应用直连官方"}
-          </span>
-        </div>
-      );
-    }
-    if (page === "settings") {
-      return (
-        <div className="status-group">
-          <span className="status-pill" title="当前运行的应用版本">
-            <IconClock size={13} />
-            v{version || "…"}
-          </span>
-        </div>
-      );
-    }
-    // 签到日志页的工具条在页面内部（筛选 + 清空与列表状态强相关），页头留空
-    return null;
+    if (page !== "accounts") return null;
+    return (
+      <div className="action-group">
+        <button className="btn ghost" onClick={() => setAdding(true)}>
+          <IconUserPlus size={15} />
+          添加账号
+        </button>
+        <button
+          className="btn ghost"
+          disabled={busy.refresh || accounts.length === 0}
+          onClick={() => void runRefresh()}
+        >
+          <IconRefresh size={15} className={busy.refresh ? "spin" : undefined} />
+          刷新状态
+        </button>
+        <button
+          className="btn primary"
+          disabled={busy.all || accounts.length === 0}
+          onClick={() => void runCheckinAll()}
+        >
+          {busy.all ? "签到中…" : "全部签到"}
+        </button>
+      </div>
+    );
   };
 
   return (
@@ -581,7 +516,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <span className="logo">
-            <IconCheck size={19} />
+            <img src={brandIcon} alt="" aria-hidden="true" />
           </span>
           <div className="brand-text">
             <span className="brand-name">Trae Assistant</span>
@@ -594,39 +529,40 @@ export default function App() {
             <button
               key={key}
               className={"nav-item" + (page === key ? " active" : "")}
-              onClick={() => {
-                setPage(key);
-                // 进设置页 = 看到了更新提醒，熄灭小红点
-                if (key === "settings") markUpdateSeen();
-              }}
+              onClick={() => setPage(key)}
               title={label}
             >
               <span className="nav-icon">
                 <Icon />
               </span>
-              {label}
+              <span className="nav-label">{label}</span>
               {key === "takeover" && settings?.takeover_enabled && (
                 <span className="nav-dot" title="接管生效中" />
               )}
-              {key === "settings" && showUpdateDot && (
+              {key === "settings" && updateVersion !== null && (
                 <span
-                  className="nav-dot err"
-                  title={`有新版本 v${updateNotice?.version} 可更新`}
+                  className="nav-dot warn"
+                  title={`有新版本 v${updateVersion} 可更新`}
                 />
               )}
             </button>
           ))}
         </nav>
 
-        {/* 全局更新状态：检查/下载/安装进行中时在侧边栏底部常驻，切页不丢进度。
+        {/* 全局更新状态：离开设置页后仍在侧边栏底部常驻，切页不丢进度。
+            停留在设置页时进度就在第一张卡片里，这里不再重复。
             error / no-update 已由 runUpdate 弹 toast，不在这里占位。 */}
         {updateStatus &&
+          page !== "settings" &&
           (updateStatus.status === "checking" ||
             updateStatus.status === "downloading" ||
             updateStatus.status === "installing" ||
             updateStatus.status === "updated") && (
             <div className="sidebar-update">
-              <div className="sidebar-update-title">应用更新</div>
+              <div className="sidebar-update-title">
+                <IconDownload size={13} />
+                应用更新
+              </div>
               <div className="upd-status">{updateStatus.message}</div>
               {(() => {
                 const dl = downloadProgress(updateStatus);
@@ -659,12 +595,14 @@ export default function App() {
             <span className="pagebar-icon">
               {(() => {
                 const I = PAGE_ICON[page];
-                return <I size={17} />;
+                return <I size={18} />;
               })()}
             </span>
-            <h2>{PAGE_TITLES[page]}</h2>
+            <div className="pagebar-titles">
+              <h2>{PAGE_TITLES[page]}</h2>
+            </div>
           </div>
-          {pagebarRight()}
+          <div className="pagebar-right">{pagebarRight()}</div>
         </header>
 
         <main className="content">
@@ -674,7 +612,6 @@ export default function App() {
               <AccountsPage
                 accounts={accounts}
                 statuses={statuses}
-                statusText={statusText}
                 busyIds={busy.ids}
                 onCheckinOne={(id) => void runCheckinOne(id)}
                 onRemove={(a) => void removeOne(a)}
@@ -715,7 +652,7 @@ export default function App() {
                 updateStatus={updateStatus}
                 updateBusy={updateBusy}
                 onRunUpdate={() => void runUpdate()}
-                updateVersion={updateNotice?.version ?? null}
+                updateVersion={updateVersion}
               />
             )}
           </div>
@@ -723,7 +660,20 @@ export default function App() {
       </div>
       </div>
 
-      {toast && <div className={`toast toast-${toast.kind}`}>{toast.text}</div>}
+      {toast && (
+        <div className={`toast toast-${toast.kind}`} role="status">
+          <span className="toast-icon">
+            {toast.kind === "ok" ? (
+              <IconCircleCheck size={15} />
+            ) : toast.kind === "err" ? (
+              <IconAlertTriangle size={15} />
+            ) : (
+              <IconInfo size={15} />
+            )}
+          </span>
+          {toast.text}
+        </div>
+      )}
 
       {adding && (
         <AddAccountModal

@@ -36,7 +36,9 @@ export const refreshAccountStatus = (id: string) =>
 export const getSettings = () => invoke<Settings>("get_settings");
 export const saveSettings = (settings: Settings) =>
   invoke<Settings>("save_settings", { settings });
+/** 统一日志流（签到 / 续签 / 通知 / 系统 + 接管动态），最新在前 */
 export const getLogs = () => invoke<LogEntry[]>("get_logs");
+/** 清空**全部**日志：应用日志与接管动态一起清（界面上是同一张流水） */
 export const clearLogs = () => invoke<void>("clear_logs");
 
 /** 上传：创建 / 复用本机凭证池，返回 uuid —— 唯一要展示给用户复制的东西 */
@@ -53,8 +55,7 @@ export const brokerState = () => invoke<BrokerStatus>("broker_state");
  * 未绑定时后端直接报错，不会静默跳过。
  */
 export const brokerSyncNow = () => invoke<SyncReport>("broker_sync_now");
-export const oauthStart = (host?: string | null) =>
-  invoke<OAuthStart>("oauth_start", { host: host ?? null });
+export const oauthStart = () => invoke<OAuthStart>("oauth_start");
 export const oauthPoll = (loginId: string) =>
   invoke<OAuthPoll>("oauth_poll", { loginId });
 export const openExternal = (url: string) => invoke<void>("open_external", { url });

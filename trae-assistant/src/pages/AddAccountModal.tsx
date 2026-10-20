@@ -1,16 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { discoverLocal, importAccounts, oauthStart, oauthPoll, openExternal } from "../api";
 import type { Account, NewAccount } from "../types";
-import type { Toast } from "../common";
+import { AccountCell, type Toast } from "../common";
 import { Dialog } from "../components/Dialog";
 import { IconUserPlus, IconRefresh } from "../components/Icons";
 
 /**
- * 「添加账号」弹窗：两条路 —— 扫描本机登录态 / 浏览器授权登录。
+ * 「添加账号」弹窗：打开即扫描本机登录态，列出找到的账号供勾选导入；
+ * 另一条路是通过浏览器授权登录。
  *
- * 弹窗外壳、Esc、遮罩关闭、滚动锁全部交给 `Dialog`（这里只写内容）。
- * 旧版是手写 `.overlay + .modal + stopPropagation`，于是它**按 Esc 关不掉**，
- * 也没有 dialog 语义。
+ * 扫描只读不写：`discover_local` 已排除库里已有的账号，用户勾选后才调
+ * `import_accounts` —— 不再有「点一下直接把所有本机账号塞进来」的动作。
  *
  * ⚠️ 浏览器登录是**轮询**：申请授权 → 打开系统浏览器 → 每 2 秒问一次回调是否拿到 token。
  * 轮询必须能在弹窗关闭时停下来（`cancelRef`），否则关掉弹窗后循环还在跑，
@@ -27,8 +27,10 @@ interface Props {
 export default function AddAccountModal({ onClose, onImported, notify }: Props) {
   const [tab, setTab] = useState<Tab>("scan");
   const [busy, setBusy] = useState(false);
-  const [host, setHost] = useState("https://api.trae.cn");
   const [err, setErr] = useState("");
+  const [found, setFound] = useState<Account[]>([]);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [scanning, setScanning] = useState(true);
   /** 浏览器登录：已打开的授权页（给「重新打开」用） */
   const [uri, setUri] = useState("");
   const [waiting, setWaiting] = useState(false);
@@ -41,21 +43,49 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
     };
   }, []);
 
-  const scan = async () => {
+  const scan = useCallback(async () => {
+    setScanning(true);
+    setErr("");
+    try {
+      const list = await discoverLocal();
+      setFound(list);
+      setPicked(new Set(list.map((a) => a.id)));
+    } catch (e) {
+      setFound([]);
+      setPicked(new Set<string>());
+      setErr("扫描失败：" + e);
+    } finally {
+      setScanning(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void scan();
+  }, [scan]);
+
+  const allPicked = found.length > 0 && picked.size === found.length;
+
+  const toggle = (id: string) => {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const importPicked = async () => {
+    const list = found.filter((a) => picked.has(a.id));
+    if (list.length === 0) return;
     setBusy(true);
     setErr("");
     try {
-      const found = await discoverLocal();
-      if (!found.length) {
-        setErr("本机未发现新的未导入账号。");
-        return;
-      }
-      const list = await importAccounts(found);
-      onImported(list);
-      notify({ kind: "ok", text: `已导入 ${found.length} 个本机账号` });
+      const merged = await importAccounts(list);
+      onImported(merged);
+      notify({ kind: "ok", text: `已导入 ${list.length} 个本机账号` });
       onClose();
     } catch (e) {
-      setErr("扫描失败：" + e);
+      setErr("导入失败：" + e);
     } finally {
       setBusy(false);
     }
@@ -67,7 +97,7 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
     setErr("");
     cancelRef.current = false;
     try {
-      const st = await oauthStart(host.trim() || null);
+      const st = await oauthStart();
       setUri(st.verification_uri);
       await openExternal(st.verification_uri);
       setWaiting(true);
@@ -89,11 +119,9 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
           const acct: NewAccount = {
             name: p.nickname || p.phone || "浏览器登录账号",
             phone: p.phone ?? null,
-            region: p.region ?? null,
             user_id: p.uid ?? null,
             token: p.token,
             refresh_token: p.refresh_token ?? null,
-            host: p.host ?? null,
             expires_at: p.expires_at ?? null,
             refresh_expires_at: null,
             device_id: p.device_id ?? null,
@@ -120,7 +148,7 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
     <Dialog
       label="添加账号"
       title="添加账号"
-      subtitle="把本机已登录的 Trae CN 账号收进来，或走浏览器授权新登录一个。"
+      subtitle="导入本机已登录的账号，或通过浏览器登录。"
       onClose={onClose}
       footer={
         <>
@@ -128,14 +156,20 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
             {busy && waiting ? "取消" : "关闭"}
           </button>
           {tab === "scan" ? (
-            <button className="btn primary" disabled={busy} onClick={() => void scan()}>
+            <button
+              className="btn primary"
+              disabled={busy || scanning || picked.size === 0}
+              onClick={() => void importPicked()}
+            >
               {busy ? (
                 <>
                   <IconRefresh size={15} className="spin" />
-                  扫描中…
+                  导入中…
                 </>
+              ) : picked.size > 0 ? (
+                `导入 ${picked.size} 个账号`
               ) : (
-                "扫描并导入"
+                "导入所选"
               )}
             </button>
           ) : (
@@ -150,7 +184,7 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
       <div className="seg">
         {(
           [
-            ["scan", "扫描本机登录"],
+            ["scan", "本机账号"],
             ["browser", "浏览器登录"],
           ] as [Tab, string][]
         ).map(([k, label]) => (
@@ -158,47 +192,89 @@ export default function AddAccountModal({ onClose, onImported, notify }: Props) 
             key={k}
             className={tab === k ? "active" : ""}
             disabled={busy}
-            onClick={() => setTab(k)}
+            onClick={() => {
+              setTab(k);
+              setErr("");
+            }}
           >
             {label}
           </button>
         ))}
       </div>
 
-      {tab === "scan" && (
-        <p className="hint">
-          读取本机 Trae CN 桌面端已登录的账号（本地加密登录态）并导入。已经导入过的账号会按
-          手机号或 token 合并，不会产生重复条目。
-        </p>
-      )}
-
-      {tab === "browser" && (
-        <>
-          <p className="hint">
-            点「去登录」后系统会打开浏览器授权页；在页面里完成登录，本助手会自动拿到 token 并导入。
-          </p>
-          <label>
-            API Host（可选）
-            <input
-              value={host}
-              onChange={(e) => setHost(e.target.value)}
-              placeholder="https://api.trae.cn"
-              disabled={busy}
-            />
-          </label>
-          {uri && (
-            <div className="oauth-uri">
-              <code title={uri}>{uri}</code>
-              <button className="btn small" onClick={() => void openExternal(uri)}>
-                重新打开
+      {/* 固定高度的内容槽：扫描中 / 列表 / 空态 / 浏览器登录 / 报错都在同一块里，
+          弹窗不会因为「加载完成」「多出一行错误」而改变大小。 */}
+      <div className="add-body">
+        {tab === "scan" &&
+          (scanning && found.length === 0 ? (
+            <div className="discover-state">
+              <IconRefresh size={20} className="spin" />
+              <span>正在读取本机登录的账号…</span>
+            </div>
+          ) : found.length === 0 ? (
+            <div className="discover-state">
+              <IconUserPlus size={22} />
+              <strong>{err ? "扫描失败" : "本机没有可导入的新账号"}</strong>
+              <span>{err || "本机登录的账号都已导入，也可以切到「浏览器登录」添加。"}</span>
+              <button className="btn small" disabled={scanning} onClick={() => void scan()}>
+                {scanning ? "扫描中…" : "重新扫描"}
               </button>
             </div>
-          )}
-          {waiting && <p className="hint">已打开浏览器，正在等待登录完成…</p>}
-        </>
-      )}
+          ) : (
+            <>
+              <div className="discover-head">
+                <label className="discover-all">
+                  <input type="checkbox" checked={allPicked} onChange={() => setPicked(allPicked ? new Set<string>() : new Set(found.map((a) => a.id)))} />
+                  全选
+                </label>
+                <span className="discover-count">发现 {found.length} 个本机登录账号</span>
+                <button
+                  className="btn small ghost"
+                  disabled={scanning || busy}
+                  onClick={() => void scan()}
+                  title="重新读取本机登录态"
+                >
+                  <IconRefresh size={13} className={scanning ? "spin" : ""} />
+                  {scanning ? "扫描中…" : "重新扫描"}
+                </button>
+              </div>
+              <div className="discover-list">
+                {found.map((a) => (
+                  <label
+                    key={a.id}
+                    className={"discover-row" + (picked.has(a.id) ? " picked" : "")}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={picked.has(a.id)}
+                      onChange={() => toggle(a.id)}
+                    />
+                    <AccountCell name={a.name} phone={a.phone} />
+                  </label>
+                ))}
+              </div>
+            </>
+          ))}
 
-      {err && <p className="form-err">{err}</p>}
+        {tab === "browser" && (
+          <>
+            <p className="hint">点「去登录」后在浏览器完成登录，本助手会自动导入。</p>
+            {uri && (
+              <div className="oauth-uri">
+                <code title={uri}>{uri}</code>
+                <button className="btn small" onClick={() => void openExternal(uri)}>
+                  重新打开
+                </button>
+              </div>
+            )}
+            {waiting && <p className="hint">正在等待登录完成…</p>}
+          </>
+        )}
+
+        {err && (tab === "browser" || found.length > 0) && (
+          <p className="form-err">{err}</p>
+        )}
+      </div>
     </Dialog>
   );
 }

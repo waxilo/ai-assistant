@@ -32,6 +32,10 @@ mod tray;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
+/// 本助手只支持 Trae CN（中国区），官方端点固定走中国区。
+pub(crate) const API_HOST: &str = "https://api.trae.cn";
+pub(crate) const SSO_HOST: &str = "https://www.trae.cn";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // ⚠️ 这里**故意什么都不做**：曾经在这里注入

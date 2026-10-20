@@ -98,7 +98,13 @@ pub fn load_or_create(
     }
     if dirty {
         if let Err(e) = write_file(dir, &id) {
-            crate::logs::push("设备", false, format!("设备身份落盘失败：{e}"));
+            crate::logs::push(
+                dir,
+                crate::logs::CAT_SYSTEM,
+                "设备",
+                false,
+                format!("设备身份落盘失败：{e}"),
+            );
         }
     }
     if let Ok(mut g) = cache().lock() {

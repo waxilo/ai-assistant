@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { Fragment, memo, useMemo, useState } from "react";
 import type { Account, AcctStatus, BrokerStatus, CreditPackage } from "../types";
 import {
   AccountCell,
@@ -21,6 +21,10 @@ import {
   IconUnlink,
   IconList,
   IconRefresh,
+  IconClock,
+  IconCircleCheck,
+  IconBolt,
+  IconChevron,
 } from "../components/Icons";
 
 /**
@@ -37,7 +41,6 @@ import {
 interface Props {
   accounts: Account[];
   statuses: Record<string, AcctStatus>;
-  statusText: string;
   /** 正在签到的账号 id */
   busyIds: Set<string>;
   onCheckinOne: (id: string) => void;
@@ -125,19 +128,17 @@ function PoolBar({
   const note = (() => {
     // 错误优先：出过错的绑定状态比「已绑定」更该被看见
     if (status?.error) return status.error;
-    if (bound) {
-      return `本机这 ${accountCount} 个账号与云端共用，续签仍在本机执行${syncNote(status)}`;
-    }
-    if (accountCount === 0) {
-      return "本机还没有账号。别的机器上已有的话，直接绑定它那串 uuid 即可把账号接过来。";
-    }
-    return `把本机这 ${accountCount} 个账号放到云端，其他机器绑定同一串 uuid 就能共用（续签始终在本机执行）`;
+    if (bound) return `与云端共用这 ${accountCount} 个账号${syncNote(status)}`;
+    if (accountCount === 0) return "本机还没有账号，可直接绑定已有的云端凭证池。";
+    return `把本机 ${accountCount} 个账号上传到云端，其他设备绑定同一 uuid 即可共用`;
   })();
 
   return (
     <div className="pool-bar card">
       <span className="pool-bar-title">
-        <IconCloud size={15} />
+        <span className="pool-bar-icon">
+          <IconCloud size={16} />
+        </span>
         云端凭证池
       </span>
       <span className={`pool-bar-note${status?.error ? " err" : ""}`} title={note}>
@@ -151,7 +152,7 @@ function PoolBar({
               className="btn small"
               disabled={busy}
               onClick={onSync}
-              title="双向同步一轮：云端更新的票与账号拉到本机，本机更新的票与账号回写云端（绕过两分钟节流；闸在别的机器手里会跳过）"
+              title="立即与云端双向同步；同步锁在别的机器手里时会跳过"
             >
               <IconSwap size={13} />
               同步
@@ -160,7 +161,7 @@ function PoolBar({
               className="btn small danger"
               disabled={busy}
               onClick={onUnbind}
-              title="摘掉本机绑定，云端那一池保留（其他机器不受影响）；本机与云端一致的账号会从本机删除"
+              title="解除本机绑定，云端保留；已上传的账号会从本机删除"
             >
               <IconUnlink size={13} />
               解绑
@@ -175,7 +176,7 @@ function PoolBar({
               title={
                 accountCount === 0
                   ? "本机还没有账号可上传"
-                  : "在云端新建一池并把本机账号放进去，之后会给你一串 uuid"
+                  : "在云端新建一池并放入本机账号，之后会给你一串 uuid"
               }
             >
               <IconUpload size={13} />
@@ -301,7 +302,6 @@ function soonestPackage(packages: CreditPackage[] | null): CreditPackage | null 
 function AccountsPage({
   accounts,
   statuses,
-  statusText,
   busyIds,
   onCheckinOne,
   onRemove,
@@ -313,8 +313,9 @@ function AccountsPage({
   onBrokerUnbind,
   onBrokerSync,
 }: Props) {
-  // 资源包列表弹窗：记录当前打开的是哪个账号；null = 未打开
+  // 资源包列表弹窗：单个账号（行内点击）或全部账号（总积分卡点击）
   const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
+  const [pkgAllOpen, setPkgAllOpen] = useState(false);
   const stats = useMemo(() => {
     const total = accounts.length;
     const checked = accounts.filter((a) => statuses[a.id]?.checked_in).length;
@@ -338,7 +339,31 @@ function AccountsPage({
     ]
       .filter(Boolean)
       .join("，");
-    return { total, checked, credits: Math.round(credits * 100) / 100, unlimited, hint };
+    // 「即将过期」取**最近一个到期日**：与行内「N 天后过期」同一条判据
+    // （只看到期未过、且有余量的包），再把那一天所有包的剩余合起来。
+    const now = Date.now();
+    const allPacks = accounts.flatMap(
+      (a) => creditsOf(a, statuses).packages ?? []
+    );
+    const soonest = soonestPackage(allPacks);
+    const soonDays = soonest ? daysUntil(soonest.expiry_ms) : null;
+    let expiringSoon = 0;
+    if (soonDays !== null) {
+      for (const p of allPacks) {
+        if (p.expiry_ms > now && daysUntil(p.expiry_ms) === soonDays) {
+          expiringSoon += p.remaining;
+        }
+      }
+    }
+    return {
+      total,
+      checked,
+      credits: Math.round(credits * 100) / 100,
+      expiringSoon: Math.round(expiringSoon * 100) / 100,
+      soonDays,
+      unlimited,
+      hint,
+    };
   }, [accounts, statuses]);
 
   // 凭证池那一栏在**两种空态下都要在**：一台全新的机器正是「先绑定、再拿账号」的
@@ -362,18 +387,52 @@ function AccountsPage({
              所以两处永远对得上（历史上各算一份，结果是合计与逐行之和对不上）。 ── */}
       <div className="summary">
         <div className="card sum-card">
+          <span className="sum-icon">
+            <IconUsers size={17} />
+          </span>
           <div className="sum-label">账号总数</div>
           <div className="sum-num">{stats.total}</div>
         </div>
-        <div className="card sum-card">
+        <div className="card sum-card tone-ok">
+          <span className="sum-icon">
+            <IconCircleCheck size={17} />
+          </span>
           <div className="sum-label">今日已签到</div>
           <div className="sum-num ok">{stats.checked}</div>
         </div>
-        <div className="card sum-card">
-          <div className="sum-label">待签到</div>
-          <div className="sum-num warn">{stats.total - stats.checked}</div>
+        <div
+          className="card sum-card tone-warn"
+          title={
+            stats.soonDays === null
+              ? "没有尚未到期的资源包"
+              : `最近一日到期的资源包剩余积分合计（${
+                  stats.soonDays === 0 ? "今天" : `${stats.soonDays} 天后`
+                }）`
+          }
+        >
+          <span className="sum-icon">
+            <IconClock size={17} />
+          </span>
+          <div className="sum-label">即将过期</div>
+          <div className="sum-num warn">{formatCredits(stats.expiringSoon)}</div>
         </div>
-        <div className="card sum-card" title={stats.hint}>
+        <div
+          className="card sum-card feature hoverable"
+          role="button"
+          tabIndex={0}
+          aria-haspopup="dialog"
+          title={`${stats.hint} · 点击查看全部资源包`}
+          onClick={() => setPkgAllOpen(true)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setPkgAllOpen(true);
+            }
+          }}
+        >
+          <span className="sum-icon">
+            <IconBolt size={17} />
+          </span>
           <div className="sum-label">总积分</div>
           <div className="sum-num">
             {formatCredits(stats.credits)}
@@ -387,7 +446,7 @@ function AccountsPage({
           <EmptyState
             icon={<IconUsers size={26} />}
             title="还没有任何账号"
-            hint="点右上角「添加账号」扫描本机已登录的 Trae CN 桌面端，或走浏览器授权登录。如果别的机器上已经有一池，也可以直接在上面的「云端凭证池」里绑定它那串 uuid。"
+            hint="点右上角「添加账号」导入，或在上方绑定已有云端凭证池。"
           />
         </div>
       ) : (
@@ -396,12 +455,11 @@ function AccountsPage({
             <thead>
               <tr>
                 <th>账号</th>
-                <th>区域</th>
                 <th className="num" title="该账号在 Trae CN 里的剩余可用积分（额度用量，非签到奖励）">
                   积分
                 </th>
                 <th>今日</th>
-                <th title="token 全自动续签：到期前 24 小时后台自己动手，界面上没有手动按钮">
+                <th title="token 到期前 24 小时会自动续签">
                   Token
                 </th>
                 <th className="col-actions">操作</th>
@@ -429,28 +487,36 @@ function AccountsPage({
                 const texpSoon = texp !== null && texp - Date.now() < RENEW_WINDOW_MS;
                 const credCls = days === null ? "" : days < 0 ? " bad" : days <= 3 ? " warn" : "";
                 const texpCls = texpExpired ? " bad" : texpSoon ? " warn" : "";
-                const cellTitle = cr.unlimited
-                  ? "不限量"
-                  : cr.stale
-                  ? `本次未取到，显示上次已知值${cr.at ? `（${cr.at}）` : ""}`
-                  : undefined;
+                // 积分数字与下方到期行都可点开资源包列表；悬停提示把「能点」说出来
+                const cellTitle = [
+                  cr.unlimited
+                    ? "不限量"
+                    : cr.stale
+                    ? `本次未取到，显示上次已知值${cr.at ? `（${cr.at}）` : ""}`
+                    : null,
+                  "点击查看资源包列表",
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
                 const busyOne = busyIds.has(a.id);
                 return (
                   <tr key={a.id}>
                     <td>
                       <AccountCell name={a.name} phone={a.phone} />
                     </td>
-                    <td className="muted">{a.region || "—"}</td>
                     <td className="num" title={cellTitle}>
-                      <span className="ac-credits">
+                      <span
+                        className="ac-credits clickable"
+                        onClick={() => setPkgAccount(a)}
+                      >
                         {cr.unlimited ? "不限" : formatCredits(cr.value)}
                       </span>
                       {/* 积分与过期合在一列：过期时间就是「智能接管先扣谁」的第一排序键，所以直接显示。
                           有 `packages` 时整行可点击，点开逐资源包列表 */}
                     {days !== null ? (
                       <span
-                        className={`sub ${credCls}`}
-                        title="智能接管优先使用到期最早的积分"
+                        className={`sub clickable ${credCls}`}
+                        title="智能接管优先使用到期最早的积分；点击查看资源包列表"
                         onClick={() => setPkgAccount(a)}
                       >
                         {days < 0
@@ -459,7 +525,7 @@ function AccountsPage({
                       </span>
                     ) : (
                       <span
-                        className="sub"
+                        className="sub clickable"
                         title="没有到期的额度信息，可点击查看资源包列表"
                         onClick={() => setPkgAccount(a)}
                       >
@@ -498,7 +564,7 @@ function AccountsPage({
                       ) : (
                         <span
                           className="sub warn"
-                          title="这个 token 不是 JWT、账号上也没有到期时间 —— 后台无从判断何时该续签，只能跳过它（总不能每 30 分钟盲换一次票）。重新登录一次即可恢复自动续签。"
+                          title="无法判断到期时间，自动续签已跳过；重新登录一次即可恢复。"
                         >
                           到期未知
                         </span>
@@ -530,9 +596,6 @@ function AccountsPage({
         </div>
       )}
 
-      {/* 刷新状态的结果（「已刷新 N 个账号状态」/ 查询失败原因） */}
-      {statusText && <p className="hint">{statusText}</p>}
-
       {/* 逐资源包列表：从「积分/过期」那一列点开，看每个额度包的名称/剩余/到期 */}
       {pkgAccount && (
         <Dialog
@@ -547,6 +610,24 @@ function AccountsPage({
           }
         >
           <PkgListAccount account={pkgAccount} statuses={statuses} onRefresh={onRefreshAccountStatus} />
+        </Dialog>
+      )}
+
+      {/* 全部资源包：总积分卡点开，按账号分组看每个包的剩余与到期 */}
+      {pkgAllOpen && (
+        <Dialog
+          size="lg"
+          icon={<IconList size={16} />}
+          title="全部资源包"
+          subtitle="点击账号展开；已隐藏过期的资源包。"
+          onClose={() => setPkgAllOpen(false)}
+          footer={
+            <button className="btn" onClick={() => setPkgAllOpen(false)}>
+              关闭
+            </button>
+          }
+        >
+          <PkgListAll accounts={accounts} statuses={statuses} onRefresh={onRefreshAccountStatus} />
         </Dialog>
       )}
     </>
@@ -596,11 +677,13 @@ function PkgListAccount({
     : "";
 
   return (
-    <div>
+    <div className="pkg-list-body">
       <div className="pkg-dialog-bar">
-        <span className="note" style={{ margin: 0 }}>
-          {note}
-        </span>
+        {note && (
+          <span className={`note pkg-note${err ? " danger" : ""}`}>
+            <span>{note}</span>
+          </span>
+        )}
         <button
           className="btn small"
           disabled={refreshing}
@@ -612,8 +695,8 @@ function PkgListAccount({
         </button>
       </div>
       {packs.length === 0 ? (
-        <p className="note" style={{ margin: 0 }}>
-          这个账号暂时没有带到期时间的额度包数据（可能从未拉到，或余额已被用尽）。
+        <p className="note pkg-empty">
+          这个账号暂时没有可用的额度包数据。
         </p>
       ) : (
         <div className="table-wrap">
@@ -635,6 +718,163 @@ function PkgListAccount({
                     <td className="num num-muted">{mmddyyyy(p.expiry_ms)}</td>
                   </tr>
                 ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 全部资源包：先列账号，点开某个账号才展开它的逐包明细（总积分卡点开）。
+ *
+ * 账号行默认折叠：账号一多，一次铺开所有包会变成一堵墙，也看不出哪一行对应谁。
+ * 过期包与单账号弹窗同口径隐藏（`expiry_ms > 0 && <= now`）。
+ * 「刷新全部」逐个账号拉取；某个账号失败只记个数，不挡住其余账号更新。
+ */
+function PkgListAll({
+  accounts,
+  statuses,
+  onRefresh,
+}: {
+  accounts: Account[];
+  statuses: Record<string, AcctStatus>;
+  onRefresh: (id: string) => Promise<string | null>;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
+  const [err, setErr] = useState("");
+  const [openIds, setOpenIds] = useState<Set<string>>(() => new Set());
+  const now = Date.now();
+  const groups = accounts.map((account) => {
+    const cr = creditsOf(account, statuses);
+    const all = cr.packages ?? [];
+    const packs = all
+      .filter((p) => !(p.expiry_ms > 0 && p.expiry_ms <= now))
+      .sort((a, b) => a.expiry_ms - b.expiry_ms);
+    return {
+      account,
+      cr,
+      packs,
+      hidden: all.length - packs.length,
+      soon: soonestPackage(packs),
+    };
+  });
+  const hidden = groups.reduce((n, g) => n + g.hidden, 0);
+
+  const toggle = (id: string) =>
+    setOpenIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const refreshAll = async () => {
+    setRefreshing(true);
+    setErr("");
+    let failed = 0;
+    for (const a of accounts) {
+      if ((await onRefresh(a.id)) !== null) failed += 1;
+    }
+    setRefreshing(false);
+    if (failed > 0) setErr(`${failed} 个账号刷新失败，其余已更新`);
+  };
+
+  const note = err || (hidden > 0 ? `已隐藏 ${hidden} 个已过期的资源包` : "");
+
+  return (
+    <div className="pkg-list-body">
+      <div className="pkg-dialog-bar">
+        {note && (
+          <span className={`note pkg-note${err ? " danger" : ""}`}>
+            <span>{note}</span>
+          </span>
+        )}
+        <button
+          className="btn small"
+          disabled={refreshing || accounts.length === 0}
+          onClick={() => void refreshAll()}
+          title="逐个拉取所有账号的最新资源包"
+        >
+          <IconRefresh size={13} className={refreshing ? "spin" : ""} />
+          {refreshing ? "刷新中…" : "刷新全部"}
+        </button>
+      </div>
+      {accounts.length === 0 ? (
+        <p className="note pkg-empty">
+          还没有账号。
+        </p>
+      ) : (
+        <div className="table-wrap">
+          <table className="data-table pkg-table">
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th className="num">剩余</th>
+                <th className="num">到期</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map(({ account, cr, packs, soon }) => {
+                const open = openIds.has(account.id);
+                return (
+                  <Fragment key={account.id}>
+                    <tr
+                      className={`pkg-acct-row${open ? " open" : ""}`}
+                      tabIndex={0}
+                      aria-expanded={open}
+                      title={open ? "收起资源包" : "展开资源包"}
+                      onClick={() => toggle(account.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          toggle(account.id);
+                        }
+                      }}
+                    >
+                      <td>
+                        <div className="pkg-acct">
+                          <IconChevron size={14} className="pkg-chevron" />
+                          <AccountCell name={account.name} phone={account.phone} />
+                          <span className="pkg-acct-count">
+                            {packs.length} 个资源包
+                          </span>
+                        </div>
+                      </td>
+                      <td className="num">
+                        {cr.unlimited ? "不限" : formatCredits(cr.value)}
+                      </td>
+                      <td
+                        className="num num-muted"
+                        title="该账号最早到期的资源包"
+                      >
+                        {soon ? mmddyyyy(soon.expiry_ms) : "—"}
+                      </td>
+                    </tr>
+                    {open &&
+                      (packs.length === 0 ? (
+                        <tr className="pkg-detail-row">
+                          <td colSpan={3} className="muted pkg-none">
+                            暂无可用资源包数据
+                          </td>
+                        </tr>
+                      ) : (
+                        packs.map((p, i) => (
+                          <tr key={i} className="pkg-detail-row">
+                            <td className="pkg-detail-name">
+                              {p.name || "未命名额度包"}
+                            </td>
+                            <td className="num">{formatCredits(p.remaining)}</td>
+                            <td className="num num-muted">
+                              {mmddyyyy(p.expiry_ms)}
+                            </td>
+                          </tr>
+                        ))
+                      ))}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>

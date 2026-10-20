@@ -18,7 +18,6 @@
 use std::path::Path;
 
 use crate::accounts::{self, Account};
-use crate::checkin;
 use crate::oauth;
 
 /// 浏览器登录流程在拿不到昵称时落的占位名（与前端 `AddAccountModal` 保持一致）。
@@ -57,8 +56,7 @@ pub async fn sync_profiles(dir: &Path) -> Vec<Account> {
         if !needs_fetch(a) {
             continue;
         }
-        let host = checkin::normalize_host(&checkin::host_of(a));
-        let Some(info) = oauth::fetch_user_info(&host, &a.token).await else {
+        let Some(info) = oauth::fetch_user_info(&a.token).await else {
             continue;
         };
 
@@ -100,11 +98,9 @@ mod tests {
             id: "local".into(),
             name: name.into(),
             phone: phone.map(str::to_string),
-            region: None,
             user_id: None,
             token: "t".into(),
             refresh_token: None,
-            host: None,
             expires_at: None,
             refresh_expires_at: None,
             device_id: None,

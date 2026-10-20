@@ -47,12 +47,24 @@ pub(crate) async fn sync_pool_if_bound(dir: &Path, force: bool) {
     match broker::sync(dir, force).await {
         Ok(report) => {
             if force {
-                crate::logs::push("凭证池", true, format!("整池同步：{}", report.message));
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_SYSTEM,
+                    "凭证池",
+                    true,
+                    format!("整池同步：{}", report.message),
+                );
             }
         }
         Err(e) => {
             if force {
-                crate::logs::push("凭证池", false, format!("整池同步失败：{e}"));
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_SYSTEM,
+                    "凭证池",
+                    false,
+                    format!("整池同步失败：{e}"),
+                );
             }
         }
     }
@@ -138,10 +150,22 @@ pub async fn checkin_one(app: tauri::AppHandle, id: String) -> Result<checkin::C
         .ok_or_else(|| "账号不存在".to_string())?;
     // 临近过期先续签（只在到期窗口内才发请求，见 `renew::needs_renew`）
     if let Some(out) = crate::renew::renew_if_needed(&dir, &mut account).await {
-        crate::logs::push(&account.name, out.renewed, format!("续签：{}", out.message));
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_RENEW,
+            &account.name,
+            out.renewed,
+            format!("续签：{}", out.message),
+        );
     }
     let result = checkin::do_checkin(&account).await;
-    crate::logs::push(&account.name, result.success, format!("签到：{}", result.message));
+    crate::logs::push(
+        &dir,
+        crate::logs::CAT_CHECKIN,
+        &account.name,
+        result.success,
+        format!("签到：{}", result.message),
+    );
     Ok(result)
 }
 
@@ -153,10 +177,22 @@ pub async fn checkin_all(app: tauri::AppHandle) -> Result<Vec<checkin::CheckinRe
     let mut results = Vec::new();
     for mut account in list {
         if let Some(out) = crate::renew::renew_if_needed(&dir, &mut account).await {
-            crate::logs::push(&account.name, out.renewed, format!("续签：{}", out.message));
+            crate::logs::push(
+                &dir,
+                crate::logs::CAT_RENEW,
+                &account.name,
+                out.renewed,
+                format!("续签：{}", out.message),
+            );
         }
         let result = checkin::do_checkin(&account).await;
-        crate::logs::push(&account.name, result.success, format!("签到：{}", result.message));
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_CHECKIN,
+            &account.name,
+            result.success,
+            format!("签到：{}", result.message),
+        );
         results.push(result);
     }
     Ok(results)
@@ -202,7 +238,13 @@ async fn account_status_entry(
     // ⓪ 未绑池时这是「刷新」唯一一次取新票的机会（绑了池的由调用方的整池同步去做）。
     //    窗口外 / 冷却中 / 绑池都会静默返回 None，不会多打接口。
     if let Some(rn) = crate::renew::renew_if_needed(dir, account).await {
-        crate::logs::push(&account.name, rn.renewed, format!("续签：{}", rn.message));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_RENEW,
+            &account.name,
+            rn.renewed,
+            format!("续签：{}", rn.message),
+        );
     }
     // ① 今日是否已签到（签到状态接口）
     let status = checkin::query_status(account).await;
@@ -274,14 +316,21 @@ pub async fn refresh_account_status(
 // 日志
 // ---------------------------------------------------------------------------
 
+/// 「日志管理」的唯一数据源：应用日志 + 接管动态，统一按时间倒序。
 #[tauri::command]
-pub fn get_logs() -> Result<Vec<crate::logs::LogEntry>, String> {
-    Ok(crate::logs::entries())
+pub fn get_logs(app: tauri::AppHandle) -> Result<Vec<crate::logs::LogEntry>, String> {
+    Ok(crate::logs::unified(&try_data_dir(&app)?))
 }
 
+/// 清空**全部**日志（应用日志 + 接管动态）。
+///
+/// 两路在界面上是同一张流水，只清一半会让用户按下「清空」后还剩一半记录 ——
+/// 那比按钮不生效更难理解。
 #[tauri::command]
-pub fn clear_logs() -> Result<(), String> {
-    crate::logs::clear();
+pub fn clear_logs(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = try_data_dir(&app)?;
+    crate::logs::clear(&dir);
+    crate::journal::clear(&dir);
     Ok(())
 }
 
@@ -352,11 +401,10 @@ fn billing_list_text(dir: &Path, ids: &[String]) -> String {
 
 /// 「浏览器登录」第一步：申请 state + 授权链接。
 ///
-/// `host` 省略时默认国内版 `https://api.trae.cn`；国际版传 `https://api.trae.ai`。
-/// 端点需抓包逆向确认后才可用（见 [`crate::oauth`] 顶部说明）。
+/// 只走 Trae CN（中国区）官方登录端点。
 #[tauri::command]
-pub async fn oauth_start(host: Option<String>) -> Result<oauth::OAuthStart, String> {
-    oauth::start(host).await
+pub async fn oauth_start() -> Result<oauth::OAuthStart, String> {
+    oauth::start().await
 }
 
 /// 「浏览器登录」第二步：轮询一次授权结果。
@@ -1079,7 +1127,13 @@ pub async fn broker_sync_now(app: tauri::AppHandle) -> Result<broker::SyncReport
         return Err("本机未绑定云端凭证池 —— 先「上传本机账号」或「绑定云端凭证池」".into());
     }
     let report = broker::sync(&dir, true).await?;
-    crate::logs::push("凭证池", true, format!("手动整池同步：{}", report.message));
+    crate::logs::push(
+        &dir,
+        crate::logs::CAT_SYSTEM,
+        "凭证池",
+        true,
+        format!("手动整池同步：{}", report.message),
+    );
     Ok(report)
 }
 
@@ -1685,10 +1739,9 @@ mod tests {
                 continue;
             }
             println!(
-                "  导入：name={} phone={} region={:?} token={} refresh={}",
+                "  导入：name={} phone={} token={} refresh={}",
                 a.name,
                 a.phone.clone().unwrap_or_else(|| "-".into()),
-                a.region,
                 if a.token.is_empty() { "无" } else { "有" },
                 if a.refresh_token.is_some() { "有" } else { "无" }
             );

@@ -7,14 +7,21 @@ import {
   clearTakeoverEvents,
 } from "../api";
 import type { Account, JournalEvent, TakeoverStatus, Settings } from "../types";
-import { mmdd, type Toast } from "../common";
+import { AccountCell, formatCredits, mmdd, type Toast } from "../common";
 import Switch from "../components/Switch";
-import { IconTrash } from "../components/Icons";
+import { Dialog } from "../components/Dialog";
+import {
+  IconAlertCircle,
+  IconChevron,
+  IconShield,
+  IconTrash,
+  IconUsers,
+} from "../components/Icons";
 
 /**
  * 智能接管页。
  *
- * 设计取向：**一个开关 + 一个端口 + 一张账号勾选表**，其余控件都只在「它此刻真的挡着路」时出现。
+ * 设计取向：**一个开关 + 一行设置（端口 / 参与扣费）**，其余控件都只在「它此刻真的挡着路」时出现。
  *
  * - 改道方式**只有一种：端点改写**（把应用安装目录里 `product.json` 的 `bootConfig`
  *   指向 `http://127.0.0.1:PORT`），端点恒为**明文回环、不需要任何证书**。
@@ -27,14 +34,15 @@ import { IconTrash } from "../components/Icons";
  *   留一个「还原补丁」按钮只会多出一个「忘了点」的状态。唯一仍要在这里说的是
  *   **打不成的时候** —— 那正是开关灰着的理由。
  * - 开关是唯一的「开着吗」，接管动态是唯一的「刚才发生了什么」，所以「已生效 / 未生效 /
- *   直连官方 / 处理中」这类复述型标签全部不进页面（页头那颗胶囊已经答了）。
+ *   直连官方 / 处理中」这类复述型标签全部不进页面。
  * - **接管动态是持久的**：打开页面就把磁盘上的全部历史读出来显示，切页面 / 重开窗口都不丢。
  *   要清只能点「清空」。
  *   ⚠️ 曾经是「打开即 `clearTakeoverEvents()`」——**每次打开页面都在删对账证据**
  *   （2026-09-16 用户报「用账号一却扣了账号二」时，唯一能回答「换给了谁」的 `route_start`
  *   就是这么丢的）；中间还试过「显示层按打开时刻过滤」，但那让用户以为日志又被清空了 ——
  *   「看不见旧记录」和「没有旧记录」在他那里是同一件事，**所以干脆都显示**。
- * - 选号规则、上游地址这类实现细节不进界面 —— 排障看「接管动态」与 `proxy-rules.json`。
+ * - 选号规则收进标题旁的感叹号悬浮说明（用户要核对「为什么先扣这个号」时才展开），
+ *   不占正文；上游地址这类实现细节仍不进界面 —— 排障看「接管动态」与 `proxy-rules.json`。
  * - 文字只在**有东西挡住你**时出现（见 `issue`，现在排进下方的接管动态第一位）：
  *   不正常才是需要解释的时刻，而且是**按应用**各说各的 —— 合成一句话必然要说谎。
  */
@@ -174,23 +182,20 @@ function shortTime(e: JournalEvent): string {
 }
 
 /**
- * chip 上的短标签。账号名是「用户0044120650」这种，直接铺开会把一行撑爆，
- * 所以优先用**人认得的尾部数字**：手机号打码串最后一个星号后可见的数字
- * （如 `190******75` ⇒ `75`）> user_id 后 4 位 > 名称本身。
- *
- * ⚠️ 必须与后端 `accounts.rs::tail` 算**同一个数**（真实尾号在星号之后，
- * 不要把所有数字拼起来取后 4 位，那会把开头的 `190` 也算进去）。
+ * 账号的积分摘要（弹窗每行右侧）：积分 + 最早到期日。
+ * 到期时间是选号的第一排序键（越早到期越先用），所以必须能在这里看到。
  */
-function shortLabel(a: Account): string {
-  const phone = a.phone ?? "";
-  let digits = "";
-  const star = phone.lastIndexOf("*");
-  if (star !== -1) digits = phone.slice(star + 1).replace(/\D/g, "");
-  if (!digits) digits = phone.replace(/\D/g, "").slice(-4);
-  if (digits) return `尾号 ${digits}`;
-  const uid = a.user_id ?? "";
-  if (uid.length >= 4) return `ID ${uid.slice(-4)}`;
-  return a.name.length > 6 ? a.name.slice(0, 6) : a.name;
+function creditMeta(a: Account): string {
+  const snap = a.credit_snapshot;
+  if (snap?.unlimited) return "积分不限量";
+  if (!snap) return "积分未知";
+  const credits =
+    snap.credits === null
+      ? "积分未知"
+      : `积分 ${formatCredits(snap.credits)}`;
+  return snap.earliest_expiry_ms
+    ? `${credits} · ${mmdd(snap.earliest_expiry_ms)} 到期`
+    : credits;
 }
 
 function TakeoverPage({ settings, update, notify, accounts }: Props) {
@@ -202,6 +207,10 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
   const [error, setError] = useState<string | null>(null);
   /** 端口输入的草稿：直接改设置会让「删一位数字」被 parseInt 兜成默认值，输入过程很跳。 */
   const [portDraft, setPortDraft] = useState(String(port));
+  /** 参与扣费弹窗是否打开 */
+  const [billingOpen, setBillingOpen] = useState(false);
+  /** 弹窗里的勾选草稿：点「保存」才写设置，取消则原样丢弃。 */
+  const [draft, setDraft] = useState<Set<string>>(new Set());
 
   useEffect(() => setPortDraft(String(port)), [port]);
 
@@ -298,12 +307,11 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
     } else if (!enabled && blocked.length > 0) {
       // 开关此刻灰着 ⇒ 要说「怎么才能开」。原因已在明细里逐条写清了，这里只给下一步。
       // 只支持一个应用，没有「改接别的」这条出路 —— 能做的只有修好它（权限 / 版本）。
-      text = "Trae CN 打不上免证书补丁，所以开不了接管。按下面「应用提示」里的说明修好后即可开启。";
+      text = "Trae CN 补丁未能应用，暂时无法开启接管。按下方提示处理后即可开启。";
     } else if (enabled && !st.proxy_active) {
-      text = st.proxy_error ? `本地反代没有在监听：${st.proxy_error}` : "本地反代没有在监听。";
+      text = st.proxy_error ? `本地代理未在运行：${st.proxy_error}` : "本地代理未在运行。";
     } else if (enabled && st.rules?.observe_only) {
-      text =
-        "当前是观察模式：流量已全部经过本机，但一个凭据都还没换 —— 把 proxy-rules.json 的 observe_only 改成 false 才会真正走账号池。";
+      text = "当前为观察模式：流量只记录、不切换账号。";
     }
     if (!text && items.length === 0) return null;
     return { text, items };
@@ -315,43 +323,35 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
     () => (settings?.billing_account_ids ?? []).filter((id) => accountIds.has(id)),
     [settings, accountIds]
   );
-  const billingOn = useCallback(
-    (id: string) => billingIds.length === 0 || billingIds.includes(id),
-    [billingIds]
-  );
+  const openBilling = () => {
+    setDraft(new Set(billingIds.length === 0 ? accounts.map((a) => a.id) : billingIds));
+    setBillingOpen(true);
+  };
 
-  const toggleBilling = (id: string) => {
-    const current = billingIds.length === 0 ? accounts.map((a) => a.id) : billingIds;
-    const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id];
-    if (next.length === 0) {
+  const toggleDraft = (id: string) =>
+    setDraft((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  /**
+   * 保存勾选。全选写空列表（后端语义就是「全部」），避免设置里留一份和默认等价的
+   * 显式名单 —— 同时也让以后新增的账号自动参与。
+   */
+  const saveBilling = () => {
+    if (draft.size === 0) {
       notify({ kind: "info", text: "至少保留一个账号" });
       return;
     }
-    // 全部选回 = 写空列表（后端语义就是「全部」），避免设置里留一份和默认等价的显式名单
-    update({ billing_account_ids: next.length === accounts.length ? [] : next });
-  };
-
-  /**
-   * chip 的悬停提示：给「核对选号依据」用 —— 账号是谁、还剩多少积分、哪天到期。
-   * 到期时间是选号的第一排序键（越早到期越先用），所以必须能在这里看到。
-   */
-  const chipTitle = (a: Account) => {
-    const parts = [a.name];
-    if (a.phone) parts.push(a.phone);
-    const snap = a.credit_snapshot;
-    if (snap?.unlimited) {
-      parts.push("积分不限量");
-    } else if (snap && (snap.credits !== null || snap.earliest_expiry_ms)) {
-      const c = snap.credits === null ? "未知" : String(snap.credits);
-      parts.push(
-        snap.earliest_expiry_ms
-          ? `积分 ${c}，${mmdd(snap.earliest_expiry_ms)} 到期`
-          : `积分 ${c}，到期未知`
-      );
-    } else {
-      parts.push("积分未知");
-    }
-    return parts.join(" · ");
+    update({
+      billing_account_ids:
+        draft.size === accounts.length
+          ? []
+          : accounts.map((a) => a.id).filter((id) => draft.has(id)),
+    });
+    setBillingOpen(false);
   };
 
   /**
@@ -443,8 +443,32 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
     <>
       {/* ── 控制区：一个开关 + 一个端口 + 哪些账号参与扣费。没有别的控件，也没有复述状态的文字 ── */}
       <section className={`card hero${live ? " live" : ""}`}>
-        <div className="hero-row">
-          <h2>智能接管</h2>
+        <div className="hero-top">
+          <div className="hero-copy">
+            <span className="hero-icon">
+              <IconShield size={19} />
+            </span>
+            <div className="hero-text">
+              <div className="hero-title">
+                <h2>接管 Trae CN 请求</h2>
+                {/* 常驻一句规则说明会把标题区撑成一段文字；收进悬浮层，只有要核对时展开 */}
+                <span
+                  className="rule-hint"
+                  role="note"
+                  tabIndex={0}
+                  aria-label="选号规则：优先使用最早到期的积分；同一天到期时待过期积分少者优先；关闭接管即恢复官方直连"
+                >
+                  <IconAlertCircle size={16} />
+                  <span className="rule-hint-pop" role="tooltip">
+                    <strong>选号规则</strong>
+                    <span>优先使用最早到期的积分账号；同一天到期时，待过期积分少的优先。</span>
+                    <span>剩余积分为 0 的账号不参与。</span>
+                    <span>关闭接管即恢复官方直连。</span>
+                  </span>
+                </span>
+              </div>
+            </div>
+          </div>
           <Switch
             size="lg"
             checked={enabled}
@@ -457,59 +481,117 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
             }
             title={
               enabled
-                ? "关闭接管：恢复官方直连，并还原给 Trae CN 打的免证书补丁（正在运行的会被强制重启，未保存的输入可能丢失；没开着的下次启动自然生效）"
-                : "开启接管：给 Trae CN 打免证书补丁、把端点改到本机反代（正在运行的会被强制重启，未保存的输入可能丢失；没开着的下次启动自然生效）"
+                ? "关闭接管会恢复官方直连，并重启正在运行的 Trae CN（未保存的输入可能丢失）"
+                : "开启接管会重启正在运行的 Trae CN（未保存的输入可能丢失）"
             }
             onChange={(v) => void onToggle(v)}
           />
         </div>
 
-        <div className="hero-row">
-          <span className="field-label">端口</span>
-          <input
-            className="port-input"
-            type="number"
-            inputMode="numeric"
-            value={portDraft}
-            disabled={enabled || busy}
-            title={enabled ? "开启接管时端口不可改，先关闭接管" : "本地反代监听端口"}
-            onChange={(e) => setPortDraft(e.target.value)}
-            onBlur={commitPort}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") e.currentTarget.blur();
-            }}
-          />
+        <div className="hero-settings">
+          <div className="hero-field">
+            <span className="field-label">端口</span>
+            <input
+              className="port-input"
+              type="number"
+              inputMode="numeric"
+              value={portDraft}
+              disabled={enabled || busy}
+              title={enabled ? "开启接管时端口不可改，先关闭接管" : "本地反代监听端口"}
+              onChange={(e) => setPortDraft(e.target.value)}
+              onBlur={commitPort}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+            />
+          </div>
+
+          {accounts.length > 0 && (
+            <div className="hero-field">
+              <span
+                className="field-label"
+                title="未勾选的账号不参与扣费；优先使用到期最早的积分"
+              >
+                参与扣费
+              </span>
+              <button
+                className="billing-trigger"
+                disabled={busy}
+                title="选择参与扣费的账号"
+                onClick={openBilling}
+              >
+                <IconUsers size={14} />
+                {billingIds.length === 0
+                  ? `全部账号（${accounts.length}）`
+                  : `已选 ${billingIds.length} / ${accounts.length}`}
+                <IconChevron size={13} className="billing-chevron" />
+              </button>
+            </div>
+          )}
         </div>
 
-        {accounts.length > 0 && (
-          <div className="hero-row">
-            <span
-              className="field-label"
-              title="没勾选的账号一律不参与扣费；在勾选的账号里，积分到期最早的最先被使用，同一天到期时先烧待过期积分少的"
-            >
-              参与扣费
-            </span>
-            <div className="chips">
-              {accounts.map((a) => {
-                const on = billingOn(a.id);
-                return (
-                  <button
-                    key={a.id}
-                    className={"chip" + (on ? " on" : "")}
-                    disabled={busy}
-                    title={chipTitle(a)}
-                    onClick={() => toggleBilling(a.id)}
-                  >
-                    {on && <span className="tick">✓</span>}
-                    {shortLabel(a)}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
       </section>
+
+      {billingOpen && (
+        <Dialog
+          icon={<IconUsers size={16} />}
+          title="参与扣费"
+          subtitle="未勾选的账号不参与扣费；全选时以后新增的账号也会自动参与。"
+          label="选择参与扣费的账号"
+          onClose={() => setBillingOpen(false)}
+          tools={
+            <div className="billing-tools">
+              <label className="billing-all">
+                <input
+                  type="checkbox"
+                  checked={draft.size === accounts.length}
+                  ref={(el) => {
+                    if (el) el.indeterminate = draft.size > 0 && draft.size < accounts.length;
+                  }}
+                  onChange={() =>
+                    setDraft(
+                      draft.size === accounts.length
+                        ? new Set()
+                        : new Set(accounts.map((a) => a.id))
+                    )
+                  }
+                />
+                全选
+              </label>
+              <span className="billing-count">
+                已选 {draft.size} / {accounts.length}
+              </span>
+            </div>
+          }
+          footer={
+            <>
+              <button className="btn" onClick={() => setBillingOpen(false)}>
+                取消
+              </button>
+              <button className="btn primary" onClick={saveBilling}>
+                保存
+              </button>
+            </>
+          }
+        >
+          <div className="billing-list">
+            {accounts.map((a) => (
+              <label
+                key={a.id}
+                className={"billing-row" + (draft.has(a.id) ? " picked" : "")}
+              >
+                <input
+                  type="checkbox"
+                  checked={draft.has(a.id)}
+                  onChange={() => toggleDraft(a.id)}
+                />
+                <AccountCell name={a.name} phone={a.phone} />
+                <span className="billing-meta">{creditMeta(a)}</span>
+              </label>
+            ))}
+          </div>
+        </Dialog>
+      )}
 
       {/* ── 接管动态：谁在什么时候用了哪个账号 / 有没有被限流换号 / 代理有没有报错。
               ⚠️ 每次打开本页都会先清空，所以这里给的是「这次打开之后」的事。 ── */}

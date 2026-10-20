@@ -97,7 +97,6 @@ pub struct CheckinResult {
     pub message: String,
     /// 签到积分余额（服务端 `credits` 原值）
     pub credit: Option<i64>,
-    pub host: Option<String>,
     pub at: String,
 }
 
@@ -133,22 +132,6 @@ pub fn is_checked_in(v: &Value) -> bool {
 /// 响应里的提示语。
 pub fn message_of(v: &Value) -> String {
     msg_of(v)
-}
-
-pub(crate) fn host_of(account: &Account) -> String {
-    account
-        .host
-        .clone()
-        .unwrap_or_else(|| "https://api.trae.cn".into())
-}
-
-pub(crate) fn normalize_host(url: &str) -> String {
-    let u = url.trim().trim_end_matches('/');
-    if u.starts_with("http://") || u.starts_with("https://") {
-        u.to_string()
-    } else {
-        format!("https://{}", u)
-    }
 }
 
 /// 本机 Trae CN 的客户端版本号（`x-app-version`）。
@@ -306,7 +289,7 @@ pub async fn query_status(account: &Account) -> Option<Value> {
 /// 同 [`query_status`]，但复用外部 `client`（反代路由每 10 分钟要批量取一次，
 /// 复用连接池避免每个账号都新建一次客户端）。
 pub async fn query_status_with(client: &reqwest::Client, account: &Account) -> Option<Value> {
-    let host = normalize_host(&host_of(account));
+    let host = crate::API_HOST;
     let (auth_hdr, hdrs) = headers(account, &device_id(account));
     let url = format!("{host}{STATUS_PATH}");
     let mut req = client
@@ -458,7 +441,7 @@ enum UsageFetch {
 }
 
 async fn post_ent_usage(client: &reqwest::Client, account: &Account) -> UsageFetch {
-    let host = normalize_host(&host_of(account));
+    let host = crate::API_HOST;
     let (auth_hdr, hdrs) = headers(account, &device_id(account));
     let url = format!("{host}{ENT_USAGE_PATH}");
     let mut req = client
@@ -639,7 +622,7 @@ pub fn credit_snapshot_of(view: &ResourceView) -> crate::accounts::CreditSnapsho
 pub async fn do_checkin(account: &Account) -> CheckinResult {
     let client = reqwest::Client::new();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let host = normalize_host(&host_of(account));
+    let host = crate::API_HOST;
     let dev = device_id(account);
     let (auth_hdr, hdrs) = headers(account, &dev);
     let body = claim_body();
@@ -656,7 +639,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
                 auth_failed: false,
                 message: "今日已签到".into(),
                 credit: credits,
-                host: Some(host.clone()),
                 at: now,
             };
         }
@@ -669,7 +651,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
                 auth_failed: false,
                 message: "签到活动未开启".into(),
                 credit: credits,
-                host: Some(host.clone()),
                 at: now,
             };
         }
@@ -719,7 +700,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
                 auth_failed: false,
                 message: msg,
                 credit,
-                host: Some(host.clone()),
                 at: now,
             };
         }
@@ -734,7 +714,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
                 auth_failed: false,
                 message: msg,
                 credit: None,
-                host: Some(host.clone()),
                 at: now,
             };
         }
@@ -749,7 +728,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
                 auth_failed: false,
                 message: msg,
                 credit: None,
-                host: Some(host.clone()),
                 at: now,
             };
         }
@@ -795,7 +773,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
         auth_failed: last_auth,
         message,
         credit: None,
-        host: None,
         at: now,
     }
 }
@@ -835,11 +812,9 @@ mod tests {
             id: "local".into(),
             name: String::new(),
             phone: None,
-            region: None,
             user_id: Some("u123".into()),
             token: "t".into(),
             refresh_token: None,
-            host: None,
             expires_at: None,
             refresh_expires_at: None,
             device_id: Some("dev".into()),
@@ -857,11 +832,9 @@ mod tests {
             id: "local".into(),
             name: String::new(),
             phone: None,
-            region: None,
             user_id: user_id.map(str::to_string),
             token: token.to_string(),
             refresh_token: None,
-            host: None,
             expires_at: None,
             refresh_expires_at: None,
             device_id: device_id.map(str::to_string),
@@ -1058,11 +1031,9 @@ mod real_tests {
             id: "t".into(),
             name: a.nickname.clone().unwrap_or_default(),
             phone: a.phone.clone(),
-            region: a.region.clone(),
             user_id: a.user_id.clone(),
             token: a.token.clone(),
             refresh_token: a.refresh_token.clone(),
-            host: a.host.clone(),
             expires_at: a.expires_at,
             refresh_expires_at: a.refresh_expires_at,
             device_id: a.device_id.clone(),

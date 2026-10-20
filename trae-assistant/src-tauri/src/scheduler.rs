@@ -160,7 +160,7 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
     // 账号列表里已无「启用」概念：所有账号一律参与定时签到。
     let mut pending: Vec<Account> = accounts::load_accounts(dir);
     if pending.is_empty() {
-        logs::push("系统", true, "暂无账号，跳过定时签到");
+        logs::push(dir, logs::CAT_CHECKIN, "系统", true, "暂无账号，跳过定时签到");
         return;
     }
 
@@ -171,6 +171,8 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
         }
         if round > 0 {
             logs::push(
+                dir,
+                logs::CAT_CHECKIN,
                 "系统",
                 true,
                 format!(
@@ -190,6 +192,8 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
             let _ = tauri::async_runtime::block_on(crate::renew::renew_if_needed(dir, &mut account));
             let r = tauri::async_runtime::block_on(crate::checkin::do_checkin(&account));
             logs::push(
+                dir,
+                logs::CAT_CHECKIN,
                 &name,
                 r.success,
                 format!("[{}] 第 {} 轮 · {}", now, round + 1, r.message),
@@ -216,7 +220,6 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
                 auth_failed: false,
                 message: "限流未放行".into(),
                 credit: None,
-                host: None,
                 at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             },
         ));
@@ -246,11 +249,18 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
         let title = crate::notify::summary_title(ok, already, unsigned.len() - inactive);
         let msg = crate::notify::summary_message(ok, already, inactive, &unsigned);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let out = match tauri::async_runtime::block_on(crate::notify::send(webhook, &title, &msg)) {
-            Ok(r) => r,
-            Err(e) => format!("发送失败：{e}"),
-        };
-        logs::push("系统", true, format!("[{}] Webhook 通知：{}", now, out));
+        let (sent, out) =
+            match tauri::async_runtime::block_on(crate::notify::send(webhook, &title, &msg)) {
+                Ok(r) => (true, r),
+                Err(e) => (false, format!("发送失败：{e}")),
+            };
+        logs::push(
+            dir,
+            logs::CAT_NOTIFY,
+            "系统",
+            sent,
+            format!("[{}] Webhook 通知：{}", now, out),
+        );
     }
     let _ = app;
 }

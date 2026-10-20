@@ -107,7 +107,13 @@ fn claim(dir: &Path, key: &str, now_ms: i64, cooldown_ms: i64) -> bool {
     st.alerts.insert(key.to_string(), now_ms);
     if let Err(e) = write_state(dir, &st) {
         // 落盘失败只影响「重启之后」的去重，本进程的内存表已经占上名额了
-        crate::logs::push(CHANNEL, false, format!("告警记账落盘失败：{e}"));
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_NOTIFY,
+            CHANNEL,
+            false,
+            format!("告警记账落盘失败：{e}"),
+        );
     }
     true
 }
@@ -141,13 +147,25 @@ pub(crate) fn notify(dir: &Path, key: &str, cooldown_ms: i64, title: &str, messa
     tauri::async_runtime::spawn(async move {
         match crate::notify::send(&url, &title, &body).await {
             Ok(resp) => {
-                crate::logs::push(CHANNEL, true, format!("告警已推送（{title}）：{resp}"));
+                crate::logs::push(
+                    &data_dir,
+                    crate::logs::CAT_NOTIFY,
+                    CHANNEL,
+                    true,
+                    format!("告警已推送（{title}）：{resp}"),
+                );
             }
             Err(e) => {
                 // 告警自己送不出去是要紧事：这正是用户唯一能知道「链断了」的通道。
                 // 除了日志，再补一条接管动态 —— 内存日志只有 200 条上限，等用户想起来查它时
                 // 早被巡检噪音刷掉了（2026-10-13 那次就是这么没人看见的）。
-                crate::logs::push(CHANNEL, false, format!("告警推送失败（{title}）：{e}"));
+                crate::logs::push(
+                    &data_dir,
+                    crate::logs::CAT_NOTIFY,
+                    CHANNEL,
+                    false,
+                    format!("告警推送失败（{title}）：{e}"),
+                );
                 crate::journal::append_dedup(
                     &data_dir,
                     "alert_send_failed",

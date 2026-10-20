@@ -1,10 +1,14 @@
 /**
- * 外壳层：应用骨架（侧栏 / 页头 / 内容区）、导航、按钮、Toast。
+ * 外壳层：应用骨架（标题栏 / 悬浮侧栏 / 页头 / 内容区）、导航、按钮、Toast。
  *
- * 关键结构（相对旧版的变化）：页头从「页面内部的一行 h2」提升为**悬浮在内容之上的
- * 玻璃层**，承载「这一页是什么 + 这一页现在什么状态 + 这一页能做什么」。内容区
- * 绝对定位并向上溢出到页头之下，滚动时内容从毛玻璃页头底下穿过 —— 侧栏与页头的
- * backdrop-filter 才有实际被模糊的对象。
+ * 结构：
+ *   titlebar  —— 自绘窗口控制，透明底
+ *   app-body  —— 左侧悬浮玻璃侧栏 + 右侧主区
+ *   pagebar   —— 主区顶部固定页头：标题 / 副标题 / 状态 / 操作
+ *   content   —— 唯一滚动区
+ *
+ * 页头不再悬浮覆盖内容，而是作为 flex 项固定在主区顶部：内容在它下方独立滚动，
+ * 窄窗口下页头可以自然换成两行，不会把标题挤成竖排。
  */
 
 .app {
@@ -16,33 +20,38 @@
   flex: 1;
   min-height: 0;
   display: flex;
+  gap: 16px;
+  padding: 0 16px 16px;
 }
 
-/* ── 自绘标题栏（decorations:false）：整条可拖，右侧三个窗口按钮 ──
-   z-index 60 > 遮罩 50：弹窗打开时窗口控制仍可用（遮罩经 Dialog portal 挂 body） */
+/* ── 自绘标题栏（decorations:false）───────────────────────── */
 .titlebar {
   position: relative;
   z-index: 60;
   flex: none;
   display: flex;
-  align-items: stretch;
-  height: 36px;
-  background: var(--glass);
-  border-bottom: 1px solid var(--hairline);
+  align-items: center;
+  height: 40px;
+  padding: 0 6px;
+  background: transparent;
   user-select: none;
   -webkit-user-select: none;
 }
 .titlebar-drag {
   flex: 1;
   min-width: 0;
+  align-self: stretch;
 }
 .win-btns {
   display: flex;
   flex: none;
+  gap: 2px;
 }
 .win-btn {
-  width: 46px;
+  width: 40px;
+  height: 30px;
   border: none;
+  border-radius: 9px;
   background: none;
   display: grid;
   place-items: center;
@@ -52,26 +61,28 @@
     color var(--dur-1) var(--ease-out);
 }
 .win-btn:hover {
-  background: rgba(0, 0, 0, 0.07);
+  background: rgba(23, 33, 28, 0.07);
   color: var(--text);
 }
 .win-btn.close:hover {
-  background: #e81123;
+  background: #e5484d;
   color: #fff;
 }
 
-/* ── 侧边导航栏：半透明玻璃 + 细描边 ───────────────────────── */
+/* ── 侧边导航栏：悬浮的白色玻璃卡 ──────────────────────────── */
 .sidebar {
-  flex: 0 0 216px;
+  flex: 0 0 224px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 18px 14px;
+  gap: 18px;
+  padding: 18px 14px 14px;
   z-index: 10;
+  border-radius: var(--radius-lg);
   background: var(--glass);
   backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
   -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
-  border-right: 1px solid var(--hairline);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm), var(--hl);
 }
 .brand {
   display: flex;
@@ -82,90 +93,91 @@
 }
 .logo {
   flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
-  border-radius: var(--radius-sm);
-  display: grid;
-  place-items: center;
-  background: linear-gradient(135deg, var(--primary-lite), var(--primary-d));
-  color: #fff;
-  box-shadow: 0 2px 8px var(--primary-ring), var(--hl);
+  width: 38px;
+  height: 38px;
+}
+.logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  -webkit-user-drag: none;
 }
 .brand-text {
   display: flex;
   flex-direction: column;
+  gap: 2px;
   min-width: 0;
   line-height: 1.25;
 }
 .brand-name {
   font-size: 14.5px;
-  font-weight: 600;
+  font-weight: 650;
+  letter-spacing: -0.01em;
   color: var(--text);
   white-space: nowrap;
 }
 .brand-ver {
-  font-size: var(--fs-micro);
-  color: var(--muted-2);
-  letter-spacing: 0.2px;
+  align-self: flex-start;
+  font-size: 10.5px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-radius: var(--radius-pill);
+  padding: 1px 7px;
   font-variant-numeric: var(--tnum);
+  letter-spacing: 0.02em;
 }
 
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
 }
-/* 导航项：选中态用一条会「长出来」的强调条（scaleY 过渡），
-   比静态的 inset box-shadow 更有反馈感。 */
 .nav-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 11px;
-  border: none;
+  height: 44px;
+  border: 1px solid transparent;
   background: none;
   color: var(--muted);
-  font-size: var(--fs-cell);
+  font-size: var(--fs-body);
+  font-weight: 500;
   font-family: inherit;
-  padding: 9px 11px;
-  border-radius: var(--radius-sm);
+  padding: 0 12px;
+  border-radius: 13px;
   cursor: pointer;
   text-align: left;
-  position: relative;
   transition: background var(--dur-2) var(--ease-out),
-    color var(--dur-2) var(--ease-out);
-}
-.nav-item::before {
-  content: "";
-  position: absolute;
-  left: -14px;
-  top: 50%;
-  width: 3px;
-  height: 20px;
-  border-radius: 0 3px 3px 0;
-  background: var(--primary);
-  transform: translateY(-50%) scaleY(0);
-  opacity: 0;
-  transition: transform var(--dur-2) var(--ease-spring),
-    opacity var(--dur-2) var(--ease-out);
+    color var(--dur-2) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out);
 }
 .nav-item:hover {
-  background: rgba(255, 255, 255, 0.66);
+  background: var(--panel-2);
   color: var(--text);
 }
 .nav-item.active {
-  background: var(--primary-soft);
+  background: linear-gradient(135deg, var(--primary-soft), var(--primary-soft-2));
+  border-color: var(--primary-line);
   color: var(--primary-d);
   font-weight: 600;
-}
-.nav-item.active::before {
-  transform: translateY(-50%) scaleY(1);
-  opacity: 1;
+  box-shadow: var(--hl);
 }
 .nav-icon {
-  width: 18px;
+  width: 20px;
   display: grid;
   place-items: center;
   flex: 0 0 auto;
+  transition: transform var(--dur-2) var(--ease-spring);
+}
+.nav-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nav-item.active .nav-icon {
+  transform: scale(1.06);
 }
 .nav-dot {
   margin-left: auto;
@@ -173,114 +185,101 @@
   height: 7px;
   border-radius: 50%;
   background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft);
 }
-.nav-dot.err {
-  background: var(--err);
-  animation: nav-dot-pulse 1.8s ease-in-out infinite;
+/* 有新版本：常驻琥珀点，不闪烁；只有更新完成或确认无更新才熄灭 */
+.nav-dot.warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px var(--warn-soft);
 }
 
-/* ── 侧栏底部：应用更新全局状态条 ────────────────────────────
-   状态持在 App 层（下载是整机动作），侧栏底部常驻一条，切换页面进度不丢。
-   内部 .upd-* 复用 ui.css 的进度样式，此处只负责卡片容器与字号微调。 */
+/* ── 侧栏底部：应用更新全局状态条 ──────────────────────────── */
 .sidebar-update {
   margin-top: auto;
-  padding: 11px 12px;
-  border-radius: var(--radius-sm);
-  background: var(--primary-soft);
-  border: 1px solid var(--hairline);
+  padding: 12px 13px;
+  border-radius: 15px;
+  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  border: 1px solid var(--primary-line);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
 }
 .sidebar-update-title {
-  font-size: 11px;
-  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 650;
   color: var(--primary-d);
-  letter-spacing: 0.2px;
+  letter-spacing: 0.01em;
 }
 .sidebar-update .upd-status {
   font-size: var(--fs-cap);
   color: var(--muted);
-  line-height: 1.35;
+  line-height: 1.45;
 }
 .sidebar-update .upd-row {
   margin-top: 0;
 }
 
-/* ── 右侧主区：页头悬浮于内容之上 ───────────────────────────── */
+/* ── 右侧主区：固定页头 + 独立滚动的画布 ────────────────────── */
 .main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   position: relative;
-  overflow: hidden;
 }
 .pagebar {
-  position: absolute;
-  inset: 0 0 auto 0;
-  z-index: 5;
-  height: var(--pagebar-h);
+  flex: none;
+  min-height: var(--pagebar-h);
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 0 var(--page-pad);
-  background: var(--glass);
-  backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
-  border-bottom: 1px solid var(--hairline);
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  padding: 16px var(--page-pad) 12px;
 }
 .pagebar-left {
+  flex: 0 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 13px;
 }
 .pagebar-icon {
+  flex: 0 0 auto;
   display: grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
-  border-radius: var(--radius-sm);
-  background: linear-gradient(150deg, var(--primary-soft-2), var(--primary-soft));
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  background: linear-gradient(150deg, #ffffff, var(--primary-soft-2));
+  border: 1px solid var(--border);
   color: var(--primary-d);
+  box-shadow: var(--shadow-xs), var(--hl);
+}
+.pagebar-titles {
+  min-width: 0;
 }
 .pagebar h2 {
   margin: 0;
   font-size: var(--fs-lg);
-  font-weight: 650;
-  letter-spacing: -0.015em;
-}
-
-/* 状态胶囊：高度由 --pill-h 统一定义，与接管页的胶囊**结构上**同高，
-   而不是靠两条 padding 公式碰巧算成一样（那样一改就分叉） */
-.status-group {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: var(--pill-h);
-  font-size: var(--fs-sm);
-  color: var(--muted);
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  padding: 0 11px;
-  border-radius: var(--radius-pill);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.25;
   white-space: nowrap;
 }
-.status-pill .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ok);
+.pagebar-right {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-left: auto;
 }
-.status-pill.warn .dot {
-  background: var(--warn);
-}
-.status-pill.err .dot {
-  background: var(--err);
-}
+
 .action-group {
   display: flex;
   align-items: center;
@@ -300,56 +299,66 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 7px;
+  height: 38px;
   border: 1px solid var(--border);
   background: var(--panel);
-  color: var(--text);
-  padding: 8px 14px;
+  color: var(--text-2);
+  padding: 0 15px;
   border-radius: var(--radius-sm);
   font-size: var(--fs-body);
-  font-weight: 500;
+  font-weight: 550;
   font-family: inherit;
   line-height: 1;
   cursor: pointer;
   white-space: nowrap;
+  box-shadow: var(--shadow-xs);
   transition: background var(--dur-1) var(--ease-out),
     border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out),
     transform var(--dur-1) var(--ease-out);
 }
 .btn:hover:not(:disabled) {
-  border-color: var(--border-strong);
-  background: var(--panel-2);
+  border-color: var(--border-hover);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
 }
-/* 按下时轻微下沉：给点击一个物理反馈，成本极低 */
 .btn:active:not(:disabled) {
-  transform: translateY(0.5px);
+  transform: translateY(0);
+  box-shadow: var(--shadow-xs);
 }
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
+  box-shadow: none;
 }
 .btn.primary {
-  background: linear-gradient(180deg, var(--primary-lite), var(--primary));
-  border-color: var(--primary);
+  background: linear-gradient(160deg, var(--primary-lite), var(--primary));
+  border-color: transparent;
   color: #fff;
   font-weight: 600;
-  box-shadow: 0 1px 2px var(--primary-ring), var(--hl);
+  box-shadow: var(--shadow-primary), var(--hl);
 }
 .btn.primary:hover:not(:disabled) {
-  background: linear-gradient(180deg, var(--primary), var(--primary-d));
-  border-color: var(--primary-d);
-  box-shadow: 0 3px 10px var(--primary-ring);
+  background: linear-gradient(160deg, var(--primary), var(--primary-d));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 14px 28px -12px rgba(14, 168, 114, 0.6);
+  transform: translateY(-1px);
 }
 .btn.ghost {
   background: transparent;
   border-color: transparent;
   color: var(--muted);
+  box-shadow: none;
 }
 .btn.ghost:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.72);
+  background: var(--panel);
+  border-color: var(--border);
   color: var(--text);
-  border-color: transparent;
+  box-shadow: var(--shadow-xs);
 }
 .btn.danger {
   color: var(--err);
@@ -358,23 +367,25 @@
 .btn.danger:hover:not(:disabled) {
   background: var(--err-soft);
   border-color: var(--err-line);
+  color: var(--err);
 }
-/* 小号按钮：只有这一个类名（不再有第二个等价的 .btn-sm） */
 .btn.small {
-  padding: 7px 12px;
+  height: 32px;
+  padding: 0 12px;
   font-size: var(--fs-sm);
+  border-radius: 10px;
 }
 .btn.block {
   width: 100%;
 }
-/* 图标按钮（日志 / 删除等轻量操作，高度 32px） */
+/* 图标按钮 */
 .icon-btn {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 34px;
+  height: 34px;
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -391,50 +402,132 @@
   color: var(--err);
   border-color: var(--err-line);
 }
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 .spin {
   animation: spin 0.7s linear infinite;
 }
 
-/* ── 内容区：绝对定位向上溢出到页头之下 ─────────────────────── */
+/* ── 内容区：唯一滚动区 ───────────────────────────────────── */
 .content {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: calc(var(--pagebar-h) + 20px) var(--page-pad) 28px;
+  padding: 8px var(--page-pad) 30px;
 }
 
-/* ── Toast：顶部居中的一条胶囊，按 kind 染色 ───────────────── */
+/* ── Toast：顶部居中的深色胶囊，图标带语义色 ───────────────── */
 .toast {
   position: fixed;
-  top: 16px;
+  top: 50px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   max-width: min(560px, 88vw);
-  padding: 10px 16px;
-  border-radius: var(--radius-pill);
+  padding: 10px 16px 10px 11px;
+  border-radius: 14px;
   font-size: var(--fs-body);
   font-weight: 500;
   color: #fff;
+  background: rgba(27, 36, 32, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(var(--blur-sm));
+  -webkit-backdrop-filter: blur(var(--blur-sm));
   z-index: 90;
   box-shadow: var(--shadow-lg);
   animation: toast-in var(--dur-3) var(--ease-spring);
 }
-.toast-ok {
-  background: var(--ok);
+.toast-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.12);
 }
-.toast-err {
-  background: var(--err);
+.toast-ok .toast-icon {
+  color: #7ce8bb;
+  background: rgba(34, 196, 141, 0.16);
 }
-.toast-info {
-  /* 中性提示用**中性深灰**，不用彩色：
-     品牌绿会把「至少保留一个应用」读成「成功了」，而另加一支蓝色会被一眼看出来
-     （2026-09-16 用户两次否掉蓝色通知条）。 */
-  background: var(--neutral-solid);
+.toast-err .toast-icon {
+  color: #ffb4ad;
+  background: rgba(229, 72, 77, 0.18);
+}
+.toast-info .toast-icon {
+  color: #d7ded9;
+}
+
+/* ── 窄窗口：侧栏收成图标轨，页头允许换行 ───────────────────── */
+@media (max-width: 900px) {
+  .app-body {
+    gap: 12px;
+    padding: 0 12px 12px;
+  }
+  .sidebar {
+    flex-basis: 76px;
+    padding: 16px 10px 12px;
+    gap: 14px;
+    align-items: center;
+  }
+  .brand {
+    padding: 0;
+    justify-content: center;
+  }
+  .brand-text,
+  .nav-label,
+  .sidebar-update {
+    display: none;
+  }
+  .nav {
+    width: 100%;
+  }
+  .nav-item {
+    justify-content: center;
+    padding: 0;
+  }
+  .nav-icon,
+  .nav-item.active .nav-icon {
+    transform: none;
+  }
+  .nav-dot {
+    position: absolute;
+    top: 9px;
+    right: 11px;
+    margin: 0;
+  }
+  .pagebar {
+    padding: 14px 20px 10px;
+    gap: 10px 14px;
+  }
+  .content {
+    padding: 6px 20px 24px;
+  }
+  :root {
+    --page-pad: 20px;
+    --pagebar-h: 76px;
+  }
+}
+
+@media (max-width: 720px) {
+  .pagebar-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 12px;
+  }
+  .pagebar h2 {
+    font-size: 19px;
+  }
+  .pagebar-right {
+    width: 100%;
+    justify-content: flex-start;
+    margin-left: 0;
+  }
 }

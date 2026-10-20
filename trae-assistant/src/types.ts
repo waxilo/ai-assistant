@@ -3,11 +3,9 @@ export interface Account {
   id: string;
   name: string;
   phone?: string | null;
-  region?: string | null;
   user_id?: string | null;
   token: string;
   refresh_token?: string | null;
-  host?: string | null;
   expires_at?: number | null;
   refresh_expires_at?: number | null;
   device_id?: string | null;
@@ -78,12 +76,26 @@ export interface CheckinResult {
   auth_failed: boolean;
   message: string;
   credit?: number | null;
-  host?: string | null;
   at: string;
 }
 
+/**
+ * 日志类别。后端 `logs.rs` 的 `CAT_*` 是唯一来源，这里只做镜像。
+ *
+ * 「报错」不在其中：它不是来源，而是**成败筛选**（`!success`），所以能横跨所有类别。
+ */
+export type LogCategory = "checkin" | "renew" | "notify" | "takeover" | "system";
+
+/**
+ * 「日志管理」里的一条。应用日志来自 `logs.rs`（持久化），接管类来自
+ * `takeover-journal.jsonl` —— 后端 `logs::unified` 已把两路并好并按时间倒序。
+ */
 export interface LogEntry {
   at: string;
+  /** 毫秒时间戳：跨来源排序用 */
+  at_ms: number;
+  category: LogCategory;
+  /** 账号名；系统 / 接管类为空串 */
   account: string;
   message: string;
   success: boolean;
@@ -141,7 +153,7 @@ export interface CreditPackage {
 
 // `RenewReport` / `RenewSource` 已随「手动续签」一起删除（2026-09-15）：
 // 后端不再有 `renew_accounts` 命令，续签结论只从两条路体现 ——
-// 账号列表里的到期时间（被推远 = 续上了）与签到日志里的失败记录。
+// 账号列表里的到期时间（被推远 = 续上了）与日志管理里的失败记录。
 
 export type Page = "accounts" | "takeover" | "briefing" | "logs" | "settings";
 
@@ -207,7 +219,6 @@ export interface SyncReport {
 export interface OAuthStart {
   login_id: string;
   verification_uri: string;
-  host: string;
   expires_in: number;
 }
 
@@ -215,8 +226,6 @@ export interface OAuthPoll {
   done: boolean;
   token?: string | null;
   refresh_token?: string | null;
-  host?: string | null;
-  region?: string | null;
   uid?: string | null;
   nickname?: string | null;
   phone?: string | null;
