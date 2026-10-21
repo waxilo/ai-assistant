@@ -77,6 +77,12 @@ body {
   background: transparent;
 }
 
+/* 表头吸顶在滚动容器里，轨道整体下移一个表头高度：
+   滚动条只落在数据区，不压表头。46px 与 .data-table thead th 的 height 一致。 */
+.table-wrap::-webkit-scrollbar-track {
+  margin-top: 46px;
+}
+
 /* ── 关键帧：全应用共用的动效词汇表 ─────────────────────────── */
 
 @keyframes spin {

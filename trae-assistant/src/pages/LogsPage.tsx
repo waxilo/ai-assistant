@@ -137,7 +137,7 @@ function LogsPage({ askConfirm, onToast }: Props) {
   };
 
   return (
-    <>
+    <section className="panel-page">
       {/* 工具条：上一行是搜索与动作，下一行是来源筛选 —— 七个类别挤一行会互相挤压 */}
       <div className="card logs-toolbar">
         <div className="logs-toolbar-row">
@@ -237,7 +237,7 @@ function LogsPage({ askConfirm, onToast }: Props) {
           </table>
         </div>
       )}
-    </>
+    </section>
   );
 }
 
