@@ -811,83 +811,85 @@ export function TakeoverPage({
             </>
           }
         >
-          <Row
-            title="限流时临时换号重试"
-            desc="关闭后限流响应原样透传，不冷却、不换号。"
-            ctrl={
-              <Toggle
-                checked={mdlFailover ?? rlFailover}
-                onChange={setMdlFailover}
-                title="会话内不换号 = 调用凭证稳定"
-              />
-            }
-          />
-          <p className="note">
-            <IconInfo size={14} />
-            <span>免费模型默认生效且不可取消；付费模型需勾选。</span>
-          </p>
-          {fm && <p className="modal-meta">来源：{SOURCE_LABEL[fm.source]}</p>}
-          {fm == null ? (
-            <p className="empty">加载中…</p>
-          ) : fm.models.length === 0 ? (
-            <p className="empty">
-              暂未获取到模型，请确认 Qoder 已登录并运行过对话，再点「刷新」。
+          <div className="modal-fill">
+            <Row
+              title="限流时临时换号重试"
+              desc="关闭后限流响应原样透传，不冷却、不换号。"
+              ctrl={
+                <Toggle
+                  checked={mdlFailover ?? rlFailover}
+                  onChange={setMdlFailover}
+                  title="会话内不换号 = 调用凭证稳定"
+                />
+              }
+            />
+            <p className="note">
+              <IconInfo size={14} />
+              <span>免费模型默认生效且不可取消；付费模型需勾选。</span>
             </p>
-          ) : (
-            <ul className="pick-list">
-              {fm.models.map((m) => {
-                const checked = m.free || (mdlDraft ?? rlModels).includes(m.id);
-                return (
-                  <li
-                    key={m.id}
-                    className={
-                      "pick-item" +
-                      (m.free ? " locked" : checked ? " picked" : "")
-                    }
-                    title={
-                      m.free
-                        ? "0 积分免费模型，恒享受限流切换，不可取消"
-                        : "勾选后该付费模型也享受 429 无感换号"
-                    }
-                    onClick={() => {
-                      if (!m.free) toggleDraftModel(m.id);
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={m.free}
-                      onChange={() => {
+            {fm && <p className="modal-meta">来源：{SOURCE_LABEL[fm.source]}</p>}
+            {fm == null ? (
+              <p className="empty">加载中…</p>
+            ) : fm.models.length === 0 ? (
+              <p className="empty">
+                暂未获取到模型，请确认 Qoder 已登录并运行过对话，再点「刷新」。
+              </p>
+            ) : (
+              <ul className="pick-list">
+                {fm.models.map((m) => {
+                  const checked = m.free || (mdlDraft ?? rlModels).includes(m.id);
+                  return (
+                    <li
+                      key={m.id}
+                      className={
+                        "pick-item" +
+                        (m.free ? " locked" : checked ? " picked" : "")
+                      }
+                      title={
+                        m.free
+                          ? "0 积分免费模型，恒享受限流切换，不可取消"
+                          : "勾选后该付费模型也享受 429 无感换号"
+                      }
+                      onClick={() => {
                         if (!m.free) toggleDraftModel(m.id);
                       }}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                    <span className="pick-main">
-                      {/* 有显示名就把名字放主行、id 退到副行；没有名字时只显示 id
-                          —— 缺名字就是缺，不编一个出来（后端取不到 name 会留空串） */}
-                      <span className={"pick-name" + (m.name ? "" : " mono")}>
-                        {m.name || m.id}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={m.free}
+                        onChange={() => {
+                          if (!m.free) toggleDraftModel(m.id);
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <span className="pick-main">
+                        {/* 有显示名就把名字放主行、id 退到副行；没有名字时只显示 id
+                            —— 缺名字就是缺，不编一个出来（后端取不到 name 会留空串） */}
+                        <span className={"pick-name" + (m.name ? "" : " mono")}>
+                          {m.name || m.id}
+                        </span>
+                        {m.name && <div className="pick-sub mono">{m.id}</div>}
                       </span>
-                      {m.name && <div className="pick-sub mono">{m.id}</div>}
-                    </span>
-                    <span className="pick-tail">
-                      {/* 倍率拿不到时说「倍率未知」，不说「付费」—— 本机痕迹那层给不出倍率，
-                          谎称付费会让人以为这些模型是收费的 */}
-                      <span
-                        className={"pick-state " + (m.free ? "ok" : "warn")}
-                      >
-                        {/* 活动价要把原价划出来：光看 x0.2 分不清常价还是错峰折扣 */}
-                        {m.original_multiplier && (
-                          <s className="pick-was">{m.original_multiplier}</s>
-                        )}
-                        {m.free ? "免费 · 默认" : m.multiplier || "倍率未知"}
+                      <span className="pick-tail">
+                        {/* 倍率拿不到时说「倍率未知」，不说「付费」—— 本机痕迹那层给不出倍率，
+                            谎称付费会让人以为这些模型是收费的 */}
+                        <span
+                          className={"pick-state " + (m.free ? "ok" : "warn")}
+                        >
+                          {/* 活动价要把原价划出来：光看 x0.2 分不清常价还是错峰折扣 */}
+                          {m.original_multiplier && (
+                            <s className="pick-was">{m.original_multiplier}</s>
+                          )}
+                          {m.free ? "免费 · 默认" : m.multiplier || "倍率未知"}
+                        </span>
                       </span>
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         </Dialog>
       )}
     </section>

@@ -175,7 +175,7 @@ export function BriefingPage({
 
   return (
     <section className="panel-page">
-      <div className="card logs-toolbar">
+      <div className="card bp-toolbar">
         <div className="bp-toggle" title="开启后每小时结算一条">
 
           <Toggle

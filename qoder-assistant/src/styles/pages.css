@@ -1165,7 +1165,15 @@ input.port-input:disabled {
   font-weight: 600;
 }
 
-/* 简报页的开关：`.logs-toolbar` 是 flex，控件间距交给它的 gap，
+/* 简报页工具条：一行放下开关、天数、当前剩余与清空 */
+.bp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 11px 18px;
+  min-height: 54px;
+}
+/* 简报页的开关：间距交给工具条的 gap，
    这里只负责「开关 + 状态文字」自己内部对齐 */
 .bp-toggle {
   display: flex;
