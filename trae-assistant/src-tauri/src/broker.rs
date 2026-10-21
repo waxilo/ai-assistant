@@ -61,6 +61,21 @@ pub const BASE: &str = "https://cred-broker.sloan.dpdns.org";
 /// 两分钟的窗口相对它完全可以忽略。
 pub const SYNC_TTL_MS: i64 = 120_000;
 
+/// 本机的「整池同步单飞闸」。
+///
+/// 为什么光有 [`SYNC_TTL_MS`] 不够：那个节流的形状是「读一次 `last_sync_ms` → 比一下 →
+/// 放行」，而判定与真正发出 `POST /lease` 之间隔着好几个 await。同一窗口内并发进来的
+/// 调用会**全部通过判定**（读到的都是同一个旧时间戳），于是同一台机器同时打好几个
+/// lease，再各自 `PUT` 整池 —— 服务端只认一个 owner，其余白打一趟，最坏还会互相踩 CAS。
+/// 而它的调用点全在热路径上：反代每个请求、拉模型清单、签到、刷新。
+///
+/// 语义按调用方分开：
+/// - 自动路径（`force = false`）：**抢不到就跳过**。它本来就是「顺手问一下」，
+///   排队只会把反代请求一起拖住；
+/// - 手动路径（`force = true`）：**排队等**。用户点了按钮就是要一轮确定的结果，
+///   回一句「正在同步，本次跳过」等于骗人。
+static SYNC_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const BROKER_FILE: &str = "broker.json";
 
 /// 出站请求默认超时（本模块没有 `http.rs`，常量内联在这一处）。
@@ -565,12 +580,31 @@ fn classify(status: u16, body: &str) -> Option<FailKind> {
     Some(FailKind::Denied)
 }
 
+/// 管家的出站客户端：**全进程复用一份**，并且强制直连。
+///
+/// - 复用：原来是每次 [`request`] 都新建一个，而调用点在热路径上（反代每个请求都可能
+///   顺带同步一轮）。每次新建 = 新连接池 + 重新 TLS 握手 + 重跑一遍代理/DNS 判定，
+///   而 `reqwest::Client` 内部就是 Arc，clone 出去比新建便宜得多。
+/// - 直连：`reqwest` 默认跟随 `HTTP_PROXY` / `HTTPS_PROXY`，于是「管家到底走哪条路」
+///   取决于进程启动时继承了什么环境变量 —— 同一个版本在两台机器上行为不同，而这种差别
+///   在日志里看不出来。管家是自托管 + cloudflared 的公网入口，本来就不需要中间还有一棒。
+///
+///   ⚠️ **它治的不是 `530 / error code 1033`**：2026-10-21 实测同一个域名直连与走代理
+///   返回完全相同的 530（`error code: 1033`），那是 cloudflared 隧道/源站那侧不可达。
+///   这里只是把「出口」这个变量从排查里去掉，别指望改它能修好 530。
+///   代价也要说清：如果哪天必须经代理访问管家，得改这一行 —— 环境变量在这里不生效。
 fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .user_agent(UA)
-        .build()
-        .map_err(|e| format!("初始化 HTTP 客户端失败：{e}"))
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .user_agent(UA)
+                .no_proxy()
+                .build()
+                .map_err(|e| format!("初始化 HTTP 客户端失败：{e}"))
+        })
+        .clone()
 }
 
 /// 这台机器的标识。**只进服务端的审计日志，不参与任何判断** ——
@@ -887,6 +921,29 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             message: "距上次同步不到两分钟，这次跳过".to_string(),
         });
     }
+
+    // 单飞闸放在节流**之后**：被节流挡掉的那次根本不该去抢锁。
+    let _gate = if force {
+        SYNC_GATE.lock().await
+    } else {
+        match SYNC_GATE.try_lock() {
+            Ok(g) => g,
+            // 另一轮正在跑：自动路径直接跳过（返回值仍是「正常跳过」，不是错误 ——
+            // 它挂在签到 / 刷新的主流程上，不该因为「别人在同步」把主流程染红）。
+            Err(_) => {
+                return Ok(SyncReport {
+                    changed: false,
+                    deferred: true,
+                    merged: 0,
+                    refreshed: 0,
+                    failed: 0,
+                    blocked: 0,
+                    version: rt.version,
+                    message: "另一轮整池同步正在进行，本次跳过".to_string(),
+                });
+            }
+        }
+    };
 
     note_start();
     let lease_value = match request(
@@ -1455,10 +1512,13 @@ mod tests {
     /// 两边各写一套类型，字段名写错时单测全绿、跑起来永远 deferred。
     /// token 用的是假的，所以不会碰到任何真实凭证，也不会去打官方续签接口。
     ///
-    /// 运行（需要走代理）：
+    /// 运行：
     /// ```text
-    /// HTTPS_PROXY=http://127.0.0.1:7897 cargo test --lib -- --ignored broker::tests::smoke --nocapture
+    /// cargo test --lib -- --ignored broker::tests::smoke --nocapture
     /// ```
+    /// **不需要再设 `HTTPS_PROXY`**：`client()` 已经是 `no_proxy()`（理由见那里）。
+    /// 若某天直连真的不通，先看返回体 —— `530 / error code 1033` 是 cloudflared 隧道
+    /// 或源站那一侧的问题，换代理也救不回来。
     #[tokio::test]
     #[ignore]
     async fn smoke_real_broker_roundtrip() {
@@ -1648,5 +1708,22 @@ mod tests {
                 a.name
             );
         }
+    }
+
+    /// 单飞闸的两种取法必须保持这两个语义，否则 [`sync`] 的两个分支都会退化：
+    /// 自动路径拿走 `lock().await` 会把反代请求排队等在前一轮同步后面；
+    /// 手动路径退回 `try_lock` 则会在「刚好有人在同步」时回一句「本次跳过」。
+    #[tokio::test]
+    async fn sync_gate_is_single_flight_but_manual_can_queue() {
+        let held = SYNC_GATE.lock().await;
+        assert!(
+            SYNC_GATE.try_lock().is_err(),
+            "闸被占住时 try_lock 必须失败（自动路径靠这个跳过）"
+        );
+        drop(held);
+        assert!(
+            SYNC_GATE.try_lock().is_ok(),
+            "闸放掉后必须能立刻拿到（否则并发窗口就永久卡住了）"
+        );
     }
 }
