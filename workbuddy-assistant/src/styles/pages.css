@@ -346,6 +346,20 @@
   visibility: visible;
   transform: translate(-50%, 0);
 }
+/* 行内图标贴着正文左缘时，居中的 320px 悬浮卡会越出弹窗，改为向右展开 */
+.rule-hint-pop.pop-left {
+  left: 0;
+  transform: translate(0, 4px);
+}
+.rule-hint:hover .rule-hint-pop.pop-left,
+.rule-hint:focus-visible .rule-hint-pop.pop-left {
+  transform: translate(0, 0);
+}
+.failover-row-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
 .hero-settings {
   display: flex;
   align-items: center;

@@ -19,7 +19,7 @@ export function Row({
   /** 展开区内部的行：不显示分隔线 */
   bare,
 }: {
-  title: string;
+  title: ReactNode;
   desc?: string;
   ctrl: ReactNode;
   sub?: boolean;

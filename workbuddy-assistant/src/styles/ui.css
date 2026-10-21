@@ -194,6 +194,16 @@
 /* ── 数据表格 ─────────────────────────────────────────────── */
 .table-wrap {
   overflow: hidden auto;
+  /* 表头和它的底边线只画到表格宽度，右侧 12px 滚动条槽会空出一条；
+     用同色横带补到容器右缘：46px 与 thead 高度一致，最后 1px 接上底边线。
+     滚动条轨道从带子下方开始（见 base.css）。 */
+  background-image: linear-gradient(
+    to bottom,
+    var(--panel-2) 0 45px,
+    var(--border) 45px 46px
+  );
+  background-size: 100% 46px;
+  background-repeat: no-repeat;
 }
 /* 资源包弹窗：固定内容槽，行数变化只让表格内部滚动 */
 .pkg-list-body {
@@ -588,6 +598,35 @@ body.modal-open .content {
 }
 .modal-body > .modal-meta {
   margin-top: 10px;
+}
+
+/* 定高弹窗的正文槽：铺满正文高度，只让内部列表滚动 ——
+   否则正文和列表会各出一条滚动条 */
+.modal-fill {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  height: 100%;
+  min-height: 0;
+}
+.modal-fill > * {
+  flex: 0 0 auto;
+}
+.modal-fill > .pick-list,
+.modal-fill > .billing-list,
+.modal-fill > .empty {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.modal-fill > .pick-list,
+.modal-fill > .billing-list {
+  max-height: none;
+}
+.modal-fill > .empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
 }
 
 .modal-foot {

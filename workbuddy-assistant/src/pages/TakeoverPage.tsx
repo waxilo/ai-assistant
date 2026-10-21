@@ -15,7 +15,6 @@ import {
   IconAlertTriangle,
   IconBolt,
   IconChevron,
-  IconInfo,
   IconRefresh,
   IconShield,
   IconTrash,
@@ -609,37 +608,39 @@ export function TakeoverPage({
             </>
           }
         >
-          <input
-            type="text"
-            placeholder="按用户名或手机号过滤…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          {accounts.length === 0 ? (
-            <p className="empty">还没有账号。先到「账号签到」页登录或导入账号。</p>
-          ) : filteredAccounts.length === 0 ? (
-            <p className="empty">没有匹配「{query}」的账号。</p>
-          ) : (
-            <div className="billing-list">
-              {filteredAccounts.map((a) => {
-                const picked = draftEffective.includes(a.id);
-                return (
-                  <label
-                    key={a.id}
-                    className={"billing-row" + (picked ? " picked" : "")}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={picked}
-                      onChange={() => toggleDraft(a.id)}
-                    />
-                    <AccountCell name={a.name} phone={a.phone} />
-                    <span className="billing-meta">{creditMeta(a)}</span>
-                  </label>
-                );
-              })}
-            </div>
-          )}
+          <div className="modal-fill">
+            <input
+              type="text"
+              placeholder="按用户名或手机号过滤…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            {accounts.length === 0 ? (
+              <p className="empty">还没有账号。先到「账号签到」页登录或导入账号。</p>
+            ) : filteredAccounts.length === 0 ? (
+              <p className="empty">没有匹配「{query}」的账号。</p>
+            ) : (
+              <div className="billing-list">
+                {filteredAccounts.map((a) => {
+                  const picked = draftEffective.includes(a.id);
+                  return (
+                    <label
+                      key={a.id}
+                      className={"billing-row" + (picked ? " picked" : "")}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={picked}
+                        onChange={() => toggleDraft(a.id)}
+                      />
+                      <AccountCell name={a.name} phone={a.phone} />
+                      <span className="billing-meta">{creditMeta(a)}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </Dialog>
       )}
 
@@ -676,82 +677,97 @@ export function TakeoverPage({
             </>
           }
         >
-          <p className="note">
-            <IconInfo size={14} />
-            <span>
-              触发限流（429）时自动换备用账号重发同一请求，对话无感；免费模型默认生效。
-            </span>
-          </p>
-          <Row
-            title="限流时在同一会话内换号"
-            desc="关掉后 429 原样透传，不冷却、不换号。"
-            ctrl={
-              <Switch
-                checked={mdlFailover ?? rlFailover}
-                onChange={setMdlFailover}
-                title="会话内不换号 = 调用凭证稳定"
-              />
-            }
-          />
-          {fm && (
-            <p className="modal-meta">
-              {fm.source === "fetched"
-                ? "来源：网关"
-                : fm.source === "cache"
-                ? "来源：缓存"
-                : "来源：内置列表"}
-            </p>
-          )}
-          {fm == null ? (
-            <p className="empty">加载中…</p>
-          ) : fm.models.length === 0 ? (
-            <p className="empty">暂未发现模型。</p>
-          ) : (
-            <ul className="pick-list">
-              {fm.models.map((m) => {
-                const checked = m.free || (mdlDraft ?? rlModels).includes(m.id);
-                return (
-                  <li
-                    key={m.id}
-                    className={
-                      "pick-item" +
-                      (m.free ? " locked" : checked ? " picked" : "")
-                    }
-                    title={
-                      m.free
-                        ? "0 积分免费模型，恒享受限流切换，不可取消"
-                        : "勾选后同样自动换号"
-                    }
-                    onClick={() => {
-                      if (!m.free) toggleDraftModel(m.id);
-                    }}
+          <div className="modal-fill">
+            <Row
+              title={
+                <span className="failover-row-title">
+                  限流时在同一会话内换号
+                  <span
+                    className="rule-hint"
+                    role="note"
+                    tabIndex={0}
+                    aria-label="触发限流（429）时自动换备用账号重发同一请求，对话无感；免费模型默认生效。关掉后 429 原样透传，不冷却、不换号。"
                   >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={m.free}
-                      onChange={() => {
+                    <IconAlertCircle size={15} />
+                    <span className="rule-hint-pop pop-left" role="tooltip">
+                      <strong>限流切换</strong>
+                      <span>
+                        触发限流（429）时自动换备用账号重发同一请求，对话无感；免费模型默认生效。
+                      </span>
+                      <span>关掉后 429 原样透传，不冷却、不换号。</span>
+                    </span>
+                  </span>
+                </span>
+              }
+              ctrl={
+                <Switch
+                  checked={mdlFailover ?? rlFailover}
+                  onChange={setMdlFailover}
+                  title="会话内不换号 = 调用凭证稳定"
+                />
+              }
+            />
+            {fm && (
+              <p className="modal-meta">
+                {fm.source === "fetched"
+                  ? "来源：网关"
+                  : fm.source === "cache"
+                  ? "来源：缓存"
+                  : "来源：内置列表"}
+              </p>
+            )}
+            {fm == null ? (
+              <p className="empty">加载中…</p>
+            ) : fm.models.length === 0 ? (
+              <p className="empty">暂未发现模型。</p>
+            ) : (
+              <ul className="pick-list">
+                {fm.models.map((m) => {
+                  const checked =
+                    m.free || (mdlDraft ?? rlModels).includes(m.id);
+                  return (
+                    <li
+                      key={m.id}
+                      className={
+                        "pick-item" +
+                        (m.free ? " locked" : checked ? " picked" : "")
+                      }
+                      title={
+                        m.free
+                          ? "0 积分免费模型，恒享受限流切换，不可取消"
+                          : "勾选后同样自动换号"
+                      }
+                      onClick={() => {
                         if (!m.free) toggleDraftModel(m.id);
                       }}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                    <span className="pick-main">
-                      <span className="pick-name mono">{m.id}</span>
-                    </span>
-                    <span className="pick-tail">
-                      {/* 免费模型：一个胶囊说清「免费 + 默认生效」——
-                          旧实现是「免费」胶囊 + 「默认」两个元素，说的是同一件事 */}
-                      <span
-                        className={"pick-state " + (m.free ? "ok" : "warn")}
-                      >
-                        {m.free ? "免费 · 默认" : m.multiplier || "付费"}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={m.free}
+                        onChange={() => {
+                          if (!m.free) toggleDraftModel(m.id);
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <span className="pick-main">
+                        <span className="pick-name mono">{m.id}</span>
                       </span>
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+                      <span className="pick-tail">
+                        {/* 免费模型：一个胶囊说清「免费 + 默认生效」——
+                            旧实现是「免费」胶囊 + 「默认」两个元素，说的是同一件事 */}
+                        <span
+                          className={"pick-state " + (m.free ? "ok" : "warn")}
+                        >
+                          {m.free ? "免费 · 默认" : m.multiplier || "付费"}
+                        </span>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         </Dialog>
       )}
     </section>
