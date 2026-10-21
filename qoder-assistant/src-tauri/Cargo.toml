@@ -1,6 +1,6 @@
 [package]
 name = "qoder-assistant"
-version = "0.1.39"
+version = "0.1.40"
 description = "Qoder 多账号签到桌面助手"
 authors = ["waxilo"]
 edition = "2021"
@@ -28,7 +28,9 @@ tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `sync`：`broker::SYNC_GATE` 的单飞闸用 `tokio::sync::Mutex`（跨 await 挂锁，
+# std 的 MutexGuard 是 !Send，不能用在这里）。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 regex = "1"
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
