@@ -2,6 +2,8 @@ mod accel;
 mod accounts;
 mod alerts;
 mod auth_file;
+// 静默自动更新：调度线程到点后驱动（见 autoupdate.rs）
+mod autoupdate;
 mod briefing;
 mod broker;
 // 智能接管的本地 TLS 材料（自签 CA + 叶证书）：端点被客户端强制成 https origin，

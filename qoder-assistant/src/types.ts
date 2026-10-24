@@ -126,6 +126,16 @@ export interface Settings {
    * 在设置页与两条签到通知开关并排展示 —— 「哪些东西会推送」集中一处才好核对。
    */
   notify_on_briefing: boolean;
+  /**
+   * 静默自动更新：每天到 `auto_update_time` 后自动检查、下载并安装，装完应用自行重启。
+   * **默认开启**；关掉只停掉后台这条路径，设置页的「检查更新」按钮照常可用。
+   */
+  auto_update_enabled: boolean;
+  /**
+   * 静默更新的每日时刻 `HH:MM`（默认 `05:00`）。
+   * 语义是「**不早于**该时刻、每天最多一次」：夜里关机错过之后，当天首次轮询补做。
+   */
+  auto_update_time: string;
 }
 
 /**

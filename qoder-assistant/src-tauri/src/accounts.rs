@@ -298,6 +298,19 @@ pub struct Settings {
     /// 与上面几项 `notify_*` 一样是**整机行为**。
     #[serde(default = "default_true", alias = "notify_on_report")]
     pub notify_on_briefing: bool,
+    /// 静默自动更新：每天到设定时刻后自动检查、下载并安装新版本，装完应用自行重启。
+    ///
+    /// **默认开启**（[`default_true`]）：这是个「装完就没人管」的常驻工具，更新是纯收益
+    /// 动作。关掉只停掉后台这条路径，设置页的「检查更新」按钮与它无关，照常可用。
+    #[serde(default = "default_true")]
+    pub auto_update_enabled: bool,
+    /// 静默更新的每日时刻，24 小时制 `HH:MM`。
+    ///
+    /// 默认 05:00 —— 这个点机器通常空闲，自动重启不会打断正在用的接管与签到。
+    /// 语义是「**不早于**该时刻、每天最多一次」：夜里关机/休眠错过之后，
+    /// 当天首次轮询就补做（否则「默认凌晨 5 点」对从不留夜机的用户等于永不生效）。
+    #[serde(default = "default_auto_update_time")]
+    pub auto_update_time: String,
 }
 
 impl Default for Settings {
@@ -324,6 +337,9 @@ impl Default for Settings {
             // 积分简报默认关闭：它要按小时打接口、改写台账，用户主动开启才跑
             briefing_enabled: false,
             notify_on_briefing: true,
+            // 静默更新默认开：常驻工具的更新不该等人想起来点按钮
+            auto_update_enabled: true,
+            auto_update_time: default_auto_update_time(),
         }
     }
 }
@@ -380,6 +396,14 @@ const LEGACY_SCHEDULE_TIME: &str = "09:07";
 
 fn default_true() -> bool {
     true
+}
+
+/// 静默更新的默认时刻：凌晨 5 点。
+///
+/// 挑深夜不是为了「隐藏」，而是因为这一刻**最不容易撞上正在使用的界面/接管**：
+/// 自动更新装完会重启整个应用，落在白天就是一次无预警的中断。
+fn default_auto_update_time() -> String {
+    "05:00".to_string()
 }
 
 /// 反代默认端口：**8789**。

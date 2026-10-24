@@ -201,3 +201,48 @@ function errMsg(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
 }
+
+/**
+ * 后端静默更新（`src-tauri/src/autoupdate.rs`）推来的阶段事件。
+ *
+ * 与 [`UpdateProgress`] 是两套东西：那是**手动**更新时前端根据 `update_accelerated`
+ * 的回调自己算出来的进度，这是后端在设定时刻自己跑时按阶段播报的结果。
+ * 两者最终都落到同一个 `updateStatus` —— 侧边栏那条进度条不该关心「谁触发的」。
+ */
+export type AutoUpdateEvent =
+  | { stage: "available"; version: string }
+  | { stage: "downloading"; downloaded: number; total: number }
+  | { stage: "installing"; version: string }
+  | { stage: "failed"; message: string };
+
+/**
+ * 静默更新事件 → 可直接渲染的 [`UpdateProgress`]。
+ *
+ * 后端**不发**「已是最新」：每天一条「无更新」只会把日志页和界面都刷成噪音，
+ * 所以这里也没有 `no-update` 分支。
+ */
+export function autoUpdateProgress(e: AutoUpdateEvent): UpdateProgress {
+  switch (e.stage) {
+    case "available":
+      return {
+        status: "available",
+        message: `发现新版本 ${e.version}（自动更新）`,
+        version: e.version,
+      };
+    case "downloading":
+      return {
+        status: "downloading",
+        message: "正在下载更新…",
+        downloaded: e.downloaded,
+        total: e.total,
+      };
+    case "installing":
+      return {
+        status: "installing",
+        message: "正在安装更新，应用即将自动重启…",
+        version: e.version,
+      };
+    case "failed":
+      return { status: "error", message: "自动更新失败：" + e.message };
+  }
+}

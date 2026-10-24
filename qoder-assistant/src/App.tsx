@@ -27,10 +27,12 @@ import {
 import { accountIdent, accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
 import { bindCredits, seedCredits } from "./credits";
 import {
+  autoUpdateProgress,
   checkAndInstall,
   downloadProgress,
   nextUpdateNotice,
   probeUpdate,
+  type AutoUpdateEvent,
   type UpdateNotice,
   type UpdateProgress,
 } from "./updater";
@@ -260,6 +262,32 @@ export default function App() {
     });
     setUpdateBusy(false);
   }, [updateBusy]);
+
+  /**
+   * 后端静默更新（设定时刻自动跑，见 src-tauri/src/autoupdate.rs）。
+   *
+   * 它把每个阶段播报过来，这里只把结论并进同一条 `updateStatus`：
+   * 深夜没人在看时，这一条是给「第二天打开窗口」的人留的解释 —— 为什么应用昨晚
+   * 自己重启过一次。**不弹 toast、不弹确认框**，静默就是字面意思。
+   */
+  useEffect(() => {
+    const un = listen<AutoUpdateEvent>("auto-update", (e) => {
+      const p = e.payload;
+      setUpdateStatus(autoUpdateProgress(p));
+      if (p.stage === "available") {
+        // 整条链路已经开跑：占住「立即更新」按钮，别让用户叠一次安装
+        setUpdateBusy(true);
+        setUpdateNotice({ version: p.version });
+      } else if (p.stage === "failed") {
+        // 失败必须放开按钮，否则界面卡在「检查中…」上再也点不动
+        setUpdateBusy(false);
+      }
+      // installing 之后 Windows 上进程直接退出（安装器接管），不必复位
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
 
   // 启动时若开启“自动签到”，则对全部账号执行一次
   useEffect(() => {
