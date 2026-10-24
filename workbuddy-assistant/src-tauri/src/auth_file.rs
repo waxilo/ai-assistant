@@ -91,17 +91,18 @@ fn auth_dir(root: PathBuf) -> PathBuf {
 // JSON 取值（外部数据，全部按宽松方式读取）
 // ---------------------------------------------------------------------------
 
+/// 取字符串。
+///
+/// 新版客户端把 `accessToken` / `refreshToken` / `nickname` / `phoneNumber` 换成了
+/// `{$wbEncrypted:1, envelope:"…"}` 密文壳子，所以这里不能只认 `as_str()`——
+/// 统一交给 [`crate::atrest::reveal`]：明文原样返回，壳子就地解开。
+/// 解不开（拿不到密钥 / 结构不认识）仍然返回 `None`，由调用方决定怎么报。
 fn str_at(root: &Value, path: &[&str]) -> Option<String> {
     let mut cur = root;
     for key in path {
         cur = cur.get(*key)?;
     }
-    let s = cur.as_str()?.trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
-    }
+    crate::atrest::reveal(cur)
 }
 
 fn bool_at(root: &Value, path: &[&str]) -> bool {
@@ -125,7 +126,9 @@ fn num_at(root: &Value, path: &[&str]) -> Option<i64> {
 }
 
 /// 把 auth.domain（如 `www.workbuddy.cn`）规整成 origin。
-/// 国际版 `*.ai` 已不再支持，返回 None（调用方退回国内默认域）。
+///
+/// 只支持 WorkBuddy：历史文件里按 CodeBuddy 国内域登录的会归一到 `workbuddy.cn`
+/// （两域同一套后端）；国际版 `*.ai` 返回 None，调用方退回国内默认域。
 fn origin_from_domain(domain: &str) -> Option<String> {
     let d = domain.trim().trim_end_matches('/');
     if d.is_empty() {
@@ -135,11 +138,12 @@ fn origin_from_domain(domain: &str) -> Option<String> {
     if lower.contains("workbuddy.ai") || lower.contains("codebuddy.ai") {
         return None;
     }
-    if d.starts_with("http://") || d.starts_with("https://") {
-        Some(d.to_string())
+    let origin = if d.starts_with("http://") || d.starts_with("https://") {
+        d.to_string()
     } else {
-        Some(format!("https://{d}"))
-    }
+        format!("https://{d}")
+    };
+    Some(crate::oauth::to_workbuddy_host(&origin))
 }
 
 /// 先按 camelCase 找，再退回 snake_case（官方字段两种风格都出现过）
@@ -157,18 +161,23 @@ fn num_pick(root: &Value, dir: &str, keys: &[&str]) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 /// 国际版识别：命中任意一条即整条丢弃 —— 本助手只保留国内版一套部署。
-/// 三个互不依赖的信号：官方 `-ai` 文件名、auth.domain 非 `.cn` 域、token iss 非 CN 网关。
+/// 三个互不依赖的信号：官方 `-ai` 文件名、auth.domain 非国内域、token iss 非国内网关。
+///
+/// 国内域见 [`crate::oauth::is_domestic_host`]：`.cn` 与 `copilot.tencent.com` 都算
+/// （后者是桌面端自己的网关）。**这一步判错会静默丢账号**，所以两个分支共用同一份判定。
 fn is_international(name: &str, json: &Value, token: &str) -> bool {
     if name.starts_with("workbuddy-desktop-ai") {
         return true;
     }
     if let Some(d) = pick(json, "auth", &["domain", "issuer"]) {
-        if !d.to_ascii_lowercase().contains(".cn") {
+        if !crate::oauth::is_domestic_host(&d) {
             return true;
         }
     }
     if let Some(iss) = checkin::token_issuer_origin(token) {
-        if !(iss.contains("workbuddy.cn") || iss.contains("codebuddy.cn")) {
+        // 只保留国内部署签发的票。历史账号可能由 CodeBuddy 国内域签发 ——
+        // 那仍是国内版、同一套后端，不算国际版；它的 host 归一会落到 workbuddy.cn。
+        if !crate::oauth::is_domestic_host(&iss) {
             return true;
         }
     }
@@ -214,20 +223,68 @@ fn parse_json(name: &str, path: &Path, json: &Value) -> Option<LocalAccount> {
     })
 }
 
-fn parse_file(path: &Path) -> Option<LocalAccount> {
-    let name = path.file_name()?.to_str()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&text).ok()?;
-    parse_json(name, path, &json)
+/// 单个登录文件的解析结果。
+///
+/// 之所以要区分 `Locked` 和 `Skip`：新版客户端把凭证字段加密后，**「解不开」与
+/// 「本来就没有账号」在界面上长得一模一样**（都是「本机未发现账号」），而这两件事
+/// 的处理方式完全不同——前者要提示用户去启动一次客户端或改用无感登录，后者只能
+/// 让用户自己去登录。所以这个区别必须在类型上保留下来，不能在这里悄悄吞掉。
+enum Parsed {
+    Account(LocalAccount),
+    /// 文件里确实有凭证字段，但它是 `$wbEncrypted` 壳子且这次解不开。
+    Locked,
+    /// 不是登录文件 / 国际版 / 字段不全，本来就不该导入。
+    Skip,
 }
 
-/// 扫描本机 WorkBuddy 登录文件，返回可直接导入的账号列表。
+fn parse_file(path: &Path) -> Parsed {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Parsed::Skip;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Parsed::Skip;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&text) else {
+        return Parsed::Skip;
+    };
+    match parse_json(name, path, &json) {
+        Some(acc) => Parsed::Account(acc),
+        None if auth_field_is_envelope(&json) => Parsed::Locked,
+        None => Parsed::Skip,
+    }
+}
+
+/// `auth.accessToken` 是不是一个没被解开的加密壳子。
+fn auth_field_is_envelope(json: &Value) -> bool {
+    json.pointer("/auth")
+        .and_then(|a| a.get("accessToken"))
+        .map(|v| v.get("$wbEncrypted").and_then(Value::as_u64) == Some(1))
+        .unwrap_or(false)
+}
+
+/// 一次扫描的完整结果。
+pub struct LocalScan {
+    /// 可以直接导入的账号（已去重、按可用性排序）。
+    pub accounts: Vec<LocalAccount>,
+    /// 「有凭证但解不开」的文件名 —— 非空即为**需要告诉用户**的状态。
+    pub locked: Vec<String>,
+    /// 当前登录文件（`workbuddy-desktop.info`）在盘上，但这次没解析出账号。
+    ///
+    /// 这时 `accounts` 里的东西**全部来自历史快照**，而快照里的票早被客户端顶掉了。
+    /// 上层必须据此报错：让旧快照悄悄顶上去，用户看到的是「导入成功」，实际导进来的
+    /// 是一张死票，签到必定 401 —— 比直接说「取不到当前登录信息」难查得多。
+    pub stale_only: bool,
+}
+
+/// 扫描本机 WorkBuddy 登录文件。
 ///
-/// 国际版账号（`-ai` 文件 / `*.ai` 域 / 非 CN 网关 iss）整条丢弃，只回国内版；
+/// 国际版账号（`-ai` 文件 / `*.ai` 域 / 非国内网关 iss）整条丢弃，只回国内版；
 /// 同一账号的多份快照（官方落盘的带时间戳备份）按 uid 去重，保留「当前登录」优先的那份；
 /// 未过期的排在前面。
-pub fn discover_local_accounts() -> Vec<LocalAccount> {
+pub fn scan_local_accounts() -> LocalScan {
     let mut found: Vec<LocalAccount> = Vec::new();
+    let mut locked: Vec<String> = Vec::new();
+    let mut on_disk: Vec<String> = Vec::new();
     for dir in auth_dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -242,13 +299,47 @@ pub fn discover_local_accounts() -> Vec<LocalAccount> {
             if !name.ends_with(".info") || name.ends_with(".tmp") {
                 continue;
             }
-            if let Some(acc) = parse_file(&path) {
-                found.push(acc);
+            on_disk.push(name.to_string());
+            match parse_file(&path) {
+                Parsed::Account(acc) => found.push(acc),
+                Parsed::Locked => locked.push(name.to_string()),
+                Parsed::Skip => {}
             }
         }
     }
 
-    found.sort_by(|a, b| b.is_current.cmp(&a.is_current));
+    let is_canonical = |n: &str| CANONICAL_FILES.contains(&n);
+    dedup_and_sort(&mut found);
+    // 判定放在去重之后：万一 canonical 被去重挤掉（它才是唯一可信的那份），
+    // 结果就只剩快照了，这时必须报错。
+    let stale_only = on_disk.iter().any(|n| is_canonical(n))
+        && !found
+            .iter()
+            .filter_map(|a| Path::new(&a.file).file_name().and_then(|n| n.to_str()))
+            .any(is_canonical);
+
+    LocalScan {
+        accounts: found,
+        locked,
+        stale_only,
+    }
+}
+
+/// 只要账号列表（调用方不关心「为什么少了一个」时用这个）。
+pub fn discover_local_accounts() -> Vec<LocalAccount> {
+    scan_local_accounts().accounts
+}
+
+/// 去重 + 排序。
+///
+/// **优先级必须是「canonical 文件 > lastLogin 标记 > 目录顺序」**：官方落盘的
+/// 历史快照（`workbuddy-desktop.2026-09-11T….info`）里也写着 `lastLogin: true`，
+/// 如果只按 `is_current` 排、再按目录顺序取第一条，读到哪份快照就导哪份 ——
+/// 结果是「导入成功，票却是两个月前的死票」。目录顺序在 NTFS 上完全不可控。
+fn dedup_and_sort(found: &mut Vec<LocalAccount>) {
+    found.sort_by(|a, b| {
+        canonical_rank(a).cmp(&canonical_rank(b)).reverse().then(b.is_current.cmp(&a.is_current))
+    });
     let mut seen: HashSet<String> = HashSet::new();
     found.retain(|a| {
         let key = a.uid.clone().unwrap_or_else(|| a.token.clone());
@@ -260,7 +351,20 @@ pub fn discover_local_accounts() -> Vec<LocalAccount> {
         let live = |x: &LocalAccount| x.expires_at.map(|e| e > now).unwrap_or(true);
         live(b).cmp(&live(a)).then(b.expires_at.cmp(&a.expires_at))
     });
-    found
+}
+
+/// 文件是不是「当前登录」那份（`workbuddy-desktop.info`）。
+fn is_canonical_file(field: &str) -> bool {
+    Path::new(field)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| CANONICAL_FILES.contains(&n))
+        .unwrap_or(false)
+}
+
+/// 排序用：canonical 记 1，历史快照记 0。
+fn canonical_rank(a: &LocalAccount) -> u8 {
+    u8::from(is_canonical_file(&a.file))
 }
 
 #[cfg(test)]
@@ -272,9 +376,9 @@ mod tests {
     fn sample(access_token: &str) -> Value {
         json!({
             "account": {
-                "uid": "bf8a3f24-6415",
-                "nickname": "waxiloao",
-                "phoneNumber": "19098779775",
+                "uid": "aaaaaaaa-0000",
+                "nickname": "demo-user",
+                "phoneNumber": "13800000000",
                 "lastLogin": true
             },
             "auth": {
@@ -296,9 +400,9 @@ mod tests {
         )
         .expect("应能解析");
 
-        assert_eq!(acc.uid.as_deref(), Some("bf8a3f24-6415"));
-        assert_eq!(acc.nickname.as_deref(), Some("waxiloao"));
-        assert_eq!(acc.phone.as_deref(), Some("19098779775"));
+        assert_eq!(acc.uid.as_deref(), Some("aaaaaaaa-0000"));
+        assert_eq!(acc.nickname.as_deref(), Some("demo-user"));
+        assert_eq!(acc.phone.as_deref(), Some("13800000000"));
         assert_eq!(acc.expires_at, Some(1794410008517));
         assert_eq!(acc.host.as_deref(), Some("https://www.workbuddy.cn"));
         assert!(acc.is_current);
@@ -318,7 +422,8 @@ mod tests {
 
         assert_eq!(acc.phone.as_deref(), Some("13800000000"));
         assert_eq!(acc.expires_at, Some(1794410008517));
-        assert_eq!(acc.host.as_deref(), Some("https://www.codebuddy.cn"));
+        // 老文件里按 CodeBuddy 国内域登录的账号，host 归一到 WorkBuddy
+        assert_eq!(acc.host.as_deref(), Some("https://www.workbuddy.cn"));
     }
 
     #[test]
@@ -360,6 +465,117 @@ mod tests {
         assert!(parse_json("someone.info", Path::new("x"), &iss_ai).is_none());
         // 对照：国内域照常解析
         assert!(parse_json("workbuddy-desktop.info", Path::new("x"), &sample(&token)).is_some());
+
+        // 对照：CodeBuddy 国内域签发（历史账号）仍属国内版 —— 不能当国际版丢掉，
+        // 它的 host 要归一成 WorkBuddy 后继续可用
+        let cn_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"https://www.codebuddy.cn/auth/realms/copilot"}"#);
+        let cn_jwt = format!("{}.{}.{}", "x", cn_payload, "y");
+        let iss_cn = json!({
+            "account": { "uid": "u-cn", "nickname": "old-cn" },
+            "auth": { "accessToken": cn_jwt }
+        });
+        let acc = parse_json("someone.info", Path::new("x"), &iss_cn)
+            .expect("CodeBuddy 国内域不算国际版");
+        assert_eq!(acc.host.as_deref(), Some("https://www.workbuddy.cn"));
+    }
+
+    #[test]
+    fn keeps_accounts_signed_by_the_desktop_gateway() {
+        // 回归：桌面端签发的 token `iss` 与 auth.domain 都是 `copilot.tencent.com`。
+        // 曾经把它当「国际版」整条丢掉，于是导入只剩历史快照 → 导进来的是死票，签到一直 401。
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"https://copilot.tencent.com/auth/realms/copilot"}"#);
+        let jwt = format!("{}.{}.{}", "x", payload, "y");
+        let json = json!({
+            "account": {
+                "uid": "aaaaaaaa-0000-4000-8000-000000000000",
+                "nickname": "demo-user",
+                "phoneNumber": "13800000000",
+                "lastLogin": true
+            },
+            "auth": {
+                "accessToken": jwt,
+                "refreshToken": "refresh-value",
+                "expiresAt": 1795245624261i64,
+                "domain": "copilot.tencent.com"
+            }
+        });
+        let acc = parse_json("workbuddy-desktop.info", Path::new("x"), &json)
+            .expect("桌面端网关签发的票属于国内版，不能丢");
+        assert_eq!(acc.uid.as_deref(), Some("aaaaaaaa-0000-4000-8000-000000000000"));
+        assert_eq!(acc.host.as_deref(), Some("https://copilot.tencent.com"));
+        assert!(acc.is_current);
+    }
+
+    /// 端到端自检：跑一遍真实的「从本机凭证导入」，打印结果。
+    ///
+    /// 需要客户端已登录且在运行（密钥从它的内存里来），所以默认忽略：
+    ///
+    /// ```text
+    /// WB_ATREST_LIVE=1 cargo test --lib --offline auth_file::tests::scans_real_auth_dir \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "读本机真实登录文件，需要客户端已登录且在运行"]
+    fn scans_real_auth_dir() {
+        // 用临时缓存目录，强制走「扫内存拿密钥」这条真实路径
+        let tmp = std::env::temp_dir().join("wb-import-selfcheck");
+        let _ = std::fs::remove_file(tmp.join("atrest-key.bin"));
+        crate::atrest::init(&tmp);
+
+        let scan = scan_local_accounts();
+        for a in &scan.accounts {
+            println!(
+                "account nickname={:?} uid={:?} host={:?} current={} token_len={} file={}",
+                a.nickname,
+                a.uid,
+                a.host,
+                a.is_current,
+                a.token.len(),
+                a.file
+            );
+        }
+        println!("locked={:?} stale_only={}", scan.locked, scan.stale_only);
+        assert!(
+            !scan.stale_only,
+            "当前登录文件没解析出来 —— 只会导进历史快照的死票"
+        );
+        assert!(
+            scan.accounts.iter().any(|a| a.is_current),
+            "结果里必须包含「当前登录」那个账号"
+        );
+    }
+
+    #[test]
+    fn canonical_login_file_wins_over_stale_snapshots() {
+        // 回归：历史快照里也写着 lastLogin: true，曾经靠目录顺序决定谁胜出 ——
+        // 结果导进来的是两个月前的死票（签到必 401）。canonical 必须无条件优先。
+        let mk = |file: &str, token: &str, exp: i64| LocalAccount {
+            token: token.to_string(),
+            refresh_token: None,
+            source: "test".into(),
+            host: None,
+            uid: Some("same-uid".into()),
+            nickname: None,
+            phone: None,
+            expires_at: Some(exp),
+            rt_expires_at: None,
+            is_current: true,
+            file: file.to_string(),
+        };
+        let mut found = vec![
+            mk(
+                "/a/workbuddy-desktop.2026-09-11T09-10-52-457Z.44696.x.info",
+                "stale-token",
+                1794410008517,
+            ),
+            mk("/a/workbuddy-desktop.info", "live-token", 1795245624261),
+        ];
+        dedup_and_sort(&mut found);
+
+        assert_eq!(found.len(), 1, "同 uid 只留一条");
+        assert_eq!(found[0].token, "live-token", "必须留当前登录那份");
     }
 
     #[test]
@@ -381,9 +597,10 @@ mod tests {
             origin_from_domain("www.workbuddy.cn").as_deref(),
             Some("https://www.workbuddy.cn")
         );
+        // CodeBuddy 国内域归一到 WorkBuddy（同一套后端，只换域名）
         assert_eq!(
             origin_from_domain("https://www.codebuddy.cn/").as_deref(),
-            Some("https://www.codebuddy.cn")
+            Some("https://www.workbuddy.cn")
         );
         // 国际版已移除：*.ai 不再产出 host
         assert_eq!(origin_from_domain("https://www.workbuddy.ai/"), None);

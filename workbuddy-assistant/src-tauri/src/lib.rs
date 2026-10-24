@@ -1,6 +1,7 @@
 mod accel;
 mod accounts;
 mod alerts;
+mod atrest;
 mod auth_file;
 mod briefing;
 mod broker;
@@ -57,6 +58,9 @@ pub fn run() {
                 // **必须在调度线程与反代起来之前** —— 两者都会调 `sync_pool_if_bound`，
                 // 而它读的就是这份内存状态（读到「未绑定」会静默跳过整池同步）。
                 broker::init(&dir);
+                // 静态加密字段（新版客户端的 `$wbEncrypted`）的解密缓存目录。
+                // 只影响「从本机凭证导入」这一条路：拿不到密钥就明确报错，而不是静默导不出。
+                atrest::init(dir);
             }
             // 定时自动签到：独立后台线程，与进程同生命周期。
             // 只在应用运行期间生效——桌面端退出后没有守护进程可代为执行。

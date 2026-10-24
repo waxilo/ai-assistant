@@ -25,8 +25,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// 会改变 base url 的环境变量。取自在 CLI 产物中实际出现的名字
-/// （`codebuddy.js` 里 grep 到的 URL/HOST 类变量），不凭印象编。
+/// 会改变 base url 的环境变量。取自在客户端内置 CLI 产物里实际出现的名字
+/// （grep 到的 URL/HOST 类变量），不凭印象编。
+///
+/// 变量名沿用官方的 `CODEBUDDY_*` 前缀 —— 那是 CLI 真正读取的键名，
+/// 改名就失效了（它属于客户端契约，不代表本助手支持另一个产品）。
 ///
 /// 有意**不包含** `CODEBUDDY_GATEWAY_HOST` / `CODEBUDDY_HOST` / `CODEBUDDY_IDE_HOST`
 /// —— 它们是沙箱/IDE 管道的地址，与「模型请求打到哪」无关，报出来只会造成误判。
@@ -100,11 +103,11 @@ pub struct NetRestoreReport {
 // ---------------------------------------------------------------------------
 
 /// WorkBuddy 可能写「服务端点」的配置文件
+///
+/// 只看 `~/.workbuddy`：`~/.codebuddy` 是上一代（CodeBuddy 版）客户端的目录，
+/// 本助手已不支持它 —— 扫它只会把「早已不生效的旧端点」报成污染。
 fn config_files(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(".workbuddy").join("settings.json"),
-        home.join(".codebuddy").join("settings.json"),
-    ]
+    vec![home.join(".workbuddy").join("settings.json")]
 }
 
 /// 可能导出全局环境变量的 shell 启动脚本

@@ -14,7 +14,7 @@
 - **账号获取（两条通道，无手工录入）**：
   - **导入本机账号**：直接读 WorkBuddy 写在本机的 `CodeBuddyExtension/Data/Public/auth/*.info`，**不需要应用运行、也不需要调试端口**，并且一次就能拿到 token + 昵称 + 手机号 + refresh token（已存在的账号会合并补全凭证，不会重复添加）。
   - **登录新账号**：走官方 OAuth state 轮询（`/v2/plugin/auth/state` → 浏览器扫码 → `/v2/plugin/auth/token`），**不重启、不打断当前 WorkBuddy、不改动本机登录文件**，能主动签发**任意新账号**的凭证与昵称/手机号。
-- **智能 host 推断**：根据 JWT 的 `iss` 字段判断该用 `workbuddy.cn` / `codebuddy.cn`；**只支持国内版**，国际版 `*.ai` 已移除。默认 Base URL 为内置常量，**界面不提供修改入口**（改错会让签到打到错误的域）。
+- **智能 host 推断**：从 JWT 的 `iss` 字段取签发域；**只支持 WorkBuddy 国内版 `www.workbuddy.cn`**，国际版 `*.ai` 已移除，历史数据里按 CodeBuddy 国内域登录的账号会自动归一过来（两个域是同一套后端，无需重新登录）。默认 Base URL 为内置常量，**界面不提供修改入口**（改错会让签到打到错误的域）。
 - **GitHub Release 自动更新**：内置 `tauri-plugin-updater`，点击「检查更新」即可从 Release 拉取并安装新版本。
 - **积分日报（按天 + 逐小时）**：按**自然日**统计积分消耗与新增，每天一条，展开可见**每小时**明细（总览柱状图 + 逐账号列表）。
   口径是资源包**累计量**的差值（`CapacityUsed` / `CapacitySize`），不是「抓余额算涨跌」——
@@ -192,8 +192,7 @@ WorkBuddy 登录成功后会自己把账号与凭证写到本机：
 点工具栏「**添加账号**」，在弹窗里切到「浏览器登录」。它走官方的 OAuth state 轮询，
 **不重启、不打断当前 WorkBuddy，也不改动本机登录文件**，是加第二个 / 第三个账号最省事的路子：
 
-1. 选择**接口域**（只支持国内版：`www.workbuddy.cn` / `www.codebuddy.cn`）。
-   默认会自动跟随你「当前登录」账号所属的域。
+1. 接口域固定为 WorkBuddy 国内版 `www.workbuddy.cn`（不提供选择，也不再支持 CodeBuddy 域）。
 2. 点「打开授权页并开始」→ 本工具请求
    `POST {host}/v2/plugin/auth/state?platform=workbuddy` 拿到 `state`，
    并用**系统浏览器**打开返回的授权页（`{host}/login?platform=workbuddy&state=…`）。

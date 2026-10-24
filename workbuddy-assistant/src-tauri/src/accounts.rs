@@ -325,7 +325,17 @@ pub fn load_accounts(dir: &Path) -> Vec<Account> {
         return Vec::new();
     }
     let s = fs::read_to_string(&f).unwrap_or_default();
-    serde_json::from_str(&s).unwrap_or_default()
+    let mut accounts: Vec<Account> = serde_json::from_str(&s).unwrap_or_default();
+    // 本助手只支持 WorkBuddy：历史数据里按 CodeBuddy 国内域登录的账号，
+    // `base_url` 在**读入时**就归一（同一套后端，只换域名）。
+    // 放在读入口而不是各调用点，是因为读这份数据的地方有七八处 —— 漏一处就是
+    // 「界面上还显示 codebuddy.cn、请求也还打到那个域」的半迁移状态。
+    for a in &mut accounts {
+        if let Some(b) = a.base_url.as_deref() {
+            a.base_url = Some(crate::oauth::to_workbuddy_host(b));
+        }
+    }
+    accounts
 }
 
 /// **原子写**：临时文件 + `sync_all` + `rename`，并且**把错误原样还回去**。
@@ -392,6 +402,8 @@ pub fn load_settings(dir: &Path) -> Settings {
     if crate::oauth::is_foreign_host(&settings.default_base_url) {
         settings.default_base_url = default_base_url();
     }
+    // 只支持 WorkBuddy：老配置里指向 CodeBuddy 国内域的一并归一
+    settings.default_base_url = crate::oauth::to_workbuddy_host(&settings.default_base_url);
     settings
 }
 
@@ -429,7 +441,7 @@ mod tests {
             account: Account {
                 id: "a1".into(),
                 name: "主号".into(),
-                phone: Some("190****9775".into()),
+                phone: Some("138****0000".into()),
                 token: "t".into(),
                 refresh_token: None,
                 expires_at: None,
@@ -616,7 +628,7 @@ mod tests {
         let a = Account {
             id: "a1".into(),
             name: "主号".into(),
-            phone: Some("190****9775".into()),
+            phone: Some("138****0000".into()),
             token: "dt-new".into(),
             refresh_token: Some("rt-new".into()),
             expires_at: Some(2_000),
@@ -639,6 +651,66 @@ mod tests {
         assert!(
             save_accounts(&blocker, &[a]).is_err(),
             "写不进去必须返回 Err，而不是静默成功"
+        );
+    }
+
+    /// 只支持 WorkBuddy：老数据里按 CodeBuddy 国内域登录的账号，读入即归一。
+    #[test]
+    fn load_accounts_rewrites_legacy_codebuddy_host() {
+        let dir = temp_dir("migrate_codebuddy_host");
+        let mut a = Account {
+            id: "a1".into(),
+            name: "老号".into(),
+            phone: None,
+            token: "dt".into(),
+            refresh_token: None,
+            expires_at: None,
+            rt_expires_at: None,
+            base_url: Some("https://www.codebuddy.cn".into()),
+            created_at: "2026-09-28 11:56:00".into(),
+            last: None,
+            checked_today: None,
+            invalidated_at: None,
+            renew_blocked_until: None,
+        };
+        // 直接写盘（绕过归一），模拟升级前的数据
+        fs::write(
+            accounts_file(&dir),
+            serde_json::to_string(&vec![a.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_accounts(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].base_url.as_deref(), Some("https://www.workbuddy.cn"));
+
+        // 与 CodeBuddy 无关的域一个字都不改
+        a.base_url = Some("https://copilot.tencent.com".into());
+        fs::write(
+            accounts_file(&dir),
+            serde_json::to_string(&vec![a.clone()]).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_accounts(&dir);
+        assert_eq!(
+            loaded[0].base_url.as_deref(),
+            Some("https://copilot.tencent.com")
+        );
+    }
+
+    /// 老配置里的默认域指向 CodeBuddy 时同样归一。
+    #[test]
+    fn load_settings_rewrites_legacy_codebuddy_default() {
+        let dir = temp_dir("migrate_codebuddy_settings");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            settings_file(&dir),
+            r#"{"default_base_url":"https://www.codebuddy.cn"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings(&dir).default_base_url,
+            "https://www.workbuddy.cn"
         );
     }
 }

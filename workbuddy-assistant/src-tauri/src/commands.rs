@@ -368,22 +368,37 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
             .map(str::to_string);
         // 国际版已不再支持：导入时直接丢掉 *.ai 的 host，避免落到账号配置里
         let host = it.host.filter(|h| !crate::oauth::is_foreign_host(h));
+        // 第三个判据是 JWT 的 `sub`：客户端会把手机号打码（`138****0000`），
+        // 而库里那条存的可能是完整号码 —— 只比手机号会把同一个账号导成两条。
+        let incoming_iat = crate::checkin::token_issued_at(&token);
         let found = accounts.iter_mut().find(|a| {
-            a.token == token || phone.is_some() && a.phone.as_deref() == phone.as_deref()
+            a.token == token
+                || phone.is_some() && a.phone.as_deref() == phone.as_deref()
+                || crate::checkin::token_subject(&a.token)
+                    .zip(crate::checkin::token_subject(&token))
+                    .is_some_and(|(x, y)| x == y)
         });
         match found {
             Some(a) => {
-                a.token = token;
-                if let Some(rt) = it.refresh_token.filter(|s| !s.trim().is_empty()) {
-                    a.refresh_token = Some(rt);
-                }
-                if it.expires_at.is_some() {
-                    a.expires_at = it.expires_at;
-                }
-                // 两个 token 的过期时间各自独立覆盖：新来源没给就保留本地那份，
-                // 别把「不知道」写成「没有」（那会让界面直接判成已失效）。
-                if it.rt_expires_at.is_some() {
-                    a.rt_expires_at = it.rt_expires_at;
+                // 只在「来源这张票更新」时才换票。导入的可能是历史快照（手机上被打码时
+                // 尤其容易挑错文件），拿旧快照覆盖活票等于把好账号弄死。
+                let keep_existing = match (incoming_iat, crate::checkin::token_issued_at(&a.token)) {
+                    (Some(i), Some(e)) => i < e,
+                    _ => false,
+                };
+                if !keep_existing {
+                    a.token = token;
+                    if let Some(rt) = it.refresh_token.filter(|s| !s.trim().is_empty()) {
+                        a.refresh_token = Some(rt);
+                    }
+                    if it.expires_at.is_some() {
+                        a.expires_at = it.expires_at;
+                    }
+                    // 两个 token 的过期时间各自独立覆盖：新来源没给就保留本地那份，
+                    // 别把「不知道」写成「没有」（那会让界面直接判成已失效）。
+                    if it.rt_expires_at.is_some() {
+                        a.rt_expires_at = it.rt_expires_at;
+                    }
                 }
                 if phone.is_some() {
                     a.phone = phone;
@@ -473,8 +488,8 @@ mod import_tests {
 
     #[test]
     fn merges_existing_account_by_phone_and_fills_credentials() {
-        let mut accs = vec![acct("waxiloao", Some("19098779775"), "old-token")];
-        let r = merge_import(&mut accs, vec![item("new-token", Some("19098779775"))]);
+        let mut accs = vec![acct("demo-user", Some("13800000000"), "old-token")];
+        let r = merge_import(&mut accs, vec![item("new-token", Some("13800000000"))]);
         assert_eq!((r.added, r.updated), (0, 1), "同手机号应识别为同一账号");
         assert_eq!(accs.len(), 1, "不应产生重复条目");
         let a = &accs[0];
@@ -482,7 +497,30 @@ mod import_tests {
         assert_eq!(a.refresh_token.as_deref(), Some("rt-new"));
         assert_eq!(a.expires_at, Some(123456));
         assert_eq!(a.rt_expires_at, Some(234567), "refresh token 的有效期也要落库");
-        assert_eq!(a.name, "waxiloao", "已有名字不应被覆盖");
+        assert_eq!(a.name, "demo-user", "已有名字不应被覆盖");
+    }
+
+    /// 造一张只带 `sub` / `iat` 的 JWT（本地不验签，只用来判身份与新旧）。
+    fn jwt_claims(sub: &str, iat: i64) -> String {
+        use base64::Engine;
+        let payload = format!(r#"{{"sub":"{sub}","iat":{iat}}}"#);
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        format!("h.{enc}.s")
+    }
+
+    #[test]
+    fn masked_phone_merges_by_subject_instead_of_adding_a_duplicate() {
+        // 实测场景：客户端把手机号打码成 `138****0000`，库里那条是完整号码 `13800000000`，
+        // 再点一次本机导入就多出一条重复账号（一条活票、一条死票）。
+        let fresh = jwt_claims("aaaaaaaa-0000", 1_700);
+        let stale = jwt_claims("aaaaaaaa-0000", 900);
+        let mut accs = vec![acct("demo-user", Some("138****0000"), &fresh)];
+
+        let r = merge_import(&mut accs, vec![item(&stale, Some("13800000000"))]);
+
+        assert_eq!((r.added, r.updated), (0, 1), "同一个 sub 必须识别成同一账号");
+        assert_eq!(accs.len(), 1, "不许出现两条");
+        assert_eq!(accs[0].token, fresh, "旧快照不许把活票覆盖掉");
     }
 
     #[test]
@@ -894,9 +932,31 @@ pub async fn broker_sync_now(app: AppHandle) -> Result<broker::SyncReport, Strin
 /// 首选通道：直接读本机 WorkBuddy 写在磁盘上的登录信息文件（auth/*.info）。
 ///
 /// 不需要应用处于运行状态、不需要调试端口，且一次就能拿到 token + 昵称 + 手机号。
+///
+/// 新版客户端把这些字段加密了（`$wbEncrypted`，算法与密钥来源见 [`crate::atrest`]）。
+/// 密钥来自客户端**正在运行的进程**，所以客户端没起来、或版本换了密钥而我们没扫到时，
+/// 这里会明确报出来 —— 否则用户只会看到「本机没有账号」，然后以为是自己没登录。
 #[tauri::command]
 pub fn discover_local_accounts() -> Result<Vec<LocalAccount>, String> {
-    Ok(auth_file::discover_local_accounts())
+    let scan = auth_file::scan_local_accounts();
+    if scan.accounts.is_empty() && !scan.locked.is_empty() {
+        return Err(format!(
+            "本机登录信息已被 WorkBuddy 客户端加密（{} 个文件），当前取不到解密密钥。\
+             请先启动一次 WorkBuddy 桌面端再试，或改用「登录新账号」。",
+            scan.locked.len()
+        ));
+    }
+    // 当前登录文件在盘上却没用上：能导的只有历史快照，而那些票早已失效。
+    // 必须在这里拦住 —— 否则用户会看到「导入成功」，然后对着死票反复签到失败。
+    if scan.stale_only {
+        return Err(
+            "只能找到 WorkBuddy 的历史登录快照，当前登录的凭证这次没能读取。\
+             快照里的 token 已失效，导入也无法签到。请确认 WorkBuddy 桌面端处于已登录状态\
+             后重试，或改用「登录新账号」。"
+                .to_string(),
+        );
+    }
+    Ok(scan.accounts)
 }
 
 /// 「无感登录」第一步：申请 state + 授权链接（不重启应用、不打断当前 WorkBuddy）。
@@ -1510,6 +1570,58 @@ mod tests {
         assert!(!re.is_match(
             "/Applications/WorkBuddy.app/Contents/MacOS/Electron --type=renderer"
         ));
+    }
+
+    /// 回归：这次「只留 WorkBuddy」的改动，对**非 CodeBuddy 账号**必须是恒等变换。
+    ///
+    /// 续签的 host 只从 [`account_host`] 来（`refresh::refresh(&host, ..)` 的唯一来源），
+    /// 而 `account_host = normalize_host(issuer_host(token))`。老代码里
+    /// `normalize_host` 对任何「不是 codebuddy.cn」的输入本来就返回 workbuddy.cn，
+    /// 所以现有账号（iss 全是 workbuddy.cn）应当**一字不差**地维持原行为。
+    #[test]
+    fn refresh_host_stays_workbuddy_for_normal_accounts() {
+        fn acct(token: String, base: Option<&str>) -> Account {
+            Account {
+                id: "t".into(),
+                name: "t".into(),
+                phone: None,
+                token,
+                refresh_token: Some("rt".into()),
+                expires_at: None,
+                rt_expires_at: None,
+                base_url: base.map(str::to_string),
+                created_at: String::new(),
+                last: None,
+                checked_today: None,
+                invalidated_at: None,
+                renew_blocked_until: None,
+            }
+        }
+        fn jwt(iss: &str) -> String {
+            use base64::Engine;
+            let payload = format!(r#"{{"iss":"{iss}"}}"#);
+            let enc = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            format!("h.{enc}.s")
+        }
+
+        // 现行账号的形态：iss 与 base_url 都是 workbuddy.cn
+        let a = acct(
+            jwt("https://www.workbuddy.cn/auth/realms/copilot"),
+            Some("https://www.workbuddy.cn"),
+        );
+        assert_eq!(account_host(&a), "https://www.workbuddy.cn");
+
+        // 没记 base_url 的老账号
+        let a = acct(jwt("https://www.workbuddy.cn/auth/realms/copilot"), None);
+        assert_eq!(account_host(&a), "https://www.workbuddy.cn");
+
+        // 国际版/未知签发方：老代码同样退回内置国内域，行为不能变
+        let a = acct(jwt("https://gateway.workbuddy.ai/v1"), None);
+        assert_eq!(account_host(&a), "https://www.workbuddy.cn");
+
+        // 非 JWT（占位符/被截断的票）：也退回内置国内域
+        let a = acct("plain-token".into(), None);
+        assert_eq!(account_host(&a), "https://www.workbuddy.cn");
     }
 
     #[test]

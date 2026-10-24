@@ -35,12 +35,6 @@ import {
 
 const DEFAULT_HOST = "https://www.workbuddy.cn";
 
-// 只保留国内域；不提供国际版（*.ai）入口
-const OAUTH_HOSTS = [
-  { value: "https://www.workbuddy.cn", label: "WorkBuddy · www.workbuddy.cn" },
-  { value: "https://www.codebuddy.cn", label: "CodeBuddy · www.codebuddy.cn" },
-];
-
 type AddTab = "local" | "oauth";
 
 export function AddAccountModal({
@@ -97,18 +91,7 @@ export function AddAccountModal({
   });
 
   // ── 浏览器登录 ────────────────────────────────────────────
-  // 默认打到「当前登录账号」所属的国内域（WorkBuddy / CodeBuddy CN）；
-  // 读不到或读到的不是国内域就退回 WorkBuddy 国内版。复用本机扫描结果，不再额外读一次。
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const hostInit = useRef(false);
-  useEffect(() => {
-    if (hostInit.current || loading) return;
-    hostInit.current = true;
-    const cur = list.find((d) => d.is_current) ?? list[0];
-    const domestic = OAUTH_HOSTS.find((h) => cur?.host?.startsWith(h.value));
-    if (domestic) setHost(domestic.value);
-  }, [list, loading]);
-
+  // 本助手只支持 WorkBuddy 国内版，接口域固定，不再给用户选。
   const [phase, setPhase] = useState<"idle" | "waiting" | "done" | "error">(
     "idle"
   );
@@ -135,7 +118,7 @@ export function AddAccountModal({
     setUri("");
     setPhase("waiting");
     try {
-      const s = await oauthStart(host);
+      const s = await oauthStart(DEFAULT_HOST);
       setUri(s.verification_uri);
       try {
         await openExternal(s.verification_uri);
@@ -399,19 +382,6 @@ export function AddAccountModal({
                 在系统浏览器完成登录，本应用自动取得凭证；不重启 WorkBuddy，也不改动本机登录文件。
               </span>
             </p>
-
-            {(phase === "idle" || phase === "error") && (
-              <label>
-                接口域
-                <select value={host} onChange={(e) => setHost(e.target.value)}>
-                  {OAUTH_HOSTS.map((h) => (
-                    <option key={h.value} value={h.value}>
-                      {h.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
 
             {waiting && (
               <>

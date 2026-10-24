@@ -114,8 +114,9 @@ export const clearLogs = () => invoke<void>("clear_logs");
 
 /**
  * 诊断 WorkBuddy 的全局网络配置（**只读**，不会改动任何文件）。
- * 扫的是：`~/.workbuddy/settings.json` / `~/.codebuddy/settings.json` 里的
- * `endpoint` 与 `env.CODEBUDDY_*`、launchd 全局环境变量、shell 启动脚本、本应用反代开关。
+ * 扫的是：`~/.workbuddy/settings.json` 里的 `endpoint` 与 `env.CODEBUDDY_*`
+ * （`CODEBUDDY_*` 是客户端内置 CLI 真正读取的键名，不是另一个产品的配置）、
+ * launchd 全局环境变量、shell 启动脚本、本应用反代开关。
  */
 export const netDiagnose = () => invoke<NetReport>("net_diagnose");
 

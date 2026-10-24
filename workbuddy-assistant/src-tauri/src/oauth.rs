@@ -13,8 +13,9 @@
 //! 相比「导入本机账号」（[`crate::auth_file`]）：那条通道只能拿到本机**已经登录过**的账号，
 //! 而这条能主动签发**任意新账号**的凭证；代价是需要用户在浏览器里完成一次授权。
 //!
-//! host 只支持国内官方域（`www.workbuddy.cn` / `www.codebuddy.cn`），
-//! 不提供国际版（`*.ai`）适配；无法识别的域一律退回 `www.workbuddy.cn`。
+//! 本助手只支持 WorkBuddy 国内版：host 恒为 `www.workbuddy.cn`。
+//! 国际版 `*.ai` 与其它任何域一律退回该域；历史数据里残留的 `*.codebuddy.cn`
+//! 会被 [`to_workbuddy_host`] 归一过来（两者是同一套后端，仅登录页品牌不同）。
 
 use serde::Serialize;
 use serde_json::Value;
@@ -34,6 +35,40 @@ const DEFAULT_HOST: &str = "https://www.workbuddy.cn";
 pub fn is_foreign_host(input: &str) -> bool {
     let raw = input.trim().to_ascii_lowercase();
     raw.contains("workbuddy.ai") || raw.contains("codebuddy.ai")
+}
+
+/// 国内部署的 host 判定。
+///
+/// 两个来源都算国内版：
+/// - `.cn` 域（`www.workbuddy.cn` / 历史 `www.codebuddy.cn`）；
+/// - `copilot.tencent.com` —— **WorkBuddy 桌面端自己用的网关**，也是本应用内置的
+///   默认上游（`accounts::default_base_url()`）。它和 `www.workbuddy.cn` 是同一套后端：
+///   同一张票打两域结论一致（实测 `/v2/billing/meter/checkin-status` 三域全 200）。
+///
+/// **别把 `copilot.tencent.com` 当国际版**：桌面端签发的 token `iss` 就是它，
+/// 判成国际版会让「从本机凭证导入」把**当前登录的那个账号**整条丢掉，只剩历史快照
+/// —— 表现为「导入成功了，但导进来的是早就失效的老票，签到一直 401」。
+pub fn is_domestic_host(input: &str) -> bool {
+    let raw = input.trim().to_ascii_lowercase();
+    raw.contains(".cn") || raw.contains("copilot.tencent.com")
+}
+
+/// 把历史数据里的 CodeBuddy 国内域归一为 WorkBuddy 国内域。
+///
+/// `www.codebuddy.cn` 与 `www.workbuddy.cn` 是**同一套后端**：同一账号体系，
+/// 同一张 token 在两个域上都能用（实测同一票打两域结论一致），差别只在登录页品牌。
+/// 所以升级到「只支持 WorkBuddy」后，老数据里按 CodeBuddy 域登录的账号不需要重登 ——
+/// 把域名换掉即可继续签到与续签（`iss` 里带的 `codebuddy.cn` 同样按此处理）。
+///
+/// 只替换域名片段，scheme / 端口 / 路径原样保留。
+///
+/// 只匹配小写形式：URL 里的 host 恒为小写（官方返回值、本仓自拼的 origin、
+/// serde 反序列化之后都是），不做整串小写化 —— 那会顺手把路径也改掉。
+pub fn to_workbuddy_host(input: &str) -> String {
+    if !input.contains("codebuddy.cn") {
+        return input.to_string();
+    }
+    input.replace("codebuddy.cn", "workbuddy.cn")
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -112,25 +147,10 @@ fn sweep(map: &mut HashMap<String, Pending>) {
 
 /// 把用户输入/账号 base_url 归一化成国内官方 API host。
 ///
-/// 只认国内官方域（WorkBuddy / CodeBuddy CN）；国际版 `*.ai` 与任何未知域
-/// 一律退回 `www.workbuddy.cn`。
-pub fn normalize_host(input: Option<&str>) -> String {
-    let raw = input.unwrap_or("").trim().trim_end_matches('/').to_lowercase();
-    if raw.is_empty() || is_foreign_host(&raw) {
-        return DEFAULT_HOST.to_string();
-    }
-    let bare = raw
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim_start_matches("www.");
-    let domain = match bare {
-        "codebuddy.cn" => "codebuddy.cn",
-        _ => "workbuddy.cn",
-    };
-    format!("https://www.{domain}")
+/// 只支持 WorkBuddy 国内版：无论传入什么（含 `*.codebuddy.cn`、国际版 `*.ai`、
+/// 空值、未知域），结果恒为 `https://www.workbuddy.cn`。
+pub fn normalize_host(_input: Option<&str>) -> String {
+    DEFAULT_HOST.to_string()
 }
 
 fn biz_code(v: &Value) -> Option<i64> {
@@ -477,9 +497,58 @@ mod tests {
             "https://www.workbuddy.cn"
         );
         assert_eq!(normalize_host(Some("codebuddy.ai")), "https://www.workbuddy.cn");
-        assert_eq!(normalize_host(Some("codebuddy.cn")), "https://www.codebuddy.cn");
+        // 只支持 WorkBuddy：CodeBuddy 国内域也归一到 workbuddy.cn
+        assert_eq!(normalize_host(Some("codebuddy.cn")), "https://www.workbuddy.cn");
+        assert_eq!(
+            normalize_host(Some("https://www.codebuddy.cn")),
+            "https://www.workbuddy.cn"
+        );
         // 未知域一律退回国内版，避免把请求打到任意 host
         assert_eq!(normalize_host(Some("evil.example.com")), "https://www.workbuddy.cn");
+    }
+
+    #[test]
+    fn domestic_hosts_include_the_desktop_gateway() {
+        // 国内部署的两类 host：`.cn` 域 + 桌面端自己的 `copilot.tencent.com`
+        for host in [
+            "https://www.workbuddy.cn",
+            "https://www.codebuddy.cn",
+            "https://copilot.tencent.com",
+            "https://copilot.tencent.com/auth/realms/copilot",
+            "  WWW.WORKBUDDY.CN  ",
+        ] {
+            assert!(is_domestic_host(host), "{host} 应判为国内域");
+        }
+        for host in [
+            "https://www.workbuddy.ai",
+            "https://gateway.workbuddy.ai/v1",
+            "https://evil.example.com",
+            "",
+        ] {
+            assert!(!is_domestic_host(host), "{host} 不该判为国内域");
+        }
+    }
+
+    #[test]
+    fn codebuddy_host_is_rewritten_to_workbuddy() {
+        assert_eq!(
+            to_workbuddy_host("https://www.codebuddy.cn"),
+            "https://www.workbuddy.cn"
+        );
+        // 端口 / 路径原样保留，只换域名
+        assert_eq!(
+            to_workbuddy_host("http://www.codebuddy.cn:8799/v2/x"),
+            "http://www.workbuddy.cn:8799/v2/x"
+        );
+        // 无关域名一个字都不动
+        assert_eq!(
+            to_workbuddy_host("https://copilot.tencent.com"),
+            "https://copilot.tencent.com"
+        );
+        assert_eq!(
+            to_workbuddy_host("https://www.workbuddy.cn"),
+            "https://www.workbuddy.cn"
+        );
     }
 
     #[test]
@@ -579,12 +648,12 @@ mod tests {
     #[test]
     fn parses_account_info_with_field_fallbacks() {
         let v = json!({"code": 0, "data": {
-            "uid": "u-1", "nickname": "waxiloao", "phoneNumber": "190****9775", "uin": "123"
+            "uid": "u-1", "nickname": "demo-user", "phoneNumber": "138****0000", "uin": "123"
         }});
         let a = parse_account_response(&v);
         assert_eq!(a.uid, "u-1");
-        assert_eq!(a.nickname.as_deref(), Some("waxiloao"));
-        assert_eq!(a.phone.as_deref(), Some("190****9775"));
+        assert_eq!(a.nickname.as_deref(), Some("demo-user"));
+        assert_eq!(a.phone.as_deref(), Some("138****0000"));
 
         // uid 缺失时不 panic，字段留空
         let a = parse_account_response(&json!({"code": 0, "data": {"phone": "1"}}));
@@ -609,13 +678,14 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn smoke_real_oauth_state_and_waiting_poll() {
+        // 只支持 WorkBuddy：即便传 CodeBuddy 国内域，也应当落到 workbuddy.cn
         for host in ["https://www.workbuddy.cn", "https://www.codebuddy.cn"] {
             let s = start(Some(host.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("[{host}] auth/state 失败: {e}"));
             assert!(
-                s.verification_uri.starts_with(host),
-                "[{host}] 授权链接应落在同一域：{}",
+                s.verification_uri.starts_with("https://www.workbuddy.cn"),
+                "[{host}] 授权链接应落在 WorkBuddy 国内域：{}",
                 s.verification_uri
             );
             println!("[{host}] start ok  uri={}", s.verification_uri);

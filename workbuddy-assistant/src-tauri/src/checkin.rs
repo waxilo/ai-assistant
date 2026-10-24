@@ -46,8 +46,10 @@ fn classify(http_ok: bool, code: Option<i64>, message: &str) -> Outcome {
     Outcome { ok, already, inactive }
 }
 
-/// 从 JWT 的 iss 字段推断签发方 origin（端口到 host 映射）
-pub(crate) fn token_issuer_origin(token: &str) -> Option<String> {
+/// 取 JWT payload（第二段）里的任意一个 claim。
+///
+/// **不验签**：只用于本地判断「是不是同一个账号」「哪张更新」，不参与任何鉴权决策。
+fn token_claim(token: &str, key: &str) -> Option<serde_json::Value> {
     let part = token.split('.').nth(1)?;
     let mut padded = part.replace('-', "+").replace('_', "/");
     while padded.len() % 4 != 0 {
@@ -55,20 +57,43 @@ pub(crate) fn token_issuer_origin(token: &str) -> Option<String> {
     }
     let bytes = STANDARD.decode(padded).ok()?;
     let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let iss = payload.get("iss")?.as_str()?;
-    Some(iss.to_string())
+    payload.get(key).cloned()
+}
+
+/// 从 JWT 的 iss 字段推断签发方 origin（端口到 host 映射）
+pub(crate) fn token_issuer_origin(token: &str) -> Option<String> {
+    token_claim(token, "iss")?.as_str().map(str::to_string)
+}
+
+/// 账号真身：JWT 的 `sub`。
+///
+/// **身份锚点只认它**：手机号在客户端里会被打码（`138****0000`），昵称能改，
+/// 只有 `sub` 跨机、跨次导入都不变。少了这一条，「打码手机号」和「池里的完整手机号」
+/// 会被当成两个账号，一次导入就出现一真一假两条。
+pub(crate) fn token_subject(token: &str) -> Option<String> {
+    token_claim(token, "sub")?.as_str().map(str::to_string)
+}
+
+/// token 的签发时间（秒）。同一账号换票时它**单调递增**。
+///
+/// 比 `exp` 可靠：被顶掉的死票往往把 `exp` 声明得更晚（实测 09-28 那张 `exp` 11-22，
+/// 反而比 10-24 换到的新票 11-21 更晚）—— 拿 `exp` 比新旧，死票会被判成「更新」。
+pub(crate) fn token_issued_at(token: &str) -> Option<i64> {
+    let v = token_claim(token, "iat")?;
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
 }
 
 /// 把 iss（如 https://www.workbuddy.cn/...）映射到签到 API host。
-/// 只认国内官方域；国际版 `*.ai` 不再适配，返回 None 让调用方退回国内默认域。
+///
+/// **只认 WorkBuddy 国内域**：结果恒为 `https://www.workbuddy.cn`。
+/// 国际版 `*.ai` 返回 None，让调用方退回账号/默认域。
+/// 历史账号的 iss 可能是 `codebuddy.cn` —— 那仍是国内版、同一套后端，
+/// 这里直接给出 WorkBuddy 域（不给它单独的 host），所以不需要保留那个域名的分支。
 fn host_for_iss(iss: &str) -> Option<&'static str> {
-    if iss.contains("workbuddy.cn") {
-        Some("https://www.workbuddy.cn")
-    } else if iss.contains("codebuddy.cn") {
-        Some("https://www.codebuddy.cn")
-    } else {
-        None
-    }
+    iss.to_ascii_lowercase()
+        .contains(".cn")
+        .then_some("https://www.workbuddy.cn")
 }
 
 /// 由 token 推断其来源 origin（JWT 的 iss → 签到 host 映射；非 JWT 返回 None）
@@ -83,7 +108,10 @@ fn normalize_host(url: &str) -> String {
     } else {
         format!("https://{}", u)
     };
-    u.trim_end_matches('/').to_string()
+    // 老数据里按 CodeBuddy 国内域登录的账号统一改打 WorkBuddy（同一套后端）
+    crate::oauth::to_workbuddy_host(&u)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// 候选 host 顺序：token iss 推断 > 账号自定义 base_url > 默认 base_url
@@ -696,6 +724,53 @@ mod tests {
         let body = account(&[("a", json!("500")), ("b", json!("805.14000097"))]);
         // 小数按两位四舍五入，与官方前端展示一致
         assert_eq!(sum_credits(&body), Some(1305.14));
+    }
+
+    /// 只支持 WorkBuddy：按 CodeBuddy 域签发的历史账号，签到也只会打到 workbuddy.cn。
+    #[test]
+    fn codebuddy_accounts_check_in_against_workbuddy() {
+        let payload = json!({"iss": "https://www.codebuddy.cn/auth/realms/copilot"}).to_string();
+        let enc = STANDARD.encode(payload.as_bytes());
+        let token = format!("h.{enc}.s");
+
+        // iss 来自国内域（哪怕是 CodeBuddy 域），一律映射到 WorkBuddy
+        assert_eq!(
+            issuer_host(&token).as_deref(),
+            Some("https://www.workbuddy.cn")
+        );
+
+        // 账号 base_url 里残留的 CodeBuddy 域会被归一
+        let hosts = candidate_hosts(
+            &token,
+            Some("https://www.codebuddy.cn"),
+            "https://www.workbuddy.cn",
+        );
+        assert_eq!(
+            hosts.first().map(String::as_str),
+            Some("https://www.workbuddy.cn")
+        );
+        assert!(
+            !hosts.iter().any(|h| h.contains("codebuddy")),
+            "候选 host 不应再出现 CodeBuddy：{hosts:?}"
+        );
+
+        // 连 base_url 都没有的老账号，也只会打 WorkBuddy
+        assert_eq!(
+            candidate_hosts(&token, None, "https://www.workbuddy.cn"),
+            vec!["https://www.workbuddy.cn".to_string()]
+        );
+
+        // 账号 base_url 自身的归一（含裸域写法）
+        assert_eq!(
+            normalize_host("https://www.codebuddy.cn/"),
+            "https://www.workbuddy.cn"
+        );
+        assert_eq!(normalize_host("www.codebuddy.cn"), "https://www.workbuddy.cn");
+        // 非 CodeBuddy 域原样保留
+        assert_eq!(
+            normalize_host("https://copilot.tencent.com"),
+            "https://copilot.tencent.com"
+        );
     }
 
     #[test]

@@ -401,7 +401,32 @@ pub fn account_from_item(item: &PoolItem) -> Account {
 ///
 /// 「读不出到期」不等于「更旧」：一侧读得出、另一侧读不出时，读得出的算新；
 /// 两侧都读不出（不透明票又没带到期字段）就**谁也不许盖谁**，来历不明的不算更新。
+/// 两张票是不是同一个账号签出来的（JWT `sub` 相同）。
+///
+/// 手机号是池条目的 key，但客户端会把手机号打码（`138****0000`），而池里那条仍是
+/// 完整号码 —— 只比 key 会把同一个账号拆成「本机一条 + 池里一条」，
+/// 表现为**点一次导入出现两条，一真一假**。`sub` 是唯一能穿透打码的身份锚点。
+fn same_subject(a: &str, b: &str) -> bool {
+    match (
+        crate::checkin::token_subject(a),
+        crate::checkin::token_subject(b),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 fn cloud_is_newer(item: &PoolItem, account: &Account) -> bool {
+    // 先用 `iat`（签发时间）判：同一账号换票时它单调递增，而 `exp` 会骗人 ——
+    // 已被顶掉的死票常把 `exp` 写得更晚（09-28 那张 exp 11-22 比 10-24 新票的 11-21 还晚），
+    // 按 exp 判就会拿死票盖掉活票。
+    match (
+        crate::checkin::token_issued_at(&item.access_token),
+        crate::checkin::token_issued_at(&account.token),
+    ) {
+        (Some(p), Some(l)) if p != l => return p > l,
+        _ => {}
+    }
     match (item_expiry(item), acct_expiry(account)) {
         (Some(p), Some(l)) => p > l,
         (Some(_), None) => true,
@@ -411,6 +436,13 @@ fn cloud_is_newer(item: &PoolItem, account: &Account) -> bool {
 
 /// 本机这一条是否**严格新于**池里那一份 —— [`cloud_is_newer`] 的反方向，供本地 → 云端回写用。
 fn local_is_newer(account: &Account, item: &PoolItem) -> bool {
+    match (
+        crate::checkin::token_issued_at(&account.token),
+        crate::checkin::token_issued_at(&item.access_token),
+    ) {
+        (Some(l), Some(p)) if l != p => return l > p,
+        _ => {}
+    }
     match (acct_expiry(account), item_expiry(item)) {
         (Some(l), Some(p)) => l > p,
         (Some(_), None) => true,
@@ -499,7 +531,7 @@ pub fn merge_into(accounts: &mut Vec<Account>, items: &[PoolItem]) -> usize {
         }
         match accounts
             .iter_mut()
-            .find(|a| item_key_of(a) == item.key.trim())
+            .find(|a| item_key_of(a) == item.key.trim() || same_subject(&a.token, &item.access_token))
         {
             Some(a) => {
                 if adopt(a, item) {
@@ -536,8 +568,18 @@ pub fn union_pool(cloud: &[PoolItem], local: &[Account]) -> Vec<PoolItem> {
         if key.trim().is_empty() {
             continue;
         }
-        if !pool.iter().any(|i| i.key.trim() == key) {
-            pool.push(to_item(acct));
+        let hit = pool
+            .iter()
+            .position(|i| i.key.trim() == key || same_subject(&i.access_token, &acct.token));
+        match hit {
+            // 云端那条更旧（手机号打码后它会落在另一个 key 上）就用本机的替换掉：
+            // 否则池里永远躺着一张死票，下次在别的机器上再被拉回来。
+            Some(idx) => {
+                if local_is_newer(acct, &pool[idx]) {
+                    pool[idx] = to_item(acct);
+                }
+            }
+            None => pool.push(to_item(acct)),
         }
     }
     pool
@@ -1390,8 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_skips_items_without_a_key() {
-        let mut accs = vec![acct("a", Some("111"), "t1")];
+    fn merge_skips_items_without_a_key() {        let mut accs = vec![acct("a", Some("111"), "t1")];
         let mut keyless = item("", "t", Some(5));
         keyless.key = String::new();
         assert_eq!(merge_into(&mut accs, &[keyless]), 0);
@@ -1401,14 +1442,14 @@ mod tests {
     #[test]
     fn merge_round_trips_through_item_and_back() {
         let original = {
-            let mut a = acct("waxiloao", Some("19098779775"), "at");
+            let mut a = acct("demo-user", Some("13800000000"), "at");
             a.expires_at = Some(1_760_000_000_000);
             a.rt_expires_at = Some(1_770_000_000_000);
             a.refresh_token = Some("rt".into());
             a
         };
         let as_item = to_item(&original);
-        assert_eq!(as_item.key, "19098779775");
+        assert_eq!(as_item.key, "13800000000");
         assert_eq!(as_item.access_token, "at");
 
         // 另一台机器收到这一条：本地没有 → 建一个新账号，字段逐项相等
@@ -1417,8 +1458,8 @@ mod tests {
         assert_eq!(born.refresh_token.as_deref(), Some("rt"));
         assert_eq!(born.expires_at, Some(1_760_000_000_000));
         assert_eq!(born.rt_expires_at, Some(1_770_000_000_000));
-        assert_eq!(item_key_of(&born), "19098779775", "两机认的是同一个 key");
-        assert_eq!(born.name, "waxiloao");
+        assert_eq!(item_key_of(&born), "13800000000", "两机认的是同一个 key");
+        assert_eq!(born.name, "demo-user");
     }
 
     #[test]
@@ -1426,6 +1467,63 @@ mod tests {
         let mut nameless = item("13800000000", "t", Some(1));
         nameless.name = String::new();
         assert_eq!(account_from_item(&nameless).name, "账号-138000");
+    }
+
+    /// 造一张只带 `sub` / `iat` 的 JWT（本地不验签，只用来判身份与新旧）。
+    fn jwt_claims(sub: &str, iat: i64) -> String {
+        use base64::Engine as _;
+        let payload = format!(r#"{{"sub":"{sub}","iat":{iat}}}"#);
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        format!("h.{enc}.s")
+    }
+
+    /// 回归（2026-10-24 实测）：本机那条手机号被打码 `138****0000`，池里那条是完整号码
+    /// `13800000000` —— 只比 key 就并不到一起，一次导入出现**两条同名账号，一真一假**。
+    /// 而且池里那张是 09-28 的死票，`exp` 反而更晚，不能被它盖掉。
+    #[test]
+    fn masked_phone_merges_by_subject_and_never_downgrades_the_token() {
+        let fresh = jwt_claims("aaaaaaaa-0000", 1_700);
+        let stale = jwt_claims("aaaaaaaa-0000", 900);
+        let mut accs = vec![{
+            let mut a = acct("demo-user", Some("138****0000"), &fresh);
+            a.expires_at = Some(500_000);
+            a
+        }];
+        let mut pool_item = item("13800000000", &stale, Some(900_000));
+        pool_item.name = "demo-user".into();
+
+        merge_into(&mut accs, &[pool_item]);
+
+        assert_eq!(accs.len(), 1, "同一个 sub 不该变成两条");
+        assert_eq!(accs[0].token, fresh, "死票的 exp 更晚也不许盖掉活票");
+    }
+
+    #[test]
+    fn newer_iat_wins_even_when_its_expiry_is_earlier() {        let mut a = acct("n", Some("138"), &jwt_claims("s", 100));
+        a.expires_at = Some(900_000);
+        let mut it = item("138", &jwt_claims("s", 300), Some(500_000));
+        it.refresh_token = "rt-new".into();
+
+        assert!(adopt(&mut a, &it));
+        assert_eq!(a.token, jwt_claims("s", 300), "签发时间更晚 ⇒ 采用");
+        assert_eq!(a.refresh_token.as_deref(), Some("rt-new"));
+    }
+
+    #[test]
+    fn union_pool_replaces_a_stale_cloud_entry_for_the_same_account() {
+        let fresh = jwt_claims("s1", 1_700);
+        let stale = jwt_claims("s1", 900);
+        let cloud = vec![item("13800000000", &stale, Some(900_000))];
+        let local = vec![{
+            let mut a = acct("demo-user", Some("138****0000"), &fresh);
+            a.expires_at = Some(500_000);
+            a
+        }];
+
+        let pool = union_pool(&cloud, &local);
+
+        assert_eq!(pool.len(), 1, "同一账号不许在池里留两份");
+        assert_eq!(pool[0].access_token, fresh, "用本机的新票替换云端的死票");
     }
 
     #[test]

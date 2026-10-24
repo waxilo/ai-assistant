@@ -38,6 +38,10 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 minisign-verify = "0.2"
 thiserror = "1"
+# 新版 WorkBuddy 客户端把 auth/*.info 的关键字段做了静态加密（suite 1 = AES-256-GCM），
+# 「从本机凭证导入」必须能解开它，否则读到的只是 `$wbEncrypted` 壳子（详见 atrest.rs）。
+aes-gcm = "0.10"
+sha2 = "0.10"
 
 [profile.release]
 panic = "abort"
