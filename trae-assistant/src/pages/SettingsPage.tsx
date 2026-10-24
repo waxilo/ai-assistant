@@ -92,6 +92,37 @@ function SettingsPage({
               </button>
             }
           />
+          {/* 静默更新：后台调度线程在设定时刻自己查、自己下、自己装，装完应用自动重启。
+              与上面那个按钮是**两条独立通路** —— 关掉这里不影响手动检查更新。 */}
+          <Row
+            title="静默自动更新"
+            desc="到点自动下载并安装，装完自动重启；关掉后只能手动检查更新。"
+            ctrl={
+              <Switch
+                checked={!!settings?.auto_update_enabled}
+                onChange={(v) => update({ auto_update_enabled: v })}
+                title="到点自动下载并安装新版本"
+              />
+            }
+          />
+          <Row
+            sub
+            title="更新时刻"
+            desc="应用保持运行时生效；该时刻关机则在当天首次启动后补做。"
+            ctrl={
+              <input
+                type="time"
+                value={settings?.auto_update_time || "05:00"}
+                disabled={!settings?.auto_update_enabled}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  // 清空不是有效时刻（后端 due() 解析失败 ⇒ 永不触发）。
+                  // 与其让「开关还开着、时间却空着」这种状态存在，不如不落盘、控件回显原值。
+                  if (v) update({ auto_update_time: v });
+                }}
+              />
+            }
+          />
           {/* 固定高度的状态槽：没有状态时也占着这一行，
               检查中 / 已是最新 / 下载中 / 失败都只在原地换字，不把卡片顶高。 */}
           <div className="upd-line" aria-live="polite">

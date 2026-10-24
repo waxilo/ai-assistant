@@ -64,6 +64,16 @@ export interface Settings {
    * 落盘是为了**重启后不再重推**（调度线程每次启动都补推一次，原先去重只在内存）。
    */
   last_briefing_push_date: string | null;
+  /**
+   * 静默自动更新：每天到 `auto_update_time` 后自动检查、下载并安装，装完应用自行重启。
+   * **默认开启**；关掉只停掉后台这条路径，设置页的「检查更新」按钮照常可用。
+   */
+  auto_update_enabled: boolean;
+  /**
+   * 静默更新的每日时刻 `HH:MM`（默认 `05:00`）。
+   * 语义是「**不早于**该时刻、每天最多一次」：夜里关机错过之后，当天首次轮询补做。
+   */
+  auto_update_time: string;
 }
 
 export interface CheckinResult {

@@ -3,6 +3,8 @@
 mod accel;
 mod accounts;
 mod alerts;
+// 静默自动更新：调度线程到点后驱动（见 autoupdate.rs）
+mod autoupdate;
 mod briefing;
 mod broker;
 mod checkin;

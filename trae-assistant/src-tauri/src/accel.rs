@@ -18,6 +18,7 @@
 
 use base64::Engine as _;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
 use tauri::{Manager, ResourceId, Runtime, Webview};
@@ -69,6 +70,33 @@ const SPEED_CHECK_EVERY: Duration = Duration::from_secs(10);
 /// 两端产品共用同一发布校验 key。
 const RELEASE_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5RjM1MTUxMDgxRjJBREMKUldUY0toOElVVkh6ZVpaOWo2YnU2aWhNQUphbVgyYmdjaDM4RnE2b0crK0VtR3BDMnNCb25CRGYK";
 
+/// 同一时刻只允许一条「下载 + 安装」在跑。
+///
+/// 现在有两条入口会走到安装：设置页的「立即更新」（[`update_accelerated`]）和
+/// 后台的静默更新（[`crate::autoupdate`]）。两者撞在一起就会把**同一个安装包
+/// 执行两遍**，而安装器本身不是幂等友好的东西。真实场景也不罕见：
+/// 凌晨 5 点的静默更新正在跑，恰好在电脑前的人点了一下「立即更新」。
+static INSTALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 单飞闸的 RAII 句柄：离开作用域自动放行（Windows 上 install 会 `exit(0)`，
+/// 那时进程整体消失，锁本来也就没意义了）。
+struct InstallGuard;
+
+impl InstallGuard {
+    fn acquire() -> Result<Self, String> {
+        INSTALL_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| InstallGuard)
+            .map_err(|_| "另一个更新任务正在进行，请稍后再试".to_string())
+    }
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALL_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 前端 `check()` 拿到新版本后调用：选源下载 → 自验签名 → 安装。
 ///
 /// `rid` 是前端 `Update` 对象持有的资源 id；事件通过 `on_event` 逐块上报。
@@ -84,16 +112,36 @@ pub async fn update_accelerated<R: Runtime>(
         .map_err(|e| format!("找不到更新实例：{e}"))?;
     let update = (*update).clone();
 
-    // 官方 latest.json 解析出的原始 GitHub 直链（最终打好的 release asset 地址）
-    let original = update.download_url.to_string();
-
     let mut emit = |e: AccelEvent| {
         let _ = on_event.send(e);
     };
-    let bytes = download_from_sources(&original, &mut emit).await?;
+    // 手动路径没有安装前的额外动作：进度条本身就说明了「马上要装」。
+    accelerated_install(&update, &mut emit, || {}).await
+}
+
+/// 加速下载 + 验签 + 安装。**手动更新与静默更新共用这一条链路**。
+///
+/// 抽出来是因为「怎么下载、信谁」只有一套答案：多源竞速选源、换源重下、minisign
+/// 自验之后再交给插件安装。静默更新只差一个「谁触发」和「装之前记一笔日志」。
+///
+/// `before_install` 在验签通过、真正交给安装器**之前**执行 —— 这是静默更新唯一
+/// 来得及写日志的位置（Windows 上 install 会用 `exit(0)` 立刻接管进程）。
+pub(crate) async fn accelerated_install(
+    update: &Update,
+    emit: &mut impl FnMut(AccelEvent),
+    before_install: impl FnOnce(),
+) -> Result<(), String> {
+    let _guard = InstallGuard::acquire()?;
+
+    // 官方 latest.json 解析出的原始 GitHub 直链（最终打好的 release asset 地址）
+    let original = update.download_url.to_string();
+
+    let bytes = download_from_sources(&original, emit).await?;
 
     verify_signature(&bytes, &update.signature, RELEASE_PUBKEY)
         .map_err(|e| format!("签名校验失败，已中止安装：{e}"))?;
+
+    before_install();
 
     update
         .install(&bytes)

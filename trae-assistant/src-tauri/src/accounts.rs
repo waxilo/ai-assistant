@@ -214,6 +214,21 @@ pub struct Settings {
     /// ⚠️ 前端 `Settings` 类型必须带上这个字段：界面走的是**整体覆盖保存**
     /// （`save_settings`），前端不认识它就会被抹掉。
     pub last_briefing_push_date: Option<String>,
+    /// 静默自动更新：每天到 `auto_update_time` 后自动检查、下载并安装，装完应用自行重启。
+    ///
+    /// **默认开启**。关掉只停掉后台这条路径，设置页的「检查更新」按钮照常可用。
+    ///
+    /// ⚠️ 本结构的其它字段都**不带** `serde(default)`（老配置缺任一键会整份回退默认），
+    /// 新增字段必须自带 `default`，否则升级上来的人一次读设置就把签到时间/接管开关全丢了。
+    #[serde(default = "default_true")]
+    pub auto_update_enabled: bool,
+    /// 静默更新的每日时刻，24 小时制 `HH:MM`。
+    ///
+    /// 默认 05:00 —— 这个点机器通常空闲，自动重启不会打断正在用的接管与签到。
+    /// 语义是「**不早于**该时刻、每天最多一次」：夜里关机/休眠错过之后，
+    /// 当天首次轮询就补做（否则「默认凌晨 5 点」对从不留夜机的用户等于永不生效）。
+    #[serde(default = "default_auto_update_time")]
+    pub auto_update_time: String,
 }
 
 impl Default for Settings {
@@ -227,8 +242,23 @@ impl Default for Settings {
             webhook_url: String::new(),
             briefing_enabled: false,
             last_briefing_push_date: None,
+            // 静默更新默认开：常驻工具的更新不该等人想起来点按钮
+            auto_update_enabled: true,
+            auto_update_time: default_auto_update_time(),
         }
     }
+}
+
+/// 静默更新的默认时刻：凌晨 5 点。
+///
+/// 挑深夜不是为了「隐藏」，而是因为这一刻**最不容易撞上正在使用的界面/接管**：
+/// 自动更新装完会重启整个应用，落在白天就是一次无预警的中断。
+fn default_auto_update_time() -> String {
+    "05:00".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------

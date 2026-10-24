@@ -13,6 +13,7 @@
 //! 所以这里在单账号内部退避重试之外，再加**整体补签轮次**。
 
 use crate::accounts::{self, Account};
+use crate::autoupdate;
 use crate::briefing;
 use crate::commands;
 use crate::checkin::CheckinResult;
@@ -59,6 +60,12 @@ fn briefing_state() -> &'static Mutex<BriefingState> {
 pub fn spawn(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last_day: Option<chrono::NaiveDate> = None;
+        // 静默更新的「今天跑过没有」。**只在内存**：本项目没有 `schedule_state.json`，
+        // 重启后可能再查一次更新 —— 但 check 本身是幂等的（已是最新就什么都不做），
+        // 代价只是多一次 HEAD 请求，不值得为它引入一个状态文件。
+        let mut last_update_day: Option<String> = None;
+        // 线程起点即「应用启动时刻」：静默更新用它挡住「刚打开就自己重启」（见 autoupdate）
+        let started = std::time::Instant::now();
         // 启动即检查一次端点改写是否还在
         let mut next_repair = std::time::Instant::now();
         // 第一跳是「启动补采」：应用刚起来就采一次样 + 补一次固化，
@@ -77,6 +84,10 @@ pub fn spawn(app: tauri::AppHandle) {
             // 积分简报有自己的开关，不受「定时签到」影响；放最前，别被下面的分支吞掉
             maybe_seal_briefing(&app, &dir, &settings, startup);
             startup = false;
+            // 静默更新：同样是独立开关 + 独立时刻，与「定时签到」无关。
+            // 执行时会把本线程阻塞几十秒（下载 + 安装）—— trae 这边的定时签到按分钟
+            // 匹配，晚几秒仍落在同一分钟内；补签轮次也有 10 分钟间隔，容错足够。
+            autoupdate::maybe_run(&app, &dir, &settings, &mut last_update_day, started);
             if settings.takeover_enabled && std::time::Instant::now() >= next_repair {
                 // ⚠️ 端点必须与 `commands::enable_endpoint` 用**同一个**来源
                 // （`endpoint::base_url`）。端点只有一种形态了，所以这里不再随模式二选一 ——
