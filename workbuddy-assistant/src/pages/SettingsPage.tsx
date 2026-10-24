@@ -56,6 +56,9 @@ export function SettingsPage({
   const [auto, setAuto] = useState(settings.auto_checkin_on_start);
   // 界面字体：纯前端偏好，即时生效并持久化（见 src/font.ts），不经过后端 settings
   const [fontKey, setFontKeyState] = useState(() => getFontKey());
+  // 静默更新：后端在设定时刻自己跑，本页只是开关 + 时刻（默认开、默认 05:00）
+  const [autoUpd, setAutoUpd] = useState(settings.auto_update_enabled);
+  const [autoUpdTime, setAutoUpdTime] = useState(settings.auto_update_time);
   const [schedOn, setSchedOn] = useState(settings.schedule_enabled);
   const [schedTime, setSchedTime] = useState(settings.schedule_time);
   // 定时签到的随机时间窗（分钟）：0 = 关闭随机，精确到设定时刻
@@ -192,6 +195,42 @@ export function SettingsPage({
               >
                 {updateBusy ? "检查中…" : updateVersion ? "立即更新" : "检查更新"}
               </button>
+            }
+          />
+          {/* 静默更新：后台调度线程在设定时刻自己查、自己下、自己装，装完应用自动重启。
+              与上面那个按钮是**两条独立通路** —— 关掉这里不影响手动检查更新。 */}
+          <Row
+            title="静默自动更新"
+            desc="到点自动下载并安装，装完自动重启；关掉后只能手动检查更新。"
+            ctrl={
+              <Switch
+                checked={autoUpd}
+                onChange={(v) => {
+                  setAutoUpd(v);
+                  patch({ auto_update_enabled: v });
+                }}
+                title="静默自动更新"
+              />
+            }
+          />
+          <Row
+            sub
+            title="更新时刻"
+            desc="应用保持运行时生效；该时刻关机则在当天首次启动后补做。"
+            ctrl={
+              <input
+                type="time"
+                value={autoUpdTime}
+                disabled={!autoUpd}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  // 清空不是有效时刻（后端 due() 解析失败 ⇒ 永不触发）。
+                  // 与其让「开关还开着、时间却空着」这种状态存在，不如不落盘、控件回显原值。
+                  if (!v) return;
+                  setAutoUpdTime(v);
+                  patch({ auto_update_time: v.trim() });
+                }}
+              />
             }
           />
           {/* 固定高度的状态槽：没有状态时也占着这一行，

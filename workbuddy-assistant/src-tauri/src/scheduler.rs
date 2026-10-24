@@ -35,6 +35,7 @@
 //!   增量前后归到不同的小时里。统计口径见 [`crate::briefing`] 与 [`crate::ledger`]。
 
 use crate::accounts::{self, Settings};
+use crate::autoupdate;
 use crate::briefing;
 use crate::commands;
 use crate::notify;
@@ -106,6 +107,13 @@ struct ScheduleState {
     /// 所以每天最多一条。先落盘再推送：推送失败也不该让同一份简报反复重推。
     #[serde(default)]
     last_briefing_push_date: Option<String>,
+    /// 最后一次执行静默更新的日期（`YYYY-MM-DD`）
+    ///
+    /// 「当天**尝试**过」就记 —— 成功、失败、查到已是最新都算。失败不当天重试是有意的：
+    /// 网络断的时候每一跳（30s）都重下一遍安装包，就成了重试风暴。
+    /// 也必须是落盘状态：否则重启一次就可能在同一天里再更新一遍。
+    #[serde(default)]
+    last_auto_update_date: Option<String>,
 }
 
 fn state_file(dir: &Path) -> PathBuf {
@@ -271,6 +279,8 @@ pub(crate) fn due_at(
 /// 启动后台调度线程。线程与进程同生命周期，无需 join。
 pub fn spawn(app: AppHandle) {
     std::thread::spawn(move || {
+        // 线程起点即「应用启动时刻」：静默更新用它挡住「刚打开就自己重启」（见 autoupdate）
+        let started = std::time::Instant::now();
         // 启动先扫一次续签：等 app 初始化完成（数据目录就绪）再动手
         std::thread::sleep(Duration::from_secs(5));
         if let Ok(dir) = commands::try_data_dir(&app) {
@@ -298,10 +308,24 @@ pub fn spawn(app: AppHandle) {
             // 必须放在下面那个 continue 之前 —— 否则用户一关定时签到，简报也顺带没了
             maybe_seal_briefing(&app, &dir, &settings, false);
 
+            // 静默更新：同样是独立开关 + 独立时刻，也在 continue 之前。
+            // 执行时会把调度线程**阻塞**几十秒（下载 + 安装）—— 凌晨那个点上的
+            // 其它定时任务（签到 / 简报）都是分钟级容错，被推迟一会儿没有影响。
+            let mut state = load_state(&dir);
+            if autoupdate::maybe_run(
+                &app,
+                &dir,
+                &settings,
+                &mut state.last_auto_update_date,
+                started,
+            ) {
+                // 「今天已跑」必须当场落盘：Windows 上安装会 exit(0)，晚了就写不进去
+                save_state(&dir, &state);
+            }
+
             if !settings.schedule_enabled {
                 continue;
             }
-            let mut state = load_state(&dir);
             let now = chrono::Local::now().naive_local();
             let today = now.date().format("%Y-%m-%d").to_string();
             // 当天目标时刻：第一次算出来后立刻落盘，之后每一跳都复用同一个值，
@@ -843,10 +867,13 @@ mod tests {
                 }),
                 last_sample_hour: Some("2026-09-12 09".into()),
                 last_briefing_push_date: Some("2026-09-13".into()),
+                // 静默更新的「今天已跑」也必须在盘上：丢了就会在重启后同一天再更一遍
+                last_auto_update_date: Some("2026-09-14".into()),
             },
         );
         let loaded = load_state(&dir);
         assert_eq!(loaded.last_run_date.as_deref(), Some("2026-09-12"));
+        assert_eq!(loaded.last_auto_update_date.as_deref(), Some("2026-09-14"));
         assert_eq!(loaded.last_refresh_scan_ms, Some(1_700_000_000_000));
         // 当天目标必须扛得住重启，否则「随机窗口」会被重启重新摇一次
         assert_eq!(
