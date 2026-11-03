@@ -1,4 +1,7 @@
-//! 签到结果通知：把结果推送到用户自配的 webhook 地址。
+//! 签到失败告警：**只在有账号签到失败时**推送到用户自配的 webhook 地址。
+//!
+//! 全部成功 / 今日已签 / 活动未开都不发 —— 日常推送只会在手机上刷成噪音，
+//! 真正需要人处理的是「哪个账号失败了、为什么」。失败明细见 [`alert_message`]。
 //!
 //! 对齐参考脚本 `qoder-checkin/qoder_checkin.py` 的 `notify_webhook`：
 //!   * `GET {webhook}?message=<消息内容>`（query 参数，需 URL 编码）
@@ -23,8 +26,8 @@
 use crate::accounts::{Account, AccountView};
 use std::time::Duration;
 
-/// 通知品牌前缀。改名只改这一处（`summary_message` 等文案里不要再写应用名，
-/// 否则会变成「【Qoder 助手】Qoder 签到完成」这种重复）。
+/// 通知品牌前缀。改名只改这一处（`alert_message` 等文案里不要再写应用名，
+/// 否则会变成「【Qoder 助手】Qoder 签到失败」这种重复）。
 pub const BRAND: &str = "【Qoder 助手】";
 
 /// 普通浏览器 UA。Cloudflare 按 UA 拦截脚本类客户端，缺了它必然 403。
@@ -108,21 +111,12 @@ pub async fn send(webhook: &str, message: &str) -> Result<String, String> {
     Err(format!("已重试 {MAX_ATTEMPTS} 次仍失败：{last_err}"))
 }
 
-/// 随机时间窗生效时，「今天几点签」在**摇定那一刻**就推出去的一条预告。
-///
-/// 开了窗口之后，用户配的 `08:00` 只是窗口起点，今天真正的时刻是窗口内摇出来的 ——
-/// 不预告的话，除了「签到完成」那一条之外，用户没有任何途径知道今天定在了几点，
-/// 只能等签完之后再回头看。
-pub fn target_preview(plan: &str, base: &str, window_minutes: u32) -> String {
-    format!("今日签到时间：{plan}（设定 {base} + 随机时间窗 {window_minutes} 分钟）")
-}
-
-/// 「本次触发时刻」那一行，附在签到结果正文之后。
+/// 「本次触发时刻」那一行，附在失败告警正文之后。
 ///
 /// `plan` 是当天计划时刻（随机窗口生效时即摇出来的值），`base` 是用户配置值，
 /// `actual` 是真正跑的那一刻。三者常常互不相等：随机窗口让 `plan != base`，
 /// 而**补跑**（错过时刻后 30 分钟内打开应用）让 `actual != plan`。
-/// 只报「签到完成」看不出今天究竟几点签的，这一行就是答案。
+/// 告警里不带这一行，就看不出今天究竟几点跑的，也就对不上「为什么没签上」。
 pub fn trigger_line(actual: &str, plan: &str, base: &str) -> String {
     let (actual, plan, base) = (actual.trim(), plan.trim(), base.trim());
     if plan == base {
@@ -137,72 +131,72 @@ pub fn trigger_line(actual: &str, plan: &str, base: &str) -> String {
     format!("触发时刻 {actual}（今日随机 {plan}，设定 {base}）")
 }
 
-/// 把一批账号的签到结果汇总成一条人类可读的通知正文（品牌前缀由 [`send`] 施加）。
+/// 这一轮里**真正失败**的账号（`last` 缺失 = 没执行，也算失败）。
 ///
-/// 全签上时只报数量；有「未签」（活动未开 / 失败）时附上前 5 条未签明细
-///（账号名 + 展示标识 + 原因），因为推送里最有价值的信息就是「哪个账号为什么没签到」。
-pub fn summary_message(views: &[AccountView]) -> String {
-    // 通知只关心账号本身（签到结果 / 名称 / 手机号），积分与它无关：
-    // 先摊平成账号列表，下面的逻辑与从前完全一致。
-    let accounts: Vec<&Account> = views.iter().map(|v| &v.account).collect();
-    let total = accounts.len();
-    // 「已签」也算 success=true（幂等成功），但计数时必须与「成功」互斥，
-    // 否则一个账号会被同时算进两栏（实测：1 个账号显示「成功 1 / 已签 1」）。
-    let already = accounts.iter().filter(|a| matches!(&a.last, Some(r) if r.already)).count();
-    let ok = accounts
+/// 「活动未开」不在此列：那是还没到刷新点 / 当天没有可领活动，不是错误。
+fn failed_accounts(views: &[AccountView]) -> Vec<&Account> {
+    views
         .iter()
-        .filter(|a| matches!(&a.last, Some(r) if r.success && !r.already))
-        .count();
-    // 「活动未开」既不算成功也不算失败，但**必须占一个计数框**：上一版把它从三个
-    // 计数里全部排除，3 个账号只报出 2 个、明细里也没有它 —— 用户根本不知道谁没签上。
-    let inactive = accounts
-        .iter()
-        .filter(|a| matches!(&a.last, Some(r) if !r.success && !r.already && r.inactive))
-        .count();
-    // 四个计数互斥，且加总恒等于总数：成功 + 已签 + 活动未开 + 失败 == total
-    let failed = accounts
-        .iter()
+        .map(|v| &v.account)
         .filter(|a| match &a.last {
             Some(r) => !r.success && !r.already && !r.inactive,
             None => true,
         })
+        .collect()
+}
+
+/// 一批账号的**失败告警**正文（品牌前缀由 [`send`] 施加）；没有失败时返回 `None`。
+///
+/// 这就是「只有失败才告警」的唯一出口：调用点拿到 `None` 就什么都不发。
+/// 正文带四个计数做上下文，但明细只列失败账号 —— 活动未开是正常状态，
+/// 混进明细只会把真正要处理的那几条挤出前 5 行。
+pub fn alert_message(views: &[AccountView]) -> Option<String> {
+    // 通知只关心账号本身（签到结果 / 名称 / 手机号），积分与它无关
+    let accounts: Vec<&Account> = views.iter().map(|v| &v.account).collect();
+    let failed = failed_accounts(views);
+    if failed.is_empty() {
+        return None;
+    }
+    let total = accounts.len();
+    // 「已签」也算 success=true（幂等成功），但计数时必须与「成功」互斥，
+    // 否则一个账号会被同时算进两栏（实测：1 个账号显示「成功 1 / 已签 1」）。
+    let already = accounts
+        .iter()
+        .filter(|a| matches!(&a.last, Some(r) if r.already))
+        .count();
+    let ok = accounts
+        .iter()
+        .filter(|a| matches!(&a.last, Some(r) if r.success && !r.already))
+        .count();
+    let inactive = accounts
+        .iter()
+        .filter(|a| matches!(&a.last, Some(r) if !r.success && !r.already && r.inactive))
         .count();
 
     let mut s = format!(
-        "签到完成：成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}（共 {total} 个账号）"
+        "签到失败 {} 个：成功 {ok} / 已签 {already} / 活动未开 {inactive}（共 {total} 个账号）",
+        failed.len()
     );
-    // 「未签明细」= 活动未开 + 失败（按账号列表顺序）：未开多是窗口/查询问题，
-    // 失败是真错误 —— 都附上各自的原因，用户在推送里就能判断要不要处理
-    let unsigned: Vec<&Account> = accounts
-        .iter()
-        .filter(|a| match &a.last {
-            Some(r) => !r.success && !r.already,
-            None => true,
-        })
-        .copied()
-        .collect();
-    if !unsigned.is_empty() {
-        s.push_str("\n未签明细：");
-        for a in unsigned.iter().take(5) {
-            // 展示标识与界面同一套规则（见 `Account::identity`）：
-            // 推送里的「谁没签上」与界面上看到的名字必须是同一条
-            let who = match a.identity() {
-                Some(id) => format!("{}（{}）", a.name, id),
-                None => a.name.clone(),
-            };
-            let why = a
-                .last
-                .as_ref()
-                .map(|r| r.message.clone())
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| "未执行".to_string());
-            s.push_str(&format!("\n· {who}：{why}"));
-        }
-        if unsigned.len() > 5 {
-            s.push_str(&format!("\n…另有 {} 个未签账号", unsigned.len() - 5));
-        }
+    s.push_str("\n失败明细：");
+    for a in failed.iter().take(5) {
+        // 展示标识与界面同一套规则（见 `Account::identity`）：
+        // 推送里的「谁失败了」与界面上看到的名字必须是同一条
+        let who = match a.identity() {
+            Some(id) => format!("{}（{}）", a.name, id),
+            None => a.name.clone(),
+        };
+        let why = a
+            .last
+            .as_ref()
+            .map(|r| r.message.clone())
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "未执行".to_string());
+        s.push_str(&format!("\n· {who}：{why}"));
     }
-    s
+    if failed.len() > 5 {
+        s.push_str(&format!("\n…另有 {} 个失败账号", failed.len() - 5));
+    }
+    Some(s)
 }
 
 #[cfg(test)]
@@ -297,9 +291,9 @@ mod tests {
     /// 三款助手共用同一个通知通道，每条推送都要能一眼看出是谁发的。
     #[test]
     fn brands_every_message_exactly_once() {
-        assert_eq!(branded("签到完成"), "【Qoder 助手】签到完成");
+        assert_eq!(branded("签到失败"), "【Qoder 助手】签到失败");
         // 幂等：调用点万一自己写了前缀，也不该变成两个
-        assert_eq!(branded("【Qoder 助手】签到完成"), "【Qoder 助手】签到完成");
+        assert_eq!(branded("【Qoder 助手】签到失败"), "【Qoder 助手】签到失败");
         // 空消息不硬凑一条只剩前缀、没有信息量的推送
         assert_eq!(branded(""), "");
         assert_eq!(branded("   "), "");
@@ -308,7 +302,8 @@ mod tests {
     /// 前缀必须真的落进发出去的 query（顺带覆盖中文编码后的形态）。
     #[test]
     fn brand_reaches_the_webhook_query() {
-        let u = build_url("https://h/x", &branded(&summary_message(&[]))).unwrap();
+        let alert = alert_message(&[acct("a", None, None)]).unwrap();
+        let u = build_url("https://h/x", &branded(&alert)).unwrap();
         let parsed = reqwest::Url::parse(&u).unwrap();
         let msg = parsed
             .query_pairs()
@@ -316,86 +311,93 @@ mod tests {
             .map(|(_, v)| v.to_string())
             .unwrap();
         assert!(msg.starts_with("【Qoder 助手】"), "{msg}");
-        assert!(msg.contains("签到完成"), "{msg}");
+        assert!(msg.contains("签到失败"), "{msg}");
     }
 
-    /// 正文自己带品牌词的话，前缀一加就成了「【X 助手】X 签到完成」——
+    /// 正文自己带品牌词的话，前缀一加就成了「【X 助手】X 签到失败」——
     /// 文案里不许再出现应用名（前缀是唯一的品牌出口）。
     #[test]
-    fn summary_text_does_not_repeat_the_brand() {
-        let m = summary_message(&[acct("a", None, Some(rec(true, false, false, "签到成功")))]);
+    fn alert_text_does_not_repeat_the_brand() {
+        let m = alert_message(&[acct("a", None, Some(rec(false, false, false, "HTTP 401")))])
+            .unwrap();
         assert!(!m.contains("Qoder"), "{m}");
-        assert!(m.starts_with("签到完成"), "{m}");
+        assert!(m.starts_with("签到失败"), "{m}");
     }
 
+    /// 核心契约：**没有失败就一条都不发**。全成功、已签、活动未开都不算失败。
     #[test]
-    fn summary_reports_counts_when_all_good() {
+    fn no_failure_means_no_notification() {
         let accounts = vec![
             acct("a", Some("138"), Some(rec(true, false, false, "签到成功"))),
-            acct("b", None, Some(rec(false, true, false, "今天已签到"))),
+            acct("b", None, Some(rec(true, true, false, "今天已签到"))),
+            acct(
+                "c",
+                None,
+                Some(rec(false, false, true, "当前没有可领取的活动")),
+            ),
         ];
-        let m = summary_message(&accounts);
-        assert!(m.contains("成功 1"), "{m}");
-        assert!(m.contains("已签 1"), "{m}");
-        assert!(m.contains("活动未开 0"), "{m}");
-        assert!(m.contains("失败 0"), "{m}");
-        // 全成功/已签不该堆未签明细
-        assert!(!m.contains("未签明细"), "{m}");
+        assert!(alert_message(&accounts).is_none());
+        assert!(alert_message(&[]).is_none());
     }
 
+    /// 「今天已领」是幂等成功态（success 与 already 同为 true）：单独出现时同样静音，
+    /// 有失败时计数必须互斥，否则 1 个账号会显示成「成功 1 / 已签 1」。
     #[test]
-    fn already_claimed_is_counted_once_not_as_success_too() {
-        // 「今天已领」是幂等成功态：此时 success 与 already 会同时为 true
-        // （查询到 `claimStatus == "CLAIMED"` 就直接落成这个组合，没打领取接口），
-        // 所以计数必须互斥，否则 1 个账号会显示成「成功 1 / 已签 1」。
-        let accounts = vec![acct(
+    fn already_claimed_is_silent_and_never_double_counted() {
+        let already = acct(
             "waxiloao",
             Some("190****9775"),
             Some(rec(true, true, false, "今日已领取")),
-        )];
-        let m = summary_message(&accounts);
-        assert!(m.contains("成功 0 / 已签 1"), "{m}");
-        assert!(m.contains("失败 0"), "{m}");
+        );
+        assert!(alert_message(&[already]).is_none());
+
+        let m = alert_message(&[
+            acct("waxiloao", None, Some(rec(true, true, false, "今日已领取"))),
+            acct("小号", None, Some(rec(false, false, false, "HTTP 500"))),
+        ])
+        .unwrap();
+        assert!(m.contains("签到失败 1 个：成功 0 / 已签 1 / 活动未开 0"), "{m}");
     }
 
     #[test]
-    fn summary_lists_failures_with_phone_and_reason() {
+    fn alert_lists_failures_with_phone_and_reason() {
         let accounts = vec![
             acct("主号", Some("190****9775"), Some(rec(true, false, false, "签到成功"))),
             acct("小号", Some("138****0000"), Some(rec(false, false, false, "HTTP 401 (token expired)"))),
             acct("无记录", None, None),
         ];
-        let m = summary_message(&accounts);
-        assert!(m.contains("成功 1"), "{m}");
-        assert!(m.contains("失败 2"), "{m}");
-        assert!(m.contains("未签明细"), "{m}");
+        let m = alert_message(&accounts).unwrap();
+        assert!(m.contains("签到失败 2 个：成功 1 / 已签 0 / 活动未开 0（共 3 个账号）"), "{m}");
+        assert!(m.contains("失败明细"), "{m}");
         assert!(m.contains("小号（138****0000）：HTTP 401 (token expired)"), "{m}");
         // last 为 None 的账号算失败，原因写「未执行」
         assert!(m.contains("无记录：未执行"), "{m}");
     }
 
-    /// 「活动未开」的账号必须出现在计数与明细里 —— 上一版把它从三个计数里全部排除，
-    /// 3 个账号只报出 2 个（真实案例：国际版缺设备头时整批显示活动未开）。
+    /// 「活动未开」只做计数上下文，不进失败明细：它是正常状态，
+    /// 混进来只会把真正要处理的失败挤出前 5 行。
     #[test]
-    fn inactive_accounts_are_counted_and_listed_as_unsigned() {
+    fn inactive_is_context_not_a_failure_detail() {
         let mut a = acct(
             "waxilo",
             None,
             Some(rec(false, false, true, "当前没有可领取的活动（每日 10:00 UTC+8 刷新后才会出现）")),
         );
         a.account.email = Some("waxilo88@gmail.com".into());
-        let m = summary_message(&[
+        let m = alert_message(&[
             acct("主号", Some("190****9775"), Some(rec(true, false, false, "已领取 100 Credits"))),
             a,
-        ]);
-        assert!(m.contains("成功 1 / 已签 0 / 活动未开 1 / 失败 0（共 2 个账号）"), "{m}");
-        assert!(m.contains("未签明细"), "{m}");
-        assert!(m.contains("waxilo（waxilo88@gmail.com）：当前没有可领取的活动"), "{m}");
+            acct("小号", Some("138****0000"), Some(rec(false, false, false, "HTTP 500"))),
+        ])
+        .unwrap();
+        assert!(m.contains("签到失败 1 个：成功 1 / 已签 0 / 活动未开 1（共 3 个账号）"), "{m}");
+        assert!(!m.contains("waxilo"), "活动未开不该出现在失败明细：{m}");
+        assert!(m.contains("小号（138****0000）：HTTP 500"), "{m}");
     }
 
-    /// 四个计数互斥，加总恒等于总数：成功 + 已签 + 活动未开 + 失败 == 账号数
+    /// 计数覆盖全部账号：失败 + 成功 + 已签 + 活动未开 + 未执行 == 总数。
     #[test]
-    fn buckets_partition_all_accounts() {
+    fn counts_cover_every_account() {
         let accounts = vec![
             acct("a", Some("1"), Some(rec(true, false, false, "签到成功"))),
             acct("b", Some("2"), Some(rec(true, true, false, "今日已领取"))),
@@ -403,8 +405,8 @@ mod tests {
             acct("d", Some("4"), Some(rec(false, false, false, "HTTP 500"))),
             acct("e", Some("5"), None),
         ];
-        let m = summary_message(&accounts);
-        assert!(m.contains("成功 1 / 已签 1 / 活动未开 1 / 失败 2（共 5 个账号）"), "{m}");
+        let m = alert_message(&accounts).unwrap();
+        assert!(m.contains("签到失败 2 个：成功 1 / 已签 1 / 活动未开 1（共 5 个账号）"), "{m}");
     }
 
     /// 手机号为空、只有邮箱的失败账号不能再退回「只有名字」，
@@ -413,7 +415,7 @@ mod tests {
     fn an_email_only_failure_is_named_by_its_email() {
         let mut a = acct("小号", None, Some(rec(false, false, false, "HTTP 401 (token expired)")));
         a.account.email = Some("a@b.c".into());
-        let m = summary_message(&[a]);
+        let m = alert_message(&[a]).unwrap();
         assert!(m.contains("小号（a@b.c）"), "{m}");
     }
 
@@ -433,17 +435,6 @@ mod tests {
         // 没开窗口（或摇号恰好落在设定值上）：只有一个时刻，别硬凑出「随机 08:00」
         assert_eq!(trigger_line("08:00", "08:00", "08:00"), "触发时刻 08:00");
     }
-
-    /// 预告文案要一眼看出「哪天、几点、为什么不是配置的那个点」。
-    #[test]
-    fn target_preview_states_the_real_time_and_the_window() {
-        let m = target_preview("09:42", "08:00", 90);
-        assert!(m.contains("今日签到时间：09:42"), "{m}");
-        assert!(m.contains("设定 08:00"), "{m}");
-        assert!(m.contains("随机时间窗 90 分钟"), "{m}");
-        assert_eq!(branded(&m), format!("{BRAND}{m}"));
-    }
-
 
     /// 本机冒烟：真的往 webhook 发一条（会收到真实推送）。
     /// 运行：`cargo test -- --ignored --nocapture`

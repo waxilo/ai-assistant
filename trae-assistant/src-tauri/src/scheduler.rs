@@ -239,26 +239,28 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
     let mut ok = 0usize;
     let mut already = 0usize;
     let mut inactive = 0usize;
-    // 「未签明细」= 活动未开 + 失败（按账号顺序）：未开另占一个计数框，不是失败
-    let mut unsigned: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    // 失败明细（只收失败；活动未开另占一个计数框，不是失败）
+    let mut failures: Vec<String> = Vec::new();
     for (name, r) in &done {
         if r.already {
             already += 1;
         } else if r.success {
             ok += 1;
+        } else if r.inactive {
+            inactive += 1;
         } else {
-            if r.inactive {
-                inactive += 1;
-            }
-            unsigned.push(format!("{}：{}", name, r.message));
+            failed += 1;
+            failures.push(format!("{}：{}", name, r.message));
         }
     }
 
-    // webhook 通知：仅配置了地址才发，失败只记日志、不影响签到结果
+    // webhook 通知：**只在有失败时**发（全部成功 / 已签 / 活动未开都不发），
+    // 失败只记日志、不影响签到结果
     let webhook = settings.webhook_url.trim();
-    if !webhook.is_empty() {
-        let title = crate::notify::summary_title(ok, already, unsigned.len() - inactive);
-        let msg = crate::notify::summary_message(ok, already, inactive, &unsigned);
+    if !webhook.is_empty() && failed > 0 {
+        let title = crate::notify::summary_title(failed);
+        let msg = crate::notify::summary_message(ok, already, inactive, failed, &failures);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let (sent, out) =
             match tauri::async_runtime::block_on(crate::notify::send(webhook, &title, &msg)) {

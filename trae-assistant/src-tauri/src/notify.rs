@@ -1,12 +1,12 @@
-//! 通知/告警：把签到结果与积分简报推送到用户自配的 webhook（失败只记日志，
-//! 绝不影响主流程）。
+//! 通知/告警：把**签到失败**与积分简报推送到用户自配的 webhook（失败只记日志，
+//! 绝不影响主流程）。签到成功 / 已签 / 活动未开都不发 —— 只有失败才告警。
 //!
 //! # Webhook 形状
 //! `GET {webhook}?title=<url-encoded>&message=<url-encoded>`
 //!
 //! 标题与正文**分开传**：仅把正文塞进 `message` 时，多数中转（含自建 Notify Hub、
 //! qmsg 类）会把整段正文当成标题，于是通知标题变成一长串状态汇总——这就是之前
-//! 「标题有问题」的原因。现在显式给出精简 title（如「签到」）。
+//! 「标题有问题」的原因。现在显式给出精简 title（如「签到失败（2 个）」）。
 //!
 //! 必须带浏览器 UA（Cloudflare 前置会对脚本类 UA 返回 403）；最多重试 3 次
 //! （1.5s / 3s 退避）。
@@ -111,38 +111,34 @@ pub async fn send(webhook: &str, title: &str, message: &str) -> Result<String, S
     Err(format!("已重试 {MAX_ATTEMPTS} 次仍失败：{last_err}"))
 }
 
-/// 通知标题：按结果给一个短标题（品牌前缀由 [`send`] 施加），
-/// 避免正文被当成标题。
-pub fn summary_title(ok: usize, already: usize, failed: usize) -> String {
-    if failed > 0 {
-        format!("签到异常（{failed} 个失败）")
-    } else if ok > 0 {
-        format!("签到成功（{ok} 个）")
-    } else if already > 0 {
-        "签到：今日已签".to_string()
-    } else {
-        "签到".to_string()
-    }
+/// 通知标题。只在有失败时才调用，所以标题直接报失败数
+/// （品牌前缀由 [`send`] 施加），避免正文被当成标题。
+pub fn summary_title(failed: usize) -> String {
+    format!("签到失败（{failed} 个）")
 }
 
-/// 把一次定时签到的计数汇总成一条通知正文（不含标题，品牌前缀由 [`send`] 施加）。
+/// 把一次定时签到的**失败告警**汇成一条正文（不含标题，品牌前缀由 [`send`] 施加）。
 ///
-/// `inactive` 是「活动未开」的数量；`unsigned` 是「未签明细」行（活动未开 + 失败，
-/// 按账号顺序）—— 四个计数互斥、加总恒等于账号数：失败数 = 未签总数 − 活动未开数。
-pub fn summary_message(ok: usize, already: usize, inactive: usize, unsigned: &[String]) -> String {
-    let failed = unsigned.len() - inactive;
-    let total = ok + already + unsigned.len();
+/// `failed` 是失败数，`failures` 是失败明细（账号 + 原因，按账号顺序）。
+/// 「活动未开」只做计数上下文，不进明细：那是还没到窗口，不是错误；
+/// 混进来只会把真正要处理的那几条挤出前 5 行。
+pub fn summary_message(
+    ok: usize,
+    already: usize,
+    inactive: usize,
+    failed: usize,
+    failures: &[String],
+) -> String {
+    let total = ok + already + inactive + failed;
     let mut s = format!(
-        "成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}（共 {total} 个账号）"
+        "签到失败 {failed} 个：成功 {ok} / 已签 {already} / 活动未开 {inactive}（共 {total} 个账号）"
     );
-    if !unsigned.is_empty() {
-        s.push_str("\n未签明细：");
-        for f in unsigned.iter().take(5) {
-            s.push_str(&format!("\n· {f}"));
-        }
-        if unsigned.len() > 5 {
-            s.push_str(&format!("\n…另有 {} 个未签账号", unsigned.len() - 5));
-        }
+    s.push_str("\n失败明细：");
+    for f in failures.iter().take(5) {
+        s.push_str(&format!("\n· {f}"));
+    }
+    if failures.len() > 5 {
+        s.push_str(&format!("\n…另有 {} 个失败账号", failures.len() - 5));
     }
     s
 }
@@ -167,8 +163,8 @@ mod tests {
     fn brand_reaches_both_title_and_message() {
         let url = build_url(
             "https://h/x",
-            &branded(&summary_title(1, 0, 0)),
-            &branded(&summary_message(1, 0, 0, &[])),
+            &branded(&summary_title(1)),
+            &branded(&summary_message(0, 0, 0, 1, &["小号：HTTP 401".to_string()])),
         )
         .unwrap();
         let parsed = reqwest::Url::parse(&url).unwrap();
@@ -183,26 +179,17 @@ mod tests {
         assert!(pairs[1].1.starts_with("【Trae 助手】"), "{pairs:?}");
     }
 
-    /// 标题/正文里不许再出现应用名，否则前缀一加就成了「【Trae 助手】Trae CN 签到成功」。
+    /// 标题/正文里不许再出现应用名，否则前缀一加就成了「【Trae 助手】Trae CN 签到失败」。
     #[test]
     fn summary_text_does_not_repeat_the_brand() {
-        for t in [
-            summary_title(1, 0, 0),
-            summary_title(0, 1, 0),
-            summary_title(0, 0, 1),
-            summary_title(0, 0, 0),
-        ] {
-            assert!(!t.contains("Trae CN"), "{t}");
-        }
-        assert!(!summary_message(1, 0, 0, &[]).contains("Trae CN"));
+        assert!(!summary_title(1).contains("Trae CN"));
+        assert!(!summary_message(1, 0, 1, 1, &["小号：HTTP 401".to_string()]).contains("Trae CN"));
     }
 
     #[test]
-    fn title_reflects_the_worst_case() {
-        assert_eq!(summary_title(3, 0, 0), "签到成功（3 个）");
-        assert_eq!(summary_title(0, 2, 0), "签到：今日已签");
-        // 有失败就报失败，成功数不该把这个信息盖掉
-        assert_eq!(summary_title(3, 0, 1), "签到异常（1 个失败）");
+    fn title_reports_the_failure_count() {
+        assert_eq!(summary_title(1), "签到失败（1 个）");
+        assert_eq!(summary_title(3), "签到失败（3 个）");
     }
 
     #[test]
@@ -240,20 +227,27 @@ mod tests {
     }
 
     #[test]
-    fn summary_lists_failures() {
-        let m = summary_message(1, 1, 0, &["小号：HTTP 401".to_string()]);
-        assert!(m.contains("成功 1 / 已签 1 / 活动未开 0 / 失败 1（共 3 个账号）"), "{m}");
-        assert!(m.contains("未签明细"), "{m}");
+    fn summary_lists_failures_only() {
+        let m = summary_message(1, 1, 0, 1, &["小号：HTTP 401".to_string()]);
+        assert!(m.contains("签到失败 1 个：成功 1 / 已签 1 / 活动未开 0（共 3 个账号）"), "{m}");
+        assert!(m.contains("失败明细"), "{m}");
         assert!(m.contains("· 小号：HTTP 401"), "{m}");
     }
 
-    /// 「活动未开」的账号必须出现在计数与明细里 —— 上一版把它整个丢掉，
-    /// 账号总数对不上，「谁没签上」也查不到。
+    /// 「活动未开」只做计数上下文，不进失败明细 —— 它是正常状态，
+    /// 混进来只会把真正要处理的失败挤出前 5 行。
     #[test]
-    fn inactive_accounts_are_counted_and_listed_as_unsigned() {
-        let m = summary_message(1, 0, 1, &["waxilo：活动未开启".to_string()]);
-        assert!(m.contains("成功 1 / 已签 0 / 活动未开 1 / 失败 0（共 2 个账号）"), "{m}");
-        assert!(m.contains("· waxilo：活动未开启"), "{m}");
+    fn inactive_is_counted_but_not_listed_as_a_failure() {
+        let m = summary_message(
+            1,
+            0,
+            1,
+            1,
+            &["小号：HTTP 500".to_string()],
+        );
+        assert!(m.contains("签到失败 1 个：成功 1 / 已签 0 / 活动未开 1（共 3 个账号）"), "{m}");
+        assert!(!m.contains("活动未开启"), "{m}");
+        assert!(m.contains("· 小号：HTTP 500"), "{m}");
     }
 
     /// 本机冒烟：真的往 webhook 发一条（会收到真实推送）。

@@ -1157,9 +1157,11 @@ pub async fn checkin_all(app: AppHandle) -> Result<Vec<accounts::AccountView>, S
     let settings = accounts::load_settings(&dir);
     // 手动「全部签到」走短间隔档（manual_stagger_*）：同样打散顺序与节奏，只是等待短得多
     let results = checkin_all_inner(&app, false).await?;
-    // 手动批量签到是否推送由设置决定（默认关，免得连点几下就把通知刷屏）
+    // 手动批量签到是否推送由设置决定（默认关）；且同样只在有失败时告警
     if settings.notify_enabled && settings.notify_on_manual {
-        let _ = notify::send(&settings.notify_webhook, &notify::summary_message(&results)).await;
+        if let Some(alert) = notify::alert_message(&results) {
+            let _ = notify::send(&settings.notify_webhook, &alert).await;
+        }
     }
     Ok(results)
 }

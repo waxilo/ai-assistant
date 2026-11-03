@@ -553,7 +553,7 @@ export function SettingsPage({
               </div>
               <Row
                 bare
-                title="定时签到后推送"
+                title="定时签到失败时推送"
                 ctrl={
                   <Toggle
                     checked={notifySched}
@@ -566,7 +566,7 @@ export function SettingsPage({
               />
               <Row
                 bare
-                title="手动「全部签到」后推送"
+                title="手动签到失败时推送"
                 ctrl={
                   <Toggle
                     checked={notifyManual}

@@ -162,7 +162,7 @@ pub(crate) fn notify(dir: &Path, key: &str, cooldown_ms: i64, message: &str) {
 ///
 /// 聚合成一条是刻意的：一轮扫描里十几个账号同时失败，逐账号推会把通道刷爆、
 /// 而用户真正要做的事只有一件（重新登录 / 检查网络）。明细照旧列出，前 5 条 + 计数，
-/// 与 [`crate::notify::summary_message`] 的「未签明细」同一个口径。
+/// 与 [`crate::notify::alert_message`] 的「失败明细」同一个口径。
 pub fn batch_message(headline: &str, lines: &[String], footnote: &str) -> String {
     let mut s = headline.to_string();
     for l in lines.iter().take(5) {

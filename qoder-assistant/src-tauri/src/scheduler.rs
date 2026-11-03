@@ -1,4 +1,5 @@
-//! 定时自动签到：应用常驻时，每天在用户设定的时刻执行一次「全部签到」并推送通知。
+//! 定时自动签到：应用常驻时，每天在用户设定的时刻执行一次「全部签到」，
+//! **只有账号失败时**才推送告警。
 //!
 //! 触发模型：**到点即触发 + 补跑窗口**，而不是「当前分钟恰好等于设定值」。
 //! 后者有两个必踩的坑：
@@ -12,20 +13,20 @@
 //! 「精确到分钟」的老行为。
 //!
 //! 窗口一开，「设定时刻」就不再是「今天的签到时刻」了 —— 用户配的 08:00 只是窗口起点。
-//! 所以摇定当天时刻后会**先推一条预告**（[`preview_time`] + [`notify::target_preview`]），
-//! 签到结果的通知里也带上真实触发时刻（[`notify::trigger_line`]）。两处合起来，
-//! 「今天到底几点签的」在任何时候都答得出来。
+//! 真实触发时刻只在失败告警里交代（[`notify::trigger_line`]）；签到成功不发通知，
+//! 所以不另推「今天几点签」的预告 —— 通知只在失败时才有意义。
 //!
 //! 跨启动去重靠 `schedule_state.json` 记一份排期。一跑就是**全部账号**
 //! （见 [`run_once`]：每日活动窗口本来就是同一个 10:00 UTC+8 → 次日 09:59），
-//! 触发即记上「今天跑过了」。「今天摇到几点」「预告推了没」也在同一份状态里。
+//! 触发即记上「今天跑过了」。「今天摇到几点」也在同一份状态里。
 //!
 //! 自动续签：常驻期间每 12 小时扫一遍账号，**剩余有效期不足 48 小时就静默续一次**；
 //! 启动后也会立刻扫一次（久未开应用的情况靠它兜住）。
 //! 与定时签到开关无关——续签是保命操作，不该被「没设定时签到」连带关掉。
 //! 扫描间隔落盘在 `schedule_state.json`，避免每次启动/每跳都打接口。
 //!
-//! 通知只在 `notify_enabled && notify_on_schedule` 时发送，且**失败不影响签到**。
+//! 签到通知**只在有账号失败时**发送（`notify_enabled && notify_on_schedule` 是总闸），
+//! 且推送失败不影响签到。
 //!
 //! 除定时签到外，本模块还管两件事，各自有独立开关，互不影响：
 //!
@@ -87,13 +88,6 @@ struct ScheduleState {
     /// 今天随机挑定的触发时刻（跨天自动重挑；见 [`target_time`]）
     #[serde(default)]
     today_target: Option<DayTarget>,
-    /// 已经推送过预告的那个目标时刻（见 [`preview_time`]）
-    ///
-    /// 与 `today_target` 分开记：前者是「今天几点签」，这里是「这点**已经告诉过用户**」。
-    /// 合并成一个字段就没法区分「摇定了」和「通知过了」，重启或每 30s 一跳都会重推。
-    /// 时刻被重新摇过（用户改了设置）时它自然不再相等，于是会补推新时刻。
-    #[serde(default)]
-    notified_target: Option<DayTarget>,
     /// 最后一次自动续签扫描的时刻（毫秒时间戳）—— 整机事实：续签扫的是全部账号
     #[serde(default)]
     last_refresh_scan_ms: Option<i64>,
@@ -125,8 +119,6 @@ struct RegionSchedule {
     last_run_date: Option<String>,
     #[serde(default)]
     today_target: Option<DayTarget>,
-    #[serde(default)]
-    notified_target: Option<DayTarget>,
 }
 
 /// 反序列化用的中间形态：同时认**三种**历史格式 ——
@@ -141,8 +133,6 @@ struct RawState {
     #[serde(default)]
     today_target: Option<DayTarget>,
     #[serde(default)]
-    notified_target: Option<DayTarget>,
-    #[serde(default)]
     last_refresh_scan_ms: Option<i64>,
     #[serde(default)]
     last_sample_hour: Option<String>,
@@ -156,17 +146,16 @@ impl RawState {
     /// per-region 老格式：排期按区域各一份，取 `cn` 那份迁回顶层 ——
     /// 只认 cn 之外的区域等于把「今天已跑过」弄失忆，升级当天会在补跑窗口重复签一遍。
     fn into_state(self) -> ScheduleState {
-        let (last_run_date, today_target, notified_target) = match self.regions {
+        let (last_run_date, today_target) = match self.regions {
             Some(mut m) => {
                 let s = m.remove("cn").unwrap_or_default();
-                (s.last_run_date, s.today_target, s.notified_target)
+                (s.last_run_date, s.today_target)
             }
-            None => (self.last_run_date, self.today_target, self.notified_target),
+            None => (self.last_run_date, self.today_target),
         };
         ScheduleState {
             last_run_date,
             today_target,
-            notified_target,
             last_refresh_scan_ms: self.last_refresh_scan_ms,
             last_sample_hour: self.last_sample_hour,
             last_briefing_push_date: self.last_briefing_push_date,
@@ -257,46 +246,6 @@ fn in_window(target: &DayTarget, base: &str, window_minutes: u32) -> bool {
     at_m >= base_m && at_m <= base_m + window_minutes as i64
 }
 
-/// 今天是否该推「随机时刻预告」，该预告哪个时刻。
-///
-/// 只在**窗口真的摇出了另一个时刻、且这个时刻还没到**时推。四条排除理由：
-///
-/// - `window == 0`，或摇号恰好停在 `base` 上：此时「设定时刻」本身就是答案，
-///   再推一条纯属噪音。
-/// - `now < base`：窗口还没开。当天的目标是在**零点后第一跳**就算出来的，
-///   不加这条就会在半夜给人发推送。
-/// - `now >= target`：已经到点（或早过了），这不再是「预告」；真实时刻由签到结果
-///   那条通知里的 [`notify::trigger_line`] 交代，不必提前废掉一条。
-/// - 同一个目标已经推过：重启、每 30s 一跳都不能重复推。
-///
-/// 返回 `Some(时刻)` = 该推这条预告。
-pub(crate) fn preview_time(
-    base: &str,
-    window_minutes: u32,
-    target: &DayTarget,
-    notified: Option<&DayTarget>,
-    now: chrono::NaiveDateTime,
-) -> Option<String> {
-    if window_minutes == 0 || notified == Some(target) {
-        return None;
-    }
-    let (Ok(base_t), Ok(target_t)) = (
-        chrono::NaiveTime::parse_from_str(base.trim(), "%H:%M"),
-        chrono::NaiveTime::parse_from_str(target.at.trim(), "%H:%M"),
-    ) else {
-        // 时刻非法（`due_at` 反正也不会触发）：不在这里瞎猜一个点出来
-        return None;
-    };
-    if target_t == base_t {
-        return None;
-    }
-    let cur = now.time();
-    if cur < base_t || cur >= target_t {
-        return None;
-    }
-    Some(target.at.clone())
-}
-
 /// 距上次自动续签扫描是否已满一个间隔（从未扫过 → 立刻扫）。
 fn refresh_scan_due(last_scan_ms: Option<i64>, now_ms: i64) -> bool {
     match last_scan_ms {
@@ -382,8 +331,7 @@ pub fn spawn(app: AppHandle) {
             }
             let now = chrono::Local::now().naive_local();
             let today = now.date().format("%Y-%m-%d").to_string();
-            // 今天已经跑过就什么都不再判：不能再摇号、更不能推预告，否则用户会收到
-            // 一条「今天定在几点」的预告，而今天其实早就签完了。
+            // 今天已经跑过就什么都不再判：不能再摇号，也不能在补跑窗口里重跑。
             if state.last_run_date.as_deref() == Some(today.as_str()) {
                 continue;
             }
@@ -407,34 +355,6 @@ pub fn spawn(app: AppHandle) {
                         settings.schedule_window_minutes
                     ),
                 );
-            }
-            // 窗口一开，「设定时刻」就不再是今天的签到时刻了：摇定的那一刻先推一条，
-            // 否则用户只能等签完之后才知道今天定在了几点。
-            if let Some(at) = preview_time(
-                &settings.schedule_time,
-                settings.schedule_window_minutes,
-                &target,
-                state.notified_target.as_ref(),
-                now,
-            ) {
-                // 通知关着时**不记账**：这样用户中途打开通知仍能收到这条（否则白等一天）。
-                // 判定本身是纯函数、不打接口，每 30s 重算一次没有代价。
-                if settings.notify_enabled && settings.notify_on_schedule {
-                    state.notified_target = Some(target.clone());
-                    save_state(&dir, &state);
-                    let outcome = match tauri::async_runtime::block_on(notify::send(
-                        &settings.notify_webhook,
-                        &notify::target_preview(
-                            &at,
-                            &settings.schedule_time,
-                            settings.schedule_window_minutes,
-                        ),
-                    )) {
-                        Ok(resp) => format!("今日签到时刻预告已发送（{at}）：{resp}"),
-                        Err(e) => format!("今日签到时刻预告发送失败（{at}）：{e}"),
-                    };
-                    log_event(&dir, &outcome);
-                }
             }
             if !due_at(now, &target.at, state.last_run_date.as_deref()) {
                 continue;
@@ -780,14 +700,17 @@ async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &st
                 EVENT,
                 serde_json::json!({ "stage": "done", "count": views.len() }),
             );
+            // 只有失败才告警：全部成功 / 已签 / 活动未开时 `alert_message` 返回 None
             if notify_on {
-                let body = format!("{}\n{trigger}", notify::summary_message(&views));
-                // 通知失败只记日志，绝不影响签到结果
-                let outcome = match notify::send(&settings.notify_webhook, &body).await {
-                    Ok(resp) => format!("通知已发送：{resp}"),
-                    Err(e) => format!("通知发送失败：{e}"),
-                };
-                log_event(dir, &outcome);
+                if let Some(alert) = notify::alert_message(&views) {
+                    let body = format!("{alert}\n{trigger}");
+                    // 通知失败只记日志，绝不影响签到结果
+                    let outcome = match notify::send(&settings.notify_webhook, &body).await {
+                        Ok(resp) => format!("通知已发送：{resp}"),
+                        Err(e) => format!("通知发送失败：{e}"),
+                    };
+                    log_event(dir, &outcome);
+                }
             }
         }
         Err(e) => {
@@ -919,10 +842,6 @@ mod tests {
                     date: "2026-09-12".into(),
                     at: "10:12".into(),
                 }),
-                notified_target: Some(DayTarget {
-                    date: "2026-09-12".into(),
-                    at: "10:12".into(),
-                }),
                 last_refresh_scan_ms: Some(1_700_000_000_000),
                 last_sample_hour: Some("2026-09-12 09".into()),
                 last_briefing_push_date: Some("2026-09-13".into()),
@@ -939,8 +858,6 @@ mod tests {
         // 采样标记必须扛得住重启，否则每次启动都会重采一遍（多打一轮接口）
         assert_eq!(loaded.last_sample_hour.as_deref(), Some("2026-09-12 09"));
         assert_eq!(loaded.last_briefing_push_date.as_deref(), Some("2026-09-13"));
-        // 「预告已推过」也必须扛得住重启，否则每次开应用都会把今天的时刻重推一遍
-        assert_eq!(loaded.notified_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -956,7 +873,6 @@ mod tests {
             state_file(&dir),
             r#"{"last_run_date":"2026-09-12","last_refresh_scan_ms":1700000000000,
                "today_target":{"date":"2026-09-12","at":"10:12"},
-               "notified_target":{"date":"2026-09-12","at":"10:12"},
                "last_sample_hour":"2026-09-12 09","last_briefing_push_date":"2026-09-13"}"#,
         )
         .unwrap();
@@ -964,7 +880,6 @@ mod tests {
         let st = load_state(&dir);
         assert_eq!(st.last_run_date.as_deref(), Some("2026-09-12"));
         assert_eq!(st.today_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
-        assert_eq!(st.notified_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
         // 整机三项不能丢
         assert_eq!(st.last_refresh_scan_ms, Some(1_700_000_000_000));
         assert_eq!(st.last_sample_hour.as_deref(), Some("2026-09-12 09"));
@@ -981,8 +896,7 @@ mod tests {
         fs::write(
             state_file(&dir),
             r#"{"regions":{"cn":{"last_run_date":"2026-09-12",
-                                 "today_target":{"date":"2026-09-12","at":"10:12"},
-                                 "notified_target":{"date":"2026-09-12","at":"10:12"}},
+                                 "today_target":{"date":"2026-09-12","at":"10:12"}},
                        "global":{"last_run_date":"2026-09-11"}},
                "last_refresh_scan_ms":1700000000000,
                "last_sample_hour":"2026-09-12 09","last_briefing_push_date":"2026-09-13"}"#,
@@ -992,7 +906,6 @@ mod tests {
         let st = load_state(&dir);
         assert_eq!(st.last_run_date.as_deref(), Some("2026-09-12"), "取 cn 那份");
         assert_eq!(st.today_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
-        assert_eq!(st.notified_target.as_ref().map(|t| t.at.as_str()), Some("10:12"));
         assert_eq!(st.last_refresh_scan_ms, Some(1_700_000_000_000));
         assert_eq!(st.last_sample_hour.as_deref(), Some("2026-09-12 09"));
         assert_eq!(st.last_briefing_push_date.as_deref(), Some("2026-09-13"));
@@ -1057,114 +970,6 @@ mod tests {
         );
     }
 
-    /// 窗口一开，「设定时刻」就不再是今天的签到时刻 —— 摇定后必须先告诉用户真正的那个。
-    #[test]
-    fn previews_the_random_time_between_window_start_and_the_target() {
-        let target = DayTarget {
-            date: "2026-09-12".into(),
-            at: "09:42".into(),
-        };
-        let t = |h, m| preview_time("08:00", 90, &target, None, at(h, m));
-
-        // 窗口已开、还没到点 → 推
-        assert_eq!(t(8, 0), Some("09:42".into()), "窗口起点整点也该推");
-        assert_eq!(t(9, 0), Some("09:42".into()));
-        // 窗口还没开（当天的目标在零点后第一跳就算出来了）→ 不推，否则半夜发推送
-        assert_eq!(t(0, 1), None);
-        assert_eq!(t(7, 59), None);
-        // 已经到点 / 过点 → 不推，这不是预告了（真实时刻由结果通知里那一行交代）
-        assert_eq!(t(9, 42), None);
-        assert_eq!(t(10, 30), None);
-        // 同一目标推过一次就不再推（每 30s 一跳、每次重启都会走到这里）
-        assert_eq!(
-            preview_time("08:00", 90, &target, Some(&target), at(9, 0)),
-            None
-        );
-    }
-
-    /// 用户改了设置导致重摇 → 新时刻要补推一条；窗口关掉/没摇出新时刻 → 一条都不推。
-    #[test]
-    fn previews_again_only_when_the_target_actually_moves() {
-        let old = DayTarget {
-            date: "2026-09-12".into(),
-            at: "09:42".into(),
-        };
-        let moved = DayTarget {
-            date: "2026-09-12".into(),
-            at: "10:05".into(),
-        };
-        // 时刻变了（用户把窗口起点从 08:00 改到 09:30）：旧的那条已经不作数了
-        assert_eq!(
-            preview_time("09:30", 90, &moved, Some(&old), at(9, 40)),
-            Some("10:05".into())
-        );
-
-        // 窗口为 0：设定时刻就是答案，没有「另一个时刻」可预告
-        assert_eq!(preview_time("08:00", 0, &target_of("09:42"), None, at(9, 0)), None);
-        // 摇号恰好停在设定值上：同上
-        assert_eq!(preview_time("08:00", 90, &target_of("08:00"), None, at(8, 30)), None);
-        // 时分解析不出来：不瞎猜，交给 `due_at` 去拒绝触发
-        for bad in ["", "9", "24:00", "aa:bb"] {
-            assert_eq!(
-                preview_time(bad, 90, &target_of("09:42"), None, at(9, 0)),
-                None,
-                "{bad:?} 不该推出预告"
-            );
-            assert_eq!(
-                preview_time("08:00", 90, &target_of(bad), None, at(9, 0)),
-                None,
-                "目标 {bad:?} 不该推出预告"
-            );
-        }
-    }
-
-    fn target_of(at: &str) -> DayTarget {
-        DayTarget {
-            date: "2026-09-12".into(),
-            at: at.into(),
-        }
-    }
-
-    /// 把一整天按 30s 一跳跑一遍（摇号 + 预告 + 记账都照真实顺序走）：
-    /// 预告只该出现一次，且落在 `[窗口起点, 目标时刻)` 之间。
-    ///
-    /// 单跳判定已由上面两条覆盖；这条盯的是**记账**——漏掉某次状态回写，
-    /// 每 30s 一跳就会变成每跳推一条。
-    #[test]
-    fn a_full_day_of_ticks_emits_exactly_one_preview() {
-        let (base, window) = ("08:00", 90u32);
-        let day = NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();
-        let mut target: Option<DayTarget> = None;
-        let mut notified: Option<DayTarget> = None;
-        let mut pushes: Vec<(u32, String)> = Vec::new();
-
-        for min in 0..24 * 60 {
-            let now = day.and_hms_opt(min / 60, min % 60, 0).unwrap();
-            // 与 tick 循环同一顺序：先算/复用当天目标，再判要不要预告
-            let t = target_time("2026-09-12", base, window, target.as_ref());
-            target = Some(t.clone());
-            if let Some(at) = preview_time(base, window, &t, notified.as_ref(), now) {
-                notified = Some(t.clone());
-                pushes.push((min, at));
-            }
-        }
-
-        assert_eq!(pushes.len(), 1, "一天只该推一条预告：{pushes:?}");
-        let (min, at) = &pushes[0];
-        let t = target_of(at);
-        assert!(in_window(&t, base, window), "预告的时刻该在窗口内：{at}");
-        let t_at = chrono::NaiveTime::parse_from_str(at, "%H:%M").unwrap();
-        let (start, end) = (
-            chrono::NaiveTime::parse_from_str(base, "%H:%M").unwrap(),
-            t_at,
-        );
-        let pushed_at = chrono::NaiveTime::from_hms_opt(min / 60, min % 60, 0).unwrap();
-        assert!(
-            pushed_at >= start && pushed_at < end,
-            "预告应在 {base} 之后、{at} 之前推出，实际 {:?}",
-            pushed_at
-        );
-    }
 
     #[test]
     fn log_event_appends_and_caps_length() {

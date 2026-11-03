@@ -190,7 +190,7 @@ function SettingsPage({
           />
           <Row
             title="失败通知地址"
-            desc="签到结果会推送一条；需要处理的失败会单独提醒。留空则不通知。"
+            desc="仅在有账号签到失败时推送。留空则不通知。"
             ctrl={
               <input
                 className="set-input"

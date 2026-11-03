@@ -216,17 +216,17 @@ pub struct Settings {
     #[serde(default = "default_schedule_window")]
     pub schedule_window_minutes: u32,
     // ── 以下几项 `notify_*` 与 `briefing` 的推送开关是**整机行为**（一个 webhook 频道），
-    //    不随任何配置分片：签到结果、简报都往同一个频道推。
+    //    不随任何配置分片：签到失败告警、简报都往同一个频道推。
     /// 通知总开关（关掉后定时与手动都不推送，**续签失败告警也一起静音**）
     #[serde(default)]
     pub notify_enabled: bool,
     /// 通知 webhook 地址，形如 `https://…/hook/<key>`
     #[serde(default)]
     pub notify_webhook: String,
-    /// 定时签到结束后推送
+    /// 定时签到**有失败时**推送
     #[serde(default = "default_true")]
     pub notify_on_schedule: bool,
-    /// 手动「全部签到」结束后推送（默认关，避免连点造成刷屏）
+    /// 手动签到**有失败时**推送（默认关，避免连点造成刷屏）
     #[serde(default)]
     pub notify_on_manual: bool,
     /// 智能接管总开关（127.0.0.1 反代 + 把 Qoder 端点指向它，按积分过期时间优先路由）。

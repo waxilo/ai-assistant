@@ -198,7 +198,7 @@ pub struct Settings {
     pub takeover_port: u16,
     /// 参与接管的账号白名单（空 = 全部）
     pub billing_account_ids: Vec<String>,
-    /// 告警 webhook（可选）
+    /// 告警 webhook（可选）：签到**有失败时**推送，另用于积分简报
     pub webhook_url: String,
     /// **积分简报开关**：开启后后台每小时采样一次（`ide_user_ent_usage`），
     /// 并把已经走完的小时固化成「时条目」（见 `ledger` / `briefing`）。
