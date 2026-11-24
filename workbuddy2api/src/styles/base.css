@@ -1,0 +1,194 @@
+/**
+ * 基础层：重置、画布底色、排版、焦点、滚动条、动效关键帧、入场节奏。
+ *
+ * 画布是**中性浅灰**（`--bg`），不带任何彩色环境光 —— 品牌色只出现在强调件上。
+ * 白卡与浅灰画布之间的明度差，加上低透明度的环境阴影，构成整套界面的层次。
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  color: var(--text);
+  font-size: var(--fs-cell);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background-color: var(--bg);
+  background-image: none;
+  color-scheme: light;
+  /* 应用外壳是固定高度的两栏结构，滚动只发生在内容区 */
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--primary-soft);
+  color: var(--primary-d);
+}
+
+/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示。 */
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* 滚动条：细、圆、低对比。 */
+.content::-webkit-scrollbar,
+.modal::-webkit-scrollbar,
+.modal-body::-webkit-scrollbar,
+.billing-list::-webkit-scrollbar,
+.feed::-webkit-scrollbar,
+.table-wrap::-webkit-scrollbar,
+.brief-hours::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+.content::-webkit-scrollbar-thumb,
+.modal::-webkit-scrollbar-thumb,
+.modal-body::-webkit-scrollbar-thumb,
+.billing-list::-webkit-scrollbar-thumb,
+.feed::-webkit-scrollbar-thumb,
+.table-wrap::-webkit-scrollbar-thumb,
+.brief-hours::-webkit-scrollbar-thumb {
+  background: rgba(93, 108, 100, 0.24);
+  border: 3px solid transparent;
+  border-radius: var(--radius-pill);
+  background-clip: content-box;
+}
+.content::-webkit-scrollbar-thumb:hover,
+.modal::-webkit-scrollbar-thumb:hover,
+.modal-body::-webkit-scrollbar-thumb:hover,
+.billing-list::-webkit-scrollbar-thumb:hover,
+.feed::-webkit-scrollbar-thumb:hover,
+.table-wrap::-webkit-scrollbar-thumb:hover,
+.brief-hours::-webkit-scrollbar-thumb:hover {
+  background: rgba(93, 108, 100, 0.4);
+  background-clip: content-box;
+}
+.content::-webkit-scrollbar-track,
+.modal::-webkit-scrollbar-track,
+.modal-body::-webkit-scrollbar-track,
+.billing-list::-webkit-scrollbar-track,
+.feed::-webkit-scrollbar-track,
+.table-wrap::-webkit-scrollbar-track,
+.brief-hours::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 表头吸顶在滚动容器里，轨道整体下移一个表头高度：
+   滚动条只落在数据区，不压表头。46px 与 .data-table thead th 的 height 一致。 */
+.table-wrap::-webkit-scrollbar-track {
+  margin-top: 46px;
+}
+
+/* ── 关键帧：全应用共用的动效词汇表 ─────────────────────────── */
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px var(--primary-ring);
+  }
+  50% {
+    box-shadow: 0 0 0 5px transparent;
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+/* 页面入场：轻微上浮 */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 遮罩淡入 */
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+/* 弹窗落定：略带回弹 */
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 内容块出现（列表项、提示块） */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 页面入场节奏：面板页的直接子块依次浮现。 */
+.panel-page > * {
+  animation: rise var(--dur-3) var(--ease-out) both;
+}
+.panel-page > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.panel-page > *:nth-child(2) {
+  animation-delay: 40ms;
+}
+.panel-page > *:nth-child(3) {
+  animation-delay: 80ms;
+}
+.panel-page > *:nth-child(4) {
+  animation-delay: 120ms;
+}
+.panel-page > *:nth-child(5) {
+  animation-delay: 160ms;
+}
+.panel-page > *:nth-child(n + 6) {
+  animation-delay: 200ms;
+}
+
+/* 无障碍：尊重系统的「减少动态效果」。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

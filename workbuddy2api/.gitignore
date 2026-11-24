@@ -1,0 +1,21 @@
+# Tauri / Rust
+/src-tauri/target/
+/src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+
+# 本地产物
+*.log
+.DS_Store
+
+# UI 预览脚手架（一次性，用来截图自检；见 ~/.workbuddy/skills/local-ui-preview-screenshot）
+.preview/
+
+# 项目本地数据（工作记忆 / 预览产物 / 调试材料），不进仓库
+.workbuddy/
+
+# 更新签名私钥绝不能进仓库（即使误放在项目目录）
+*.key
+*.key.pub

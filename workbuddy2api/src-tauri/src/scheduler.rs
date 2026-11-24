@@ -1,0 +1,874 @@
+//! 定时自动签到：应用常驻时，每天在用户设定的时刻执行一次「全部签到」，
+//! **只有账号失败时**才推送告警。
+//!
+//! 触发模型：**到点即触发 + 补跑窗口**，而不是「当前分钟恰好等于设定值」。
+//! 后者有两个必踩的坑：
+//!   1. 轮询粒度做不到精确命中某一分钟（30s 一跳也可能整分钟落在两跳之间）；
+//!   2. 应用常常是在预定时刻之后才被打开的（比如 09:10 才开机）。
+//! 所以判定条件是「今天还没跑过 && 已过设定时刻但不超过 30 分钟」。
+//!
+//! 设定时刻是**窗口起点**：`schedule_window_minutes > 0` 时，当天实际触发时刻会在
+//! `[设定时刻, +窗口]` 内随机挑一分钟，挑完落盘、当天不再变（见 [`target_time`]）。
+//! 固定在同一分钟触发是脚本最好认的特征，窗口把它抹掉；`window = 0` 即回到
+//! 「精确到分钟」的老行为。
+//!
+//! 窗口一开，「设定时刻」就不再是「今天的签到时刻」了 —— 用户配的 08:00 只是窗口起点。
+//! 真实触发时刻只在失败告警里交代（[`notify::trigger_line`]）；签到成功不发通知，
+//! 所以不另推「今天几点签」的预告 —— 通知只在失败时才有意义。
+//!
+//! 跨启动去重靠 `schedule_state.json`（只记最后一次执行的日期），
+//! 这样重启应用不会在补跑窗口内重复签一遍。
+//!
+//! 自动续签：常驻期间每 12 小时扫一遍账号，**剩余有效期不足 48 小时就静默续一次**；
+//! 启动后也会立刻扫一次（久未开应用的情况靠它兜住）。
+//! 与定时签到开关无关——续签是保命操作，不该被「没设定时签到」连带关掉。
+//! 扫描间隔落盘在 `schedule_state.json`，避免每次启动/每跳都打接口。
+//!
+//! 签到通知**只在有账号失败时**发送（`notify_enabled && notify_on_schedule` 是总闸），
+//! 且推送失败不影响签到。
+//!
+//! 除定时签到外，本模块还管两件事，各自有独立开关，互不影响：
+//!
+//! - 自动续签（见 [`maybe_auto_refresh`]）：剩余有效期不足 48 小时就静默续一次。
+//! - **积分简报**（见 [`maybe_seal_briefing`]）：每小时采一次样，把已经走完的小时
+//!   固化成「时条目」，并按 `notify_on_briefing` 每天推一条当天汇总。
+//!   它**没有随机时间窗** —— 触发时刻就是「哪一个小时」这件事本身，抖动会让同一段
+//!   增量前后归到不同的小时里。统计口径见 [`crate::briefing`] 与 [`crate::ledger`]。
+
+use crate::accounts::{self, Settings};
+use crate::autoupdate;
+use crate::briefing;
+use crate::commands;
+use crate::notify;
+use chrono::Timelike;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter};
+
+/// 轮询间隔：30s 足够（补跑窗口有 30 分钟余量），开销可忽略
+const TICK: Duration = Duration::from_secs(30);
+/// 补跑窗口：错过设定时刻后仍愿意补签的时长
+const CATCH_UP_MINUTES: i64 = 30;
+/// 自动续签的扫描间隔：token 有效期 60 天，12 小时一跳足够从容
+const REFRESH_SCAN_MS: i64 = 12 * 60 * 60 * 1000;
+/// 每小时第几分钟起可以采样。
+///
+/// 台账把增量归入**采样时刻所属的那个小时**，所以想让整个小时的量落进这一小时，
+/// 采样就必须赶在整点之前完成。定成「最后 5 分钟」而不是「最后一分钟」：
+/// 30s 一跳只要有一次落在窗口里就够，窗口太窄时一次系统卡顿就会整小时没有采样。
+const SAMPLE_AT_MINUTE: i64 = 55;
+/// 定时任务进度事件，前端据此刷新列表并提示
+pub const EVENT: &str = "checkin-scheduled";
+/// 自动续签事件（payload：续签成功的账号数），前端据此刷新列表
+pub const REFRESH_EVENT: &str = "auto-refreshed";
+/// 积分简报固化完成事件，前端据此刷新简报列表
+pub const BRIEFING_EVENT: &str = "credit-briefing-sealed";
+
+/// 当天随机挑定的定时签到时刻。
+///
+/// 必须落盘：否则每 30s 一跳都会重摇一次（「等时钟走过刚摇出来的那一分钟」这种判定
+/// 在每跳都换目标时形同虚设），重启也会把当天已经用过的时刻换掉。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct DayTarget {
+    /// 归属日期（`YYYY-MM-DD`）
+    date: String,
+    /// 当天实际触发时刻（`HH:MM`）
+    at: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ScheduleState {
+    /// 最后一次定时执行的日期（`YYYY-MM-DD`）
+    #[serde(default)]
+    last_run_date: Option<String>,
+    /// 最后一次自动续签扫描的时刻（毫秒时间戳）
+    #[serde(default)]
+    last_refresh_scan_ms: Option<i64>,
+    /// 今天随机挑定的触发时刻（跨天自动重挑；见 [`target_time`]）
+    #[serde(default)]
+    today_target: Option<DayTarget>,
+    /// 最后一次积分简报采样所属的小时（`YYYY-MM-DD HH`）
+    ///
+    /// 用来保证**每小时只采一次**：采样窗口有 5 分钟、轮询 30s 一跳，
+    /// 没有这个标记就会在窗口里连采十来次（每次都打一遍接口）。
+    #[serde(default)]
+    last_sample_hour: Option<String>,
+    /// 最后一次推送简报的日期（`YYYY-MM-DD`）
+    ///
+    /// 推送粒度是**天**（时条目每小时结算，但「今天花了多少」要等当天结束才有定论），
+    /// 所以每天最多一条。先落盘再推送：推送失败也不该让同一份简报反复重推。
+    #[serde(default)]
+    last_briefing_push_date: Option<String>,
+    /// 最后一次执行静默更新的日期（`YYYY-MM-DD`）
+    ///
+    /// 「当天**尝试**过」就记 —— 成功、失败、查到已是最新都算。失败不当天重试是有意的：
+    /// 网络断的时候每一跳（30s）都重下一遍安装包，就成了重试风暴。
+    /// 也必须是落盘状态：否则重启一次就可能在同一天里再更新一遍。
+    #[serde(default)]
+    last_auto_update_date: Option<String>,
+}
+
+fn state_file(dir: &Path) -> PathBuf {
+    dir.join("schedule_state.json")
+}
+
+fn load_state(dir: &Path) -> ScheduleState {
+    fs::read_to_string(state_file(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(dir: &Path, st: &ScheduleState) {
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(json) = serde_json::to_string_pretty(st) else {
+        return;
+    };
+    // 原子写：这份状态记着「今天几点触发过 / 补跑没有」，半截落盘会被读回成默认值，
+    // 症状是当天漏跑一次签到而界面上没有任何痕迹。权限由 [`write_atomic`] 在建
+    // 临时文件时一并收到 0600，不需要 rename 之后再补一次。
+    //
+    // 失败**必须留痕**（修 4）：定时任务最坏的失败模式就是静默不生效，而这份状态是
+    // 「今天到底跑过没有」的唯一本地证据（见 `crate::logs`）。
+    if let Err(e) = accounts::write_atomic(&state_file(dir), &json) {
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            format!("定时任务状态落盘失败：{e}"),
+        );
+    }
+}
+
+/// 今天该在几点几分触发。
+///
+/// - 已经为**同一个日期**挑过、且旧目标仍落在当前窗口内 → 原样复用；
+/// - 否则在 `[base, base + window]` 内随机取一分钟；
+/// - `window == 0`（或 base 非法）→ 直接用 base，等于关掉随机、保留「精确到分钟」的老行为。
+///
+/// 窗口会被截断在当天 23:59 之内，绝不跨天——跨天会让 [`due_at`] 的「补跑窗口」
+/// 判定失去意义（今天的任务跑到明天零点后触发）。
+pub(crate) fn target_time(
+    date: &str,
+    base: &str,
+    window_minutes: u32,
+    existing: Option<&DayTarget>,
+) -> DayTarget {
+    if let Some(t) = existing.filter(|t| t.date == date && in_window(t, base, window_minutes)) {
+        return t.clone();
+    }
+    let at = chrono::NaiveTime::parse_from_str(base.trim(), "%H:%M")
+        .ok()
+        .filter(|_| window_minutes > 0)
+        .map(|t| {
+            let base_min = t.hour() * 60 + t.minute();
+            // 上限 23:59，保证不跨天
+            let span = window_minutes.min(24 * 60 - 1 - base_min);
+            let total = base_min + crate::rng::range(0, span as u64) as u32;
+            format!("{:02}:{:02}", total / 60, total % 60)
+        })
+        .unwrap_or_else(|| base.trim().to_string());
+    DayTarget {
+        date: date.to_string(),
+        at,
+    }
+}
+
+/// 旧目标是否仍落在 `[base, base + window]` 内。
+///
+/// 用它判断「设置改过了要不要重挑」：只按日期复用的话，用户把签到时刻从 09:00
+/// 改到 11:00 之后，那个 10:12 的旧目标既不在新窗口里、又已经过期（按补跑窗口
+/// 立刻触发一次），等于改了设置反而提前签了。
+fn in_window(target: &DayTarget, base: &str, window_minutes: u32) -> bool {
+    let (Ok(at), Ok(b)) = (
+        chrono::NaiveTime::parse_from_str(target.at.trim(), "%H:%M"),
+        chrono::NaiveTime::parse_from_str(base.trim(), "%H:%M"),
+    ) else {
+        // 两边都解析不出来时退化成字面比较：不相等就重挑
+        return target.at.trim() == base.trim();
+    };
+    let mins = |t: chrono::NaiveTime| t.hour() as i64 * 60 + t.minute() as i64;
+    let (at_m, base_m) = (mins(at), mins(b));
+    at_m >= base_m && at_m <= base_m + window_minutes as i64
+}
+
+/// 距上次自动续签扫描是否已满一个间隔（从未扫过 → 立刻扫）。
+fn refresh_scan_due(last_scan_ms: Option<i64>, now_ms: i64) -> bool {
+    match last_scan_ms {
+        Some(last) => now_ms - last >= REFRESH_SCAN_MS,
+        None => true,
+    }
+}
+
+/// 今天是否该跑了：设定时刻已过（但不超过补跑窗口），且今天还没跑过。
+///
+/// 抽成纯函数以便单测——时间判断最容易在边界上出错（跨天、未来时刻、重复跑）。
+///
+/// **只服务定时签到。** 简报不走这里：它按「整点」结算，而 `NaiveTime`
+/// （合法范围到 `23:59:59`）表示不了 24:00 这种边界；简报改用「这一小时采过没有」
+/// 的判定，见 [`maybe_seal_briefing`]。
+pub(crate) fn due_at(
+    now: chrono::NaiveDateTime,
+    time: &str,
+    last_run_date: Option<&str>,
+) -> bool {
+    let Ok(t) = chrono::NaiveTime::parse_from_str(time.trim(), "%H:%M") else {
+        return false; // 时刻非法时宁可不跑
+    };
+    let today = now.date();
+    if let Some(d) = last_run_date {
+        if d == today.format("%Y-%m-%d").to_string() {
+            return false;
+        }
+    }
+    let mins = (now - today.and_time(t)).num_minutes();
+    (0..=CATCH_UP_MINUTES).contains(&mins)
+}
+
+/// 启动后台调度线程。线程与进程同生命周期，无需 join。
+pub fn spawn(app: AppHandle) {
+    std::thread::spawn(move || {
+        // 线程起点即「应用启动时刻」：静默更新用它挡住「刚打开就自己重启」（见 autoupdate）
+        let started = std::time::Instant::now();
+        // 启动先扫一次续签：等 app 初始化完成（数据目录就绪）再动手
+        std::thread::sleep(Duration::from_secs(5));
+        if let Ok(dir) = commands::try_data_dir(&app) {
+            maybe_auto_refresh(&app, &dir);
+            // 启动就把简报补一遍。固化只读台账、不需要网络，而应用关着的那些小时
+            // 只有在这一刻才补得出来；顺带采一次样，让「上次运行到现在」的增量
+            // 落进当前小时（用户一打开就能看到今天的最新数字，而不是等下一个整点）。
+            let settings = accounts::load_settings(&dir);
+            maybe_seal_briefing(&app, &dir, &settings, true);
+        }
+
+        loop {
+            std::thread::sleep(TICK);
+
+            // 每跳都重读配置：用户在设置里改了时刻/开关即刻生效，不需要重启应用
+            let Ok(dir) = commands::try_data_dir(&app) else {
+                continue;
+            };
+            let settings = accounts::load_settings(&dir);
+
+            // 自动续签与「定时签到」开关无关，单独判定
+            maybe_auto_refresh(&app, &dir);
+
+            // 积分简报同理：有自己的开关，不受「定时签到」影响。
+            // 必须放在下面那个 continue 之前 —— 否则用户一关定时签到，简报也顺带没了
+            maybe_seal_briefing(&app, &dir, &settings, false);
+
+            // 静默更新：同样是独立开关 + 独立时刻，也在 continue 之前。
+            // 执行时会把调度线程**阻塞**几十秒（下载 + 安装）—— 凌晨那个点上的
+            // 其它定时任务（签到 / 简报）都是分钟级容错，被推迟一会儿没有影响。
+            let mut state = load_state(&dir);
+            if autoupdate::maybe_run(
+                &app,
+                &dir,
+                &settings,
+                &mut state.last_auto_update_date,
+                started,
+            ) {
+                // 「今天已跑」必须当场落盘：Windows 上安装会 exit(0)，晚了就写不进去
+                save_state(&dir, &state);
+            }
+
+            if !settings.schedule_enabled {
+                continue;
+            }
+            let now = chrono::Local::now().naive_local();
+            let today = now.date().format("%Y-%m-%d").to_string();
+            // 当天目标时刻：第一次算出来后立刻落盘，之后每一跳都复用同一个值，
+            // 否则「随机窗口」每跳重摇一次，等于没加（详见 DayTarget）
+            let target = target_time(
+                &today,
+                &settings.schedule_time,
+                settings.schedule_window_minutes,
+                state.today_target.as_ref(),
+            );
+            if state.today_target.as_ref() != Some(&target) {
+                state.today_target = Some(target.clone());
+                save_state(&dir, &state);
+                crate::logs::push(
+                    &dir,
+                    crate::logs::CAT_CHECKIN,
+                    "系统",
+                    true,
+                    format!(
+                        "今日签到目标已定：{}（设定 {}，随机时间窗 {} 分钟）",
+                        target.at, settings.schedule_time, settings.schedule_window_minutes
+                    ),
+                );
+            }
+            if !due_at(now, &target.at, state.last_run_date.as_deref()) {
+                continue;
+            }
+
+            // 先落盘「今天已跑」再执行：万一执行中崩溃，也不会在补跑窗口里反复重试
+            state.last_run_date = Some(today.clone());
+            save_state(&dir, &state);
+            let actual = now.format("%H:%M").to_string();
+            crate::logs::push(
+                &dir,
+                crate::logs::CAT_CHECKIN,
+                "系统",
+                true,
+                format!(
+                    "触发定时签到（设定 {}，今日随机目标 {}，实际 {}）",
+                    settings.schedule_time, target.at, actual
+                ),
+            );
+            // 真实触发时刻随通知一起发出去：开了窗口之后，通知里不写这一栏
+            // 就没人知道今天究竟是几点签的（见 [`notify::trigger_line`]）
+            let trigger = notify::trigger_line(&actual, &target.at, &settings.schedule_time);
+            tauri::async_runtime::block_on(run_once(&app, &settings, &dir, &trigger));
+        }
+    });
+}
+
+/// 自动续签扫描：距上次扫描超过 `REFRESH_SCAN_MS` 才真跑。
+///
+/// 先落盘扫描时刻再执行——续签接口可能耗时/失败，先记账可避免同一时刻被反复触发。
+fn maybe_auto_refresh(app: &AppHandle, dir: &Path) {
+    let mut state = load_state(dir);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if !refresh_scan_due(state.last_refresh_scan_ms, now_ms) {
+        return;
+    }
+    state.last_refresh_scan_ms = Some(now_ms);
+    save_state(dir, &state);
+
+    match tauri::async_runtime::block_on(commands::auto_refresh_all(app)) {
+        Ok(report) => {
+            if !report.refreshed.is_empty() {
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_RENEW,
+                    "系统",
+                    true,
+                    format!("自动续签完成：{}", report.refreshed.join("、")),
+                );
+                let _ = app.emit(
+                    REFRESH_EVENT,
+                    serde_json::json!({ "count": report.refreshed.len() }),
+                );
+            }
+            for f in &report.failed {
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_RENEW,
+                    "系统",
+                    false,
+                    format!("自动续签失败：{f}"),
+                );
+            }
+            // 分开记是因为**人的动作不同**：失败等下一轮自动重试，死链只能重登一次。
+            // 混在一句「续签失败」里，用户会等一个永远不会来的好转。
+            for d in &report.dead {
+                crate::logs::push(
+                    dir,
+                    crate::logs::CAT_RENEW,
+                    "系统",
+                    false,
+                    format!("自动续签放弃（这条链已死，要重新登录才能自动续）：{d}"),
+                );
+            }
+            // ── 告警：日志是给「会去翻文件的人」看的，推送是给「此刻不在应用前的人」看的。
+            // 两类分开推、各占自己的冷却：死链只有重新登录能救（结论不会自己变，一天一次），
+            // 临时失败下一轮大概率自己就好（六小时一次足够）。
+            if !report.dead.is_empty() {
+                crate::alerts::notify(
+                    dir,
+                    "renew-dead",
+                    crate::alerts::DEAD_COOLDOWN_MS,
+                    &crate::alerts::batch_message(
+                        &format!(
+                            "自动续签：{} 个账号的链已死，只有重新登录能救",
+                            report.dead.len()
+                        ),
+                        &report.dead,
+                        "这些账号的票一到期，接管就会一路 401。重新登录对应账号即可恢复自动续签。",
+                    ),
+                );
+            }
+            if !report.failed.is_empty() {
+                crate::alerts::notify(
+                    dir,
+                    "renew-fail",
+                    crate::alerts::COOLDOWN_MS,
+                    &crate::alerts::batch_message(
+                        &format!("自动续签失败：{} 个账号本轮没续上", report.failed.len()),
+                        &report.failed,
+                        "临时失败会在下一轮扫描（12 小时）重试；反复签不动会被判成死链并单独告警。",
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            crate::logs::push(
+                dir,
+                crate::logs::CAT_RENEW,
+                "系统",
+                false,
+                format!("自动续签异常：{e}"),
+            );
+            // 整轮异常意味着**一个账号都没续**：比逐账号失败更严重，必须推出去
+            crate::alerts::notify(
+                dir,
+                "renew-run",
+                crate::alerts::COOLDOWN_MS,
+                &format!("自动续签整轮失败，本轮没有任何账号被续签：{e}"),
+            );
+        }
+    }
+}
+
+/// 这一跳的采样决定。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SamplePlan {
+    /// 要不要真去采一次样
+    pub sample: bool,
+    /// 要不要占掉「本小时已采过」的名额（`Some(key)` = 写进 `last_sample_hour`）
+    pub mark_hour: Option<String>,
+}
+
+/// 采样判定（纯函数，便于单测）。
+///
+/// 两条规则合起来才既做到「每小时一次」，又让**这一小时的桶是完整的一小时**：
+///
+/// 1. **窗口采样**（`minute >= SAMPLE_AT_MINUTE`）：每小时最多一次，并占掉本小时的名额。
+///    采样必须赶在整点之前 —— 台账把增量归入「采样时刻所属的小时」，想让整个小时的量
+///    落进这一小时就得在本小时里采；采完记下 `last_sample_hour`，否则 5 分钟窗口里
+///    会被 30s 一跳连采十来次。
+/// 2. **启动补采**（`at_startup`）：应用刚起来顺带采一次，让用户一打开就看到最新数字。
+///    它**不占本小时的名额** —— 否则「15:03 启动」会把 15:55 那次窗口采样挡掉，
+///    于是 `15:03 → 16:55` 这一大段增量整块落进 16 点的桶，从启动那一小时起就错位。
+///    代价只是同一小时里多采一次（增量本来就累加到同一个桶里）。
+pub(crate) fn sample_plan(
+    at_startup: bool,
+    minute: i64,
+    cur_key: &str,
+    last_sample_hour: Option<&str>,
+) -> SamplePlan {
+    if minute >= SAMPLE_AT_MINUTE {
+        if last_sample_hour == Some(cur_key) {
+            // 本小时的窗口采样已经做过了（启动补采若落在窗口内，也会顺带把名额占上）
+            return SamplePlan { sample: false, mark_hour: None };
+        }
+        return SamplePlan {
+            sample: true,
+            mark_hour: Some(cur_key.to_string()),
+        };
+    }
+    SamplePlan {
+        sample: at_startup,
+        mark_hour: None,
+    }
+}
+
+/// 简报的推送窗口：**跨零点的那一跳**（`hour == 0`，即用户口径里的「24 点」），
+/// 或应用刚起来时补一次。
+///
+/// 为什么是这一跳才推得完整：23 点的桶在 23:5x 就采过样，而 `seal_hours` 只固化
+/// 「比当前小时早」的桶 —— 昨天要到 `today` 翻页、`hour` 归 0 的这一跳才收口。
+///
+/// 为什么不能挂在「这一跳固化出了东西」上（旧写法）：夜里那一小时没动静就固化不出
+/// 任何条目，推送跟着被吃掉，简报于是拖到白天下一次有动静才冒出来 —— 用户看到的
+/// 推送时刻是随机的。
+///
+/// `at_startup` 兜住「整夜关着 ⇒ 根本没有零点那一跳」：开机补推一次。桌面端没有
+/// 守护进程，应用没运行时刻表本身就无从执行，这是唯一的补偿。
+fn briefing_push_due(at_startup: bool, hour: u8) -> bool {
+    at_startup || hour == 0
+}
+
+/// 积分简报：**每小时结算一次**（时条目），并按设置每天推一条当天汇总。
+///
+/// 两件事，各自独立判定：
+///
+/// 1. **采样**（[`commands::fetch_samples`] + [`commands::apply_samples`]）：安排在每小时的**最后几分钟**
+///    （`SAMPLE_AT_MINUTE` 之后，判定见 [`sample_plan`]）。这不是随手定的时刻 ——
+///    台账的规则是「增量归入采样时刻所属的那个小时」，所以想让整个小时的量都落进这一小时，
+///    采样就必须赶在整点之前完成。`at_startup` 为真时（应用刚起来）在窗口外也采一次：
+///    用户一打开就该看到今天的最新数字，而不是干等到下一个整点 —— 但那次**不占**本小时的
+///    窗口名额，否则启动那一小时会把整点前的采样挡掉，增量错位到下一小时。
+/// 2. **固化**（[`commands::seal_hours`]）：把所有「已经走完、台账里有数据、
+///    还没固化」的小时变成时条目。它只读台账，**不依赖网络**，所以即便这一轮采样
+///    全失败，之前采到的部分照样能固化；应用关了两天再打开，那两天也补得出来
+///    （桶留 60 天）。固化是幂等的，每跳都跑一遍没有副作用。
+///
+/// 代价与边界：**应用没运行的时段不会采样**，那几格既不会产生时条目、日条目里也没有
+/// 那一块。恢复运行后的第一次采样会把这段空白期攒下的增量整块记进「恢复后的那个小时」
+/// —— 这是台账的既有口径（界面上的说明照实写了这一条），丢掉它会让总消耗少算。
+///
+/// 推送只推**已经走完的那一天**，且时刻固定在**跨零点那一跳**（即「24 点」，判定见
+/// [`briefing_push_due`]）：时条目每小时都在结算，但「今天花了多少」要等当天
+/// 结束才有定论，每小时推一条只会把通知刷成流水账。
+fn maybe_seal_briefing(app: &AppHandle, dir: &Path, settings: &Settings, at_startup: bool) {
+    if !settings.briefing_enabled {
+        return;
+    }
+    let Ok(data_dir) = commands::try_data_dir(app) else {
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            false,
+            "积分简报跳过：数据目录不可用",
+        );
+        return;
+    };
+    let accounts = accounts::load_accounts(&data_dir);
+    if accounts.is_empty() {
+        return;
+    }
+
+    let now = chrono::Local::now().naive_local();
+    let today = now.date().format("%Y-%m-%d").to_string();
+    let hour = now.hour() as u8;
+    let now_s = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let cur_key = format!("{today} {hour:02}");
+
+    let mut state = load_state(dir);
+    // 采样判定见 [`sample_plan`]：窗口内每小时一次，**启动补采不占本小时的窗口名额**
+    let plan = sample_plan(
+        at_startup,
+        now.minute() as i64,
+        &cur_key,
+        state.last_sample_hour.as_deref(),
+    );
+    if let Some(mark) = plan.mark_hour {
+        // 先落盘采样标记再真采：采样要打接口、可能耗时或失败，
+        // 先记账可避免同一个小时里反复触发（窗口有 5 分钟、轮询 30s 一跳）
+        state.last_sample_hour = Some(mark);
+        save_state(dir, &state);
+    }
+    if plan.sample {
+        // 采集（打接口）在锁外完成，入账一次性写进**唯一那本内存台账**并广播给界面 ——
+        // 见 `commands::fetch_samples` / `commands::apply_samples`。
+        // 这里用正常记账（不是 baseline）：断档期攒下的量虽然归不到具体的小时，
+        // 但它**是真的消耗**，丢掉会让总账少算。归到「恢复后的那个小时」是最不坏的归属。
+        let (at, readings) = tauri::async_runtime::block_on(commands::fetch_samples(&accounts));
+        commands::apply_samples(app, &readings, &at, false);
+    }
+
+    let sealed = commands::seal_hours(&data_dir, &accounts, &today, hour, &now_s);
+    if !sealed.is_empty() {
+        crate::logs::push(
+            dir,
+            crate::logs::CAT_SYSTEM,
+            "系统",
+            true,
+            format!("积分简报：固化 {} 个小时条目", sealed.len()),
+        );
+        let _ = app.emit(
+            BRIEFING_EVENT,
+            serde_json::json!({ "hours": sealed.len() }),
+        );
+    }
+
+    if !briefing_push_due(at_startup, hour) {
+        return;
+    }
+
+    // 每天最多推一条，且只推最近一个**已经走完**的日子。
+    // 先落盘推送日期再推：推送失败也不该让同一份简报反复重推。
+    let days = briefing::day_entries(&briefing::load(&data_dir), &today);
+    let Some(day) = days.iter().find(|d| d.sealed) else {
+        return;
+    };
+    if state.last_briefing_push_date.as_deref() == Some(day.date.as_str()) {
+        return;
+    }
+    state.last_briefing_push_date = Some(day.date.clone());
+    save_state(dir, &state);
+    if !(settings.notify_enabled && settings.notify_on_briefing) {
+        return;
+    }
+    let (sent, outcome) = match tauri::async_runtime::block_on(notify::send(
+        &settings.notify_webhook,
+        &briefing::message(day),
+    )) {
+        Ok(resp) => (true, format!("简报通知已发送（{}）：{resp}", day.date)),
+        Err(e) => (false, format!("简报通知发送失败（{}）：{e}", day.date)),
+    };
+    crate::logs::push(dir, crate::logs::CAT_NOTIFY, "系统", sent, outcome);
+}
+
+
+/// 执行一次「全部签到」并推送结果。
+///
+/// `trigger` 是本次触发时刻的说明（[`notify::trigger_line`]），拼在通知正文之后 ——
+/// 随机窗口 / 补跑都会让真实时刻与用户配置的值对不上，通知里得说清楚是哪个。
+async fn run_once(app: &AppHandle, settings: &Settings, dir: &Path, trigger: &str) {
+    let _ = app.emit(EVENT, serde_json::json!({ "stage": "start" }));
+
+    let notify_on = settings.notify_enabled && settings.notify_on_schedule;
+    match commands::checkin_all_inner(app, true).await {
+        Ok(views) => {
+            // 与 notify 一致：「已签」与「成功」互斥计数（已签的响应 success 也是 true），
+            // «活动未开»与«失败»各占一个计数框 —— 四个互斥、加总恒等于账号数。
+            // 视图里的账号那一半就是签到结果，积分读数在这里不参与统计。
+            let already = views
+                .iter()
+                .filter(|v| matches!(&v.account.last, Some(r) if r.already))
+                .count();
+            let ok = views
+                .iter()
+                .filter(|v| matches!(&v.account.last, Some(r) if r.success && !r.already))
+                .count();
+            let inactive = views
+                .iter()
+                .filter(|v| {
+                    matches!(&v.account.last, Some(r) if !r.success && !r.already && r.inactive)
+                })
+                .count();
+            let failed = views
+                .iter()
+                .filter(|v| match &v.account.last {
+                    Some(r) => !r.success && !r.already && !r.inactive,
+                    None => true,
+                })
+                .count();
+            let msg = format!(
+                "签到完成：{} 个账号，成功 {ok} / 已签 {already} / 活动未开 {inactive} / 失败 {failed}",
+                views.len()
+            );
+            crate::logs::push(dir, crate::logs::CAT_CHECKIN, "系统", true, msg);
+            let _ = app.emit(
+                EVENT,
+                serde_json::json!({ "stage": "done", "count": views.len() }),
+            );
+            // 只有失败才告警：全部成功 / 已签 / 活动未开时 `alert_message` 返回 None
+            if notify_on {
+                if let Some(alert) = notify::alert_message(&views) {
+                    let body = format!("{alert}\n{trigger}");
+                    // 通知失败只记日志，绝不影响签到结果
+                    let (sent, outcome) = match notify::send(&settings.notify_webhook, &body).await
+                    {
+                        Ok(resp) => (true, format!("通知已发送：{resp}")),
+                        Err(e) => (false, format!("通知发送失败：{e}")),
+                    };
+                    crate::logs::push(dir, crate::logs::CAT_NOTIFY, "系统", sent, outcome);
+                }
+            }
+        }
+        Err(e) => {
+            crate::logs::push(
+                dir,
+                crate::logs::CAT_CHECKIN,
+                "系统",
+                false,
+                format!("签到异常：{e}"),
+            );
+            let _ = app.emit(EVENT, serde_json::json!({ "stage": "error", "message": e }));
+            if notify_on {
+                let _ = notify::send(
+                    &settings.notify_webhook,
+                    &format!("定时签到异常：{e}\n{trigger}"),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::NaiveDate;
+
+    #[test]
+    fn briefing_push_is_due_at_midnight_and_on_startup_only() {
+        assert!(briefing_push_due(false, 0), "跨零点那一跳（24 点）推");
+        assert!(!briefing_push_due(false, 1), "过了零点就不再补推");
+        assert!(!briefing_push_due(false, 9), "白天不推（旧写法：有动静才顺带推，时刻随机）");
+        assert!(briefing_push_due(true, 9), "整夜没运行 ⇒ 开机补推一次");
+    }
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 9, 12)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn fires_at_the_configured_minute() {
+        assert!(due_at(at(9, 7), "09:07", None));
+        // 轮询粒度落在同一分钟内的任意秒都算数
+        let t = NaiveDate::from_ymd_opt(2026, 9, 12)
+            .unwrap()
+            .and_hms_opt(9, 7, 45)
+            .unwrap();
+        assert!(due_at(t, "09:07", None));
+    }
+
+    #[test]
+    fn catches_up_when_app_starts_late() {
+        // 09:30 才打开应用，仍在 30 分钟补跑窗口内
+        assert!(due_at(at(9, 30), "09:07", None));
+        // 超出窗口就不再补，避免晚上开应用时突然签一次
+        assert!(!due_at(at(9, 38), "09:07", None));
+        assert!(!due_at(at(20, 0), "09:07", None));
+    }
+
+    #[test]
+    fn does_not_fire_before_the_time_or_twice_a_day() {
+        assert!(!due_at(at(9, 6), "09:07", None));
+        // 同一天已跑过 → 不再补
+        assert!(!due_at(at(9, 20), "09:07", Some("2026-09-12")));
+        // 昨天的记录不影响今天
+        assert!(due_at(at(9, 7), "09:07", Some("2026-09-11")));
+    }
+
+    #[test]
+    fn tolerates_loose_or_invalid_time() {
+        assert!(due_at(at(9, 7), " 09:07 ", None));
+        for bad in ["", "9", "24:00", "aa:bb", "09:07:00"] {
+            assert!(!due_at(at(9, 7), bad, None), "{bad:?} 不应触发");
+        }
+    }
+
+    /// 启动补采**不许**占掉本小时的窗口名额。
+    ///
+    /// 这就是「简报没按每小时一条」的第二处坑：原来 `last_sample_hour` 在启动采样时也会被
+    /// 写成本小时，于是 H 点启动（且没到 H:55）会让 H:55 那次窗口采样被自己挡掉，
+    /// `H:03 → H+1:55` 整段增量落进 H+1 的桶 —— 从启动那一小时起，每个「小时」都不再是小时。
+    #[test]
+    fn a_startup_sample_never_consumes_the_hours_window_slot() {
+        // 15:03 启动：采一次，但不占「15 点已采过」的名额
+        let p = sample_plan(true, 3, "2026-09-16 15", Some("2026-09-16 14"));
+        assert!(p.sample, "启动该补采一次");
+        assert_eq!(p.mark_hour, None, "但不许占掉 15 点的窗口名额");
+
+        // 因此 15:55 的窗口采样照旧发生 —— 15 点这一格的桶才是完整的
+        let p = sample_plan(false, 55, "2026-09-16 15", Some("2026-09-16 14"));
+        assert!(p.sample);
+        assert_eq!(p.mark_hour.as_deref(), Some("2026-09-16 15"));
+
+        // 窗口内采过一次之后，5 分钟窗口里的后续 tick 不再重复采
+        assert!(!sample_plan(false, 56, "2026-09-16 15", Some("2026-09-16 15")).sample);
+
+        // 启动恰好落在窗口内、且本小时还没采过：采一次并占名额（不会紧接着再采一遍）
+        let p = sample_plan(true, 57, "2026-09-16 15", Some("2026-09-16 14"));
+        assert!(p.sample);
+        assert_eq!(p.mark_hour.as_deref(), Some("2026-09-16 15"));
+        // 落在窗口内但本小时已采过：不重复采
+        assert!(!sample_plan(true, 57, "2026-09-16 15", Some("2026-09-16 15")).sample);
+
+        // 窗口外、非启动：什么都不做（30s 一跳也只有窗口内那一分钟会采）
+        let p = sample_plan(false, 20, "2026-09-16 15", Some("2026-09-16 14"));
+        assert!(!p.sample && p.mark_hour.is_none());
+    }
+
+    #[test]
+    fn scans_refresh_at_most_once_per_interval() {
+        let now = 1_700_000_000_000;
+        assert!(refresh_scan_due(None, now), "从未扫过应立刻扫");
+        assert!(!refresh_scan_due(Some(now), now), "刚扫过不应立刻再扫");
+        assert!(!refresh_scan_due(Some(now - REFRESH_SCAN_MS + 1), now));
+        assert!(refresh_scan_due(Some(now - REFRESH_SCAN_MS - 1), now));
+        // 时钟回拨 / 文件被手改成未来时间：视为「刚扫过」，宁可不扫也不刷接口
+        assert!(!refresh_scan_due(Some(now + 1000), now));
+    }
+
+    #[test]
+    fn state_round_trips_on_disk() {
+        let dir = std::env::temp_dir().join(format!("wba-sched-{}", uuid::Uuid::new_v4()));
+        assert!(load_state(&dir).last_run_date.is_none());
+        assert!(load_state(&dir).today_target.is_none());
+        save_state(
+            &dir,
+            &ScheduleState {
+                last_run_date: Some("2026-09-12".into()),
+                last_refresh_scan_ms: Some(1_700_000_000_000),
+                today_target: Some(DayTarget {
+                    date: "2026-09-12".into(),
+                    at: "10:12".into(),
+                }),
+                last_sample_hour: Some("2026-09-12 09".into()),
+                last_briefing_push_date: Some("2026-09-13".into()),
+                // 静默更新的「今天已跑」也必须在盘上：丢了就会在重启后同一天再更一遍
+                last_auto_update_date: Some("2026-09-14".into()),
+            },
+        );
+        let loaded = load_state(&dir);
+        assert_eq!(loaded.last_run_date.as_deref(), Some("2026-09-12"));
+        assert_eq!(loaded.last_auto_update_date.as_deref(), Some("2026-09-14"));
+        assert_eq!(loaded.last_refresh_scan_ms, Some(1_700_000_000_000));
+        // 当天目标必须扛得住重启，否则「随机窗口」会被重启重新摇一次
+        assert_eq!(
+            loaded.today_target.as_ref().map(|t| t.at.as_str()),
+            Some("10:12")
+        );
+        // 简报的两个标记独立于签到：开关互不影响，去重也必须独立。
+        // 采样标记必须扛得住重启，否则每次启动都会重采一遍（多打一轮接口）
+        assert_eq!(loaded.last_sample_hour.as_deref(), Some("2026-09-12 09"));
+        assert_eq!(loaded.last_briefing_push_date.as_deref(), Some("2026-09-13"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn target_time_without_window_stays_on_the_exact_minute() {
+        // 窗口 0 = 关掉随机，保持「精确到分钟」的老行为
+        assert_eq!(target_time("2026-09-12", "09:07", 0, None).at, "09:07");
+        // 非法时刻原样留着（due_at 会拒绝触发），不在这里瞎猜一个点
+        assert_eq!(target_time("2026-09-12", "aa:bb", 90, None).at, "aa:bb");
+    }
+
+    #[test]
+    fn target_time_lands_inside_the_window_and_is_stable_for_the_day() {
+        let first = target_time("2026-09-12", "08:00", 90, None);
+        assert!(in_window(&first, "08:00", 90), "落在窗口外：{}", first.at);
+        for _ in 0..100 {
+            assert_eq!(
+                target_time("2026-09-12", "08:00", 90, Some(&first)).at,
+                first.at,
+                "同一天重复调用不该重摇"
+            );
+        }
+        // 换一天就要重挑（值可以碰巧相同，但归属日期必须更新）
+        let next = target_time("2026-09-13", "08:00", 90, Some(&first));
+        assert_eq!(next.date, "2026-09-13");
+        assert!(in_window(&next, "08:00", 90));
+    }
+
+    #[test]
+    fn target_time_never_crosses_midnight() {
+        let lo = chrono::NaiveTime::from_hms_opt(23, 30, 0).unwrap();
+        let hi = chrono::NaiveTime::from_hms_opt(23, 59, 0).unwrap();
+        for _ in 0..200 {
+            let t = target_time("2026-09-12", "23:30", 90, None);
+            let at = chrono::NaiveTime::parse_from_str(&t.at, "%H:%M").unwrap();
+            assert!(at >= lo && at <= hi, "窗口被截断失败：{}", t.at);
+        }
+    }
+
+    #[test]
+    fn target_time_repicks_when_the_setting_moves_later() {
+        // 旧目标 09:40 对应的设置是 09:00 + 90min；用户把时刻改到 11:00 后
+        // 旧目标既不在新窗口里、按补跑窗口又会立刻触发一次 → 必须重挑
+        let stale = DayTarget {
+            date: "2026-09-12".into(),
+            at: "09:40".into(),
+        };
+        let t = target_time("2026-09-12", "11:00", 90, Some(&stale));
+        assert!(in_window(&t, "11:00", 90), "旧目标不该被复用：{}", t.at);
+
+        // 反向：设置改早时旧目标仍在新窗口内，继续用，不必重摇
+        let keep = DayTarget {
+            date: "2026-09-12".into(),
+            at: "10:12".into(),
+        };
+        assert_eq!(
+            target_time("2026-09-12", "09:00", 120, Some(&keep)).at,
+            "10:12"
+        );
+    }
+
+}

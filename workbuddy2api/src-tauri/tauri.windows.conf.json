@@ -1,0 +1,6 @@
+{
+  "bundle": {
+    "shortDescription": "WorkBuddy multi-account checkin desktop assistant",
+    "longDescription": "WorkBuddy Assistant: multi-account checkin, account import/export, token renewal, webhook notify, and GitHub Release auto-update."
+  }
+}

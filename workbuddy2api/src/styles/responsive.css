@@ -1,0 +1,63 @@
+/**
+ * WorkBuddy 的窄窗口补充。
+ *
+ * 通用断点（1180 / 900 / 720 / 620）已经写在 tokens 之外的各层里（见 chrome/ui/pages），
+ * 这里只保留**本应用页面特有**的两条：页头状态胶囊的收起方式，以及账号/日志表格里
+ * 那两列的让位规则。不要再把通用规则抄回来 —— 两处各写一份，早晚会打架。
+ */
+
+/* ── 1080：页头状态胶囊收成圆点 ────────────────────────────
+   默认窗口只有 980 宽，而这一排要同时放「标题 + 两枚状态 + 四个动作」。
+   文案收进 title（两枚胶囊本来就带 title），只留圆点省下约 200px。 */
+@media (max-width: 1080px) {
+  .status-chip {
+    width: var(--pill-h);
+    padding: 0;
+    justify-content: center;
+  }
+  .status-chip .chip-text {
+    display: none;
+  }
+}
+
+/* ── 900：次要列收起 ──────────────────────────────────────
+   滚动条在内容区是可见的，但表格一旦横向溢出仍然会静默截断；
+   宁可少显示一列（Token 过期在日志页 / 资源包弹窗里都有）。 */
+@media (max-width: 900px) {
+  .col-secondary {
+    display: none;
+  }
+  .ac-name,
+  .ac-phone {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .log-cell-msg {
+    min-width: 120px;
+  }
+  .logs-toolbar-row .filter select {
+    min-width: 150px;
+  }
+}
+
+/* ── 820：最小窗口（minWidth = 760）的兜底余量 ─────────────── */
+@media (max-width: 820px) {
+  .pagebar {
+    gap: 8px;
+  }
+  .pagebar .action-group {
+    gap: 6px;
+  }
+  .pagebar .action-group .btn {
+    padding: 0 11px;
+  }
+}
+
+/* ── 800：日志「积分」列的余额副行收起 ──────────────────────
+   五列在最小窗口里只剩约 60px 给积分列，「余额 12840」会被折成两行；
+   余额在账号页与资源包弹窗里都能看到，这里先让位给消息列。 */
+@media (max-width: 800px) {
+  .log-credit .sub {
+    display: none;
+  }
+}

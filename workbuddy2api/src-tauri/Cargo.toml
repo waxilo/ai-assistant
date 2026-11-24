@@ -1,0 +1,54 @@
+[package]
+name = "workbuddy2api"
+version = "0.2.0"
+description = "WorkBuddy2API：WorkBuddy 账号池转 OpenAI / Responses 兼容 API"
+authors = ["waxilo"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "workbuddy2api_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon：后台常驻托盘（关闭窗口不退出进程，定时签到/反代持续生效）
+tauri = { version = "2", features = ["tray-icon"] }
+# 单实例守卫：托盘常驻后用户再点图标会起第二个进程（Windows 上尤其明显）。
+tauri-plugin-single-instance = "2.4.4"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# 文件对话框：账号导出 / 导入选路径用
+tauri-plugin-dialog = "2"
+# 开机自启动：定时签到只有应用在跑才可能触发，所以由应用自己注册登录启动项。
+# 只在 Rust 侧调用（`app.autolaunch()`），因此不需要前端 npm 包，也不需要额外 capability。
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `sync`：`broker::SYNC_GATE` 的单飞闸用 `tokio::sync::Mutex`（跨 await 挂锁，
+# std 的 MutexGuard 是 !Send，不能用在这里）。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+regex = "1"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+minisign-verify = "0.2"
+thiserror = "1"
+# 新版 WorkBuddy 客户端把 auth/*.info 的关键字段做了静态加密（suite 1 = AES-256-GCM），
+# 「从本机凭证导入」必须能解开它，否则读到的只是 `$wbEncrypted` 壳子（详见 atrest.rs）。
+aes-gcm = "0.10"
+sha2 = "0.10"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[dev-dependencies]
+# 目前测试仅用 std + tokio 自带能力，无额外 dev 依赖

@@ -1,0 +1,524 @@
+//! 一键接入 Cursor。
+//!
+//! # 为什么是「写数据库」而不是「改配置文件」
+//!
+//! Cursor 是 VS Code 的 fork，它的 AI 设置**不存在 JSON 文件里**，而是塞在
+//! `%APPDATA%\Cursor\User\globalStorage\state.vscdb` 这个 SQLite 库的 `ItemTable` 表里：
+//!
+//! | 键 | 内容 |
+//! | --- | --- |
+//! | `cursorAuth/openAIKey` | 自定义 OpenAI Key（明文） |
+//! | `src.vs.platform...persistentStorage.applicationUser` | 用户级设置大 JSON，含 `useOpenAIKey`、`openAIBaseUrl`、`aiSettings.*` |
+//!
+//! # 三条硬约束（都来自 Cursor 的实现方式，不是我们的选择）
+//!
+//! 1. **写入前 Cursor 必须完全退出**：它把这份设置缓存在内存里，运行中写库会在下次
+//!    刷盘时被覆盖，用户看到的是「点了接入但没反应」。
+//! 2. **必须留备份**：库里是用户全部的自定义模型与 Key，写坏了他得重配。
+//!    备份只在**首次**接入时写一次 —— 否则第二次接入会把我们自己写过的值当成"原值"，
+//!    断开时还原回来的还是接入态，等于没有还原能力。
+//! 3. **只动认得的键**：`applicationUser` 是个大 JSON，除我们设置的几个字段外一律原样写回。
+//!
+//! 键名来自公开资料（Fireworks 的 FireConnect、若干 Cursor 接入教程，互相印证一致），
+//! **没有在本机实测过**（本机未安装 Cursor）。所以 `state()` 会把库里**实际读到**的值
+//! 回给界面：用户点完接入能立刻看见 Cursor 那边是不是真的变了。
+
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// `state.vscdb` 里的键值表（VS Code 标准结构）
+const ITEM_TABLE: &str = "ItemTable";
+
+/// 用户级设置整包 JSON。键名是 VS Code reactive storage 的固定拼法，别改。
+const APP_USER_KEY: &str =
+    "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser";
+
+/// 自定义 OpenAI Key（明文，Cursor 自己就这么存的）
+const OPENAI_KEY_KEY: &str = "cursorAuth/openAIKey";
+
+/// 接入前的原值备份（放在我们自己的 app_data 里，不污染 Cursor 目录）
+const BACKUP_FILE: &str = "cursor-backup.json";
+
+/// 给界面看的 Cursor 接入状态。全部从库里**现读**，不缓存。
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct CursorState {
+    /// `state.vscdb` 存在（没装 Cursor / 从没打开过就是 false）
+    pub found: bool,
+    pub db_path: String,
+    /// 库里当前的 `openAIBaseUrl`
+    pub base_url: String,
+    /// 库里有没有自定义 Key
+    pub key_set: bool,
+    /// `useOpenAIKey` —— Cursor 里「OpenAI API Key」那个开关
+    pub use_key: bool,
+    /// 库里现有的自定义模型
+    pub models: Vec<String>,
+    /// 是否已经指向本网关（`use_key` 且 `base_url` 与期望值一致）
+    pub connected: bool,
+}
+
+/// 默认的 `state.vscdb` 路径。
+///
+/// Windows：`%APPDATA%\Cursor\User\globalStorage\state.vscdb`
+/// （`dirs::config_dir()` 在 Windows 上就是 `%APPDATA%`，macOS/Linux 也各自对得上）。
+pub fn default_db_path() -> Option<PathBuf> {
+    let base = dirs::config_dir()?;
+    Some(base.join("Cursor").join("User").join("globalStorage").join("state.vscdb"))
+}
+
+/// 本机 Cursor 配置库存在吗（界面用它决定显示「未安装」还是「未接入」）。
+pub fn db_exists() -> bool {
+    default_db_path().map(|p| p.is_file()).unwrap_or(false)
+}
+
+/// 读当前接入状态。`expected_base` 是网关的 `/v1` 地址，用来判「接的是不是我们」。
+pub fn state(expected_base: &str) -> CursorState {
+    let Some(db) = default_db_path() else {
+        return CursorState::default();
+    };
+    state_in(&db, expected_base)
+}
+
+fn state_in(db: &Path, expected_base: &str) -> CursorState {
+    let mut st = CursorState {
+        db_path: db.display().to_string(),
+        ..Default::default()
+    };
+    if !db.is_file() {
+        return st;
+    }
+    st.found = true;
+    let Ok(conn) = open(db) else {
+        return st;
+    };
+    let Ok(app_user) = read_item(&conn, APP_USER_KEY) else {
+        return st;
+    };
+    let Ok(key) = read_item(&conn, OPENAI_KEY_KEY) else {
+        return st;
+    };
+    st.key_set = key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+    if let Some(v) = app_user.as_deref().and_then(parse_json) {
+        st.use_key = v.get("useOpenAIKey").and_then(|x| x.as_bool()).unwrap_or(false);
+        st.base_url = v
+            .get("openAIBaseUrl")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        st.models = v
+            .get("aiSettings")
+            .and_then(|a| a.get("userAddedModels"))
+            .and_then(|m| m.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    st.connected = st.use_key && normalize(&st.base_url) == normalize(expected_base);
+    st
+}
+
+/// 比对 base_url 时忽略末尾斜杠：用户手填过一次带 `/` 的也不会被判成"另一种配置"。
+fn normalize(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// 接入：把 Key / BaseURL / 自定义模型写进 Cursor 的配置库。
+///
+/// `models` 是要写进 `aiSettings.userAddedModels` 的模型 id（上游 slug）。
+/// 首次调用会把原值备份到 `backup_dir`，之后更新接入**不再覆盖备份**。
+pub fn connect(
+    base_url: &str,
+    api_key: &str,
+    models: &[String],
+    backup_dir: &Path,
+) -> Result<CursorState, String> {
+    let db = default_db_path().ok_or("找不到 Cursor 配置目录（无法定位用户配置）")?;
+    connect_in(&db, base_url, api_key, models, backup_dir)
+}
+
+fn connect_in(
+    db: &Path,
+    base_url: &str,
+    api_key: &str,
+    models: &[String],
+    backup_dir: &Path,
+) -> Result<CursorState, String> {
+    if !db.is_file() {
+        return Err(format!(
+            "没有找到 Cursor 的配置库（{}）。请先安装 Cursor 并打开一次，让它生成配置。",
+            db.display()
+        ));
+    }
+    if models.is_empty() {
+        return Err("至少要勾选一个模型".into());
+    }
+    let mut conn = open(db)?;
+    ensure_table(&conn)?;
+
+    let orig_app_user = read_item(&conn, APP_USER_KEY)?;
+    let orig_key = read_item(&conn, OPENAI_KEY_KEY)?;
+
+    // 备份只在首次接入时落盘：第二次接入若覆盖备份，"断开还原"就会把我们写过的
+    // 值当成原值还回去，用户永远回不到接入前的状态。
+    backup_once(backup_dir, &orig_app_user, &orig_key)?;
+
+    let patched = patch_app_user(orig_app_user.as_deref(), base_url, models)?;
+
+    // 两条语句要么都成、要么都不成：只写半截会让 Cursor 处于「有 Key 没 BaseURL」
+    // 的中间态，比两个都没写更难看懂。
+    let tx = conn.transaction().map_err(|e| format!("开启事务失败：{e}"))?;
+    write_item(&tx, APP_USER_KEY, &patched)?;
+    write_item(&tx, OPENAI_KEY_KEY, api_key)?;
+    tx.commit().map_err(|e| format!("写入 Cursor 配置失败：{e}"))?;
+
+    Ok(state_in(db, base_url))
+}
+
+/// 断开：按首次接入时的备份，把我们改过的那两个键还原。
+///
+/// 没有备份就**不猜**——直接报错。库里现在是用户可能已经手调过的状态，
+/// 凭"把开关关掉"糊弄过去，会把他的自定义模型一起留在那。
+pub fn disconnect(backup_dir: &Path) -> Result<CursorState, String> {
+    let db = default_db_path().ok_or("找不到 Cursor 配置目录")?;
+    disconnect_in(&db, backup_dir)
+}
+
+fn disconnect_in(db: &Path, backup_dir: &Path) -> Result<CursorState, String> {
+    if !db.is_file() {
+        return Err(format!("没有找到 Cursor 的配置库（{}）", db.display()));
+    }
+    let backup = read_backup(backup_dir)?.ok_or(
+        "找不到接入前的备份，无法确定该还原成什么。可以在 Cursor 的 Settings → Models 里手动关掉 OpenAI Key 覆盖。",
+    )?;
+
+    let mut conn = open(db)?;
+    ensure_table(&conn)?;
+    let tx = conn.transaction().map_err(|e| format!("开启事务失败：{e}"))?;
+    restore_item(&tx, APP_USER_KEY, backup.app_user.as_deref())?;
+    restore_item(&tx, OPENAI_KEY_KEY, backup.openai_key.as_deref())?;
+    tx.commit().map_err(|e| format!("还原 Cursor 配置失败：{e}"))?;
+
+    // 备份用完就删：留着它会让下次接入误以为"已经备份过"，于是又跳过备份。
+    let _ = std::fs::remove_file(backup_dir.join(BACKUP_FILE));
+
+    // 还原后库里多半已经没有我们的地址了，connected 会自然变 false
+    let mut st = state_in(db, "");
+    st.connected = false;
+    Ok(st)
+}
+
+// ---------------------------------------------------------------- JSON 改写
+
+fn parse_json(s: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(s).ok()
+}
+
+/// 在用户级设置 JSON 上打补丁：只动我们认识的字段，其余原样保留。
+///
+/// 解析失败 → **报错**，不拿空对象覆盖。库里那一大坨是用户的全部 AI 配置，
+/// "清空重建"等于把他的自定义模型全删了。
+fn patch_app_user(raw: Option<&str>, base_url: &str, models: &[String]) -> Result<String, String> {
+    let mut v = match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => serde_json::from_str::<serde_json::Value>(s)
+            .map_err(|e| format!("Cursor 的用户设置不是合法 JSON（{e}），为避免写坏它，已中止"))?,
+        None => serde_json::json!({}),
+    };
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let obj = v.as_object_mut().expect("刚判过是 object");
+
+    obj.insert("useOpenAIKey".into(), serde_json::json!(true));
+    obj.insert("openAIBaseUrl".into(), serde_json::json!(base_url));
+
+    let ai = obj
+        .entry("aiSettings")
+        .or_insert_with(|| serde_json::json!({}));
+    if !ai.is_object() {
+        *ai = serde_json::json!({});
+    }
+    let ai = ai.as_object_mut().expect("刚判过是 object");
+    ai.insert("userAddedModels".into(), serde_json::json!(models));
+    // 新版用 enabled、老版用 disabled。两个都写，省得猜用户装的是哪一版；
+    // 语义相反但都指向同一件事：让自定义模型出现在选择器里。
+    ai.insert("modelOverrideEnabled".into(), serde_json::json!(true));
+    ai.insert("modelOverrideDisabled".into(), serde_json::json!(false));
+
+    serde_json::to_string(&v).map_err(|e| format!("序列化 Cursor 设置失败：{e}"))
+}
+
+// ---------------------------------------------------------------- 备份
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Backup {
+    /// `applicationUser` 的原值；`None` = 原本没有这个键
+    app_user: Option<String>,
+    /// `cursorAuth/openAIKey` 的原值；`None` = 原本没有
+    openai_key: Option<String>,
+    /// 备份时间（秒）
+    at: i64,
+}
+
+fn backup_once(dir: &Path, app_user: &Option<String>, key: &Option<String>) -> Result<(), String> {
+    let path = dir.join(BACKUP_FILE);
+    if path.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建备份目录失败：{e}"))?;
+    let b = Backup {
+        app_user: app_user.clone(),
+        openai_key: key.clone(),
+        at: chrono::Local::now().timestamp(),
+    };
+    let text = serde_json::to_string_pretty(&b).map_err(|e| format!("序列化备份失败：{e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("写备份失败：{e}"))
+}
+
+fn read_backup(dir: &Path) -> Result<Option<Backup>, String> {
+    let path = dir.join(BACKUP_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读备份失败：{e}"))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("备份文件已损坏（{e}），请手动在 Cursor 里关闭 OpenAI Key 覆盖"))
+}
+
+/// 备份值是 `Some` 就写回，是 `None` 就把这一行删掉（原本就没有这个键）。
+fn restore_item(conn: &Connection, key: &str, val: Option<&str>) -> Result<(), String> {
+    match val {
+        Some(v) => write_item(conn, key, v),
+        None => conn
+            .execute(&format!("DELETE FROM {ITEM_TABLE} WHERE key = ?1"), params![key])
+            .map(|_| ())
+            .map_err(|e| format!("删除 {key} 失败：{e}")),
+    }
+}
+
+// ---------------------------------------------------------------- SQLite
+
+fn open(db: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(db).map_err(|e| {
+        format!("打开 Cursor 配置库失败：{e}（如果 Cursor 正在运行，请先完全退出）")
+    })?;
+    // Cursor 没退出时会短暂持锁，给它 3 秒而不是立刻失败
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+    Ok(conn)
+}
+
+/// 新装的 Cursor 可能还没写过这张表 —— 建一个和 VS Code 同构的空表。
+fn ensure_table(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        &format!("CREATE TABLE IF NOT EXISTS {ITEM_TABLE} (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)"),
+        [],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("初始化 ItemTable 失败：{e}"))
+}
+
+/// 读一个键。value 列历史上存过 TEXT 也存过 BLOB，两种都要认。
+fn read_item(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT value FROM {ITEM_TABLE} WHERE key = ?1"))
+        .map_err(|e| format!("准备查询失败：{e}"))?;
+    let mut rows = stmt.query(params![key]).map_err(|e| format!("查询 {key} 失败：{e}"))?;
+    let Some(row) = rows.next().map_err(|e| format!("读取 {key} 失败：{e}"))? else {
+        return Ok(None);
+    };
+    let cell = row.get_ref(0).map_err(|e| format!("读取 {key} 失败：{e}"))?;
+    Ok(match cell {
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    })
+}
+
+/// 写一个键：先 UPDATE，没改到行再 INSERT。
+///
+/// 不用 `INSERT ... ON CONFLICT`：VS Code 建表用的是 `UNIQUE ON CONFLICT REPLACE`
+/// 而不是 `PRIMARY KEY`，各版本 DDL 细节未必一致，UPDATE-then-INSERT 不依赖约束声明。
+fn write_item(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    let n = conn
+        .execute(
+            &format!("UPDATE {ITEM_TABLE} SET value = ?2 WHERE key = ?1"),
+            params![key, value],
+        )
+        .map_err(|e| format!("写 {key} 失败：{e}"))?;
+    if n == 0 {
+        conn.execute(
+            &format!("INSERT INTO {ITEM_TABLE} (key, value) VALUES (?1, ?2)"),
+            params![key, value],
+        )
+        .map_err(|e| format!("写 {key} 失败：{e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::env;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = env::temp_dir().join(format!("wb2api_cursor_{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 造一个和 Cursor 同构的库：ItemTable + 几条无关记录
+    fn make_db(dir: &Path, app_user: Option<&str>, key: Option<&str>) -> PathBuf {
+        let db = dir.join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        ensure_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('aicontext.personalContext', 'keep me')",
+            [],
+        )
+        .unwrap();
+        if let Some(a) = app_user {
+            write_item(&conn, APP_USER_KEY, a).unwrap();
+        }
+        if let Some(k) = key {
+            write_item(&conn, OPENAI_KEY_KEY, k).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn patch_keeps_unknown_fields_and_sets_our_four() {
+        let raw = json!({
+            "theme": "dark",
+            "aiSettings": { "composerModel": "gpt-5", "userAddedModels": ["old"] },
+            "cursorAuth": { "x": 1 }
+        })
+        .to_string();
+        let out = patch_app_user(Some(&raw), "http://127.0.0.1:8790/v1", &["m1".into()]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["theme"], "dark", "无关字段必须原样保留");
+        assert_eq!(v["cursorAuth"]["x"], 1);
+        assert_eq!(v["aiSettings"]["composerModel"], "gpt-5");
+        assert_eq!(v["useOpenAIKey"], true);
+        assert_eq!(v["openAIBaseUrl"], "http://127.0.0.1:8790/v1");
+        assert_eq!(v["aiSettings"]["userAddedModels"], json!(["m1"]));
+        assert_eq!(v["aiSettings"]["modelOverrideEnabled"], true);
+    }
+
+    #[test]
+    fn patch_refuses_to_clobber_broken_json() {
+        // 库里是坏 JSON 时必须报错：拿空对象覆盖 = 用户的模型全没了
+        assert!(patch_app_user(Some("not json"), "http://x/v1", &["m".into()]).is_err());
+    }
+
+    #[test]
+    fn patch_builds_from_scratch_when_absent() {
+        let out = patch_app_user(None, "http://x/v1", &["m".into()]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["useOpenAIKey"], true);
+        assert_eq!(v["aiSettings"]["userAddedModels"], json!(["m"]));
+    }
+
+    #[test]
+    fn connect_writes_and_reads_back() {
+        let dir = temp_dir("connect");
+        let db = make_db(&dir, Some(r#"{"theme":"dark"}"#), None);
+        let st = connect_in(
+            &db,
+            "http://127.0.0.1:8790/v1",
+            "sk-wb-test",
+            &["a".to_string(), "b".to_string()],
+            &dir,
+        )
+        .unwrap();
+        assert!(st.connected);
+        assert!(st.key_set);
+        assert_eq!(st.models, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(st.base_url, "http://127.0.0.1:8790/v1");
+
+        // 无关记录不能被碰
+        let conn = open(&db).unwrap();
+        assert_eq!(
+            read_item(&conn, "aicontext.personalContext").unwrap().as_deref(),
+            Some("keep me")
+        );
+        // Theme 也还在
+        let au = read_item(&conn, APP_USER_KEY).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&au).unwrap();
+        assert_eq!(v["theme"], "dark");
+    }
+
+    #[test]
+    fn backup_is_written_once_so_disconnect_can_restore() {
+        let dir = temp_dir("backup_once");
+        let db = make_db(&dir, Some(r#"{"useOpenAIKey":false}"#), Some("sk-old"));
+
+        connect_in(&db, "http://127.0.0.1:8790/v1", "sk-new", &["a".into()], &dir).unwrap();
+        // 第二次接入换了模型：备份**不能**被覆盖成接入后的值
+        connect_in(&db, "http://127.0.0.1:8790/v1", "sk-new", &["a".into(), "b".into()], &dir)
+            .unwrap();
+
+        let st = disconnect_in(&db, &dir).unwrap();
+        assert!(!st.connected);
+        let conn = open(&db).unwrap();
+        assert_eq!(
+            read_item(&conn, OPENAI_KEY_KEY).unwrap().as_deref(),
+            Some("sk-old"),
+            "要还原成接入前的那把 Key"
+        );
+        let au = read_item(&conn, APP_USER_KEY).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&au).unwrap();
+        assert_eq!(v["useOpenAIKey"], false, "开关要还原成接入前的 false");
+    }
+
+    #[test]
+    fn disconnect_removes_keys_that_did_not_exist_before() {
+        let dir = temp_dir("disconnect_fresh");
+        let db = make_db(&dir, None, None);
+        connect_in(&db, "http://127.0.0.1:8790/v1", "sk-new", &["a".into()], &dir).unwrap();
+        disconnect_in(&db, &dir).unwrap();
+        let conn = open(&db).unwrap();
+        assert!(
+            read_item(&conn, OPENAI_KEY_KEY).unwrap().is_none(),
+            "接入前没有的键，断开后要删掉而不是留空串"
+        );
+        assert!(read_item(&conn, APP_USER_KEY).unwrap().is_none());
+    }
+
+    #[test]
+    fn disconnect_without_backup_is_a_clear_error() {
+        let dir = temp_dir("no_backup");
+        let db = make_db(&dir, Some("{}"), None);
+        let err = disconnect_in(&db, &dir).unwrap_err();
+        assert!(err.contains("备份"), "{err}");
+    }
+
+    #[test]
+    fn missing_db_is_reported_not_silently_ignored() {
+        let dir = temp_dir("missing");
+        let err = connect_in(
+            &dir.join("nope.vscdb"),
+            "http://x/v1",
+            "k",
+            &["a".into()],
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("没有找到 Cursor 的配置库"), "{err}");
+    }
+
+    #[test]
+    fn connected_ignores_trailing_slash_difference() {
+        let dir = temp_dir("slash");
+        let db = make_db(&dir, None, None);
+        connect_in(&db, "http://127.0.0.1:8790/v1", "k", &["a".into()], &dir).unwrap();
+        let st = state_in(&db, "http://127.0.0.1:8790/v1/");
+        assert!(st.connected, "末尾斜杠不同不该判成没接入");
+    }
+}

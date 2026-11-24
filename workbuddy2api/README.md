@@ -1,0 +1,99 @@
+# WorkBuddy2API（Tauri 桌面端）
+
+把 **WorkBuddy 账号池**变成一个**可对外使用的 API**：本地起网关，给 Key，
+OpenAI Chat Completions / Responses 兼容，任何能填自定义 Base URL 的客户端都能直接接上。
+
+> 本目录由 `workbuddy-assistant` 整体复制而来（同为 Tauri v2 + Rust + React），
+> 但**定位不同、独立迭代**：
+>
+> | | `workbuddy-assistant` | `workbuddy2api` |
+> | --- | --- | --- |
+> | 定位 | 桌面助手：签到、续签、积分、接管官方客户端 | API 网关：把账号池的额度转成标准 API |
+> | 对官方客户端 | 接管（改 `CODEBUDDY_BASE_URL`） | 不接管 |
+> | 对外端口 | 8787（无鉴权、仅本机） | 8790（带 Key、可配置暴露范围） |
+> | 数据目录 | `com.waxilo.workbuddy-assistant` | `com.waxilo.workbuddy2api` |
+> | 更新通道 | `workbuddy-latest` | `workbuddy2api-latest` |
+
+两者的账号池、设置、台账、日志**完全隔离**（不同签名、不同 AppData 目录），可以同时运行。
+
+---
+
+## 为什么上游不需要协议翻译
+
+腾讯网关本身就是 OpenAI Chat Completions 兼容的（`POST /v2/chat/completions`，
+标准 SSE chunk、标准 `tool_calls` 增量、标准 `usage`）。本项目要补的是**网关外壳**：
+
+- Key 鉴权、监听范围、限速
+- `/v1/models` 模型清单（上游没有这个路由）
+- **非流式**响应（上游明确拒绝 `stream:false`，必须内部聚合）
+- **`/v1/responses`**（只认 Responses API 的客户端用；上游没有该路由，网关双向翻译）
+
+方案与实测证据见 [`docs/api-gateway-plan.md`](docs/api-gateway-plan.md)。
+
+---
+
+## 本地开发
+
+前置：Node 20+、Rust 1.77+、WebView2（Windows，通常已预装）。
+
+```bash
+npm install
+npm run tauri dev
+```
+
+后端单测（纯本地）：
+
+```bash
+cd src-tauri && cargo test --offline
+```
+
+> 本机 `crates.io` 走代理会 502，**必须带 `--offline`**。
+
+## 本地构建
+
+```bash
+npx tauri icon src-tauri/icons/icon-source.svg   # 只有改了图标才需要
+npm run tauri build
+```
+
+## 发布
+
+打 tag `workbuddy2api-v<版本>` 并推送，`release-workbuddy2api.yml` 会构建
+macOS universal + Windows NSIS 并更新 `workbuddy2api-latest` 通道。
+
+```bash
+git tag workbuddy2api-v0.1.0
+git push origin workbuddy2api-v0.1.0
+```
+
+---
+
+## 状态
+
+- [x] 骨架从 `workbuddy-assistant` 复制、身份隔离（productName / identifier / 包名 / 更新通道 / 数据目录）
+- [x] 网关：`/v1/chat/completions`、`/v1/models`、Key 鉴权、非流式聚合
+- [x] 上游加固：错误分级（12 类）、两档冷却、熔断、`developer` 角色归一
+- [x] 网关：`/v1/responses` 转换层（[说明](docs/responses-wire.md)）
+- [x] API 接入页：开关、Key、监听设置、扣费备选账号、接入 Codex（一键写入 config.toml + 模型目录）
+
+---
+
+## 两条客户端路线
+
+| 客户端 | 用哪个路由 | 备注 |
+| --- | --- | --- |
+| Cursor、Cline、Cherry Studio、Continue、自己的脚本 | `POST /v1/chat/completions` | 原样转发 + 非流式聚合 |
+| 新版 OpenAI SDK 等只认 Responses 的客户端 | `POST /v1/responses` | 网关双向翻译（上游没有这个路由） |
+
+**Codex 可以在页面上「一键接入」**：点一次把本网关写进它的 `config.toml` 与模型目录，
+之后在 Codex 里正常对话即可。只改网关相关的那几个键，断开时按备份原样还原
+（含 `[features] apps = false` —— 不写它 Codex 会一直重试 `chatgpt.com` 的 mcp 端点、turn 走不完）。
+
+其它客户端（Cursor、Cline、Cherry Studio、Continue、自己的脚本）**由你自己填**：
+把上面的 Base URL 与 API Key 填进「自定义供应商 / 覆盖 OpenAI Base URL」，模型名照清单挑一个。
+Cursor 仍未做自动接入 —— 它的 AI 设置只存在自己的 SQLite（`state.vscdb`）里，写库必须等它
+完全退出、键名还随版本漂移，风险与收益不成比例。
+
+细节见 [`docs/responses-wire.md`](docs/responses-wire.md)。
+
+网关只监听 `127.0.0.1`，且**每个请求都必须带 Key**（没有本机豁免）。
