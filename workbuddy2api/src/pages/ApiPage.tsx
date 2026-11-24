@@ -18,6 +18,7 @@ import {
   IconAlertTriangle,
   IconBolt,
   IconChevron,
+  IconList,
   IconPlug,
   IconPower,
   IconRefresh,
@@ -65,6 +66,9 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
   const [modelErr, setModelErr] = useState("");
   const [modelBusy, setModelBusy] = useState(false);
   const [modelQuery, setModelQuery] = useState("");
+  // 可用模型清单：只读清单也走弹窗（与「参与扣费」同一套入口样式），
+  // 不再把几十行模型直接铺在「接入 Codex」卡片里
+  const [modelsOpen, setModelsOpen] = useState(false);
 
   // 扣费备选账号：同样是草稿制弹窗（与「参与扣费」同一套交互）
   const [billOpen, setBillOpen] = useState(false);
@@ -209,6 +213,14 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
   const copy = async (text: string, label: string) => {
     const ok = await copyText(text);
     onToast({ kind: ok ? "ok" : "err", text: ok ? `${label}已复制` : "复制失败，请手动选中" });
+  };
+
+  const openModels = () => {
+    setModelQuery("");
+    setModelsOpen(true);
+    // 清单为空（进页面时网关还没开、或上次拉失败）就顺手补拉一次；
+    // 拉过的走 1h 缓存，不会每次点开都打上游
+    if (models.length === 0 && !modelBusy) void refreshModels();
   };
 
   const openBillPick = () => {
@@ -468,6 +480,25 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
               </button>
             }
           />
+          <Row
+            title="可用模型"
+            desc="上游账号池当前支持的对话模型。点开可查倍率、复制模型名；接入 Codex 时也从这份清单里勾选。"
+            ctrl={
+              <button
+                className="billing-trigger"
+                title="查看上游可用模型清单"
+                onClick={openModels}
+              >
+                <IconList size={14} />
+                {models.length > 0
+                  ? `${models.length} 个模型`
+                  : modelBusy
+                    ? "拉取中…"
+                    : "查看清单"}
+                <IconChevron size={13} className="billing-chevron" />
+              </button>
+            }
+          />
         </div>
       </div>
 
@@ -541,44 +572,15 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
                 <span>{modelErr}</span>
               </div>
             ) : models.length === 0 ? (
-              <p className="empty">
-                {modelBusy
-                  ? "正在拉取上游模型清单…"
-                  : "还没拉到模型清单：先打开网关开关，并确保至少有一个可用账号。"}
-              </p>
-            ) : (
-              <>
-                <input
-                  type="text"
-                  placeholder="按模型名或 slug 过滤…"
-                  value={modelQuery}
-                  onChange={(e) => setModelQuery(e.target.value)}
-                />
-                <ul className="pick-list">
-                  {modelFiltered.map((m) => (
-                    <li key={m.slug} className="pick-item static">
-                      <span className="pick-main">
-                        <span className="pick-name">
-                          {m.name}
-                          <span className="mono pick-slug">{m.slug}</span>
-                        </span>
-                      </span>
-                      <span className="pick-tail">
-                        <span className={"pick-state " + (m.free ? "ok" : "warn")}>
-                          {m.free ? "免费" : m.credits.trim() || "倍率未知"}
-                        </span>
-                        <button className="btn small" onClick={() => void copy(m.slug, "模型名")}>
-                          复制
-                        </button>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-                {modelFiltered.length === 0 && (
-                  <p className="empty">没有匹配「{modelQuery}」的模型。</p>
-                )}
-              </>
-            )}
+              <div className="note warn">
+                <IconAlertTriangle />
+                <span>
+                  {modelBusy
+                    ? "正在拉取上游模型清单…"
+                    : "还没拉到模型清单：先打开网关开关，并确保至少有一个可用账号。"}
+                </span>
+              </div>
+            ) : null}
           </>
         )}
 
@@ -643,6 +645,86 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
           )}
         </div>
       </div>
+
+      {/* ── 可用模型弹窗（只读清单：查倍率、复制模型名） ── */}
+      {modelsOpen && (
+        <Dialog
+          size="md"
+          icon={<IconList size={16} />}
+          title="可用模型"
+          subtitle="上游账号池当前支持的对话模型。复制模型名填进任意 OpenAI 兼容客户端；接入 Codex 时也从这份清单里勾选。"
+          label="可用模型"
+          fixedBodyHeight={420}
+          onClose={() => setModelsOpen(false)}
+          tools={<span className="billing-count">共 {models.length} 个</span>}
+          footer={
+            <>
+              <button
+                className="btn small"
+                disabled={modelBusy}
+                onClick={() => void refreshModels()}
+              >
+                <IconRefresh size={13} className={modelBusy ? "spin" : ""} />
+                {modelBusy ? "刷新中…" : "刷新清单"}
+              </button>
+              <button className="btn primary" onClick={() => setModelsOpen(false)}>
+                关闭
+              </button>
+            </>
+          }
+        >
+          <div className="modal-fill">
+            {modelErr ? (
+              <div className="note danger">
+                <IconAlertTriangle />
+                <span>{modelErr}</span>
+              </div>
+            ) : models.length === 0 ? (
+              <p className="empty">
+                {modelBusy
+                  ? "正在拉取上游模型清单…"
+                  : "还没拉到模型清单：先打开网关开关，并确保至少有一个可用账号。"}
+              </p>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  placeholder="按模型名或 slug 过滤…"
+                  value={modelQuery}
+                  onChange={(e) => setModelQuery(e.target.value)}
+                />
+                {modelFiltered.length === 0 ? (
+                  <p className="empty">没有匹配「{modelQuery}」的模型。</p>
+                ) : (
+                  <ul className="pick-list">
+                    {modelFiltered.map((m) => (
+                      <li key={m.slug} className="pick-item static">
+                        <span className="pick-main">
+                          <span className="pick-name">
+                            {m.name}
+                            <span className="mono pick-slug">{m.slug}</span>
+                          </span>
+                        </span>
+                        <span className="pick-tail">
+                          <span className={"pick-state " + (m.free ? "ok" : "warn")}>
+                            {m.free ? "免费" : m.credits.trim() || "倍率未知"}
+                          </span>
+                          <button
+                            className="btn small"
+                            onClick={() => void copy(m.slug, "模型名")}
+                          >
+                            复制
+                          </button>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+          </div>
+        </Dialog>
+      )}
 
       {/* ── 接入 Codex 弹窗（草稿制：点「接入」才写文件） ── */}
       {codexOpen && (

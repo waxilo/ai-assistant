@@ -779,14 +779,6 @@ input.port-input:disabled {
 .card > .note {
   margin: 14px 20px 18px;
 }
-.card > .pick-list {
-  margin: 12px 20px 18px;
-}
-/* 卡片里的过滤框：和下面的清单同宽（左右各留 20px），否则会贴到卡片边框上 */
-.card > input[type="text"] {
-  width: calc(100% - 40px);
-  margin: 14px 20px 0;
-}
 /* 列表里的空态：全局 .empty 的 64px 上下留白在这种框里太沉 */
 .pick-list .empty {
   padding: 26px 20px;
