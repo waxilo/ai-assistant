@@ -16,13 +16,11 @@ import type { ConfirmReq, Toast } from "../common";
 import { creditsOf, expiryOf, useCredits } from "../credits";
 import {
   IconAlertTriangle,
-  IconBolt,
   IconChevron,
   IconList,
   IconPlug,
   IconPower,
   IconRefresh,
-  IconShield,
   IconUsers,
 } from "../components/Icons";
 import { Row } from "../components/SettingsControls";
@@ -176,8 +174,33 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
       if (!ok) return;
     }
     setBusy(true);
-    await patch({ gateway_enabled: on });
-    setBusy(false);
+    try {
+      const saved = await patch({ gateway_enabled: on });
+      if (!saved) return;
+
+      // 关网关时 Codex 还指着本网关的话，顺手断开并重启：
+      // 否则 Codex 会继续往一个已关闭的端口发请求，界面里全是连不上
+      if (!on && codex?.connected) {
+        setCodexBusy(true);
+        try {
+          setCodex(await codexDisconnect());
+          const r = await codexRestart().catch(() => null);
+          setCodexRunning(await codexAppRunning().catch(() => false));
+          onToast({
+            kind: "ok",
+            text: r?.restarted
+              ? `网关已关闭，Codex 配置已还原并重启 ${r.app ?? "Codex"}`
+              : "网关已关闭，Codex 配置已还原（下次启动 Codex 生效）",
+          });
+        } catch (e) {
+          onToast({ kind: "err", text: `网关已关闭，但 Codex 配置还原失败：${e}` });
+        } finally {
+          setCodexBusy(false);
+        }
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   const rotate = async () => {
@@ -200,6 +223,11 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
   };
 
   const commitPort = async () => {
+    // 网关运行中不允许改端口：先关掉网关再改，避免「改完立刻重绑」在调用中途断连
+    if (settings.gateway_enabled) {
+      setPortDraft(String(settings.gateway_port));
+      return;
+    }
     const n = Number(portDraft);
     if (!Number.isInteger(n) || n < 1024 || n > 65535) {
       onToast({ kind: "err", text: "端口需在 1024–65535 之间" });
@@ -358,32 +386,6 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
 
   return (
     <div className="panel-page">
-      <div className="hero-block">
-        <div className="hero-top">
-          <div className="hero-copy">
-            <span className="hero-icon">
-              <IconBolt size={19} />
-            </span>
-            <div className="hero-text">
-              <div className="hero-title">
-                <h2>对外 API 网关</h2>
-              </div>
-            </div>
-          </div>
-          <Switch
-            checked={settings.gateway_enabled}
-            disabled={busy}
-            size="lg"
-            title="开启后会在本机监听一个端口，供客户端用 API Key 调用"
-            onChange={(v) => void toggle(v)}
-          />
-        </div>
-        <div className="hero-desc">
-          把账号池的积分变成一个 OpenAI 兼容接口：只在本机起端口、每个请求都要带 Key、按积分到期时间自动选号。
-          这条通道<b>不碰官方客户端</b>的任何配置，客户端该登录还登录、该用还照用。
-        </div>
-      </div>
-
       {settings.gateway_enabled && (
         <div className="card">
           <div className="card-head">
@@ -401,7 +403,7 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
               <span>
                 {state.error}
                 <div style={{ opacity: 0.75, marginTop: 6 }}>
-                  端口被别的程序占用时就是这个提示。换一个端口，或先关掉占用它的程序。
+                  端口被别的程序占用时就是这个提示。先关掉网关，换个端口再开，或先关掉占用它的程序。
                 </div>
               </span>
             </div>
@@ -434,28 +436,42 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
               <IconRefresh /> 重新生成
             </button>
           </div>
-
-          <div className="note warn">
-            <IconShield />
-            <span>
-              Key 等同于账号池的使用权。不要提交进仓库、不要发到群里；
-              怀疑泄露就点「重新生成」——它只换密钥，不影响任何账号的登录状态。
-            </span>
-          </div>
         </div>
       )}
 
       <div className="card">
-        <div className="card-head">网关</div>
+        <div className="card-head gateway-head">
+          <div className="gateway-head-main">
+            <span>网关</span>
+            <p className="gateway-head-desc">
+              把账号池的积分变成一个 OpenAI 兼容接口：只在本机起端口、每个请求都要带
+              Key、按积分到期时间自动选号。这条通道<b>不碰官方客户端</b>的任何配置，
+              客户端该登录还登录、该用还照用。关掉网关时会自动断开 Codex
+              接入、还原它的配置并重启。
+            </p>
+          </div>
+          <Switch
+            checked={settings.gateway_enabled}
+            disabled={busy}
+            size="lg"
+            title="开启后会在本机监听一个端口，供客户端用 API Key 调用"
+            onChange={(v) => void toggle(v)}
+          />
+        </div>
         <div className="set-group">
           <Row
             title="端口"
-            desc="默认 8790。改完 500ms 内自动重绑，不用重启应用。只监听 127.0.0.1，不对局域网开放。"
+            desc={
+              settings.gateway_enabled
+                ? "网关开启中，端口锁定；要换端口先关掉网关。只监听 127.0.0.1，不对局域网开放。"
+                : "默认 8790。开网关前先定好端口；只监听 127.0.0.1，不对局域网开放。"
+            }
             ctrl={
               <input
                 className="port-input"
                 value={portDraft}
                 inputMode="numeric"
+                disabled={settings.gateway_enabled || busy}
                 onChange={(e) => setPortDraft(e.target.value.replace(/[^0-9]/g, ""))}
                 onBlur={() => void commitPort()}
                 onKeyDown={(e) => e.key === "Enter" && void commitPort()}
@@ -519,42 +535,24 @@ export function ApiPage({ settings, accounts, askConfirm, onSettings, onToast }:
                   : "未接入"}
           </span>
         </div>
-        <div className="set-row-desc">
-          把本网关写进 Codex 的 <code className="mono">config.toml</code>，并在它自己的{" "}
-          <code className="mono">/model</code> 选择器里列出你勾的模型 —— 之后在 Codex 里正常对话，
-          扣的就是这个账号池的积分。<b>只改网关相关的那几个键</b>：它的登录、别的 provider、
-          以及你原有的其它配置一字不动。
-        </div>
 
         {codex?.connected ? (
-          <>
-            <div className="set-group">
-              <Row
-                title="服务地址"
-                desc="Codex 的每个请求都打到这里（只在本机监听）。"
-                ctrl={<code className="mono">{codex.baseUrl || "（未读到）"}</code>}
-              />
-              <Row
-                title="默认模型"
-                desc="Codex 启动时默认选中的那个，进去之后也能换。"
-                ctrl={<code className="mono">{codex.model || "—"}</code>}
-              />
-              <Row
-                title="已接入的模型"
-                desc={codex.catalogModels.join("、") || "（模型目录是空的）"}
-                ctrl={<span className="badge badge-ok">{codex.catalogModels.length} 个</span>}
-              />
-            </div>
-            {codexRunning && (
-              <div className="note warn">
-                <IconAlertTriangle />
-                <span>
-                  Codex 正在运行，而它<b>只在启动时读一次配置</b> —— 点「重启 Codex」才会用上
-                  刚写进去的配置。
-                </span>
-              </div>
-            )}
-          </>
+          <div className="set-group">
+            <Row
+              title="默认模型"
+              desc="Codex 启动时默认选中的那个，进去之后也能换。"
+              ctrl={<code className="mono">{codex.model || "—"}</code>}
+            />
+            <Row
+              title="已接入的模型"
+              // 后端旧版本这一栏可能没字段（见 codex.rs 的 camelCase 契约）：
+              // 兜底成空表，宁可不显示也不能在渲染里抛错把整棵树带走
+              desc={(codex.catalogModels ?? []).join("、") || "（模型目录是空的）"}
+              ctrl={
+                <span className="badge badge-ok">{(codex.catalogModels ?? []).length} 个</span>
+              }
+            />
+          </div>
         ) : (
           <>
             <div className="note info">

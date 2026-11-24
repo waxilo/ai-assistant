@@ -49,6 +49,11 @@ const BASE_INSTRUCTIONS: &str =
     "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 #[derive(Clone, Default, Debug, Serialize)]
+// 前端 `CodexState`（src/types.ts）按 camelCase 读：`configPath` / `baseUrl` /
+// `catalogModels`。少了这行，IPC 发出去的是 `config_path` 这套蛇形键，
+// 页面拿 `catalogModels` 就是 undefined —— 在「已接入」分支里 `.join()` 一调，
+// 整个 React 树卸载，窗口只剩一片灰（2026-11-24 实测踩过）。
+#[serde(rename_all = "camelCase")]
 pub struct CodexState {
     /// `~/.codex` 目录是否存在（没装 Codex 就没得接）
     pub found: bool,
@@ -1120,6 +1125,30 @@ enabled = true
         println!(
             "features.apps = {:?}（原文；原来是 None 就删掉这个键）",
             table_raw_value(&text, "features", "apps")
+        );
+    }
+
+    /// IPC 序列化契约：前端 `CodexState` 读的是 camelCase。
+    ///
+    /// 2026-11-24 的「接入 Codex 整屏灰」就是这里少了 rename：`catalogModels`
+    /// 拿到 undefined，`codex.catalogModels.join()` 抛错，整个 React 树被卸载。
+    #[test]
+    fn state_serializes_camel_case_keys() {
+        let st = CodexState {
+            found: true,
+            config_path: "~/.codex".into(),
+            connected: true,
+            base_url: "http://127.0.0.1:8790/v1".into(),
+            model: "hy3".into(),
+            catalog_models: vec!["hy3".into()],
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(v["catalogModels"][0], "hy3");
+        assert_eq!(v["configPath"], "~/.codex");
+        assert_eq!(v["baseUrl"], "http://127.0.0.1:8790/v1");
+        assert!(
+            v.get("catalog_models").is_none(),
+            "蛇形键不该出现在 IPC 载荷里"
         );
     }
 }

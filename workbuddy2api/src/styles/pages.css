@@ -444,6 +444,29 @@ input.port-input:disabled {
   color: var(--muted-2);
 }
 
+/* 网关卡头：标题 + 说明在左，主开关在右。说明常驻（不折叠），
+   所以卡头用顶部对齐，开关贴着标题那一行，而不是整块垂直居中。 */
+.card-head.gateway-head {
+  align-items: flex-start;
+}
+.gateway-head-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.gateway-head-desc {
+  margin: 0;
+  max-width: 760px;
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+  color: var(--muted);
+}
+.card-head.gateway-head .switch {
+  flex: 0 0 auto;
+}
+
 /* 卡片右上角的图标按钮：悬停/聚焦才出现 */
 .card-head .icon-btn {
   opacity: 0;
@@ -770,12 +793,7 @@ input.port-input:disabled {
   flex: 0 0 auto;
 }
 
-/* 直接挂在卡片里的块（说明段 / 提示条 / 按钮行 / 账号列表）：
-   统一左右 20px 与 card-head 对齐，不要给每个节点内联 padding。 */
-.card > .set-row-desc {
-  padding: 14px 20px 0;
-  max-width: 720px;
-}
+/* 直接挂在卡片里的提示条：统一左右 20px 与 card-head 对齐，不要给每个节点内联 padding。 */
 .card > .note {
   margin: 14px 20px 18px;
 }

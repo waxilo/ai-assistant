@@ -62,8 +62,8 @@ npm run tauri build
 macOS universal + Windows NSIS 并更新 `workbuddy2api-latest` 通道。
 
 ```bash
-git tag workbuddy2api-v0.2.1
-git push origin workbuddy2api-v0.2.1
+git tag workbuddy2api-v0.2.2
+git push origin workbuddy2api-v0.2.2
 ```
 
 ---
@@ -75,6 +75,9 @@ git push origin workbuddy2api-v0.2.1
 - [x] 上游加固：错误分级（12 类）、两档冷却、熔断、`developer` 角色归一
 - [x] 网关：`/v1/responses` 转换层（[说明](docs/responses-wire.md)）
 - [x] API 接入页：开关、Key、监听设置、扣费备选账号、接入 Codex（一键写入 config.toml + 模型目录）
+- [x] 端口只在网关关闭时可改：开着网关时输入框锁定，先关网关再改端口
+- [x] 关网关自动收尾：断开 Codex 接入、按备份还原 `config.toml`，并重启正在运行的 Codex
+- [x] 紫色应用图标：与同门的 WorkBuddy Assistant（深绿底）在 Dock / 任务栏里一眼分开
 
 ---
 
