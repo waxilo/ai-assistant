@@ -90,8 +90,15 @@ git push origin workbuddy2api-v0.2.3
 
 **Codex 可以在页面上「一键接入」**：点一次把本网关写进它的 `config.toml` 与模型目录，
 之后在 Codex 里正常对话即可。只改网关相关的那几个键，断开时按备份原样还原
-（含 `[features]` 里 `apps = false` / `tool_suggest = false` / `remote_plugin = false` —— 不关这几个，
-Codex 会在 turn 开始前去打 `chatgpt.com` 的 mcp 端点与插件目录，连不上就一直重试，表现为「一直正在思考」）。
+（含 `[features]` 里 `apps = false` / `tool_suggest = false` / `remote_plugin = false`
+与 `[analytics] enabled = false` —— 不关这几个，Codex 会在 turn 开始前去打 `chatgpt.com`
+的 apps/connectors、插件目录与统计上报，连不上就一直重试）。
+
+⚠️ 装了企业 EDR 的 Windows 机器上，如果仍然「思考很久」，先看一眼机器级受管文件
+`C:\ProgramData\OpenAI\Codex\requirements.toml` 里 `codex_userpromptsubmit` 出现了几次：
+本机曾累积 **392 条完全相同的 UserPromptSubmit hook**，每个 turn 都要跑完它们才发请求
+（实测 118~153 秒），而这一层是用户配置改不掉的。排查与去重步骤见
+[`docs/responses-wire.md`](docs/responses-wire.md) 的「思考很久」一节。
 
 其它客户端（Cursor、Cline、Cherry Studio、Continue、自己的脚本）**由你自己填**：
 把上面的 Base URL 与 API Key 填进「自定义供应商 / 覆盖 OpenAI Base URL」，模型名照清单挑一个。

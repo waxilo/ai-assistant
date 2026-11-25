@@ -148,6 +148,9 @@ experimental_bearer_token = "sk-wb-…"
 apps = false
 tool_suggest = false
 remote_plugin = false
+
+[analytics]
+enabled = false
 ```
 
 同时生成模型目录 `workbuddy2api-model-catalog.json`：勾了几个模型就有几条，
@@ -155,21 +158,74 @@ remote_plugin = false
 `128000`；`supported_reasoning_levels` 给空数组 —— Codex 就不显示 effort 选择器、
 也不会发 `reasoning.effort`。
 
-**三个实测必需的细节**（Codex 桌面端 26.1117.41037 / Windows，2026-11-24、11-25）：
+### 这四行分别省掉什么（Codex 桌面端 26.1117.41037 / Windows，2026-11-24、11-25）
 
-- **`[features] apps = false` 必写**。不写时 Codex 每 10 秒去
-  `POST chatgpt.com/backend-api/ps/mcp` 重试（它内置的 apps/connectors 后台），连不上就一直重试，
-  一个 turn 永远走不到结束 —— 表现为「卡住不动」。
-- **`tool_suggest = false` 与 `remote_plugin = false` 也必写**。只关 `apps` 时，turn **开始前**
-  的 `built_tools` 还会做两条要 ChatGPT 账号的插件发现：
-  `list_tool_suggest_discoverable_plugins`（`tool_suggest`）与
-  `POST chatgpt.com/backend-api/ps/plugins/installed`（`remote_plugin`）。
-  在访问不到 `chatgpt.com` 的机器上（企业代理/DLP 常见「TCP 能建连、永不回包」）这两条会串行
-  阻塞十几秒到半分钟，**网关一个请求都收不到**，界面从头到尾「正在思考」；
-  用户点停止后 UI 还会停在那一帧。同一台机器上 mac 往往没事 —— 那边要么直连、要么立刻 RST。
-  2026-11-25 实测：`09:28:40` 发消息 → `09:28:46` 之后 25 秒零日志（`built_tools`）→ 用户中断；
-  同一条消息重发 9 秒就出结果（网关只用了 2.5 秒）。
-- **不要写 `disable_response_storage`**。0.171 已废弃这个键，写进去日志会报 `is ignored`。
+- **`[features] apps = false`**：Codex 内置的 `codex_apps` MCP 服务要从
+  `https://chatgpt.com/backend-api/*` 拉 apps/connectors 目录，连不上时 `rmcp` 每 10 秒重试，
+  `world_state.build` 一直等它才降级（日志里那句
+  `omitting MCP server without an exact ready client server_name=codex_apps`）。
+  不关它，`codex debug prompt-input` 30 秒都走不完；关掉后 6.0~6.1 秒。
+- **`tool_suggest = false` 与 `remote_plugin = false`**：各自还有一条要 ChatGPT 账号的
+  插件发现/目录刷新（`list_tool_suggest_discoverable_plugins`、
+  `POST chatgpt.com/backend-api/ps/plugins/installed`），同样打在注定失败的端点上。
+- **`[analytics] enabled = false`**：它不是 feature 而是官方文档里明写的表
+  （app-server 默认关、桌面端显式开）。不关时它每 10 秒往
+  `chatgpt.com/backend-api/codex/analytics-events` 打一次、每次等满超时。
+- **不要写 `disable_response_storage`**（0.171 已废弃，只会进 `unrecognized configuration
+  setting` 列表），**也不要写 `[cloud.skills]`**（0.171 里根本没这个键，关它零收益）。
+
+⚠️ **这四行不等于解决「思考很久」。** 下面第二节才是本机几十秒~两分钟的真正来源。
+
+### 「思考很久」的真正来源：受管 UserPromptSubmit hook 被重复下发
+
+装了企业 EDR 的 Windows 机器上（本机是微步 Threatbook，`C:\Program Files (x86)\Threatbook\Agent\Kuafu.exe`），
+Codex 会从**机器级受管文件**读 hook：
+
+```
+C:\ProgramData\OpenAI\Codex\requirements.toml
+```
+
+本机这份文件 1965 行 / 65 KB，里面是 **392 条完全相同的块**：
+
+```toml
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+command = '& "C:\Program Files (x86)\Threatbook\Agent\Kuafu.exe" codex_userpromptsubmit'
+type = 'command'
+```
+
+Codex 对每条都执行一次，而且是在模型请求**之前**跑完：
+
+| 证据 | 数值 |
+| --- | --- |
+| 单次 `Kuafu.exe codex_userpromptsubmit` | 527 ms（PowerShell 计时） |
+| 一次 turn 里 `hook/started` 事件数（`codex debug app-server send-message-v2`） | **392** |
+| 桌面端首轮：`task_started` → 真正发出 `POST /v1/responses` | **118 秒**（11:30 那轮） |
+| 同上，`apps=false` 已生效、app-server 已重启 | **153 秒**（14:07 那轮） |
+| 同一轮网关自身耗时 | 1~3 秒 |
+
+时间与条数严格成正比（118 / 392 ≈ 0.30 s、153 / 392 ≈ 0.39 s），而日志特征也一样：一整段
+零日志空白，然后几百条 `hook/completed` 在同一秒刷出来，紧接着才发模型请求。
+
+**用户配置改不掉它**：`requirements.toml` 是机器级受管层（`%ProgramData%`），里面还写着
+`[features] hooks = true`（`featureRequirements: {hooks: true}`），`hooks` 开关不允许用户关。
+唯一的修法是把那份文件**去重成 1 条**（需要管理员权限，且要跟 IT 确认），或让 IT 修 EDR 的
+注入逻辑（它每同步一次策略就 append 一段，从不查重）。去重后这一项从 100 多秒降到 0.5 秒。
+
+### 量化手段（都**不需要开桌面端**）
+
+```bash
+# A. 测「注定失败的联网等待」这一段：这条路径不跑 hook，所以只反映 apps 等开关
+codex debug prompt-input "你好"          # 用 `timeout 40 …` 包一下看退出码；关 apps 后恒为 ~6s
+
+# B. 测完整 turn 准备（含 hook）：会打印 app-server 的 JSON-RPC 通知流
+codex debug app-server send-message-v2 "你好"
+#   数一下 "hook/started" 出现几次、从第一次到最后一次隔多久，就是 hook 的净开销
+```
+
+⚠️ 别拿 `codex exec` 做计时：本机安全策略会在它开始请求时把进程杀掉。
+⚠️ 也**别**只看 `debug prompt-input` 的 6 秒就以为「已经好了」——它不跑 hook，
+在装 EDR 的机器上会和真实体感差 100 秒以上。
 
 排查同款「正在思考」时按这个顺序看：
 
@@ -177,19 +233,39 @@ remote_plugin = false
 # 1. 网关有没有真的收到请求（没有 ⇒ 卡在 Codex 侧，与网关无关）
 tail -n 20 "$APPDATA/com.waxilo.workbuddy2api/app-logs.jsonl"
 
-# 2. Codex 自己的日志里那一轮走到哪了（Windows：%USERPROFILE%\.codex\logs_2.sqlite 的 logs 表）
-#    正常 3 秒内就会出现 run_run_sampling_request；卡在 built_tools 就是上面那两个开关
+# 2. 受管 hook 有没有被重复下发（本机踩过的坑，一眼就能看出来）
+grep -c codex_userpromptsubmit "/c/ProgramData/OpenAI/Codex/requirements.toml"   # 正常应为 1
 
-# 3. chatgpt.com 是不是「连得上但不回包」
+# 3. Codex 自己的日志里那一轮走到哪了（Windows：%USERPROFILE%\.codex\logs_2.sqlite 的 logs 表）
+#    按 id 倒序看：world_state.build 之后长时间零日志、随后几百条 hook/completed 齐刷
+#    ⇒ 就是 hook 重复
+
+# 4. chatgpt.com 是不是「连得上但不回包」
 curl -s -o /dev/null -m 40 -w 'code=%{http_code} connect=%{time_connect} total=%{time_total}\n' \
   'https://chatgpt.com/backend-api/ps/plugins/installed?limit=200'
-#    connect 很快、code=000 且 total≈10s ⇒ 被代理黑洞，就是它把 turn 拖住了
+#    connect 很快、code=000 且 total≈10s ⇒ 被代理黑洞
 ```
 
+去重（**管理员 PowerShell**，先备份；EDR 有篡改保护时可能被拦或下次同步又写回来）：
+
+```powershell
+$p = 'C:\ProgramData\OpenAI\Codex\requirements.toml'
+Copy-Item $p "$p.bak" -Force
+$t = [IO.File]::ReadAllText($p)
+$i = $t.IndexOf('[[hooks.UserPromptSubmit]]')
+$one = "[[hooks.UserPromptSubmit]]`r`n[[hooks.UserPromptSubmit.hooks]]`r`n" +
+       "command = '& `"C:\Program Files (x86)\Threatbook\Agent\Kuafu.exe`" codex_userpromptsubmit'`r`n" +
+       "type = 'command'`r`n"
+[IO.File]::WriteAllText($p, $t.Substring(0, $i).TrimEnd() + "`r`n`r`n" + $one, (New-Object Text.UTF8Encoding $false))
+Select-String -Path $p -Pattern 'codex_userpromptsubmit' | Measure-Object | % Count   # 期望 1
+```
+
+改完要**重启 app-server**（桌面端彻底退出再打开；有 daemon 时 `codex app-server daemon restart`）。
+
 首次接入把原文件备份到 `<app_data>/codex-config.bak.toml`。**断开**会删掉 provider 段、
-把 `model_provider` / `model_catalog_json` / `model` 与 `[features]` 里的
-`apps` / `tool_suggest` / `remote_plugin` 恢复成备份里的原值
-（原本没有的键就删掉，`[features]` 表空了连表头一起删），并删掉我们生成的模型目录。
+把 `model_provider` / `model_catalog_json` / `model`、`[features]` 里的
+`apps` / `tool_suggest` / `remote_plugin` 与 `[analytics] enabled` 恢复成备份里的原值
+（原本没有的键就删掉，表空了连表头一起删），并删掉我们生成的模型目录。
 
 **Codex 只在启动时读一次配置**，所以接入/断开后要重启才生效。页面上的「重启 Codex」只结束
 「有窗口 + 进程名 `codex`/`chatgpt` + 路径属 OpenAI 桌面应用」的进程 —— 你在终端里跑的

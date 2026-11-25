@@ -17,21 +17,57 @@
 //! 数据目录（`<app_data>/codex-config.bak.toml`），不往 `.codex/` 里扔垃圾。
 //! 断开时按备份恢复那几个键的原值。
 //!
-//! # 三条实测结论（2026-11-24 / 11-25，Codex 桌面端 26.1117.41037 / Windows）
+//! # 实测结论（2026-11-24 / 11-25，Codex 桌面端 26.1117.41037 / Windows）
 //!
-//! * **必须**写 `[features] apps = false`。不写时 Codex 会每 10 秒去
-//!   `POST chatgpt.com/backend-api/ps/mcp` 重试（那是它内置的 apps/connectors 后台），
-//!   连不上就一直重试，一个 turn 永远走不到结束 —— 表现为「卡住不动」。
-//! * **必须**同时关掉 `tool_suggest` 与 `remote_plugin`（见 [`DISABLED_FEATURES`]）。
-//!   只关 `apps` 时，turn **开始前**的 `built_tools` 仍会做两条需要 ChatGPT 账号的
-//!   插件发现：`list_tool_suggest_discoverable_plugins`（受 `tool_suggest` 控制）与
-//!   `POST chatgpt.com/backend-api/ps/plugins/installed`（受 `remote_plugin` 控制）。
-//!   访问不到 chatgpt.com 的机器上，这两条会串行阻塞十几秒到半分钟：**网关一个请求
-//!   都收不到**，界面从头到尾「正在思考」，用户点停止后 UI 还停在那一帧
-//!   （2026-11-25 实测：09:28:40 发消息 → 09:28:46 之后 25 秒零日志 → 用户中断；
-//!   同一条消息重发只要 9 秒）。关掉这两个开关后该阶段不再发请求。
-//! * **不能**写 `disable_response_storage`。0.171 已废弃这个键，写进去日志会报
-//!   `is ignored`，等于往用户配置里塞一行无效噪声。
+//! ## 一、turn 准备阶段会去 chatgpt.com 的几条链路（本模块关掉的就是这些）
+//!
+//! 本网关给的是本地 provider、本机也没有 ChatGPT 账号，这些请求注定失败；失败方式
+//! 决定体验好坏：直连不通会立刻 RST（无感），经企业代理/DLP 时常见「TCP 能建连、
+//! 永不回包」，每条都要等满超时。
+//!
+//! * `[features] apps = false` —— Codex 内置的 `codex_apps` MCP 服务要走
+//!   `https://chatgpt.com/backend-api/*` 拉 apps/connectors 目录。用
+//!   `codex debug prompt-input` 量化：不关时 30 秒都走不完（日志里那句
+//!   `omitting MCP server without an exact ready client server_name=codex_apps`），
+//!   关掉后 6.0~6.1 秒。
+//! * `[features] tool_suggest = false` / `remote_plugin = false` —— turn 前还有两条
+//!   要 ChatGPT 账号的插件发现与远程插件目录刷新，同样打在 chatgpt.com 上。
+//! * `[analytics] enabled = false` —— 见 [`DISABLED_TABLES`]。
+//!
+//! ## 二、「思考很久」（几十秒到两分钟）在本机的真凶不是上面这些
+//!
+//! 装了企业 EDR（本机是微步 Threatbook / `Kuafu.exe`）的机器上，
+//! `C:\ProgramData\OpenAI\Codex\requirements.toml` 会下发 **UserPromptSubmit hook**。
+//! 该文件本机已累积 **392 条完全相同的块**（同一句 `Kuafu.exe codex_userpromptsubmit`），
+//! Codex 每条都会执行，且在模型请求**之前**：
+//!
+//! * 2026-11-25 11:30 那轮：`task_started` 之后 **118 秒**零日志，随后一次性刷出
+//!   300+ 条 `hook/completed`，才去发 `POST /v1/responses`（网关自身 3.1 秒）。
+//! * 14:07 那轮（`apps = false` 已生效、app-server 也重启过）：仍是 **153 秒**空白，
+//!   392 个 hook 齐刷刷跑完才发请求。
+//! * 复现/量化不要用 `debug prompt-input` —— 那条路径**不跑 hook**，会把人骗了
+//!   （它测出来永远是 6 秒）。用 `codex debug app-server send-message-v2 "你好"`，
+//!   一次 turn 里能数到 **392 次 `hook/started`**；单次 `Kuafu.exe`
+//!   `codex_userpromptsubmit` 实测 ~0.5 秒。
+//!
+//! **这是机器级受管配置，用户级 `config.toml` 删不掉、覆盖不了**（requirements 里
+//! 还写了 `features.hooks = true`，`hooks` 不可关）。只能把那份文件去重成 1 条
+//! （需要管理员权限、且要跟 IT 确认），或由 IT 修 EDR 的注入逻辑（它会反复追加）。
+//! 详见 `docs/responses-wire.md` 的「思考很久」一节。
+//!
+//! 所以：本模块关掉的那几项是**应该关**（省掉注定失败的联网等待），但**不等于**
+//! 解决「思考很久」。装 EDR 的 Windows 机器上要另外处理 hook 重复。
+//!
+//! ## 三、别往配置里加的东西
+//!
+//! **不能**写 `disable_response_storage`（0.171 已废弃，写了只会出现在
+//! "unrecognized configuration setting" 里）；`[cloud.skills]` 也不是可识别的键，
+//! 关它零收益。
+//!
+//! `codex exec` 在本机会被安全策略中途杀掉，别拿它做计时。
+//!
+//! 改完 `config.toml` 要**重启 app-server**（桌面端彻底退出后重开；有托管 daemon 时
+//! `codex app-server daemon restart`）才生效 —— 只重开对话不算，配置是 daemon 启动时读的。
 
 use crate::catalog::ChatModel;
 use serde::Serialize;
@@ -48,18 +84,30 @@ pub const BACKUP_FILE: &str = "codex-config.bak.toml";
 ///
 /// 三个开关背后都要 ChatGPT 账号、都要打 `chatgpt.com`；本网关给的是本地
 /// provider，这些请求注定失败。失败方式决定体验好坏：直连不通会立刻 RST（无感），
-/// 而经企业代理/DLP 时常见「TCP 能建连、永不回包」，每条要等 10 秒超时 ——
-/// 串在 turn 开始前就是「一直正在思考」。
+/// 而经企业代理/DLP 时常见「TCP 能建连、永不回包」，每条要等 10 秒超时。
+///
+/// **注意：关掉它们只省掉这部分联网等待，并不解决「思考很久」**——那件事在本机是
+/// EDR 下发的 392 条重复 UserPromptSubmit hook（见文件头第二节），用户配置改不动。
 ///
 /// 断开时按备份逐个还原（原文没有的键连空表头一起删），见 [`disconnect_in`]。
 pub const DISABLED_FEATURES: [(&str, &str); 3] = [
-    // 内置 apps/connectors 后台（`/backend-api/ps/mcp` 循环重试）
+    // 内置 apps/connectors 后台：`world_state.build` 会等它拿到工具目录，
+    // 本机关不掉时 30 秒都走不完（2026-11-25 实测）。
     ("apps", "false"),
     // turn 前的插件发现 `list_tool_suggest_discoverable_plugins`
     ("tool_suggest", "false"),
     // 远程插件目录刷新 `POST /backend-api/ps/plugins/installed`
     ("remote_plugin", "false"),
 ];
+
+/// 与 [`DISABLED_FEATURES`] 同样受管、但要写进**独立表**的开关
+/// （`(表名, 键, 值)`）。
+///
+/// `[analytics]` 不是 feature，是官方文档里明写的表（app-server 默认关闭，
+/// 桌面端会显式打开）。它每 10 秒往 `chatgpt.com/backend-api/codex/analytics-events`
+/// 打一次、每次等满超时；turn 里的 `run_hooks_and_record_inputs` 还会等这一批
+/// 刷完才发模型请求（2026-11-25 实测：124.3s → 134.3s，整整 10 秒）。
+pub const DISABLED_TABLES: [(&str, &str, &str); 1] = [("analytics", "enabled", "false")];
 
 /// catalog 里声明的上下文窗口。
 ///
@@ -218,8 +266,8 @@ fn connect_in(
         .map_err(|e| format!("写模型目录失败：{e}"))?;
 
     let mut text = original;
-    // 关掉那几个「要 ChatGPT 账号」的 feature（见文件头第二条）：它们会在 turn
-    // 开始前串行阻塞，界面表现就是一直「正在思考」。
+    // 关掉那几个「要 ChatGPT 账号」的开关（见文件头）：它们会在 turn 开始前串行阻塞，
+    // 界面表现就是一直「正在思考」。feature 进 `[features]`，analytics 进 `[analytics]`。
     text = apply_disabled_features(&text);
     text = upsert_table(
         &text,
@@ -548,12 +596,28 @@ fn set_table_key(text: &str, table: &str, key: &str, val: &str) -> String {
 /// 删表内的一个键；删完表体空了，连表头一起删 —— 空表是只在文件里多出来的东西。
 fn drop_table_key(text: &str, table: &str, key: &str) -> String {
     let header = format!("[{table}]");
-    // 表头是最后压进去的一行 ⇒ 表体一行都没留下 ⇒ 连表头（与其前空行）一起摘掉
+    // 表头是最后压进去的一行 ⇒ 表体一行都没留下 ⇒ 连表头（与其前空行）一起摘掉。
+    //
+    // 表在**文件中间**时，表尾那几行空行是它与下一张表的分隔，得先收起来再判断：
+    // 只看 `last()` 会把「`[features]` 后面跟着空行 + `[analytics]`」判成「表体非空」，
+    // 结果在文件里留下一张空表头（2026-11-25 加 `[analytics]` 时踩到）。
     fn prune(out: &mut Vec<String>, header: &str) {
+        let mut blanks = 0;
+        while out.last().is_some_and(|l| l.trim().is_empty()) {
+            out.pop();
+            blanks += 1;
+        }
         if out.last().is_some_and(|l| l.trim() == header) {
             out.pop();
             while out.last().is_some_and(|l| l.trim().is_empty()) {
                 out.pop();
+            }
+            if blanks > 0 {
+                out.push(String::new()); // 中间的表：留一行空行给下一张表
+            }
+        } else if blanks > 0 {
+            for _ in 0..blanks {
+                out.push(String::new());
             }
         }
     }
@@ -588,24 +652,38 @@ fn drop_table_key(text: &str, table: &str, key: &str) -> String {
     s
 }
 
-/// 把 [`DISABLED_FEATURES`] 逐个写进 `[features]`：只碰这几行，同表其它开关原样保留。
+/// 把 [`DISABLED_FEATURES`] 逐个写进 `[features]`、把 [`DISABLED_TABLES`] 写进各自的表：
+/// 只碰这几行，同表其它键（用户自己开的开关、别人的 analytics 设置）原样保留。
 fn apply_disabled_features(text: &str) -> String {
-    DISABLED_FEATURES
+    let acc = DISABLED_FEATURES
         .iter()
         .fold(text.to_string(), |acc, (key, val)| {
             set_table_key(&acc, "features", key, val)
+        });
+    DISABLED_TABLES
+        .iter()
+        .fold(acc, |acc, (table, key, val)| {
+            set_table_key(&acc, table, key, val)
         })
 }
 
-/// 按备份把 [`DISABLED_FEATURES`] 逐个还原：原文里没有这个键就删掉（表空了连表头
-/// 一起删），有则按**原文**写回 —— 去引号再写会把布尔变成字符串。
+/// 按备份把 [`DISABLED_FEATURES`] 与 [`DISABLED_TABLES`] 逐个还原：原文里没有这个键就
+/// 删掉（表空了连表头一起删），有则按**原文**写回 —— 去引号再写会把布尔变成字符串。
 fn restore_disabled_features(text: &str, orig: &str) -> String {
-    DISABLED_FEATURES
+    let acc = DISABLED_FEATURES
         .iter()
         .fold(text.to_string(), |acc, (key, _)| {
             match table_raw_value(orig, "features", key) {
                 Some(v) => set_table_key(&acc, "features", key, &v),
                 None => drop_table_key(&acc, "features", key),
+            }
+        });
+    DISABLED_TABLES
+        .iter()
+        .fold(acc, |acc, (table, key, _)| {
+            match table_raw_value(orig, table, key) {
+                Some(v) => set_table_key(&acc, table, key, &v),
+                None => drop_table_key(&acc, table, key),
             }
         })
 }
@@ -970,6 +1048,26 @@ enabled = true
         assert_eq!(out.matches("[features]").count(), 1, "不该重复建表：\n{out}");
     }
 
+    /// `[analytics]` 是被单独管的表：要写 `enabled = false`，且不能顺手清掉表里
+    /// 用户自己的其它键（那是他的配置）。
+    #[test]
+    fn apply_disabled_features_also_disables_analytics_table() {
+        for (table, key, val) in DISABLED_TABLES {
+            // 没有这张表 → 建表
+            let out = apply_disabled_features("model = \"x\"\n");
+            assert!(
+                out.contains(&format!("[{table}]\n{key} = {val}")),
+                "没建出 [{table}]：\n{out}"
+            );
+            // 表在、里面有用户自己的键 → 只加我们这行
+            let src = format!("[{table}]\nsome_user_key = true\n");
+            let out = apply_disabled_features(&src);
+            assert!(out.contains("some_user_key = true"), "用户自己的键被吞了：\n{out}");
+            assert!(out.contains(&format!("{key} = {val}")), "没写进去：\n{out}");
+            assert_eq!(out.matches(&format!("[{table}]")).count(), 1, "重复建表：\n{out}");
+        }
+    }
+
     /// 重复接入不能把同一行写两遍（第二次接入门槛最低，最容易出这事）
     #[test]
     fn apply_disabled_features_is_idempotent() {
@@ -978,6 +1076,13 @@ enabled = true
         assert_eq!(once, twice);
         for (key, _) in DISABLED_FEATURES {
             assert_eq!(twice.matches(&format!("{key} = ")).count(), 1, "{key} 重复了：\n{twice}");
+        }
+        for (_, key, val) in DISABLED_TABLES {
+            assert_eq!(
+                twice.matches(&format!("{key} = {val}")).count(),
+                1,
+                "{key} 重复了：\n{twice}"
+            );
         }
     }
 
