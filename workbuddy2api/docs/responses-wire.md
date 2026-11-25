@@ -146,6 +146,8 @@ experimental_bearer_token = "sk-wb-…"
 
 [features]
 apps = false
+tool_suggest = false
+remote_plugin = false
 ```
 
 同时生成模型目录 `workbuddy2api-model-catalog.json`：勾了几个模型就有几条，
@@ -153,15 +155,40 @@ apps = false
 `128000`；`supported_reasoning_levels` 给空数组 —— Codex 就不显示 effort 选择器、
 也不会发 `reasoning.effort`。
 
-**两个实测必需的细节**（codex-cli 0.171.0-alpha.13 / Windows MSIX，2026-11-24）：
+**三个实测必需的细节**（Codex 桌面端 26.1117.41037 / Windows，2026-11-24、11-25）：
 
 - **`[features] apps = false` 必写**。不写时 Codex 每 10 秒去
   `POST chatgpt.com/backend-api/ps/mcp` 重试（它内置的 apps/connectors 后台），连不上就一直重试，
   一个 turn 永远走不到结束 —— 表现为「卡住不动」。
+- **`tool_suggest = false` 与 `remote_plugin = false` 也必写**。只关 `apps` 时，turn **开始前**
+  的 `built_tools` 还会做两条要 ChatGPT 账号的插件发现：
+  `list_tool_suggest_discoverable_plugins`（`tool_suggest`）与
+  `POST chatgpt.com/backend-api/ps/plugins/installed`（`remote_plugin`）。
+  在访问不到 `chatgpt.com` 的机器上（企业代理/DLP 常见「TCP 能建连、永不回包」）这两条会串行
+  阻塞十几秒到半分钟，**网关一个请求都收不到**，界面从头到尾「正在思考」；
+  用户点停止后 UI 还会停在那一帧。同一台机器上 mac 往往没事 —— 那边要么直连、要么立刻 RST。
+  2026-11-25 实测：`09:28:40` 发消息 → `09:28:46` 之后 25 秒零日志（`built_tools`）→ 用户中断；
+  同一条消息重发 9 秒就出结果（网关只用了 2.5 秒）。
 - **不要写 `disable_response_storage`**。0.171 已废弃这个键，写进去日志会报 `is ignored`。
 
+排查同款「正在思考」时按这个顺序看：
+
+```bash
+# 1. 网关有没有真的收到请求（没有 ⇒ 卡在 Codex 侧，与网关无关）
+tail -n 20 "$APPDATA/com.waxilo.workbuddy2api/app-logs.jsonl"
+
+# 2. Codex 自己的日志里那一轮走到哪了（Windows：%USERPROFILE%\.codex\logs_2.sqlite 的 logs 表）
+#    正常 3 秒内就会出现 run_run_sampling_request；卡在 built_tools 就是上面那两个开关
+
+# 3. chatgpt.com 是不是「连得上但不回包」
+curl -s -o /dev/null -m 40 -w 'code=%{http_code} connect=%{time_connect} total=%{time_total}\n' \
+  'https://chatgpt.com/backend-api/ps/plugins/installed?limit=200'
+#    connect 很快、code=000 且 total≈10s ⇒ 被代理黑洞，就是它把 turn 拖住了
+```
+
 首次接入把原文件备份到 `<app_data>/codex-config.bak.toml`。**断开**会删掉 provider 段、
-把 `model_provider` / `model_catalog_json` / `model` / `features.apps` 恢复成备份里的原值
+把 `model_provider` / `model_catalog_json` / `model` 与 `[features]` 里的
+`apps` / `tool_suggest` / `remote_plugin` 恢复成备份里的原值
 （原本没有的键就删掉，`[features]` 表空了连表头一起删），并删掉我们生成的模型目录。
 
 **Codex 只在启动时读一次配置**，所以接入/断开后要重启才生效。页面上的「重启 Codex」只结束

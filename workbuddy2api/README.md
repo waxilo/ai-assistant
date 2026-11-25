@@ -62,8 +62,8 @@ npm run tauri build
 macOS universal + Windows NSIS 并更新 `workbuddy2api-latest` 通道。
 
 ```bash
-git tag workbuddy2api-v0.2.2
-git push origin workbuddy2api-v0.2.2
+git tag workbuddy2api-v0.2.3
+git push origin workbuddy2api-v0.2.3
 ```
 
 ---
@@ -90,7 +90,8 @@ git push origin workbuddy2api-v0.2.2
 
 **Codex 可以在页面上「一键接入」**：点一次把本网关写进它的 `config.toml` 与模型目录，
 之后在 Codex 里正常对话即可。只改网关相关的那几个键，断开时按备份原样还原
-（含 `[features] apps = false` —— 不写它 Codex 会一直重试 `chatgpt.com` 的 mcp 端点、turn 走不完）。
+（含 `[features]` 里 `apps = false` / `tool_suggest = false` / `remote_plugin = false` —— 不关这几个，
+Codex 会在 turn 开始前去打 `chatgpt.com` 的 mcp 端点与插件目录，连不上就一直重试，表现为「一直正在思考」）。
 
 其它客户端（Cursor、Cline、Cherry Studio、Continue、自己的脚本）**由你自己填**：
 把上面的 Base URL 与 API Key 填进「自定义供应商 / 覆盖 OpenAI Base URL」，模型名照清单挑一个。

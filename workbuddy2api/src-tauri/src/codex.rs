@@ -6,9 +6,10 @@
 //! `\\?\C:\...` 转义路径一大堆。用 `toml::to_string` 整体重写会：打乱注释、
 //! 重排键序、把 `\?\` 这类字面量重新转义 —— 相当于为了改 3 行而重写整个文件。
 //!
-//! 所以这里是**外科手术式文本编辑**：只碰四个顶层键（`model_provider`、
-//! `model_catalog_json`、`model`、`[features] apps`）与一个表
-//! （`[model_providers.workbuddy2api]`），其余字节不动。
+//! 所以这里是**外科手术式文本编辑**：只碰三个顶层键（`model_provider`、
+//! `model_catalog_json`、`model`）、`[features]` 里[受管的那几个开关]
+//! （[`DISABLED_FEATURES`]）与一个表（`[model_providers.workbuddy2api]`），
+//! 其余字节不动。
 //!
 //! # 为什么写之前要备份
 //!
@@ -16,11 +17,19 @@
 //! 数据目录（`<app_data>/codex-config.bak.toml`），不往 `.codex/` 里扔垃圾。
 //! 断开时按备份恢复那几个键的原值。
 //!
-//! # 两个实测结论（2026-11-24，codex-cli 0.171.0-alpha.13 / Windows MSIX）
+//! # 三条实测结论（2026-11-24 / 11-25，Codex 桌面端 26.1117.41037 / Windows）
 //!
 //! * **必须**写 `[features] apps = false`。不写时 Codex 会每 10 秒去
 //!   `POST chatgpt.com/backend-api/ps/mcp` 重试（那是它内置的 apps/connectors 后台），
 //!   连不上就一直重试，一个 turn 永远走不到结束 —— 表现为「卡住不动」。
+//! * **必须**同时关掉 `tool_suggest` 与 `remote_plugin`（见 [`DISABLED_FEATURES`]）。
+//!   只关 `apps` 时，turn **开始前**的 `built_tools` 仍会做两条需要 ChatGPT 账号的
+//!   插件发现：`list_tool_suggest_discoverable_plugins`（受 `tool_suggest` 控制）与
+//!   `POST chatgpt.com/backend-api/ps/plugins/installed`（受 `remote_plugin` 控制）。
+//!   访问不到 chatgpt.com 的机器上，这两条会串行阻塞十几秒到半分钟：**网关一个请求
+//!   都收不到**，界面从头到尾「正在思考」，用户点停止后 UI 还停在那一帧
+//!   （2026-11-25 实测：09:28:40 发消息 → 09:28:46 之后 25 秒零日志 → 用户中断；
+//!   同一条消息重发只要 9 秒）。关掉这两个开关后该阶段不再发请求。
 //! * **不能**写 `disable_response_storage`。0.171 已废弃这个键，写进去日志会报
 //!   `is ignored`，等于往用户配置里塞一行无效噪声。
 
@@ -34,6 +43,23 @@ pub const PROVIDER_ID: &str = "workbuddy2api";
 pub const CATALOG_FILE: &str = "workbuddy2api-model-catalog.json";
 /// 备份文件名（相对应用数据目录）
 pub const BACKUP_FILE: &str = "codex-config.bak.toml";
+
+/// 接入时必须关掉的 feature 开关（`(键, 值)`，写进 `[features]`）。
+///
+/// 三个开关背后都要 ChatGPT 账号、都要打 `chatgpt.com`；本网关给的是本地
+/// provider，这些请求注定失败。失败方式决定体验好坏：直连不通会立刻 RST（无感），
+/// 而经企业代理/DLP 时常见「TCP 能建连、永不回包」，每条要等 10 秒超时 ——
+/// 串在 turn 开始前就是「一直正在思考」。
+///
+/// 断开时按备份逐个还原（原文没有的键连空表头一起删），见 [`disconnect_in`]。
+pub const DISABLED_FEATURES: [(&str, &str); 3] = [
+    // 内置 apps/connectors 后台（`/backend-api/ps/mcp` 循环重试）
+    ("apps", "false"),
+    // turn 前的插件发现 `list_tool_suggest_discoverable_plugins`
+    ("tool_suggest", "false"),
+    // 远程插件目录刷新 `POST /backend-api/ps/plugins/installed`
+    ("remote_plugin", "false"),
+];
 
 /// catalog 里声明的上下文窗口。
 ///
@@ -192,10 +218,9 @@ fn connect_in(
         .map_err(|e| format!("写模型目录失败：{e}"))?;
 
     let mut text = original;
-    // 关掉内置 apps/connectors 后台：它只认 chatgpt.com，连不上就每 10s 重试一次，
-    // 一个 turn 永远走不到结束（见文件头「两个实测结论」）。只改这一个键 ——
-    // 用户在这个表里可能还开着别的 feature，整表覆盖会把它们吞掉。
-    text = set_table_key(&text, "features", "apps", "false");
+    // 关掉那几个「要 ChatGPT 账号」的 feature（见文件头第二条）：它们会在 turn
+    // 开始前串行阻塞，界面表现就是一直「正在思考」。
+    text = apply_disabled_features(&text);
     text = upsert_table(
         &text,
         &format!("model_providers.{PROVIDER_ID}"),
@@ -216,7 +241,8 @@ fn connect_in(
     Ok(st)
 }
 
-/// 断开：删 provider 段，三个顶层键恢复成备份里的原值（备份里没有就删掉）。
+/// 断开：删 provider 段，三个顶层键与 `[features]` 里的受管开关
+/// 恢复成备份里的原值（备份里没有就删掉）。
 pub fn disconnect(backup_dir: &Path) -> Result<CodexState, String> {
     let home = codex_home().ok_or("找不到用户主目录，无法定位 Codex 配置")?;
     disconnect_in(&home, backup_dir)
@@ -240,13 +266,10 @@ fn disconnect_in(home: &Path, backup_dir: &Path) -> Result<CodexState, String> {
             None => remove_top_level(&text, key),
         };
     }
-    // `[features] apps` 是我们为了绕开 chatgpt 依赖关掉的，断开必须还原：
-    // 备份里原本没有这个键就删掉它（表空了连表头一起删），有则按原文写回
-    // （原文可能是不带引号的布尔，套上引号就变成了字符串，语义不同）。
-    text = match table_raw_value(&orig, "features", "apps") {
-        Some(v) => set_table_key(&text, "features", "apps", &v),
-        None => drop_table_key(&text, "features", "apps"),
-    };
+    // `[features]` 里我们改过的那几个开关，断开必须逐个还原：备份里原本没有这个键
+    // 就删掉它（表空了连表头一起删），有则按原文写回（原文可能是不带引号的布尔，
+    // 套上引号就变成了字符串，语义不同）。
+    text = restore_disabled_features(&text, &orig);
     std::fs::write(&config, text).map_err(|e| format!("写 Codex 配置失败：{e}"))?;
     // 模型目录是我们生成的文件（固定文件名、只写不读别的），断开时一并清掉：
     // 留着它，下次换回官方 provider 后 Codex 里会多出一份「模型目录」残留。
@@ -474,8 +497,8 @@ fn push_before_blanks(out: &mut Vec<String>, line: String) {
 /// 表内设置一个键：有就原地替换，没有就追加到表体末尾，表不存在就新建整张表。
 ///
 /// 与 [`upsert_table`] 的分工：`[model_providers.workbuddy2api]` 是**我们自己的**表，
-/// 整段覆盖才对；`[features]` 是用户本来就有的表，只许碰 `apps` 这一行 ——
-/// 整表替换会把用户开的其它 feature 一起吞掉。
+/// 整段覆盖才对；`[features]` 是用户本来就有的表，只许碰 [`DISABLED_FEATURES`]
+/// 里的那几行 —— 整表替换会把用户开的其它 feature 一起吞掉。
 fn set_table_key(text: &str, table: &str, key: &str, val: &str) -> String {
     let header = format!("[{table}]");
     let mut out: Vec<String> = Vec::new();
@@ -563,6 +586,28 @@ fn drop_table_key(text: &str, table: &str, key: &str) -> String {
     let mut s = out.join("\n");
     s.push('\n');
     s
+}
+
+/// 把 [`DISABLED_FEATURES`] 逐个写进 `[features]`：只碰这几行，同表其它开关原样保留。
+fn apply_disabled_features(text: &str) -> String {
+    DISABLED_FEATURES
+        .iter()
+        .fold(text.to_string(), |acc, (key, val)| {
+            set_table_key(&acc, "features", key, val)
+        })
+}
+
+/// 按备份把 [`DISABLED_FEATURES`] 逐个还原：原文里没有这个键就删掉（表空了连表头
+/// 一起删），有则按**原文**写回 —— 去引号再写会把布尔变成字符串。
+fn restore_disabled_features(text: &str, orig: &str) -> String {
+    DISABLED_FEATURES
+        .iter()
+        .fold(text.to_string(), |acc, (key, _)| {
+            match table_raw_value(orig, "features", key) {
+                Some(v) => set_table_key(&acc, "features", key, &v),
+                None => drop_table_key(&acc, "features", key),
+            }
+        })
 }
 
 /// 整段替换一张表（不存在就追加到文件末尾）
@@ -908,9 +953,53 @@ enabled = true
         assert_eq!(out, "model = \"x\"\n");
     }
 
-    /// 接入写的是 `apps = false`，且**不**碰已废弃的 `disable_response_storage`
+    /// 三个受管开关都要落进 `[features]`，且用户自己开的开关一个都不能少。
+    ///
+    /// 只关 `apps` 时 turn 开始前的插件发现（`tool_suggest` / `remote_plugin`）仍会
+    /// 去打 chatgpt.com，访问不到的机器上就是「一直正在思考」。
     #[test]
-    fn connect_writes_features_apps_and_leaves_the_deprecated_key_alone() {
+    fn apply_disabled_features_writes_all_three_and_keeps_user_switches() {
+        let out = apply_disabled_features(&config_with_features());
+        for (key, val) in DISABLED_FEATURES {
+            assert!(
+                out.contains(&format!("{key} = {val}")),
+                "{key} 没写进去：\n{out}"
+            );
+        }
+        assert!(out.contains("multi_agent = true"), "用户自己的开关被吞了：\n{out}");
+        assert_eq!(out.matches("[features]").count(), 1, "不该重复建表：\n{out}");
+    }
+
+    /// 重复接入不能把同一行写两遍（第二次接入门槛最低，最容易出这事）
+    #[test]
+    fn apply_disabled_features_is_idempotent() {
+        let once = apply_disabled_features(&real_config());
+        let twice = apply_disabled_features(&once);
+        assert_eq!(once, twice);
+        for (key, _) in DISABLED_FEATURES {
+            assert_eq!(twice.matches(&format!("{key} = ")).count(), 1, "{key} 重复了：\n{twice}");
+        }
+    }
+
+    /// 断开：原文没有的键删掉、有的按原文写回；表里只剩用户自己的开关
+    #[test]
+    fn restore_disabled_features_follows_the_backup_byte_for_byte() {
+        let orig = "[features]\napps = true\nmulti_agent = true\n";
+        let connected = apply_disabled_features(orig);
+        let back = restore_disabled_features(&connected, orig);
+        assert_eq!(back, "[features]\napps = true\nmulti_agent = true\n");
+
+        // 原文根本没有 `[features]` → 三个键全删，表头一起消失
+        // （用「表里只有我们写的键」的文本，否则用户自己的开关会留下，表头也必须留）
+        let connected = apply_disabled_features("model = \"x\"\n");
+        let back = restore_disabled_features(&connected, "model = \"x\"\n");
+        assert_eq!(back, "model = \"x\"\n");
+    }
+
+    /// 接入把三个「要 ChatGPT 账号」的 feature 都关掉，且**不**碰已废弃的
+    /// `disable_response_storage`
+    #[test]
+    fn connect_disables_auth_gated_features_and_leaves_the_deprecated_key_alone() {
         let base = std::env::temp_dir().join("wb2api_codex_features");
         let _ = std::fs::remove_dir_all(&base);
         let home = base.join("codex");
@@ -927,6 +1016,12 @@ enabled = true
             cfg.contains("[features]\napps = false"),
             "少了 apps = false，Codex 会一直重试 chatgpt 的 mcp 端点、turn 走不完：\n{cfg}"
         );
+        for (key, val) in DISABLED_FEATURES {
+            assert!(
+                cfg.contains(&format!("{key} = {val}")),
+                "{key} 没写进去，turn 开始前会卡在 chatgpt.com：\n{cfg}"
+            );
+        }
         // 0.171 会把这个键报成 is ignored：我们既不写、也不替用户删（那是他自己的配置）
         assert_eq!(
             cfg.matches("disable_response_storage").count(),
@@ -1043,7 +1138,12 @@ enabled = true
         assert!(after.contains("[plugins.\"browser@openai-bundled\"]"));
         assert!(after.contains("notify = ["));
         assert!(after.contains("[model_providers.kiro2api]"), "别人的 provider 段不能删");
-        assert!(after.contains("[features]\napps = false"), "必须关掉内置 apps 后台");
+        for (key, val) in DISABLED_FEATURES {
+            assert!(
+                after.contains(&format!("{key} = {val}")),
+                "{key} 必须关掉（否则 turn 前会卡在 chatgpt.com）"
+            );
+        }
 
         // 重复接入（换端口、换模型）：备份必须还是最初那份
         connect_in(&home, 8791, "sk-wb-test2", "deepseek-v4.1-flash", &models, &data).unwrap();
@@ -1063,6 +1163,9 @@ enabled = true
         assert!(back.contains("model = \"gpt-5.6-luna\""));
         assert!(back.contains("model_catalog_json = \"kiro2api-model-catalog.json\""));
         assert!(!back.contains("[features]"), "原文件没有 [features]，断开后不该多出一张空表");
+        for (key, _) in DISABLED_FEATURES {
+            assert!(!back.contains(&format!("{key} = ")), "断开了还留着我们加的 {key}：\n{back}");
+        }
         // 行数只允许因为删掉 provider 段而减少，不该多出空行
         assert!(
             back.lines().count() <= orig.lines().count(),
@@ -1099,7 +1202,7 @@ enabled = true
             return;
         };
         let mut after = text.clone();
-        after = set_table_key(&after, "features", "apps", "false");
+        after = apply_disabled_features(&after);
         after = upsert_table(&after, &format!("model_providers.{PROVIDER_ID}"), &provider_block(8790, "sk-wb-preview"));
         after = set_top_level(&after, "model_provider", &format!("\"{PROVIDER_ID}\""));
         after = set_top_level(&after, "model_catalog_json", &format!("\"{CATALOG_FILE}\""));
