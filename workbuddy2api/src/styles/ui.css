@@ -387,6 +387,9 @@
   min-width: 0;
 }
 .ac-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-size: var(--fs-cell);
   font-weight: 600;
   color: var(--text);

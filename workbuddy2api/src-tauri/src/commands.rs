@@ -172,6 +172,10 @@ pub(crate) async fn refresh_account_in_place(
 /// 这里若退回本地续签，几台机器会同时打官方接口、各自换一条新链 ——
 /// 「谁先签谁把别人踢下线」正是这么来的，所以这条分岔不能省。
 pub(crate) async fn ensure_fresh_token(account: &mut Account) -> Result<bool, refresh::RefreshError> {
+    // 公用 token（JSON 导入）绝不续签：轮换会把共享方踢下线，且它没有云端池可同步
+    if account.shared_token {
+        return Ok(false);
+    }
     if crate::broker::bound() {
         return Ok(false);
     }
@@ -236,7 +240,8 @@ pub(crate) async fn sync_pool_if_bound(dir: &Path) {
 /// 会发生的请求**留间隔——续签本就是少数事件，若「全都不需要续签」的空转也被逐个账号拖住，
 /// 一次后台自检就要凭空多花十几秒。
 fn will_refresh(account: &Account) -> bool {
-    account.refresh_token.is_some()
+    !account.shared_token
+        && account.refresh_token.is_some()
         && refresh::refresh_due(
             account.expires_at,
             &account.token,
@@ -313,6 +318,9 @@ pub struct ImportItem {
     /// refresh token 过期时间（毫秒时间戳）；本地登录文件与授权响应都可能有
     #[serde(default)]
     pub rt_expires_at: Option<i64>,
+    /// 公用 token（JSON 导入）：不续签、不上传凭证池，见 [`Account::shared_token`]
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// 导入结果：新增 / 更新各多少个（前端据此提示）
@@ -328,6 +336,10 @@ pub struct ImportReport {
 /// 合并时以新来源为准：token、refresh token 以及**两个 token 各自的过期时间**都用新值覆盖
 /// （本机登录文件 / 授权响应是权威来源），没给的字段则保留本地那份；昵称仅在原名为空时补。
 /// 这样早期导入、缺续签字段的账号重新导入一次即可获得自动续签能力，也不会产生重复条目。
+///
+/// `shared = true` 的来源（页面里的 JSON 导入）是例外：凭证是别处转来的**公用 token**，
+/// 只换票不收续签链 —— 官方续签是单链轮换，替共享票续一次会把对方踢下线（见
+/// [`Account::shared_token`]）。
 ///
 /// 绑了凭证池时还会**当场把这一批推上云**（见下方 `broker::sync` 那段）。
 #[tauri::command]
@@ -388,18 +400,24 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                 };
                 if !keep_existing {
                     a.token = token;
-                    if let Some(rt) = it.refresh_token.filter(|s| !s.trim().is_empty()) {
-                        a.refresh_token = Some(rt);
+                    // 公用 token 不带续签链：即使请求里塞了 refresh_token 也不能收
+                    if !it.shared {
+                        if let Some(rt) = it.refresh_token.filter(|s| !s.trim().is_empty()) {
+                            a.refresh_token = Some(rt);
+                        }
+                        // 两个 token 的过期时间各自独立覆盖：新来源没给就保留本地那份，
+                        // 别把「不知道」写成「没有」（那会让界面直接判成已失效）。
+                        if it.rt_expires_at.is_some() {
+                            a.rt_expires_at = it.rt_expires_at;
+                        }
                     }
                     if it.expires_at.is_some() {
                         a.expires_at = it.expires_at;
                     }
-                    // 两个 token 的过期时间各自独立覆盖：新来源没给就保留本地那份，
-                    // 别把「不知道」写成「没有」（那会让界面直接判成已失效）。
-                    if it.rt_expires_at.is_some() {
-                        a.rt_expires_at = it.rt_expires_at;
-                    }
                 }
+                // 来源决定语义：JSON 导入 = 公用 token（停续签、不上传池）；
+                // 之后从本机登录文件 / 浏览器登录再导入一次，就恢复自动续签。
+                a.shared_token = it.shared;
                 if phone.is_some() {
                     a.phone = phone;
                 }
@@ -431,9 +449,14 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     name,
                     phone,
                     token,
-                    refresh_token: it.refresh_token.filter(|s| !s.trim().is_empty()),
+                    refresh_token: if it.shared {
+                        None
+                    } else {
+                        it.refresh_token.filter(|s| !s.trim().is_empty())
+                    },
+                    shared_token: it.shared,
                     expires_at: it.expires_at,
-                    rt_expires_at: it.rt_expires_at,
+                    rt_expires_at: if it.shared { None } else { it.rt_expires_at },
                     base_url: host.filter(|s| !s.trim().is_empty()),
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     last: None,
@@ -463,6 +486,7 @@ mod import_tests {
             phone: phone.map(str::to_string),
             token: token.into(),
             refresh_token: None,
+            shared_token: false,
             expires_at: None,
             rt_expires_at: None,
             base_url: None,
@@ -483,6 +507,7 @@ mod import_tests {
             refresh_token: Some("rt-new".into()),
             expires_at: Some(123456),
             rt_expires_at: Some(234567),
+            shared: false,
         }
     }
 
@@ -498,6 +523,46 @@ mod import_tests {
         assert_eq!(a.expires_at, Some(123456));
         assert_eq!(a.rt_expires_at, Some(234567), "refresh token 的有效期也要落库");
         assert_eq!(a.name, "demo-user", "已有名字不应被覆盖");
+    }
+
+    #[test]
+    fn shared_import_marks_the_token_and_refuses_renewal_fields() {
+        let mut accs = vec![];
+        let mut it = item("shared-t", None);
+        it.shared = true;
+        it.refresh_token = Some("rt-should-be-dropped".into());
+        it.rt_expires_at = Some(999);
+
+        let r = merge_import(&mut accs, vec![it]);
+
+        assert_eq!(r.added, 1);
+        let a = &accs[0];
+        assert!(a.shared_token, "JSON 导入的账号必须带公用标记");
+        assert!(a.refresh_token.is_none(), "公用 token 不收续签链");
+        assert!(a.rt_expires_at.is_none(), "公用 token 没有续签有效期");
+    }
+
+    #[test]
+    fn a_later_authoritative_import_restores_renewal_for_a_shared_account() {
+        let mut accs = vec![];
+        let mut shared = item("t1", Some("111"));
+        shared.shared = true;
+        merge_import(&mut accs, vec![shared]);
+        assert!(accs[0].shared_token);
+
+        // 之后用户从本机登录文件 / 浏览器登录再导入同一个账号：恢复自动续签
+        merge_import(&mut accs, vec![item("t1", Some("111"))]);
+
+        assert!(!accs[0].shared_token, "权威来源应清掉公用标记");
+        assert_eq!(accs[0].refresh_token.as_deref(), Some("rt-new"));
+    }
+
+    #[test]
+    fn shared_accounts_never_ask_for_a_token_refresh() {
+        let mut a = acct("demo", None, "t");
+        a.refresh_token = Some("rt".into());
+        a.shared_token = true;
+        assert!(!will_refresh(&a));
     }
 
     /// 造一张只带 `sub` / `iat` 的 JWT（本地不验签，只用来判身份与新旧）。
@@ -1475,6 +1540,7 @@ mod tests {
                 phone: None,
                 token,
                 refresh_token: Some("rt".into()),
+                shared_token: false,
                 expires_at: None,
                 rt_expires_at: None,
                 base_url: base.map(str::to_string),
@@ -1597,6 +1663,7 @@ mod tests {
             phone: None,
             token: "t".into(),
             refresh_token: None,
+            shared_token: false,
             expires_at: None,
             rt_expires_at: None,
             base_url: None,

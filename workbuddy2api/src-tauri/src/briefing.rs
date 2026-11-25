@@ -474,6 +474,7 @@ mod tests {
             phone: None,
             token: "t".into(),
             refresh_token: None,
+            shared_token: false,
             expires_at: None,
             rt_expires_at: None,
             base_url: None,

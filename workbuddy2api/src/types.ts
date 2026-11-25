@@ -18,6 +18,11 @@ export interface Account {
   token: string;
   /** 续签用的 refresh token（有它才能自动续期） */
   refresh_token: string | null;
+  /**
+   * 公用 token：来自「JSON 导入」的共享凭证（别处转来的一张 access token）。
+   * 这类账号不自动续签、不上传凭证池；重新从本机 / 浏览器登录导入后会恢复 false。
+   */
+  shared_token: boolean;
   /** access token 过期时间（毫秒）；null 表示未知 */
   expires_at: number | null;
   /** refresh token 过期时间（毫秒）；null 表示未知。它才是「还能不能换出新 token」的判据 */
@@ -142,6 +147,8 @@ export interface ImportItem {
   refresh_token?: string | null;
   expires_at?: number | null;
   rt_expires_at?: number | null;
+  /** 公用 token（JSON 导入）：不续签、不上传凭证池 */
+  shared?: boolean;
 }
 
 /** 批量导入结果：已存在的账号会被合并补全而不是跳过 */

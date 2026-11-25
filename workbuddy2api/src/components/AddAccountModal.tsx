@@ -12,7 +12,7 @@ import {
   oauthStart,
   openExternal,
 } from "../api";
-import { maskPhone } from "../common";
+import { maskPhone, copyText } from "../common";
 import type { Toast } from "../common";
 import { Dialog } from "./Dialog";
 import {
@@ -23,19 +23,79 @@ import {
 } from "./Icons";
 
 /**
- * 「添加账号」弹窗：把「导入本机账号 / 登录新账号」合成一个入口，
- * 两条通道用分段控件切换（参考 trae）。
+ * 「添加账号」弹窗：把「导入本机账号 / 登录新账号 / JSON」合成一个入口，
+ * 三条通道用分段控件切换（参考 trae）。
  *
  * - 本机账号：读 WorkBuddy 写在本机的 auth/*.info，不需要它正在运行；
- * - 浏览器登录：官方 OAuth state 轮询，在系统浏览器完成登录。
+ * - 浏览器登录：官方 OAuth state 轮询，在系统浏览器完成登录；
+ * - JSON：粘贴别处转来的账号（或本应用导出的内容），**只有 access token**。
  *
- * 凭据只留在本机这一份：不做「导出账户 / 从文件导入」，否则多台机器各持一份
- * refresh token 副本，而官方续签是单链轮换，谁先签就把别人踢下线。
+ * 前两条是完整续签链（带 refresh token），凭据只留在本机这一份 —— 多台机器各持
+ * 一份副本会被官方的单链轮换互相踢下线，跨机器共享走凭证池。
+ * JSON 通道是明确的例外：导入的一律标记成「公用 token」，不续签、不上传凭证池，
+ * 导出也只写 access token（绝不带 refresh token）。
  */
 
 const DEFAULT_HOST = "https://www.workbuddy.cn";
 
-type AddTab = "local" | "oauth";
+type AddTab = "local" | "oauth" | "json";
+
+/**
+ * 解析导入的 JSON。顶层可以是账号数组，也可以是本应用导出的
+ * `{ accounts: [...] }`；每条只认 token（必填）与几项展示信息。
+ */
+function parseJsonAccounts(text: string): { items: ImportItem[]; error: string } {
+  const raw = text.trim();
+  if (!raw) return { items: [], error: "" };
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    return { items: [], error: "JSON 解析失败：" + String(e) };
+  }
+  const rows = Array.isArray(data)
+    ? data
+    : data &&
+        typeof data === "object" &&
+        Array.isArray((data as { accounts?: unknown }).accounts)
+      ? (data as { accounts: unknown[] }).accounts
+      : null;
+  if (!rows) {
+    return { items: [], error: "没找到账号数组：顶层数组或 { accounts: [...] }" };
+  }
+  const str = (v: unknown) =>
+    typeof v === "string" && v.trim() ? v.trim() : null;
+  const items: ImportItem[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || typeof row !== "object") {
+      return { items: [], error: `第 ${i + 1} 项不是对象` };
+    }
+    const r = row as Record<string, unknown>;
+    const token = str(r.token);
+    if (!token) return { items: [], error: `第 ${i + 1} 项缺少 token` };
+    if (seen.has(token)) continue;
+    seen.add(token);
+    const exp = Number(r.expires_at);
+    items.push({
+      token,
+      name: str(r.name),
+      phone: str(r.phone),
+      host: str(r.host) ?? str(r.base_url),
+      expires_at: Number.isFinite(exp) && exp > 0 ? exp : null,
+      // 这一类导入不续签、不上传凭证池（见文件头注释）
+      shared: true,
+    });
+  }
+  if (items.length === 0) {
+    return {
+      items: [],
+      error: rows.length === 0 ? "账号数组是空的" : "没有有效账号（token 都重复）",
+    };
+  }
+  return { items, error: "" };
+}
 
 export function AddAccountModal({
   accounts,
@@ -50,6 +110,10 @@ export function AddAccountModal({
 }) {
   const [tab, setTab] = useState<AddTab>("local");
   const [importing, setImporting] = useState(false);
+
+  // ── JSON 通道 ─────────────────────────────────────────────
+  const [jsonText, setJsonText] = useState("");
+  const parsed = useMemo(() => parseJsonAccounts(jsonText), [jsonText]);
 
   // ── 本机账号 ──────────────────────────────────────────────
   const [list, setList] = useState<LocalAccount[]>([]);
@@ -180,6 +244,8 @@ export function AddAccountModal({
     closeOnEmpty: boolean
   ) => {
     if (items.length === 0) return;
+    // JSON 通道更新的是公用 token：它不补续签信息，反而会停掉原来的续签
+    const shared = items.every((i) => i.shared);
     setImporting(true);
     try {
       const { added, updated } = await onImport(items);
@@ -191,6 +257,8 @@ export function AddAccountModal({
               ? `已导入 ${added} 个账号，更新 ${updated} 个已有账号的凭证`
               : added > 0
               ? `已导入 ${added} 个账号`
+              : shared
+              ? `已更新 ${updated} 个账号（按公用 token 处理：不续签、不上传凭证池）`
               : `已更新 ${updated} 个账号的凭证（补全续签信息）`,
         });
         onClose();
@@ -205,6 +273,40 @@ export function AddAccountModal({
     }
   };
 
+  /**
+   * 导出当前账号为 JSON：只写 access token 与展示信息，
+   * **绝不带 refresh token** —— 那份副本会让两台机器互相踢下线。
+   * 同时填进输入框并复制：剪贴板不可用时还能手动全选。
+   */
+  const exportJson = async () => {
+    const payload = {
+      app: "workbuddy2api",
+      version: 1,
+      exported_at: new Date().toISOString(),
+      accounts: accounts.map((a) => ({
+        name: a.name,
+        phone: a.phone,
+        host: a.base_url,
+        expires_at: a.expires_at,
+        token: a.token,
+      })),
+    };
+    const text = JSON.stringify(payload, null, 2);
+    setJsonText(text);
+    const ok = await copyText(text);
+    onToast(
+      ok
+        ? {
+            kind: "ok",
+            text: `已复制 ${accounts.length} 个账号的 JSON（不含续签凭证）`,
+          }
+        : {
+            kind: "err",
+            text: "复制失败：JSON 已填进输入框，可手动全选复制",
+          }
+    );
+  };
+
   const waiting = phase === "waiting";
   const locked = importing || waiting;
 
@@ -214,7 +316,7 @@ export function AddAccountModal({
       icon={<IconUserPlus size={16} />}
       title="添加账号"
       label="添加账号"
-      subtitle="导入本机已登录的账号，或用浏览器登录新账号。"
+      subtitle="导入本机已登录的账号、用浏览器登录，或粘贴 JSON（公用 token）。"
       onClose={onClose}
       tools={
         tab === "local" ? (
@@ -245,6 +347,28 @@ export function AddAccountModal({
               }
             >
               {importing ? "导入中…" : `全部导入（${pending.length}）`}
+            </button>
+          </>
+        ) : tab === "json" ? (
+          <>
+            <button className="btn ghost" onClick={onClose} disabled={importing}>
+              关闭
+            </button>
+            <button
+              className="btn"
+              disabled={accounts.length === 0 || importing}
+              onClick={() => void exportJson()}
+            >
+              导出当前账号
+            </button>
+            <button
+              className="btn primary"
+              disabled={importing || parsed.items.length === 0}
+              onClick={() =>
+                void finishImport(parsed.items, "没有可导入的账号", false)
+              }
+            >
+              {importing ? "导入中…" : `导入（${parsed.items.length}）`}
             </button>
           </>
         ) : phase === "done" && result?.token ? (
@@ -308,6 +432,13 @@ export function AddAccountModal({
           onClick={() => setTab("oauth")}
         >
           浏览器登录
+        </button>
+        <button
+          className={tab === "json" ? "active" : ""}
+          disabled={locked}
+          onClick={() => setTab("json")}
+        >
+          JSON
         </button>
       </div>
 
@@ -429,6 +560,50 @@ export function AddAccountModal({
                 <span>授权失败：{oauthErr}</span>
               </p>
             )}
+          </>
+        )}
+
+        {tab === "json" && (
+          <>
+            <p className="note">
+              <IconInfo size={14} />
+              <span>
+                粘贴账号 JSON（顶层数组，或{" "}
+                <code className="mono">{"{ accounts: [...] }"}</code>
+                ）。这类账号是别处转来的<b>公用 token</b>：能签到、能走网关，但
+                <b>不会自动续签</b>，也不会传进凭证池 —— 替共享票续签会把真正持有它
+                的一方踢下线。已经在本机、且是正常登录过的同账号，再按 JSON
+                导入会停掉它的自动续签，直到重新从本机 / 浏览器登录导入一次。
+              </span>
+            </p>
+
+            <label>
+              账号 JSON
+              <textarea
+                rows={9}
+                spellCheck={false}
+                value={jsonText}
+                placeholder={
+                  '{\n  "accounts": [\n    { "name": "示例账号", "token": "…" }\n  ]\n}'
+                }
+                onChange={(e) => setJsonText(e.target.value)}
+              />
+            </label>
+
+            {parsed.error ? (
+              <p className="note danger">
+                <IconAlertTriangle size={14} />
+                <span>{parsed.error}</span>
+              </p>
+            ) : parsed.items.length > 0 ? (
+              <p className="note info">
+                <IconInfo size={14} />
+                <span>
+                  解析到 {parsed.items.length} 个账号，导入后都会标记为公用 token
+                  （不续签、不上传凭证池）。
+                </span>
+              </p>
+            ) : null}
           </>
         )}
       </div>

@@ -212,6 +212,7 @@ mod tests {
                 phone: phone.map(|p| p.to_string()),
                 token: "t".into(),
                 refresh_token: None,
+                shared_token: false,
                 expires_at: None,
                 rt_expires_at: None,
                 base_url: None,

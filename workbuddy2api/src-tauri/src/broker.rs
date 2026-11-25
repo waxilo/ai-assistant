@@ -383,6 +383,7 @@ pub fn account_from_item(item: &PoolItem) -> Account {
         phone: Some(item.phone.clone()).filter(|s| !s.trim().is_empty()),
         token: item.access_token.clone(),
         refresh_token: Some(item.refresh_token.clone()).filter(|s| !s.trim().is_empty()),
+        shared_token: false,
         expires_at: item.expires_at,
         rt_expires_at: item.rt_expires_at,
         base_url: None,
@@ -564,6 +565,10 @@ fn write_back_allowed(account: &Account) -> bool {
 pub fn union_pool(cloud: &[PoolItem], local: &[Account]) -> Vec<PoolItem> {
     let mut pool: Vec<PoolItem> = cloud.to_vec();
     for acct in local {
+        // 公用 token 不上云：它没有续签链，进池只会让别的机器拉到一张续不动的票
+        if acct.shared_token {
+            continue;
+        }
         let key = item_key_of(acct);
         if key.trim().is_empty() {
             continue;
@@ -770,7 +775,18 @@ pub async fn upload(dir: &Path) -> Result<PoolOp, String> {
     if accounts.is_empty() {
         return Err("本机还没有账号，先「导入本机账号」或「登录新账号」".to_string());
     }
-    let items: Vec<PoolItem> = accounts.iter().map(to_item).collect();
+    // 公用 token（JSON 导入）没有续签链，放进池里谁也签不动，直接不传
+    let items: Vec<PoolItem> = accounts
+        .iter()
+        .filter(|a| !a.shared_token)
+        .map(to_item)
+        .collect();
+    if items.is_empty() {
+        return Err(
+            "本机账号都是 JSON 导入的公用 token（不续签、不上传凭证池），没有可以上传的账号"
+                .to_string(),
+        );
+    }
     let v = request(
         reqwest::Method::POST,
         "/v1/pool",
@@ -1034,6 +1050,10 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     let mut dead_lines: Vec<String> = Vec::new();
     let mut fail_lines: Vec<String> = Vec::new();
     for acct in accounts.iter_mut() {
+        // 公用 token（JSON 导入）不进续签：它没有云端池，签了也会把共享方踢下线
+        if acct.shared_token {
+            continue;
+        }
         // 「该续」= 进了续签窗口，**或已被上游判死**（吊销票的到期时间还在未来，
         // 按窗口判断它永远轮不到续，而续签是它唯一的自救通道）。
         // 冷却中的账号直接算 blocked：退避已随账号落盘，重启也不会失忆。
@@ -1227,6 +1247,7 @@ mod tests {
             phone: phone.map(str::to_string),
             token: token.into(),
             refresh_token: None,
+            shared_token: false,
             expires_at: None,
             rt_expires_at: None,
             base_url: None,
@@ -1432,7 +1453,17 @@ mod tests {
     }
 
     #[test]
-    fn merge_skips_items_without_a_key() {        let mut accs = vec![acct("a", Some("111"), "t1")];
+    fn shared_tokens_never_enter_the_pool() {
+        let mut shared = acct("公用", Some("111"), "t-shared");
+        shared.shared_token = true;
+        let pool = union_pool(&[], &[shared, acct("本机", Some("222"), "t-local")]);
+        assert_eq!(pool.len(), 1, "只有非公用账号能上云");
+        assert_eq!(pool[0].key, "222");
+    }
+
+    #[test]
+    fn merge_skips_items_without_a_key() {
+        let mut accs = vec![acct("a", Some("111"), "t1")];
         let mut keyless = item("", "t", Some(5));
         keyless.key = String::new();
         assert_eq!(merge_into(&mut accs, &[keyless]), 0);

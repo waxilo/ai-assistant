@@ -201,7 +201,20 @@ export function AccountsPage({
               return (
                 <tr key={a.id}>
                   <td>
-                    <AccountCell name={a.name} phone={a.phone} />
+                    <AccountCell
+                      name={a.name}
+                      phone={a.phone}
+                      badge={
+                        a.shared_token ? (
+                          <span
+                            className="badge badge-already"
+                            title="JSON 导入的公用 token：不自动续签、不上传凭证池"
+                          >
+                            公用·不续签
+                          </span>
+                        ) : undefined
+                      }
+                    />
                   </td>
                   <td className="num">
                     {bal != null ? (
@@ -257,7 +270,13 @@ export function AccountsPage({
                     ) : (
                       <span
                         className={"sub" + (tok.expired ? " bad" : "")}
-                        title={tok.expired ? `已于 ${tok.at} 过期` : `${tok.at} 过期`}
+                        title={
+                          a.shared_token
+                            ? `${tok.at} 过期；公用 token 不会自动续签，需要从来源重新导入`
+                            : tok.expired
+                            ? `已于 ${tok.at} 过期`
+                            : `${tok.at} 过期`
+                        }
                       >
                         {tok.text}
                       </span>

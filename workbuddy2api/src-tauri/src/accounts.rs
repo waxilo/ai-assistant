@@ -41,6 +41,13 @@ pub struct Account {
     /// 续签用的 refresh token（导入本机账号 / 无感登录时一并带上；老账号为 None）
     #[serde(default)]
     pub refresh_token: Option<String>,
+    /// 公用 token：从「JSON 导入」进来的共享凭证（别处转来的一张 access token）。
+    ///
+    /// 这类账号**不续签、不上传凭证池**：官方续签是单链轮换，替共享票续一次
+    /// 就把真正持有这条链的那一方踢下线；而它本来就没有对应的云端池，传上去也没人续。
+    /// 随账号落盘；之后再从本机登录文件 / 浏览器登录导入同一个账号时会被改回 false。
+    #[serde(default)]
+    pub shared_token: bool,
     /// access token 过期时间（毫秒时间戳）；None 表示未知
     #[serde(default)]
     pub expires_at: Option<i64>,
@@ -496,6 +503,7 @@ mod tests {
                 phone: Some("138****0000".into()),
                 token: "t".into(),
                 refresh_token: None,
+                shared_token: false,
                 expires_at: None,
                 rt_expires_at: None,
                 base_url: None,
@@ -683,6 +691,7 @@ mod tests {
             phone: Some("138****0000".into()),
             token: "dt-new".into(),
             refresh_token: Some("rt-new".into()),
+            shared_token: false,
             expires_at: Some(2_000),
             rt_expires_at: Some(3_000),
             base_url: None,
@@ -716,6 +725,7 @@ mod tests {
             phone: None,
             token: "dt".into(),
             refresh_token: None,
+            shared_token: false,
             expires_at: None,
             rt_expires_at: None,
             base_url: Some("https://www.codebuddy.cn".into()),
