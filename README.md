@@ -43,7 +43,7 @@ TraeAssistant（`traework-latest`）与 QoderAssistant（`qoder-latest`）**已�
    `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（本包条目）、
    `package.json`、`package-lock.json` 的**顶层与 `packages[""]` 两处**
    （lock 里每个依赖都有 `version`，**不能 replace_all**，要用带 `"name"` 的上下文一次覆盖相邻两处）
-2. 打 tag 推送：`workbuddy-v0.1.61` / `workbuddy2api-v0.2.7`（版本以 tag 为准；
+2. 打 tag 推送：`workbuddy-v0.1.62` / `workbuddy2api-v0.2.8`（版本以 tag 为准；
    `trae-v*` / `qoder-v*` 已停用，不要再打）
 3. CI 构建两个平台 → 由 `scripts/build-latest.mjs` 用 `.sig` 生成 `latest.json`
    （v2 的 `tauri build` 不产 manifest）→ delete+recreate 各自的固定 tag Release
@@ -60,8 +60,8 @@ TraeAssistant（`traework-latest`）与 QoderAssistant（`qoder-latest`）**已�
 
 | 应用 | 当前版本 | 版本线起点 |
 |---|---|---|
-| WorkBuddyAssistant | `0.1.61` | 0.1.x（自身历史） |
-| WorkBuddy2api | `0.2.7` | 0.2.x（自身历史） |
+| WorkBuddyAssistant | `0.1.62` | 0.1.x（自身历史） |
+| WorkBuddy2api | `0.2.8` | 0.2.x（自身历史） |
 | TraeAssistant | `0.1.46`（最终版，停止维护） | 0.1.x（原名 TraeWorkAssistant） |
 | QoderAssistant | `0.1.42`（最终版，停止维护） | 从 `0.1.0` 起算 |
 
