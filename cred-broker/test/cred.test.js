@@ -849,6 +849,113 @@ test("revive 只对墓碑生效：活条目照常提交，未点名的墓碑互�
   assert.deepEqual(got.data.deleted.map((i) => i.key), ["c"]);
 });
 
+// ── 同身份聚合（打码手机号 ↔ 完整号码）─────────────────────────────────────
+
+test("同身份聚合：打码 key 的重新登录并进完整号码墓碑复活，不另起一行", async () => {
+  const env = createEnv();
+  // 生产里的墓碑 name/phone/key 都是完整号码，这里照原样构造
+  const uuid = await newPool(env, [item("a"), item("17674785984", { name: "17674785984" })]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a")] },
+  });
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}`)).data.deleted[0].key, "17674785984");
+
+  // 重新登录的那台机器只有打码手机号：key 与 phone 都是打码形态
+  const lease2 = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m2" });
+  const back = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m2",
+    body: {
+      version: lease2.data.version,
+      items: [
+        item("a"),
+        item("176****5984", { phone: "176****5984", access_token: "relogin" }),
+      ],
+    },
+  });
+  assert.equal(back.status, 200);
+  assert.equal(back.data.count, 2);
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["17674785984", "a"]);
+  assert.equal(got.data.items[0].access_token, "relogin", "新票并进墓碑那条行");
+  assert.equal(got.data.items[0].phone, "17674785984", "完整号码不被打码的盖掉");
+  assert.equal(got.data.items[0].name, "17674785984");
+  assert.deepEqual(got.data.deleted, [], "聚合 = 墓碑复活，同一个账号不再出现在已删除里");
+});
+
+test("现网遗留形态自愈：打码活行 + 完整号码墓碑并存，一次提交后聚合到完整号码、残留墓碑清掉", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  // 直接造出修复前的数据形态（老服务端留下的）：打码 key 活行 + 完整号码 key 墓碑
+  const at = Date.now();
+  await env.DB.prepare(
+    "INSERT INTO pool_items (pool_uuid, item_key, region, name, phone, email, access_token, refresh_token, expires_at, rt_expires_at, updated_at, deleted_at) " +
+      "VALUES (?, '176****5984', 'global', '176****5984', '176****5984', '', 'at-masked', 'rt-masked', NULL, NULL, ?, NULL)"
+  )
+    .bind(uuid, at)
+    .run();
+  await env.DB.prepare(
+    "INSERT INTO pool_items (pool_uuid, item_key, region, name, phone, email, access_token, refresh_token, expires_at, rt_expires_at, updated_at, deleted_at) " +
+      "VALUES (?, '17674785984', 'global', '17674785984', '17674785984', '', 'at-old', 'rt-old', NULL, NULL, ?, ?)"
+  )
+    .bind(uuid, at, at)
+    .run();
+
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  const back = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: {
+      version: lease.data.version,
+      items: [
+        item("a"),
+        item("176****5984", { phone: "176****5984", access_token: "relogin" }),
+      ],
+    },
+  });
+  assert.equal(back.status, 200);
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["17674785984", "a"]);
+  assert.equal(got.data.items[0].access_token, "relogin");
+  assert.equal(got.data.items[0].phone, "17674785984");
+  assert.deepEqual(got.data.deleted, [], "打码 key 的残留墓碑也要清掉，已删除里不留同账号");
+});
+
+test("聚合不越界：手机号不同身份的墓碑不并入也不移除", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [
+    item("a"),
+    item("17674785984", { name: "17674785984" }),
+    item("19908449648", { name: "19908449648" }),
+  ]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  // 只回传 a：两个完整号码账号都成墓碑
+  await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a")] },
+  });
+
+  // 打码重新登录只认得 176 那一条；199 的墓碑谁也不像，原样保留
+  const lease2 = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  const back = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: {
+      version: lease2.data.version,
+      items: [
+        item("a"),
+        item("176****5984", { phone: "176****5984", access_token: "relogin" }),
+      ],
+    },
+  });
+  assert.equal(back.status, 200);
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["17674785984", "a"]);
+  assert.deepEqual(got.data.deleted.map((i) => i.key), ["19908449648"], "不同号码的墓碑不许动");
+});
+
 test("revive 不是字符串数组时 400（不静默当成空）", async () => {
   const env = createEnv();
   const uuid = await newPool(env, [item("a")]);

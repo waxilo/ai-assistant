@@ -539,6 +539,93 @@ export async function releaseRenewer(db, uuid, renewer, actor, at) {
 }
 
 /**
+ * 手机号同身份：完全相等，或一边是**打码**号码（`176****5984`）、另一边是完整号码
+ * 且所有非星号位一致。客户端会把手机号打码（展示层产物），同一个账号在 A 机器上是
+ * 完整号码、在 B 机器上是打码 —— 只按字符串比会把同一人拆成两个 key。
+ * 两个都是完整号码时必须严格相等：数字不同就是不同账号，不做任何模糊。
+ */
+export function samePhoneIdentity(x, y) {
+  const a = str(x);
+  const b = str(y);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  if (!a.includes("*") && !b.includes("*")) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i] && a[i] !== "*" && b[i] !== "*") return false;
+  }
+  return true;
+}
+
+/**
+ * 同身份聚合（2026-11-27）：把「key 不同、手机号同身份」的提交**并进对应墓碑的 key**。
+ *
+ * 背景：「删掉后重新登录」的那台机器往往只有**打码**手机号 —— 提交的 key 是
+ * `176****5984`，而墓碑的 key 是完整号码 `17674785984`。不聚合的话，池里会多出一条
+ * 打码 key 的活行、原墓碑还留在已删除里，同一个账号在「有效账号」和「已删除」里
+ * 同时出现。聚合后提交挂到墓碑的 key 上（一并复活），完整号码 / 昵称不被打码的盖掉。
+ *
+ * key 已经是墓碑 key 的条目不经过这里：它们由 revive 点名走原路。两个条目聚到同一块
+ * 墓碑时先到的赢（normalizeItems 已按 key 去重，这种情况只出现在同一提交里带了
+ * 两个不同 key 的同身份条目）。
+ */
+function aggregateOntoTombs(keep, tombs) {
+  const taken = new Set();
+  const seen = new Set();
+  const out = [];
+  for (const item of keep) {
+    if (seen.has(item.key)) continue;
+    const tomb =
+      item.phone &&
+      tombs.find(
+        (t) => t.key !== item.key && !taken.has(t.key) && samePhoneIdentity(item.phone, t.phone)
+      );
+    if (tomb) {
+      taken.add(tomb.key);
+      const merged = { ...item, key: tomb.key };
+      if (item.phone.includes("*") && !tomb.phone.includes("*")) merged.phone = tomb.phone;
+      if (item.name.includes("*") && !tomb.name.includes("*")) merged.name = tomb.name;
+      out.push(merged);
+    } else {
+      out.push(item);
+    }
+    seen.add(out[out.length - 1].key);
+  }
+  return out;
+}
+
+/**
+ * 聚合遗留墓碑：与**活条目**同身份的墓碑已失去存在意义 —— 账号活着，恢复它只会
+ * 造出重复账号。硬删并记审计。同 key 不可能同时是活条目和墓碑（主键约束），
+ * 所以这里命中的全是「换了 key 的同一账号」。
+ */
+async function aggregateStaleTombs(db, uuid, actor, at) {
+  const live = await db
+    .prepare("SELECT item_key, phone FROM pool_items WHERE pool_uuid = ? AND deleted_at IS NULL")
+    .bind(uuid)
+    .all();
+  if (!live.results.length) return 0;
+  const tombs = await db
+    .prepare("SELECT item_key, phone FROM pool_items WHERE pool_uuid = ? AND deleted_at IS NOT NULL")
+    .bind(uuid)
+    .all();
+  const victims = tombs.results
+    .filter((t) =>
+      live.results.some((l) => l.item_key !== t.item_key && samePhoneIdentity(l.phone, t.phone))
+    )
+    .map((t) => t.item_key);
+  if (!victims.length) return 0;
+  await db
+    .prepare(
+      `DELETE FROM pool_items WHERE pool_uuid = ? AND item_key IN (${victims.map(() => "?").join(", ")})`
+    )
+    .bind(uuid, ...victims)
+    .run();
+  await logEvent(db, uuid, "aggregated", actor, `墓碑与活条目同身份，移除：${victims.join("、")}`, at);
+  return victims.length;
+}
+
+/**
  * 提交整池（CAS）：版本 +1、归还闸、用本轮条目重写池内容。
  *
  * 三条语句一个事务：
@@ -553,6 +640,11 @@ export async function releaseRenewer(db, uuid, renewer, actor, at) {
  * 才会被第 3 步复活；否则整条被跳过，墓碑与它的令牌原样保留。改之前的行为是「出现即
  * 复活」，任何一台还持有旧副本的机器都能把别处删掉的账号带回来（跨设备复活事故）。
  * 跳过多少条会如实报给客户端（`ignored`）并记进审计。
+ *
+ * ⚠️ **同身份聚合**（2026-11-27）：key 不同但手机号同身份（打码 ↔ 完整）的提交
+ * 并进对应墓碑复活，不另起新行（[`aggregateOntoTombs`]）；提交完成后与活条目同身份的
+ * 遗留墓碑直接移除（[`aggregateStaleTombs`]）—— 同一个账号不允许同时在「有效」和
+ * 「已删除」里出现。
  */
 export async function commitPool(db, uuid, actor, version, rawItems, revive, at) {
   const items = normalizeItems(rawItems);
@@ -567,14 +659,18 @@ export async function commitPool(db, uuid, actor, version, rawItems, revive, at)
       .run();
     if (changes(res) !== 1) return null; // 事务里什么都没写，commit / rollback 等价
 
-    // 提交前已是墓碑的 key：这一步必须在标删活条目**之前**读，
+    // 提交前已是墓碑的条目：这一步必须在标删活条目**之前**读，
     // 否则本轮没出现的条目也会被算进来、连累了同一账号换了 key 的条目。
     const { results } = await tx
-      .prepare("SELECT item_key FROM pool_items WHERE pool_uuid = ? AND deleted_at IS NOT NULL")
+      .prepare(`SELECT ${ITEM_COLUMNS} FROM pool_items WHERE pool_uuid = ? AND deleted_at IS NOT NULL`)
       .bind(uuid)
       .all();
-    const tombstoned = new Set(results.map((r) => r.item_key));
-    const keep = items.filter((i) => !tombstoned.has(i.key) || reviveSet.has(i.key));
+    const tombs = results.map(itemFromRow);
+    const tombstoned = new Set(tombs.map((t) => t.key));
+    const keep = aggregateOntoTombs(
+      items.filter((i) => !tombstoned.has(i.key) || reviveSet.has(i.key)),
+      tombs
+    );
 
     await tx
       .prepare("UPDATE pool_items SET deleted_at = ? WHERE pool_uuid = ? AND deleted_at IS NULL")
@@ -585,13 +681,15 @@ export async function commitPool(db, uuid, actor, version, rawItems, revive, at)
   });
 
   if (result) {
+    const aggregated = await aggregateStaleTombs(db, uuid, actor, at);
     const skipped = result.ignored > 0 ? `（忽略 ${result.ignored} 个墓碑，未点名复活）` : "";
+    const merged = aggregated > 0 ? `（聚合移除同身份墓碑 ${aggregated} 条）` : "";
     await logEvent(
       db,
       uuid,
       "committed",
       actor,
-      `v${version} → v${version + 1}，${result.count} 项${skipped}`,
+      `v${version} → v${version + 1}，${result.count} 项${skipped}${merged}`,
       at
     );
     return { kind: "ok", version: version + 1, count: result.count, ignored: result.ignored };

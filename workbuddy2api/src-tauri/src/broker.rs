@@ -611,6 +611,57 @@ pub fn find_cloud_tombstone(key: &str) -> Option<PoolItem> {
     find_tombstone(key)
 }
 
+/// 按**身份**找墓碑：key 不同也可能是同一个账号（本机手机号被打码 / 换过昵称），
+/// 所以除了 key 相等还认 [`tombstone_is_same`]（`sub` 优先，打码手机号兜底）。
+/// 来源与 [`find_cloud_tombstone`] 一致：云端缓存优先，落盘快照兜底。
+pub fn find_matching_tombstone(account: &Account) -> Option<PoolItem> {
+    if let Some(cache) = cloud_cache() {
+        if let Some(i) = cache.deleted.iter().find(|i| tombstone_is_same(account, i)) {
+            return Some(i.clone());
+        }
+    }
+    let lock = STATE.get()?;
+    let s = lock.lock().ok()?;
+    s.cfg
+        .deleted_items
+        .iter()
+        .find(|i| tombstone_is_same(account, i))
+        .cloned()
+}
+
+/// 「重新登录撞上墓碑」的身份对齐（纯函数本体，便于单测）：
+/// 墓碑带着**更完整**的手机号 / 昵称时采回账号（key 跟着回到完整号码），
+/// 返回应该点名的 revive key —— 是墓碑的 key，而不是本机打码手机号拼出来的 key。
+/// 点错了 key 云端只会另起一行，墓碑还留在已删除里，同一个账号两边都看得见。
+/// 本机手机号是**完整号码**且与墓碑不同 = 改号（换了手机号），不是打码漂移：
+/// 不认领旧 key，revive 点本机 key（旧 key 的墓碑由服务端按手机号聚合收走）。
+fn align_with_tombstone(account: &mut Account, tomb: &PoolItem) -> String {
+    let key = tomb.key.trim();
+    if key.is_empty() {
+        return item_key_of(account);
+    }
+    let full = |s: &str| !s.trim().is_empty() && !s.contains('*');
+    let account_phone = account.phone.as_deref().unwrap_or("").trim();
+    if full(account_phone) && account_phone != tomb.phone.trim() {
+        return item_key_of(account);
+    }
+    if !full(account_phone) && full(&tomb.phone) {
+        account.phone = Some(tomb.phone.clone());
+    }
+    if !full(&account.name) && full(&tomb.name) {
+        account.name = tomb.name.clone();
+    }
+    key.to_string()
+}
+
+/// [`align_with_tombstone`] 的存储入口：找不到同身份墓碑时退回本机 key。
+pub fn with_tombstone_identity(account: &mut Account) -> String {
+    match find_matching_tombstone(account) {
+        Some(tomb) => align_with_tombstone(account, &tomb),
+        None => item_key_of(account),
+    }
+}
+
 /// 从「已删除」里移除一条（恢复成功后调）。
 pub fn take_tombstone(key: &str) {
     let written = mutate(|s| {
@@ -1143,6 +1194,41 @@ fn same_subject(a: &str, b: &str) -> bool {
     }
 }
 
+/// 手机号同身份：完全相等，或一边是**打码**号码（`176****5984`）、另一边是完整号码
+/// 且所有非星号位一致。打码是展示层产物，同一账号在两台机器上可能一个带完整号码、
+/// 一个带打码 —— 只按字符串比会把同一人拆成两个 key（`item_key_of` 的 key 就会分叉）。
+/// 两个都是完整号码时必须严格相等：数字不同就是不同账号，不做任何模糊。
+fn phones_same_identity(a: &str, b: &str) -> bool {
+    let (x, y) = (a.trim(), b.trim());
+    if x.is_empty() || y.is_empty() {
+        return false;
+    }
+    if x == y {
+        return true;
+    }
+    if x.len() != y.len() || (!x.contains('*') && !y.contains('*')) {
+        return false;
+    }
+    x.bytes()
+        .zip(y.bytes())
+        .all(|(p, q)| p == q || p == b'*' || q == b'*')
+}
+
+/// 这条墓碑和本机账号是同一个账号吗？`sub` 都读得出时以 `sub` 为准（唯一精确锚点）；
+/// 有一侧读不出（不透明票 / 空票）才退回手机号同身份 —— 打码号码有碰撞空间，不单独定身份。
+fn tombstone_is_same(account: &Account, tomb: &PoolItem) -> bool {
+    match (
+        crate::checkin::token_subject(&account.token),
+        crate::checkin::token_subject(&tomb.access_token),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => phones_same_identity(
+            account.phone.as_deref().unwrap_or(""),
+            &tomb.phone,
+        ),
+    }
+}
+
 fn cloud_is_newer(item: &PoolItem, account: &Account) -> bool {
     // 先用 `iat`（签发时间）判：同一账号换票时它单调递增，而 `exp` 会骗人 ——
     // 已被顶掉的死票常把 `exp` 写得更晚（09-28 那张 exp 11-22 比 10-24 新票的 11-21 还晚），
@@ -1206,6 +1292,24 @@ fn item_usable(item: &PoolItem, now: i64) -> bool {
         return !crate::refresh::rt_is_expired(item.rt_expires_at, now);
     }
     item_expiry(item).map(|exp| exp > now).unwrap_or(true)
+}
+
+/// 打码 → 完整：池里那份带着**同一账号**的完整手机号时，把本机的打码手机号换回来。
+/// 本机 key 是「手机号优先」（[`item_key_of`]），不换的话本机每轮回写都拿打码 key
+/// 在池里另起一行，云端同一个账号就有两个 key —— 一条在有效账号、一条在已删除。
+/// 完整号码之间不互改（那可能是改号，两个 key 各自成立）；空手机号由补空逻辑处理。
+fn converge_phone(account: &mut Account, item: &PoolItem) -> bool {
+    let item_phone = item.phone.trim();
+    let account_phone = account.phone.as_deref().unwrap_or("").trim();
+    if item_phone.is_empty()
+        || item_phone.contains('*')
+        || item_phone == account_phone
+        || !phones_same_identity(item_phone, account_phone)
+    {
+        return false;
+    }
+    account.phone = Some(item.phone.clone());
+    true
 }
 
 /// 把池里那一条采纳到本地账号上。返回是否真的改动了。
@@ -1273,6 +1377,9 @@ fn adopt(account: &mut Account, item: &PoolItem, class: RenewClass, now: i64) ->
             account.phone = Some(item.phone.clone());
             touched = true;
         }
+        if converge_phone(account, item) {
+            touched = true;
+        }
         return touched;
     }
     if !item.access_token.trim().is_empty() {
@@ -1294,6 +1401,7 @@ fn adopt(account: &mut Account, item: &PoolItem, class: RenewClass, now: i64) ->
     if account.phone.is_none() && !item.phone.trim().is_empty() {
         account.phone = Some(item.phone.clone());
     }
+    converge_phone(account, item);
     if account.name.trim().is_empty() && !item.name.trim().is_empty() {
         account.name = item.name.clone();
     }
@@ -2618,6 +2726,87 @@ mod tests {
     #[test]
     fn blank_phone_falls_through_to_name() {
         assert_eq!(item_key_of(&acct("n", Some("   "), "t")), "n");
+    }
+
+    // ── 打码手机号同身份 ────────────────────────────────────────────────
+
+    /// 打码 ↔ 完整是同一号码；两个完整号码必须严格相等，不做模糊。
+    #[test]
+    fn masked_and_full_phones_are_same_identity() {
+        assert!(phones_same_identity("17674785984", "176****5984"));
+        assert!(phones_same_identity("176****5984", "17674785984"));
+        assert!(phones_same_identity("176****5984", "176****5984"));
+        assert!(!phones_same_identity("17674785984", "19908449648"));
+        assert!(!phones_same_identity("17674785984", "176****9648"), "后四位不同不算同一号码");
+        assert!(!phones_same_identity("13812345678", "13856781234"), "两个完整号码必须严格相等");
+        assert!(!phones_same_identity("", "176****5984"));
+        assert!(!phones_same_identity("176****5984", "  "));
+    }
+
+    /// 本机被打码、池里是完整号码：采纳时把完整号码拉回来，本机 key 不再与池分叉。
+    #[test]
+    fn adopt_pulls_the_fuller_phone_back_over_the_masked_key() {
+        let mut a = acct("176****5984", Some("176****5984"), "t-same");
+        let pool_item = item("17674785984", "t-same", None);
+        assert!(adopt(&mut a, &pool_item, RenewClass::Local, 0));
+        assert_eq!(a.phone.as_deref(), Some("17674785984"));
+        assert_eq!(item_key_of(&a), "17674785984", "key 回到完整号码，回写不再另起一行");
+    }
+
+    /// 完整号码之间不互改：那可能是改号，两个 key 各自成立。
+    #[test]
+    fn adopt_never_rewrites_one_full_phone_with_another() {
+        let mut a = acct("n", Some("19900000000"), "t-same");
+        let pool_item = item("19911111111", "t-same", None);
+        adopt(&mut a, &pool_item, RenewClass::Local, 0);
+        assert_eq!(a.phone.as_deref(), Some("19900000000"));
+    }
+
+    // ── 重新登录撞墓碑：身份对齐 ────────────────────────────────────────
+
+    /// 打码账号撞上完整号码墓碑（同 sub）：采回完整号码，revive 点**墓碑的 key**。
+    #[test]
+    fn relogin_onto_a_tombstone_adopts_its_identity_and_revives_by_its_key() {
+        let old = jwt_claims("cccccccc-0000", 1_700);
+        let new = jwt_claims("cccccccc-0000", 1_800);
+        let mut tomb = item("17674785984", &old, None);
+        tomb.deleted_at = Some(100);
+        let mut a = acct("176****5984", Some("176****5984"), &new);
+        assert!(tombstone_is_same(&a, &tomb), "同一个 sub，就是同一个账号");
+        assert_eq!(align_with_tombstone(&mut a, &tomb), "17674785984");
+        assert_eq!(a.phone.as_deref(), Some("17674785984"));
+        assert_eq!(a.name, "17674785984", "打码昵称一并换回完整号码");
+        assert_eq!(item_key_of(&a), "17674785984");
+    }
+
+    /// 票读不出 sub（不透明票）时退回手机号同身份：打码 ↔ 完整。
+    #[test]
+    fn opaque_tickets_fall_back_to_phone_identity() {
+        let tomb = item("17674785984", "opaque-old", None);
+        let mut a = acct("176****5984", Some("176****5984"), "opaque-new");
+        assert!(tombstone_is_same(&a, &tomb));
+        assert_eq!(align_with_tombstone(&mut a, &tomb), "17674785984");
+    }
+
+    /// 读得出 sub 但不一致 = 别人的账号：手机号再像也不认（打码有碰撞空间）。
+    #[test]
+    fn different_subjects_never_match_even_with_similar_phones() {
+        let old = jwt_claims("dddddddd-0000", 1_700);
+        let new = jwt_claims("eeeeeeee-0000", 1_800);
+        let tomb = item("17674785984", &old, None);
+        let a = acct("176****5984", Some("176****5984"), &new);
+        assert!(!tombstone_is_same(&a, &tomb));
+    }
+
+    /// 改号：本机是完整号码且与墓碑不同 —— 不认领旧 key，也不动本机号码。
+    #[test]
+    fn a_renamed_phone_does_not_claim_the_old_key() {
+        let old = jwt_claims("cccccccc-0000", 1_700);
+        let new = jwt_claims("cccccccc-0000", 1_800);
+        let tomb = item("17674785984", &old, None);
+        let mut a = acct("19900000000", Some("19900000000"), &new);
+        assert_eq!(align_with_tombstone(&mut a, &tomb), "19900000000");
+        assert_eq!(a.phone.as_deref(), Some("19900000000"));
     }
 
     // ── 采纳规则 ────────────────────────────────────────────────────────

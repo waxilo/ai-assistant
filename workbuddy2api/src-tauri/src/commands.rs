@@ -455,7 +455,10 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                 // 免得又把别处删的账号带回来。
                 let newer = matches!((incoming_iat, existing_iat), (Some(i), Some(e)) if i > e);
                 if newer && !shared {
-                    revive.push(broker::item_key_of(a));
+                    // 撞上墓碑先对齐身份：打码手机号换回完整号码，revive 点名**墓碑的 key**。
+                    // 点本机打码 key 云端只会另起一行，墓碑还留在已删除里 ——
+                    // 同一个账号在有效账号和已删除里同时出现。
+                    revive.push(broker::with_tombstone_identity(a));
                 }
                 updated += 1;
             }
@@ -469,7 +472,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     .unwrap_or_else(|| {
                         format!("账号-{}", &token.chars().take(6).collect::<String>())
                     });
-                let fresh = Account {
+                let mut fresh = Account {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     phone,
@@ -489,10 +492,10 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     invalidated_at: None,
                     renew_blocked_until: None,
                 };
-                // 用户主动新加的账号：如果云端还留着它的墓碑（删掉后重新登录），要点名复活。
-                // 公用 token 从不上云，不点名。
+                // 用户主动新加的账号：如果云端还留着它的墓碑（删掉后重新登录），先对齐
+                // 墓碑身份再点名复活（说明见上面 updated 分支）。公用 token 从不上云，不点名。
                 if !shared {
-                    revive.push(broker::item_key_of(&fresh));
+                    revive.push(broker::with_tombstone_identity(&mut fresh));
                 }
                 accounts.push(fresh);
                 added += 1;
