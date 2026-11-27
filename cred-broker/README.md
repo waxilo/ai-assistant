@@ -35,6 +35,7 @@ cred-broker 提供两样东西：
 |---|---|
 | 凭证池存取 | 一整池账号凭证按 `uuid` 存 / 取，服务端只做规范化与透传，不解释业务含义 |
 | 互斥续签闸 | 同一时刻只有拿到闸的机器能提交；租约到期自动释放，**无需任何后台任务** |
+| 一池一个续签设备 | 池上只存一个组合 id（客户端类型 + 机器唯一标识）；只有它续签云端账号，其余机器只同步。换设备必须旧设备先清空、新设备再认领 |
 | 取件即最新 | 抢闸成功时**顺带返回那一刻的整池内容**，客户端不必再 GET，杜绝「读了旧副本去签」 |
 | CAS 提交 | 提交带版本号 + 持闸人双重校验，版本 +1；旧副本整块盖回会被 409 拒绝 |
 | 失败冷却 | `abort` 释放闸并记冷却期，凭证真死时所有机器停手，不轮流敲已死的链 |
@@ -74,6 +75,37 @@ cred-broker 提供两样东西：
 >
 > 三步**缺一步就退化成「两边同时续签」**。
 
+**闸只防「同时」，不防「轮流」**：两台机器错开时间各自抢闸续签，仍然会轮换同一条链，
+把上一台手里的 refresh token 作废。所以池上再记一个 `renewer`（组合 id）：
+
+```
+   PUT  /v1/pool/:uuid/renewer          认领（renewer 为空或就是自己才成功；否则 409）
+   POST /v1/pool/:uuid/renewer/release  旧设备清空（只有当前那台能清）
+   GET  /v1/pool/:uuid/renewer          读当前续签设备（客户端 10 秒回落时用它）
+```
+
+客户端只让 `renewer == 自己` 的机器续签**云端同步账号**；本机登录账号不受这个字段约束，
+手动导入的公用 token 永不续签。换设备的流程是「旧设备取消续签（置空）→ 新设备设为续签」，
+服务端不提供强制覆盖 —— 旧设备没退位就让新设备接管，等于给自己留了一条两台同时续签的路。
+旧设备清空后有 10 秒宽限：没有新设备认领就自动把自己写回去，避免整池停在「无人续签」。
+
+**删除要能被别的机器看见**：池本身没有墓碑，`PUT` 是整池替换。客户端若只做并集，任何一台
+还持有被删账号的机器都会把它原样加回来。workbuddy 系客户端于是在本机记一份「跟着池走」的
+账号 id（客户端 `broker.json` 的 `cloud_ids`），抢到闸后**先删掉池快照里已经没有的那些**，
+再合并与回写。两个安全阀：第一次升级上来的机器只登记、不删（池里恰好没有的本机账号不能被
+误伤）；空快照一律不剪（服务端坏 JSON 会被静默读成空池，不能据此删光本机账号）。
+
+**同账号冲突按来源定优先级**（客户端规则，服务端不参与）：本地登录 > 云端同步 > 手动导入。
+高优先级那一份**可用**时，低优先级的不许覆盖它 —— 池里那张就算 `iat` / `exp` 更晚也一样；
+低优先级只在「补空字段」时被采纳。反过来，**不可用就无条件换血**：本机这张已被判死、
+续签链过期、或没链又已过期时，只要池里那份可用就直接替换（2026-10-08 死票锁死事故的抢救
+通道）。同源之间（云端账号 ↔ 池里那份）仍按新序判：`iat` 更新或 `exp` 更晚才算更新。
+**池里那份自己失效就直接跳过**：不为它建新账号、也不拿它补任何字段（手机号、到期、RT），
+本机没有匹配账号时同样跳过 —— 接管一具尸体只会让本机多一条签不动的账号；要修这条链，
+靠的是本机那份可用凭证在回写方向把池里那条压掉。
+本地 → 云端方向对称执行：可用的本地登录账号永远回写并压过池里那份；云端账号只在严格更新时
+回写；手动导入的公用 token 永不回写；任何不可用的票（判死 / 链过期）都不许进池。
+
 ---
 
 ## 接口
@@ -85,9 +117,12 @@ cred-broker 提供两样东西：
 |---|---|---|
 | GET | `/v1/health` | 探活，返回 `lease_ms` / `fail_cooldown_ms`（按设计**不查库**） |
 | GET | `/healthz` | 容器健康检查，真的 `SELECT 1`；只给 compose 用，不在这张对外接口表的语义里 |
-| POST | `/v1/pool` | 新建一池，body `{ items }` |
-| GET | `/v1/pool/:uuid` | 取件（只读，不动闸） |
-| POST | `/v1/pool/:uuid/lease` | 抢闸（成功时带回整池） |
+| POST | `/v1/pool` | 新建一池，body `{ items, renewer? }`（上传者通常就是第一个续签设备） |
+| GET | `/v1/pool/:uuid` | 取件（只读，不动闸），带回 `renewer` |
+| POST | `/v1/pool/:uuid/lease` | 抢闸（成功 / 被拒都带回 `renewer`） |
+| PUT | `/v1/pool/:uuid/renewer` | 认领续签设备，body `{ renewer }` |
+| POST | `/v1/pool/:uuid/renewer/release` | 清空续签设备，body `{ renewer }`（只有当前那台成功） |
+| GET | `/v1/pool/:uuid/renewer` | 读当前续签设备（不记审计，10 秒回落会轮询） |
 | PUT | `/v1/pool/:uuid` | 提交整池（CAS），body `{ version, items }` |
 | POST | `/v1/pool/:uuid/abort` | 放弃 + 记冷却，body `{ note? }` |
 | DELETE | `/v1/pool/:uuid` | 删池（= 解绑） |
@@ -103,20 +138,21 @@ cred-broker 提供两样东西：
 
 ### POST /v1/pool
 
-请求体：`{ "items": [ ...条目... ] }`
+请求体：`{ "items": [ ...条目... ], "renewer": "workbuddy-assistant:<机器标识>" }`
 
 ```json
 // 201
-{ "uuid": "3f2c1a9e-...", "version": 0, "count": 2, "now": 1760000000000 }
+{ "uuid": "3f2c1a9e-...", "version": 0, "count": 2, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
 ```
 
 `uuid` 由**服务端**颁发（客户端不自己推导，否则两台机器会各造一个）。版本从 0 起。
+`renewer` 可省略（老客户端）→ `null`：云端账号谁都不续签，直到有设备认领。
 
 ### GET /v1/pool/:uuid
 
 ```json
 // 200
-{ "items": [ ...整池最新条目... ], "version": 0, "now": 1760000000000 }
+{ "items": [ ...整池最新条目... ], "version": 0, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
 
 // 404（池不存在，客户端据此判定「池在别处被解绑」）
 { "error": "gone", "now": 1760000000000 }
@@ -126,10 +162,44 @@ cred-broker 提供两样东西：
 
 ```json
 // 200 抢到：items 是那一刻的整池内容，客户端必须用它去签
-{ "granted": true, "items": [ ... ], "version": 0, "lease_until": 1760000180000, "now": 1760000000000 }
+{ "granted": true, "items": [ ... ], "version": 0, "lease_until": 1760000180000, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
 
 // 200 没抢到：告知持闸人 / 冷却期 / 何时能再试
-{ "granted": false, "retry_after": 1760000000000, "lease_owner": "mac-mini", "lease_until": 1760000180000, "now": 1760000000000 }
+{ "granted": false, "retry_after": 1760000000000, "lease_owner": "mac-mini", "lease_until": 1760000180000, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
+```
+
+被拒也带 `renewer`：续不续云端账号只看它，与这次有没有抢到闸无关。
+
+### PUT /v1/pool/:uuid/renewer
+
+请求体：`{ "renewer": "workbuddy2api:<机器标识>" }`
+
+```json
+// 200（空着 / 本来就是自己；重复认领幂等）
+{ "ok": true, "renewer": "workbuddy2api:<机器标识>", "now": 1760000000000 }
+
+// 409 已经被别的设备占用（换设备要先让旧设备 release）
+{ "error": "renewer_taken", "renewer": "workbuddy-assistant:<另一台机器>", "now": 1760000000000 }
+```
+
+### POST /v1/pool/:uuid/renewer/release
+
+请求体：`{ "renewer": "workbuddy-assistant:<旧机器>" }`
+
+```json
+// 200（含重复清空；清空后云端账号暂停续签，客户端 10 秒内没新设备就自己写回）
+{ "ok": true, "renewer": null, "now": 1760000000000 }
+
+// 409 当前不是这台（只有本人能清，服务端不做强制覆盖）
+{ "error": "not_renewer", "renewer": "workbuddy-assistant:<当前设备>", "now": 1760000000000 }
+```
+
+### GET /v1/pool/:uuid/renewer
+
+```json
+// 200
+{ "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
+// 或 { "renewer": null, "now": 1760000000000 }
 ```
 
 ### PUT /v1/pool/:uuid
@@ -171,10 +241,13 @@ cred-broker 提供两样东西：
 | 400 | `bad_json` | body 不是合法 JSON |
 | 400 | `bad_uuid` | 路径不是合法 uuid 形态（不去查库） |
 | 400 | `bad_version` | 提交时 `version` 不是非负整数 |
+| 400 | `bad_renewer` | 续签设备标识为空 / 非字符串 / 超过 255 字符 |
 | 404 | `gone` | 池不存在或已被删除 |
 | 404 | `not_found` | 路径不存在 / 前缀不是 `v1` |
 | 405 | `method_not_allowed` | 方法不对（如对 health 发 PUT） |
 | 409 | `stale` | CAS 失败：版本或持闸人不符 |
+| 409 | `renewer_taken` | 这一池已有别的续签设备（先让旧设备 release） |
+| 409 | `not_renewer` | 清空请求不是当前续签设备发出的 |
 | 500 | `internal` | 未捕获异常（带 message，供客户端区分「代码写错」和「网络不通」） |
 
 ---
@@ -305,7 +378,7 @@ docker exec -i mysql-server mysql -u"$DB_USER" -p"$DB_PASSWORD" cred_broker -e \
 ### 测试
 
 ```bash
-npm test        # 对 cred_broker_test 库跑，42 项
+npm test        # 对 cred_broker_test 库跑，54 项
 ```
 
 跑在**真实 MySQL** 上，不再用内存 SQLite：迁移之后生产引擎就是 MySQL，而这里最要紧的东西
@@ -315,7 +388,7 @@ npm test        # 对 cred_broker_test 库跑，42 项
 
 覆盖：健康检查、建池（颁发 uuid / 丢弃无 token 条目 / 去重 / 截断）、路径校验、取件、
 抢闸（互斥 / 租约过期接管 / 冷却）、CAS 提交（版本不符 / 持闸人不符 / version 类型）、
-abort（不要求持闸）、删池后全部 404、审计事件、actor 不参与判断、纯函数规范化、
+abort（不要求持闸）、删池后全部 404、审计事件、**续签设备的认领 / 释放 / 冲突 / 非法值 / 删除后 404 / 审计**、actor 不参与判断、纯函数规范化、
 **区域往返（显式字段 / key 前缀回填 / 老 payload 在读出口自愈）**、**邮箱往返（透传 / 不进 key / 老条目落空串）**。
 
 迁移新增的四条（都是「D1 时代不存在、换引擎后才可能错」的地方）：

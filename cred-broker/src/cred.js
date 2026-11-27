@@ -26,6 +26,21 @@
  * 抢到闸时响应里带着 `items`，**客户端必须用它去签**：本地那份 refresh token 可能早就被
  * 别的机器换掉了，再自己 GET 一次读到的是同一份，只会多一次往返、多一个出错的机会。
  *
+ * ## 闸之上再加一道「续签设备」
+ *
+ * 闸只保证同一时刻**只有一台机器在写**，不保证「每台机器都别去碰云端账号」。多台机器
+ * 各自挑不同时间抢闸续签，仍然会轮换同一条链，只是把冲突从并发变成了串行 —— 一样会
+ * 把上一台机器手里的 refresh token 作废。所以一池再记**一个** `renewer`（客户端类型 +
+ * 机器唯一标识的组合 id）：只有它续签云端账号，其余机器只同步不续签。
+ *
+ *   GET  /v1/pool/:uuid/renewer          读当前续签设备
+ *   PUT  /v1/pool/:uuid/renewer          认领（空着或本来就是自己才成功）
+ *   POST /v1/pool/:uuid/renewer/release  旧设备主动清空（只有它本人能清）
+ *
+ * 换设备必须走「旧设备先清空 → 新设备再认领」两步：服务端不做自动接管，否则一台
+ * 忘关的旧机器会在新机器续签后悄悄把身份抢回去，又变回两台同时续签。
+ * 旧设备清空后的 10 秒宽限与回落是客户端的事（见 broker.rs），服务端只存状态。
+ *
  * ## 没有任何鉴权，uuid 就是凭据
  *
  * 知道 uuid 等于有全部权限（能读整池的 token）。这是刻意的：加一层 key 只会制造
@@ -69,6 +84,33 @@ function str(v) {
 function ms(v) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+/** 续签设备标识的长度上限。与 `pools.renewer VARCHAR(255)` 一致。 */
+export const MAX_RENEWER_LEN = 255;
+
+/**
+ * 规范化「续签设备」标识。
+ *
+ * 服务端**不解释**它（客户端类型 + 机器标识怎么拼是客户端的事），只保证：
+ * 空串 / 非字符串 → null（= 没有设备认领）；超长 → 抛错（**不截断** ——
+ * 截断会让两台机器的 id 在库里撞成同一个，而界面上看不出来）。
+ */
+export function normalizeRenewer(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== "string") throw new TypeError("renewer must be a string");
+  const s = v.trim();
+  if (!s) return null;
+  if (s.length > MAX_RENEWER_LEN) throw new RangeError(`renewer too long (max ${MAX_RENEWER_LEN})`);
+  return s;
+}
+
+function renewerOfBody(body) {
+  try {
+    return { ok: true, value: normalizeRenewer(body?.renewer) };
+  } catch {
+    return { ok: false };
+  }
 }
 
 /** 条件更新上报的匹配行数：只有它等于 1 才算「这一条语句真的改到了那一行」。
@@ -200,30 +242,47 @@ async function logEvent(db, uuid, kind, actor, note, at) {
 
 // ── 业务 ──────────────────────────────────────────────────────────────────
 
-/** 新建一池：uuid 由服务端颁发（客户端不自己推导，否则两台机器会各造一个） */
-export async function createPool(db, rawItems, actor, at) {
+/**
+ * 新建一池：uuid 由服务端颁发（客户端不自己推导，否则两台机器会各造一个）。
+ *
+ * `renewer` 是建池那台机器的组合 id —— 上传者天然就是第一个续签设备。
+ * 老客户端不带它 → NULL（谁都不续签云端账号，直到有人在界面上认领）。
+ */
+export async function createPool(db, rawItems, renewer, actor, at) {
   const items = normalizeItems(rawItems);
   const uuid = crypto.randomUUID();
   await db
     .prepare(
-      "INSERT INTO pools (uuid, payload, version, lease_owner, lease_until, retry_after, created_at, updated_at) " +
-        "VALUES (?, ?, 0, NULL, 0, 0, ?, ?)"
+      "INSERT INTO pools (uuid, payload, renewer, version, lease_owner, lease_until, retry_after, created_at, updated_at) " +
+        "VALUES (?, ?, ?, 0, NULL, 0, 0, ?, ?)"
     )
-    .bind(uuid, JSON.stringify(items), at, at)
+    .bind(uuid, JSON.stringify(items), renewer, at, at)
     .run();
-  await logEvent(db, uuid, "created", actor, `${items.length} 项`, at);
-  return { uuid, version: 0, count: items.length };
+  await logEvent(
+    db,
+    uuid,
+    "created",
+    actor,
+    `${items.length} 项${renewer ? `｜续签设备 ${renewer}` : ""}`,
+    at
+  );
+  return { uuid, version: 0, count: items.length, renewer: renewer ?? null };
 }
 
 /** 取件：只读，不动闸 */
 export async function fetchPool(db, uuid, actor, at) {
   const row = await db
-    .prepare("SELECT payload, version FROM pools WHERE uuid = ?")
+    .prepare("SELECT payload, version, renewer FROM pools WHERE uuid = ?")
     .bind(uuid)
     .first();
   if (!row) return { kind: "gone" };
   await logEvent(db, uuid, "fetched", actor, null, at);
-  return { kind: "ok", items: parseItems(row.payload), version: Number(row.version) };
+  return {
+    kind: "ok",
+    items: parseItems(row.payload),
+    version: Number(row.version),
+    renewer: row.renewer ?? null,
+  };
 }
 
 /**
@@ -242,7 +301,9 @@ export async function leasePool(db, uuid, actor, at, leaseMs) {
     .run();
 
   const row = await db
-    .prepare("SELECT payload, version, lease_owner, lease_until, retry_after FROM pools WHERE uuid = ?")
+    .prepare(
+      "SELECT payload, version, renewer, lease_owner, lease_until, retry_after FROM pools WHERE uuid = ?"
+    )
     .bind(uuid)
     .first();
   if (!row) return { kind: "gone" };
@@ -264,6 +325,8 @@ export async function leasePool(db, uuid, actor, at, leaseMs) {
       retry_after: retryAfter,
       lease_owner: row.lease_owner ?? null,
       lease_until: Number(row.lease_until) || 0,
+      // 被拒也要带上：客户端要靠它判断「本机该不该续云端账号」，与有没有抢到闸无关
+      renewer: row.renewer ?? null,
     };
   }
 
@@ -273,7 +336,84 @@ export async function leasePool(db, uuid, actor, at, leaseMs) {
     items: parseItems(row.payload),
     version: Number(row.version),
     lease_until: until,
+    renewer: row.renewer ?? null,
   };
+}
+
+// ── 续签设备 ──────────────────────────────────────────────────────────────
+
+/** 读当前续签设备（不记审计：客户端的 10 秒回落会轮询它，记了会淹掉事件表） */
+export async function fetchRenewer(db, uuid) {
+  const row = await db.prepare("SELECT renewer FROM pools WHERE uuid = ?").bind(uuid).first();
+  if (!row) return { kind: "gone" };
+  return { kind: "ok", renewer: row.renewer ?? null };
+}
+
+/**
+ * 认领续签设备 = **一条带条件的 UPDATE**。
+ *
+ * 条件 `renewer IS NULL OR renewer = ?` 是换设备的全部保护：
+ * 旧设备没清空时，新设备认领不上（409）；这也是为什么服务端不提供「强制覆盖」。
+ * 重复认领（本来就是自己）成功且幂等 —— 10 秒回落与手工点按都会重放这一步。
+ */
+export async function claimRenewer(db, uuid, renewer, actor, at) {
+  const res = await db
+    .prepare(
+      "UPDATE pools SET renewer = ?, updated_at = ? " +
+        "WHERE uuid = ? AND (renewer IS NULL OR renewer = ?)"
+    )
+    .bind(renewer, at, uuid, renewer)
+    .run();
+
+  const row = await db.prepare("SELECT renewer FROM pools WHERE uuid = ?").bind(uuid).first();
+  if (!row) return { kind: "gone" };
+
+  if (changes(res) === 1) {
+    await logEvent(db, uuid, "renewer_claimed", actor, renewer, at);
+    return { kind: "ok", renewer };
+  }
+  await logEvent(
+    db,
+    uuid,
+    "renewer_denied",
+    actor,
+    `已被 ${row.renewer ?? "?"} 占用，认领 ${renewer} 被拒`,
+    at
+  );
+  return { kind: "taken", renewer: row.renewer ?? null };
+}
+
+/**
+ * 清空续签设备。**只有当前那台能清**（`AND renewer = ?`）。
+ *
+ * 清空后池里没有任何续签设备：云端账号暂停续签，客户端 10 秒内没有新设备认领就
+ * 自动把自己写回去。重复清空（已经是 NULL）成功，让重试是安全的。
+ */
+export async function releaseRenewer(db, uuid, renewer, actor, at) {
+  const res = await db
+    .prepare(
+      "UPDATE pools SET renewer = NULL, updated_at = ? WHERE uuid = ? AND renewer = ?"
+    )
+    .bind(at, uuid, renewer)
+    .run();
+
+  const row = await db.prepare("SELECT renewer FROM pools WHERE uuid = ?").bind(uuid).first();
+  if (!row) return { kind: "gone" };
+  const current = row.renewer ?? null;
+
+  if (changes(res) === 1 || current === null) {
+    await logEvent(db, uuid, "renewer_released", actor, renewer, at);
+    return { kind: "ok", renewer: null };
+  }
+  await logEvent(
+    db,
+    uuid,
+    "renewer_release_denied",
+    actor,
+    `当前是 ${current ?? "?"}，${renewer} 无权清空`,
+    at
+  );
+  return { kind: "not_renewer", renewer: current };
 }
 
 /** 提交整池（CAS）：版本 +1，同时归还闸 */
@@ -359,7 +499,15 @@ export async function handle(request, env) {
     if (method !== "POST") return json({ error: "method_not_allowed" }, 405);
     const body = await readJson(request);
     if (!body) return json({ error: "bad_json" }, 400);
-    const created = await createPool(db, body.items, actorOf(request, body), at);
+    const renewer = renewerOfBody(body);
+    if (!renewer.ok) return json({ error: "bad_renewer" }, 400);
+    const created = await createPool(
+      db,
+      body.items,
+      renewer.value,
+      actorOf(request, body),
+      at
+    );
     return json({ ...created, now: at }, 201);
   }
 
@@ -375,7 +523,7 @@ export async function handle(request, env) {
     if (method === "GET") {
       const r = await fetchPool(db, uuid, actor, at);
       if (r.kind === "gone") return json({ error: "gone", now: at }, 404);
-      return json({ items: r.items, version: r.version, now: at });
+      return json({ items: r.items, version: r.version, renewer: r.renewer, now: at });
     }
 
     if (method === "PUT") {
@@ -403,6 +551,37 @@ export async function handle(request, env) {
     return json({ error: "method_not_allowed" }, 405);
   }
 
+  // /v1/pool/:uuid/renewer 与 /v1/pool/:uuid/renewer/release
+  if (tail === "renewer" && (seg.length === 4 || seg.length === 5)) {
+    const isRelease = seg.length === 5;
+    if (isRelease && seg[4] !== "release") return json({ error: "not_found" }, 404);
+
+    if (!isRelease && method === "GET") {
+      const r = await fetchRenewer(db, uuid);
+      if (r.kind === "gone") return json({ error: "gone", now: at }, 404);
+      return json({ renewer: r.renewer, now: at });
+    }
+
+    const expected = isRelease ? "POST" : "PUT";
+    if (method !== expected) return json({ error: "method_not_allowed" }, 405);
+    const body = await readJson(request);
+    if (!body) return json({ error: "bad_json" }, 400);
+    const renewer = renewerOfBody(body);
+    if (!renewer.ok || !renewer.value) return json({ error: "bad_renewer" }, 400);
+
+    const r = isRelease
+      ? await releaseRenewer(db, uuid, renewer.value, actorOf(request, body), at)
+      : await claimRenewer(db, uuid, renewer.value, actorOf(request, body), at);
+    if (r.kind === "gone") return json({ error: "gone", now: at }, 404);
+    if (r.kind === "taken") {
+      return json({ error: "renewer_taken", renewer: r.renewer, now: at }, 409);
+    }
+    if (r.kind === "not_renewer") {
+      return json({ error: "not_renewer", renewer: r.renewer, now: at }, 409);
+    }
+    return json({ ok: true, renewer: r.renewer, now: at });
+  }
+
   // POST /v1/pool/:uuid/lease
   if (tail === "lease" && seg.length === 4) {
     if (method !== "POST") return json({ error: "method_not_allowed" }, 405);
@@ -415,6 +594,7 @@ export async function handle(request, env) {
         retry_after: r.retry_after,
         lease_owner: r.lease_owner,
         lease_until: r.lease_until,
+        renewer: r.renewer,
         now: at,
       });
     }
@@ -423,6 +603,7 @@ export async function handle(request, env) {
       items: r.items,
       version: r.version,
       lease_until: r.lease_until,
+      renewer: r.renewer,
       now: at,
     });
   }

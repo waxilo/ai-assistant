@@ -98,6 +98,36 @@ assertConfig();
 const { DB, close: closeDb } = createDatabase(databaseConfigFromEnv(env));
 env.DB = DB;
 
+/**
+ * 老库升级：`pools.renewer` 是后加的列，而 db-init.sh 只跑
+ * `CREATE TABLE IF NOT EXISTS`（已存在的表不会补列）。启动时补一次，幂等。
+ *
+ * 必须在 listen 之前完成：否则第一波请求就会撞上 `Unknown column 'renewer'`，
+ * 客户端把它当 5xx 记成「管家不可达」，看起来像网络问题。
+ * DB 账号在建库脚本里已拿到 alter 权限。
+ */
+async function ensureSchema() {
+  const row = await DB.prepare(
+    "SELECT COUNT(*) AS n FROM information_schema.columns " +
+      "WHERE table_schema = DATABASE() AND table_name = 'pools' AND column_name = 'renewer'"
+  ).first();
+  if (Number(row?.n ?? 0) > 0) return;
+  await DB.prepare(
+    "ALTER TABLE pools ADD COLUMN renewer VARCHAR(255) NULL AFTER payload"
+  ).run();
+  console.log("schema_migrated", JSON.stringify({ table: "pools", column: "renewer" }));
+}
+
+try {
+  await ensureSchema();
+} catch (err) {
+  console.error(
+    "startup_migration_failed",
+    JSON.stringify({ problem: String(err && err.message ? err.message : err) })
+  );
+  process.exit(1);
+}
+
 const server = createServer((req, res) => {
   let pathname = '/';
   try {

@@ -384,6 +384,180 @@ test("删池之后取件 / 抢闸 / 提交全变 404 gone", async () => {
   assert.equal((await call(env, "DELETE", `/v1/pool/${uuid}`)).status, 404);
 });
 
+// ── 续签设备（一池一个组合 id：多端使用、一端续签） ────────────────────────
+
+test("建池时可带续签设备，取件 / 抢闸都原样带回（含被拒的那条路）", async () => {
+  const env = createEnv();
+  const renewer = "workbuddy-assistant:8f14e45f-ceea-467f-a8b0-1f0e2d3c4b5a";
+  const created = await call(env, "POST", "/v1/pool", {
+    body: { items: [item("a")], renewer },
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.renewer, renewer);
+
+  const uuid = created.data.uuid;
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}`)).data.renewer, renewer);
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}/renewer`)).data.renewer, renewer);
+
+  const first = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  assert.equal(first.data.renewer, renewer);
+  // 闸在 m1 手里：m2 被拒，但也要知道这一池的续签设备是谁
+  const second = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m2" });
+  assert.equal(second.data.granted, false);
+  assert.equal(second.data.renewer, renewer);
+});
+
+test("老池没有续签设备时读出来是 null（不是空串，也不猜一台机器）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  const r = await call(env, "GET", `/v1/pool/${uuid}/renewer`);
+  assert.equal(r.status, 200);
+  assert.equal(r.data.renewer, null);
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}`)).data.renewer, null);
+});
+
+test("认领续签设备：空着或本来就是自己都能成功，重复认领幂等", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  const me = "workbuddy2api:mac-mini";
+
+  const first = await call(env, "PUT", `/v1/pool/${uuid}/renewer`, {
+    body: { renewer: me },
+    actor: "mac-mini",
+  });
+  assert.equal(first.status, 200);
+  assert.equal(first.data.renewer, me);
+
+  // 10 秒回落 / 手滑连点都会重放这一步，必须成功
+  const again = await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: me } });
+  assert.equal(again.status, 200);
+  assert.equal(again.data.renewer, me);
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}/renewer`)).data.renewer, me);
+});
+
+test("别的设备已认领时新设备被拒（409），池上的值一点不动", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")], "old-mac");
+  const old = "workbuddy-assistant:old";
+  const fresh = "workbuddy2api:new";
+  await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: old }, actor: "old-mac" });
+
+  const r = await call(env, "PUT", `/v1/pool/${uuid}/renewer`, {
+    body: { renewer: fresh },
+    actor: "new-mac",
+  });
+  assert.equal(r.status, 409);
+  assert.equal(r.data.error, "renewer_taken");
+  assert.equal(r.data.renewer, old);
+
+  const current = await call(env, "GET", `/v1/pool/${uuid}/renewer`);
+  assert.equal(current.data.renewer, old, "冲突失败不能顺带把旧设备挤掉");
+});
+
+test("只有当前续签设备能清空；清空后新设备才能认领（换设备的唯一路径）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  const old = "workbuddy-assistant:old";
+  const fresh = "workbuddy-assistant:new";
+  await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: old } });
+
+  const denied = await call(env, "POST", `/v1/pool/${uuid}/renewer/release`, {
+    body: { renewer: fresh },
+  });
+  assert.equal(denied.status, 409);
+  assert.equal(denied.data.error, "not_renewer");
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}/renewer`)).data.renewer, old);
+
+  const released = await call(env, "POST", `/v1/pool/${uuid}/renewer/release`, {
+    body: { renewer: old },
+  });
+  assert.equal(released.status, 200);
+  assert.equal(released.data.renewer, null);
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}/renewer`)).data.renewer, null);
+
+  // 重复清空（10 秒回落前的重试）也成功
+  assert.equal(
+    (await call(env, "POST", `/v1/pool/${uuid}/renewer/release`, { body: { renewer: old } })).status,
+    200
+  );
+
+  const claimed = await call(env, "PUT", `/v1/pool/${uuid}/renewer`, {
+    body: { renewer: fresh },
+  });
+  assert.equal(claimed.status, 200);
+  assert.equal(claimed.data.renewer, fresh);
+});
+
+test("续签设备标识不合法时 400：空、非字符串、超长都不猜也不截断", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+
+  assert.equal((await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: {} })).status, 400);
+  assert.equal(
+    (await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: "   " } })).status,
+    400
+  );
+  assert.equal(
+    (await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: 42 } })).status,
+    400
+  );
+  assert.equal(
+    (await call(env, "POST", `/v1/pool/${uuid}/renewer/release`, { body: {} })).status,
+    400
+  );
+  assert.equal(
+    (await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: "x".repeat(256) } }))
+      .status,
+    400
+  );
+  // 建池时同样不接受超长，避免一台机器的 id 在库里被截成别人的
+  assert.equal(
+    (
+      await call(env, "POST", "/v1/pool", {
+        body: { items: [item("a")], renewer: "x".repeat(256) },
+      })
+    ).status,
+    400
+  );
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}/renewer`)).data.renewer, null);
+});
+
+test("删池之后续签设备的读取 / 认领 / 清空都 404 gone", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  assert.equal((await call(env, "DELETE", `/v1/pool/${uuid}`)).status, 200);
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}/renewer`)).status, 404);
+  assert.equal(
+    (await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: "x" } })).status,
+    404
+  );
+  assert.equal(
+    (await call(env, "POST", `/v1/pool/${uuid}/renewer/release`, { body: { renewer: "x" } }))
+      .status,
+    404
+  );
+});
+
+test("续签设备的认领 / 释放 / 被拒都进审计事件表（纯旁路，不影响判定）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: "m1" }, actor: "m1" });
+  await call(env, "PUT", `/v1/pool/${uuid}/renewer`, { body: { renewer: "m2" }, actor: "m2" });
+  await call(env, "POST", `/v1/pool/${uuid}/renewer/release`, {
+    body: { renewer: "m1" },
+    actor: "m1",
+  });
+
+  const { results } = await env.DB
+    .prepare("SELECT kind FROM pool_events WHERE uuid = ? ORDER BY id")
+    .bind(uuid)
+    .all();
+  const kinds = results.map((r) => r.kind);
+  assert.ok(kinds.includes("renewer_claimed"));
+  assert.ok(kinds.includes("renewer_denied"));
+  assert.ok(kinds.includes("renewer_released"));
+});
+
 // ── 审计 ──────────────────────────────────────────────────────────────────
 
 test("事件表记下了创建 / 取件 / 抢闸 / 提交 / 解绑，且与业务判断解耦", async () => {

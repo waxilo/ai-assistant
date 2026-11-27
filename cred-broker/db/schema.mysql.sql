@@ -12,6 +12,10 @@
 CREATE TABLE IF NOT EXISTS pools (
   uuid        VARCHAR(36)  NOT NULL,
   payload     LONGTEXT     NOT NULL,
+  -- 这一池唯一的「续签设备」标识 = 客户端类型 + 机器唯一标识（客户端自己拼，服务端只存不解释）。
+  -- NULL = 还没有设备认领：云端账号一律不续签，本地登录账号不受影响。
+  -- 换设备必须由旧设备先清空、新设备再认领（CAS 在 src/cred.js 的 claim/release 里）。
+  renewer     VARCHAR(255) NULL,
   version     BIGINT       NOT NULL DEFAULT 0,
   lease_owner TEXT,
   lease_until BIGINT       NOT NULL DEFAULT 0,
