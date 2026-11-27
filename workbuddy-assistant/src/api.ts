@@ -29,8 +29,16 @@ export const listAccounts = () => invoke<Account[]>("list_accounts");
 export const importAccounts = (items: ImportItem[]) =>
   invoke<ImportReport>("import_accounts", { items });
 
-export const removeAccount = (id: string) =>
-  invoke<void>("remove_account", { id });
+/**
+ * 删除账号。
+ *
+ * - `fromCloudPool = false`（主表）：只移除本机这一份；云端副本 / 导入账号都走这里，
+ *   不动云端池。
+ * - `fromCloudPool = true`（云端账号弹窗）：删的是云端池本身，下一轮同步变成墓碑，
+ *   可在「已删除」里恢复。
+ */
+export const removeAccount = (id: string, fromCloudPool = false) =>
+  invoke<void>("remove_account", { id, fromCloudPool });
 
 /**
  * 改云端账号的资料（昵称 / 手机号）：只盖展示字段，**不动 token**；随下一轮同步上传。

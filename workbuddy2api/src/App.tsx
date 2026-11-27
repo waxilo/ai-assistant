@@ -418,18 +418,23 @@ export default function App() {
   }, [showToast]);
 
   const removeOne = useCallback(
-    async (a: Account) => {
+    async (a: Account, fromCloudPool = false) => {
+      const body = fromCloudPool
+        ? `确认从云端池删除「${accountLabel(a.name, a.phone)}」？下一轮同步会把它变成墓碑，之后可在「已删除」里恢复。`
+        : a.origin === "cloud"
+        ? `确认删除本机副本「${accountLabel(a.name, a.phone)}」？云端池不受影响；下一轮同步可能又把它拉回来。`
+        : brokerStatus?.bound
+        ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「云端账号 → 已删除」里恢复。`
+        : `确认删除「${accountLabel(a.name, a.phone)}」？`;
       const ok = await askConfirm({
         title: "删除账号",
-        body: brokerStatus?.bound
-          ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「云端账号 → 已删除」里恢复。`
-          : `确认删除「${accountLabel(a.name, a.phone)}」？`,
+        body,
         okText: "删除",
         danger: true,
       });
       if (!ok) return;
       try {
-        await removeAccount(a.id);
+        await removeAccount(a.id, fromCloudPool);
         setAccounts((l) => l.filter((x) => x.id !== a.id));
         showToast({ kind: "ok", text: `已删除 ${accountLabel(a.name, a.phone)}` });
       } catch (e) {
@@ -795,7 +800,7 @@ export default function App() {
               onRefreshBroker={refreshBrokerStatus}
               reload={load}
               onCheckinOne={(id) => void runCheckinOne(id)}
-              onRemove={(a) => void removeOne(a)}
+              onRemove={(a, fromCloudPool) => void removeOne(a, fromCloudPool)}
               onOpenLogs={(id) => {
                 // 从账号条目进日志页：锁定该账号
                 setLogsInitial(id);

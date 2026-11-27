@@ -567,17 +567,26 @@ mod import_tests {
 }
 
 #[tauri::command]
-pub fn remove_account(app: AppHandle, id: String) -> Result<(), String> {
+pub fn remove_account(
+    app: AppHandle,
+    id: String,
+    from_cloud_pool: Option<bool>,
+) -> Result<(), String> {
+    let from_cloud_pool = from_cloud_pool.unwrap_or(false);
     let dir = data_dir(&app);
     let mut accounts = accounts::load_accounts(&dir);
     let Some(victim) = accounts.iter().find(|a| a.id == id).cloned() else {
         return Err("账号不存在".into());
     };
+    // 主表（from_cloud_pool = false）删云端副本只动本机这一份，不记待删除；
+    // 云端弹窗（true）删的才是池本身，下一轮同步变成墓碑。
+    let local_removal_only = broker::origin_of(&victim) == "cloud" && !from_cloud_pool;
     accounts.retain(|a| a.id != id);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
-    // 绑定时记一笔「待删除」：下一次同步的并集不会把它从云端原样加回来
-    // （不记的话用户看到的是「删了又回来」）。未绑定 / 落盘失败都只影响这一轮的传播。
-    broker::note_deleted_account(&victim);
+    // 绑定时记一笔「待删除」：下一次同步的并集不会把它从云端原样加回来。
+    if !local_removal_only {
+        broker::note_deleted_account(&victim);
+    }
     Ok(())
 }
 

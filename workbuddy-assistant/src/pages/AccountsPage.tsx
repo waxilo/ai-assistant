@@ -50,13 +50,14 @@ const STATUS_LABEL: Record<SignState, string> = {
 };
 
 /**
- * 首页：本机账号列表 + 签到操作。
+ * 首页：账号列表 + 签到操作。
  *
  * 账号的**凭证**没有编辑入口：一律来自页头「添加账号」（本机登录文件或 OAuth），
  * 避免手工粘贴 token 出错。
  *
- * 两块列表互相独立：主表只放本机账号（本机登录 / 手动导入），云端同步来的账号
- * 只出现在池栏的「云端账号」弹窗里 —— 编辑资料、逻辑删除、恢复都在那儿做。
+ * 主表放三类账号：本机登录 / 云端副本 / 手动导入；主表里的删除只动本机这一份
+ * （删云端副本不会动云端池）。云端池本身在池栏的「云端账号」弹窗里操作 ——
+ * 编辑资料、逻辑删除、恢复都在那儿做。
  */
 export function AccountsPage({
   accounts,
@@ -80,7 +81,7 @@ export function AccountsPage({
   loading: boolean;
   busyIds: Set<string>;
   onCheckinOne: (id: string) => void;
-  onRemove: (a: Account) => void;
+  onRemove: (a: Account, fromCloudPool?: boolean) => void;
   onOpenLogs: (accountId: string) => void;
   /** 凭证池状态；null = 还没读到（首屏那一瞬） */
   brokerStatus: BrokerStatus | null;
@@ -107,8 +108,7 @@ export function AccountsPage({
   const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
   // 「云端账号」弹窗是否打开（云端账号 / 已删除都在它里面）
   const [showCloud, setShowCloud] = useState(false);
-  // 两块独立列表：主表只放本机账号，云端账号只在弹窗里
-  const localAccounts = accounts.filter((a) => a.origin !== "cloud");
+  // 云端副本：主表照常显示，弹窗里管理的是云端池那一份
   const cloudAccounts = accounts.filter((a) => a.origin === "cloud");
 
   // 凭证池那一栏在**两种空态下都要在**：一台全新的机器正是「先绑定、再拿账号」的
@@ -116,7 +116,7 @@ export function AccountsPage({
   const poolBar = (
     <PoolBar
       status={brokerStatus}
-      accountCount={localAccounts.length}
+      accountCount={accounts.length}
       cloudCount={cloudAccounts.length}
       busy={brokerBusy}
       onUpload={onBrokerUpload}
@@ -130,8 +130,8 @@ export function AccountsPage({
     />
   );
 
-  // 云端弹窗在空态与正常态都要能打开：池栏入口与行内「云端」徽标都指向它，
-  // 全部账号删光之后也还能从中恢复墓碑
+  // 云端弹窗在空态与正常态都要能打开：池栏入口指向它，全部账号删光之后
+  // 也还能从中恢复墓碑
   const cloudDialog = showCloud ? (
     <CloudAccountsDialog
       status={brokerStatus}
@@ -150,7 +150,7 @@ export function AccountsPage({
         </div>
       </section>
     );
-  if (localAccounts.length === 0)
+  if (accounts.length === 0)
     return (
       <>
         <section className="panel-page">
@@ -158,8 +158,8 @@ export function AccountsPage({
           <div className="card">
             <EmptyState
               icon={<IconUser size={26} />}
-              title="还没有本机账号"
-              hint="从页头「添加账号」接入；云端同步来的账号在「云端账号」里。"
+              title="还没有账号"
+              hint="从页头「添加账号」接入，也可以绑定云端凭证池。"
             />
           </div>
         </section>
@@ -167,11 +167,11 @@ export function AccountsPage({
       </>
     );
 
-  const total = localAccounts.length;
-  const done = localAccounts.filter((a) => signState(a, false) === "done").length;
-  const credits = totalCredits(book, localAccounts);
+  const total = accounts.length;
+  const done = accounts.filter((a) => signState(a, false) === "done").length;
+  const credits = totalCredits(book, accounts);
   // 「即将过期」= 最近一个到期日到期的所有资源包剩余积分之和（与行内天数同一判据）
-  const expiringSoon = soonestExpiringTotal(book, localAccounts);
+  const expiringSoon = soonestExpiringTotal(book, accounts);
 
   return (
     <>
@@ -237,7 +237,7 @@ export function AccountsPage({
             </tr>
           </thead>
           <tbody>
-            {localAccounts.map((a) => {
+            {accounts.map((a) => {
               const busy = busyIds.has(a.id);
               const st = signState(a, busy);
               const bal = creditsOf(book, a.id);
@@ -249,7 +249,20 @@ export function AccountsPage({
               return (
                 <tr key={a.id}>
                   <td>
-                    <AccountCell name={a.name} phone={a.phone} />
+                    <AccountCell
+                      name={a.name}
+                      phone={a.phone}
+                      badge={
+                        a.origin === "cloud" ? (
+                          <span
+                            className="badge badge-idle"
+                            title="云端副本：这里的删除只移除本机这一份，云端池在「云端账号」里管理"
+                          >
+                            云端
+                          </span>
+                        ) : undefined
+                      }
+                    />
                   </td>
                   <td className="num">
                     {bal != null ? (
@@ -338,7 +351,11 @@ export function AccountsPage({
                       </button>
                       <button
                         className="icon-btn icon-danger"
-                        title="删除账号"
+                        title={
+                          a.origin === "cloud"
+                            ? "删除本机副本（云端池不受影响）"
+                            : "删除账号"
+                        }
                         onClick={() => onRemove(a)}
                       >
                         <IconTrash size={16} />
@@ -472,7 +489,7 @@ function CloudAccountsDialog({
   status: BrokerStatus | null;
   accounts: Account[];
   onClose: () => void;
-  onRemove: (a: Account) => void;
+  onRemove: (a: Account, fromCloudPool?: boolean) => void;
   reload: () => Promise<void>;
 }) {
   const book = useCredits();
@@ -611,7 +628,7 @@ function CloudAccountsDialog({
                           <button
                             className="icon-btn icon-danger"
                             title="从云端池删除（可在「已删除」里恢复）"
-                            onClick={() => onRemove(a)}
+                            onClick={() => onRemove(a, true)}
                           >
                             <IconTrash size={16} />
                           </button>
