@@ -220,6 +220,27 @@ export function normalizeItems(list) {
 }
 
 /**
+ * 显式复活列表（`PUT` 的 `revive` 字段）：只有这里点名的 key 才允许翻开墓碑。
+ *
+ * 2026-11-27 之前，提交里出现的 key 一律复活 —— 于是任何一台**还留着旧副本**的机器
+ * （未升级、或同机另一个 app）每轮同步都把别处删掉的账号重新带回池里，删除等于没发生。
+ * 现在墓碑是粘的：不点名就不复活；客户端只在「用户点了恢复 / 重新登录」时点名。
+ *
+ * 非数组 = 没带这个字段（老客户端）→ 空；超长 key 抛错，路由层转 400。
+ */
+export function normalizeRevive(list) {
+  if (!Array.isArray(list)) return [];
+  const out = new Set();
+  for (const raw of list) {
+    const key = str(raw);
+    if (!key) continue;
+    if (key.length > MAX_KEY_LEN) throw new RangeError(`revive key too long (max ${MAX_KEY_LEN})`);
+    out.add(key);
+  }
+  return [...out];
+}
+
+/**
  * 池条目的列清单（读写共用一份，避免两处字段顺序漂移）。
  *
  * `deleted_at` **在出口带上**：墓碑要发给客户端，客户端据此移除本地那份云端账号。
@@ -276,7 +297,8 @@ async function readPoolItems(db, uuid) {
  * `revive = false` 只给老 payload 迁移用：迁移是「把旧 JSON 摊成行」，不能拿旧 JSON
  * 覆盖可能已经写进来的新行，所以用 INSERT IGNORE。
  *
- * `deleted_at = NULL` 是复活语义：用户重新登录同一个账号后再上传，那条墓碑应当变回活条目。
+ * `deleted_at = NULL` 是复活语义。**能否走到这里由 `commitPool` 决定**：墓碑的 key
+ * 只有出现在本轮 `revive` 里才会被传进来（见 [`normalizeRevive`]）。
  */
 export async function insertItems(db, uuid, items, { revive = true } = {}) {
   if (!items.length) return;
@@ -526,11 +548,16 @@ export async function releaseRenewer(db, uuid, renewer, actor, at) {
  *
  * 第 2 步就是「逻辑删除」的全部入口：提交是整池替换，本轮没出现的 key 就是被删掉的。
  * 不删除墓碑行 —— 墓碑要随 GET / lease 发给客户端，让别的机器移除本地那份云端账号。
- * 反过来，客户端带回来的条目里即使有墓碑也会被第 3 步复活（用户重新登录同一个账号）。
+ *
+ * ⚠️ **墓碑是粘的**（2026-11-27）：提交前已经是墓碑的 key，只有出现在 `revive` 里
+ * 才会被第 3 步复活；否则整条被跳过，墓碑与它的令牌原样保留。改之前的行为是「出现即
+ * 复活」，任何一台还持有旧副本的机器都能把别处删掉的账号带回来（跨设备复活事故）。
+ * 跳过多少条会如实报给客户端（`ignored`）并记进审计。
  */
-export async function commitPool(db, uuid, actor, version, rawItems, at) {
+export async function commitPool(db, uuid, actor, version, rawItems, revive, at) {
   const items = normalizeItems(rawItems);
-  const casOk = await db.transaction(async (tx) => {
+  const reviveSet = new Set(revive ?? []);
+  const result = await db.transaction(async (tx) => {
     const res = await tx
       .prepare(
         "UPDATE pools SET version = version + 1, lease_owner = NULL, lease_until = 0, updated_at = ? " +
@@ -538,18 +565,36 @@ export async function commitPool(db, uuid, actor, version, rawItems, at) {
       )
       .bind(at, uuid, version, actor)
       .run();
-    if (changes(res) !== 1) return false; // 事务里什么都没写，commit / rollback 等价
+    if (changes(res) !== 1) return null; // 事务里什么都没写，commit / rollback 等价
+
+    // 提交前已是墓碑的 key：这一步必须在标删活条目**之前**读，
+    // 否则本轮没出现的条目也会被算进来、连累了同一账号换了 key 的条目。
+    const { results } = await tx
+      .prepare("SELECT item_key FROM pool_items WHERE pool_uuid = ? AND deleted_at IS NOT NULL")
+      .bind(uuid)
+      .all();
+    const tombstoned = new Set(results.map((r) => r.item_key));
+    const keep = items.filter((i) => !tombstoned.has(i.key) || reviveSet.has(i.key));
+
     await tx
       .prepare("UPDATE pool_items SET deleted_at = ? WHERE pool_uuid = ? AND deleted_at IS NULL")
       .bind(at, uuid)
       .run();
-    await insertItems(tx, uuid, items);
-    return true;
+    await insertItems(tx, uuid, keep);
+    return { count: keep.length, ignored: items.length - keep.length };
   });
 
-  if (casOk) {
-    await logEvent(db, uuid, "committed", actor, `v${version} → v${version + 1}，${items.length} 项`, at);
-    return { kind: "ok", version: version + 1, count: items.length };
+  if (result) {
+    const skipped = result.ignored > 0 ? `（忽略 ${result.ignored} 个墓碑，未点名复活）` : "";
+    await logEvent(
+      db,
+      uuid,
+      "committed",
+      actor,
+      `v${version} → v${version + 1}，${result.count} 项${skipped}`,
+      at
+    );
+    return { kind: "ok", version: version + 1, count: result.count, ignored: result.ignored };
   }
 
   const row = await db
@@ -667,12 +712,22 @@ export async function handle(request, env) {
         return json({ error: "bad_version" }, 400);
       }
       if (!keysFit(normalizeItems(body.items))) return json({ error: "bad_item_key" }, 400);
-      const r = await commitPool(db, uuid, actor, version, body.items, at);
+      // 没带这个字段 = 老客户端，按「不复活任何墓碑」处理；带了就必须是数组
+      if (body.revive !== undefined && !Array.isArray(body.revive)) {
+        return json({ error: "bad_revive" }, 400);
+      }
+      let revive;
+      try {
+        revive = normalizeRevive(body.revive);
+      } catch {
+        return json({ error: "bad_revive" }, 400);
+      }
+      const r = await commitPool(db, uuid, actor, version, body.items, revive, at);
       if (r.kind === "gone") return json({ error: "gone", now: at }, 404);
       if (r.kind === "stale") {
         return json({ error: "stale", version: r.version, lease_owner: r.lease_owner, now: at }, 409);
       }
-      return json({ ok: true, version: r.version, count: r.count, now: at });
+      return json({ ok: true, version: r.version, count: r.count, ignored: r.ignored, now: at });
     }
 
     if (method === "DELETE") {

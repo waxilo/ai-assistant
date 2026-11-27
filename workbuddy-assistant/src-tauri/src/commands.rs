@@ -320,6 +320,10 @@ pub struct ImportItem {
 pub struct ImportReport {
     pub added: usize,
     pub updated: usize,
+    /// 要显式复活云端墓碑的 key（新加的账号 / 换了更新票的账号）。
+    /// 服务端对墓碑是「不点名不复活」，所以这两类要在下一轮同步里点名。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revive: Vec<String>,
 }
 
 /// 批量导入账号：已存在的账号**合并补全**而不是跳过。
@@ -346,6 +350,17 @@ pub async fn import_accounts(
     // 推不动（闸在别的机器手里 / 管家不可达）**不算导入失败**：整池同步每次提交的
     // 都是「云端 ∪ 本机」，下一次同步照样会把它带上，所以这里只吞掉错误、不改结果。
     if broker::bound() {
+        // 新增 / 换了更新票的账号：如果云端还留着它的墓碑（删掉后重新登录），
+        // 得点名复活 —— 服务端已经不认「出现即复活」那一套了。
+        for key in &report.revive {
+            if let Some(a) = accounts
+                .iter()
+                .find(|a| broker::item_key_of(a).trim() == key.trim())
+            {
+                broker::note_reviving(&a.id);
+                broker::cancel_pending_deletion(key);
+            }
+        }
         let _ = broker::sync(&dir, true).await;
     }
     Ok(report)
@@ -355,6 +370,7 @@ pub async fn import_accounts(
 pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) -> ImportReport {
     let mut added = 0;
     let mut updated = 0;
+    let mut revive: Vec<String> = Vec::new();
     for it in items {
         let token = it.token.trim().to_string();
         if token.is_empty() {
@@ -382,7 +398,8 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
             Some(a) => {
                 // 只在「来源这张票更新」时才换票。导入的可能是历史快照（手机上被打码时
                 // 尤其容易挑错文件），拿旧快照覆盖活票等于把好账号弄死。
-                let keep_existing = match (incoming_iat, crate::checkin::token_issued_at(&a.token)) {
+                let existing_iat = crate::checkin::token_issued_at(&a.token);
+                let keep_existing = match (incoming_iat, existing_iat) {
                     (Some(i), Some(e)) => i < e,
                     _ => false,
                 };
@@ -414,6 +431,12 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                 // 导入 = 重新同步：丢弃本地缓存的签到结果，避免陈旧的「今天失败」记录
                 // 在状态列直接显示「签到失败」（真实状态由导入后的 refreshAll 以服务端为准重写）
                 a.last = None;
+                // 换了**更新的票**才可能是「重新登录」：这条 key 如果撞上云端墓碑，
+                // 下一轮同步要显式复活它。原样导入旧快照不点名，免得又把别处删的账号带回来。
+                let newer = matches!((incoming_iat, existing_iat), (Some(i), Some(e)) if i > e);
+                if newer {
+                    revive.push(broker::item_key_of(a));
+                }
                 updated += 1;
             }
             None => {
@@ -426,7 +449,7 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     .unwrap_or_else(|| {
                         format!("账号-{}", &token.chars().take(6).collect::<String>())
                     });
-                accounts.push(Account {
+                let fresh = Account {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     phone,
@@ -440,12 +463,19 @@ pub(crate) fn merge_import(accounts: &mut Vec<Account>, items: Vec<ImportItem>) 
                     checked_today: None,
                     invalidated_at: None,
                     renew_blocked_until: None,
-                });
+                };
+                // 用户主动新加的账号：如果云端还留着它的墓碑（删掉后重新登录），要点名复活
+                revive.push(broker::item_key_of(&fresh));
+                accounts.push(fresh);
                 added += 1;
             }
         }
     }
-    ImportReport { added, updated }
+    ImportReport {
+        added,
+        updated,
+        revive,
+    }
 }
 
 // ── 账号导入的补全规则 ──────────────────────────────────────────────────────
@@ -633,12 +663,19 @@ pub fn broker_restore_account(
     };
     let dir = data_dir(&app);
     let mut accounts = accounts::load_accounts(&dir);
-    if accounts
+    if let Some(existing) = accounts
         .iter()
-        .any(|a| broker::item_key_of(a).trim() == key.trim())
+        .find(|a| broker::item_key_of(a).trim() == key.trim())
     {
+        // 本机已经有这条（典型：账号在云端被删后，本机又登录 / 导入了同一个它）：
+        // 不再报「已经在列表里」了事 —— 服务端墓碑不点名不复活，必须留一笔 revive，
+        // 下一次同步才翻得开。
+        let existing_id = existing.id.clone();
+        broker::note_reviving(&existing_id);
+        broker::cancel_pending_deletion(&key);
         broker::take_tombstone(&key);
-        return Err("账号已经在列表里了，刷新一下即可".into());
+        broker::cache_mark_revived(&key);
+        return Ok(broker::cached_snapshot());
     }
     let acct = broker::account_from_item(&tomb);
     let new_id = acct.id.clone();

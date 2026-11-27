@@ -1503,6 +1503,35 @@ fn union_pool(
     pool
 }
 
+/// 本轮**不能回传**的 key：云端墓碑里有、又不是这次显式恢复的。
+///
+/// 服务端从 2026-11-27 起把墓碑粘住：`PUT` 里出现墓碑 key 不再自动复活，必须列进
+/// `revive`。把这类 key 从提交正文里剔掉有两层作用 —— 一是不去撞服务端的闸，二是
+/// 本机「已删除」快照不会因为正文里带着它就误以为已经复活（[`merge_tombstones`]
+/// 只按活条目清墓碑）。
+fn blocked_uploads(deleted: &[PoolItem], revive_keys: &HashSet<String>) -> HashSet<String> {
+    deleted
+        .iter()
+        .map(|i| i.key.trim().to_string())
+        .filter(|k| !k.is_empty() && !revive_keys.contains(k))
+        .collect()
+}
+
+/// 本轮要显式复活的 key（来自「已删除」里点了恢复 / 重新登录的账号）。
+///
+/// 排序去重只是为了让提交正文稳定、日志好对；服务端按集合用。
+fn revive_keys_of(accounts: &[Account], reviving: &HashSet<String>) -> Vec<String> {
+    let mut keys: Vec<String> = accounts
+        .iter()
+        .filter(|a| reviving.contains(&a.id))
+        .map(|a| item_key_of(a).trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 // ── HTTP ──────────────────────────────────────────────────────────────────
 
 /// 失败的三态。**必须分开**，否则「池被删」会被当成「网络抖动」，
@@ -2224,7 +2253,19 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     //
     //    提交的初值取「云端 ∪ 本机」：`PUT` 是**整池替换**，若从 `lease.items` 起步，
     //    本机独有的账号就永远进不了正文，等于每同步一次都把并集缩回云端那份。
-    let mut pool = union_pool(&live_items, &accounts, &cloud, now);
+    //
+    //    但**命中云端墓碑的账号不回传**：服务端把墓碑粘住了（只有 `revive` 点名的
+    //    key 才复活），带着它提交只会被服务端忽略，还会让本机的「已删除」快照误判。
+    let revive_keys = revive_keys_of(&accounts, &reviving);
+    let revive_set: HashSet<String> = revive_keys.iter().cloned().collect();
+    let held = blocked_uploads(&lease.deleted, &revive_set);
+    let uploadable: Vec<Account> = accounts
+        .iter()
+        .filter(|a| !held.contains(item_key_of(a).trim()))
+        .cloned()
+        .collect();
+    let held_count = accounts.len() - uploadable.len();
+    let mut pool = union_pool(&live_items, &uploadable, &cloud, now);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
     let mut blocked = 0usize;
@@ -2260,9 +2301,11 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             Ok(()) => {
                 refreshed += 1;
                 // 把新的凭证写回池里那一份（保持并集：池里别的条目原样带回去）
-                if let Some(slot) = pool.iter_mut().find(|i| i.key.trim() == item_key_of(acct)) {
+                let key = item_key_of(acct);
+                if let Some(slot) = pool.iter_mut().find(|i| i.key.trim() == key) {
                     *slot = to_item(acct);
-                } else {
+                } else if !held.contains(key.trim()) {
+                    // 云端已删（墓碑粘住）的账号不借续签再传回去
                     pool.push(to_item(acct));
                 }
             }
@@ -2329,6 +2372,12 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     } else {
         String::new()
     };
+    // 本机还留着、云端已删的账号：不再回传（服务端墓碑粘住），界面上要说清楚
+    let held_note = if held_count > 0 {
+        format!("；{held_count} 个账号云端已删除，本机保留、未回传")
+    } else {
+        String::new()
+    };
     // 本机没续的那些云端账号要说清楚「为什么」：不是失败，是这台机器没有续签权。
     // 池上没设备时更要点名 —— 否则界面上只看得到「续签 0 个」，看起来像坏了。
     let cloud_note = if deferred_cloud == 0 {
@@ -2365,7 +2414,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
             deferred_cloud,
             version: Some(version),
             message: format!(
-                "{refreshed} 个账号续签成功、{failed} 个失败{pruned_note}{cloud_note}；已暂停整池续签一会儿{}",
+                "{refreshed} 个账号续签成功、{failed} 个失败{pruned_note}{cloud_note}{held_note}；已暂停整池续签一会儿{}",
                 if blocked > 0 {
                     format!("（另有 {blocked} 个是票已失效、重试没用的）")
                 } else {
@@ -2401,10 +2450,11 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
 
     // 提交整池：CAS 由服务端做（`version = ? AND lease_owner = ?`），新版本号就在响应里。
     // **不要再补一次 GET 去问版本** —— 那是热路径上白打的一趟接口。
+    // `revive` 只带本轮显式恢复的 key：服务端对墓碑是「不点名不复活」。
     let next_version = match request(
         reqwest::Method::PUT,
         &format!("/v1/pool/{uuid}"),
-        Some(serde_json::json!({ "version": version, "items": pool })),
+        Some(serde_json::json!({ "version": version, "items": pool, "revive": revive_keys })),
     )
     .await
     {
@@ -2450,9 +2500,9 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         deferred_cloud,
         version: next_version,
         message: if blocked > 0 {
-            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}{pruned_note}{cloud_note}；{blocked} 个已死掉、需要重新登录）")
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}{pruned_note}{cloud_note}{held_note}；{blocked} 个已死掉、需要重新登录）")
         } else {
-            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}{pruned_note}{cloud_note}）")
+            format!("整池已同步（并入 {merged} 个，续签 {refreshed} 个{upload_note}{pruned_note}{cloud_note}{held_note}）")
         },
     })
 }
@@ -2895,6 +2945,32 @@ mod tests {
         let pool = union_pool(&cloud, &local, &cloud_ids, 0);
         assert_eq!(pool.len(), 1, "同一个 key 不许出现两条");
         assert_eq!(pool[0].access_token, "leased");
+    }
+
+    // ── 墓碑粘住：只有显式恢复的 key 才回传 ─────────────────────────────
+
+    /// 云端墓碑里的 key 默认不回传（否则服务端会忽略它，本机快照还以为已复活）。
+    #[test]
+    fn tombstoned_keys_are_held_back_unless_explicitly_revived() {
+        let deleted = vec![item("138", "at-1", Some(1)), item("139", "at-2", Some(2))];
+        let revive: HashSet<String> = ["139".to_string()].into_iter().collect();
+        let held = blocked_uploads(&deleted, &revive);
+        assert!(held.contains("138"));
+        assert!(!held.contains("139"), "显式恢复的 key 不受墓碑阻挡");
+        assert_eq!(held.len(), 1);
+    }
+
+    /// `revive` 只来自「点了恢复 / 重新登录」的账号，按 key 排序去重。
+    #[test]
+    fn revive_keys_follow_the_accounts_being_restored() {
+        let restored = acct("恢复的", Some("139"), "t1");
+        let other = acct("别的", Some("138"), "t2");
+        let reviving: HashSet<String> = [restored.id.clone()].into_iter().collect();
+        assert_eq!(
+            revive_keys_of(&[other, restored], &reviving),
+            vec!["139".to_string()],
+            "没点恢复的账号不能进 revive"
+        );
     }
 
     #[test]

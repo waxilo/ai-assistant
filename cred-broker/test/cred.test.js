@@ -765,7 +765,7 @@ test("提交时本轮没出现的条目标成墓碑：items 只给活的，delet
   assert.equal(next.data.version, 1);
 });
 
-test("重新带上的 key 会复活墓碑（用户重新登录同一个账号再上传）", async () => {
+test("墓碑粘住：旧客户端把 key 原样带回来也不复活，必须显式 revive", async () => {
   const env = createEnv();
   const uuid = await newPool(env, [item("a"), item("b")]);
   const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
@@ -775,12 +775,46 @@ test("重新带上的 key 会复活墓碑（用户重新登录同一个账号再
   });
   assert.equal((await call(env, "GET", `/v1/pool/${uuid}`)).data.deleted[0].key, "b");
 
+  // 另一台机器还留着旧副本：整池 6 项原样提交（不带 revive）
+  const lease2 = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m2" });
+  const back = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m2",
+    body: {
+      version: lease2.data.version,
+      items: [item("a"), item("b", { access_token: "resurrected" })],
+    },
+  });
+  assert.equal(back.status, 200);
+  assert.equal(back.data.count, 1, "count 只数真正写进池的活条目");
+  assert.equal(back.data.ignored, 1, "被墓碑挡下的条数要如实回报");
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["a"]);
+  assert.equal(got.data.deleted[0].key, "b");
+  assert.equal(got.data.deleted[0].access_token, "at-b", "墓碑的令牌不能被旧副本盖掉");
+});
+
+test("显式 revive 才复活墓碑（恢复 / 重新登录走这条路）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a"), item("b")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a")] },
+  });
+
   const lease2 = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
   const back = await call(env, "PUT", `/v1/pool/${uuid}`, {
     actor: "m1",
-    body: { version: lease2.data.version, items: [item("a"), item("b", { access_token: "new" })] },
+    body: {
+      version: lease2.data.version,
+      items: [item("a"), item("b", { access_token: "new" })],
+      revive: ["b"],
+    },
   });
   assert.equal(back.status, 200);
+  assert.equal(back.data.count, 2);
+  assert.equal(back.data.ignored, 0);
 
   const got = await call(env, "GET", `/v1/pool/${uuid}`);
   assert.deepEqual(got.data.items.map((i) => i.key), ["a", "b"]);
@@ -788,12 +822,51 @@ test("重新带上的 key 会复活墓碑（用户重新登录同一个账号再
   assert.deepEqual(got.data.deleted, [], "复活之后墓碑必须消失");
 });
 
+test("revive 只对墓碑生效：活条目照常提交，未点名的墓碑互不影响", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a"), item("b"), item("c")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a"), item("b")] },
+  });
+
+  const lease2 = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  // 一个不在墓碑里的 key 点名复活：无害；c 仍留在墓碑
+  const r = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: {
+      version: lease2.data.version,
+      items: [item("a"), item("b"), item("c")],
+      revive: ["a", "no-such-key"],
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.count, 2, "没点名的 c 不能跟着复活");
+  assert.equal(r.data.ignored, 1);
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["a", "b"]);
+  assert.deepEqual(got.data.deleted.map((i) => i.key), ["c"]);
+});
+
+test("revive 不是字符串数组时 400（不静默当成空）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  const r = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a")], revive: "a" },
+  });
+  assert.equal(r.status, 400);
+  assert.equal(r.data.error, "bad_revive");
+});
+
 test("整池提交是一笔事务：条目写到一半失败时，版本号与旧条目都回滚", async () => {
   const env = createEnv();
   const uuid = await newPool(env, [item("a")]);
   const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
   await assert.rejects(
-    commitPool(env.DB, uuid, "m1", lease.data.version, [item("x".repeat(MAX_KEY_LEN + 1))], Date.now()),
+    commitPool(env.DB, uuid, "m1", lease.data.version, [item("x".repeat(MAX_KEY_LEN + 1))], [], Date.now()),
     "超长 key 在库里必须报错（1406），不能静默截断"
   );
 
