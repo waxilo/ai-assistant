@@ -1284,6 +1284,39 @@ body.modal-open .content {
   border-color: var(--ok-line);
   color: var(--ok-d);
 }
+
+/* 续签设备：一池一个组合 id。本机 = 绿，未指定 / 未知 = 橙（云端账号没人续签） */
+.pool-renewer {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--panel-2);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.pool-renewer.self {
+  background: var(--ok-soft);
+  border-color: var(--ok-line);
+  color: var(--ok-d);
+}
+.pool-renewer.none,
+.pool-renewer.unknown {
+  background: var(--warn-soft);
+  border-color: var(--warn-line);
+  color: var(--warn-d);
+}
+.pool-renewer-grace {
+  font-style: normal;
+  font-variant-numeric: var(--tnum);
+  opacity: 0.85;
+}
 .pool-uuid {
   display: block;
   margin: 0;

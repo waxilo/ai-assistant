@@ -115,6 +115,8 @@ pub fn run() {
             commands::broker_unbind,
             commands::broker_state,
             commands::broker_sync_now,
+            commands::broker_claim_renewer,
+            commands::broker_release_renewer,
             commands::get_settings,
             commands::save_settings,
             commands::apply_settings,

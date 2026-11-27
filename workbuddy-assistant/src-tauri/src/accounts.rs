@@ -105,13 +105,23 @@ pub struct AccountView {
     /// 签到 / 接管路由决策）都写进那份台账，账户管理与积分简报都从它读。
     /// 台账里还没有该账号的读数时是 `None`（界面显示「—」，不回退到别的字段编一个数）。
     pub credits: Option<ledger::CreditFact>,
+    /// 账号来源：`local`（本机登录，无条件续签）/ `cloud`（云端同步，只有续签设备续签）。
+    ///
+    /// 它**不落盘**（`accounts.json` 结构不动），由 `broker.json` 的来源标记现算。
+    /// 所以它只用于展示与续签判断，不是账号自身的持久属性。
+    pub origin: &'static str,
 }
 
 impl AccountView {
-    /// 给一个账号配上它当前的积分读数。
+    /// 给一个账号配上它当前的积分读数与来源。
     pub fn of(account: Account, dir: &Path) -> Self {
         let credits = ledger::store(dir).fact_of(&account.id);
-        AccountView { account, credits }
+        let origin = crate::broker::origin_of(&account);
+        AccountView {
+            account,
+            credits,
+            origin,
+        }
     }
 }
 
@@ -483,6 +493,7 @@ mod tests {
                 earliest_expiry_ms: Some(1_790_783_999_000),
                 packages: vec![],
             }),
+            origin: "local",
         }
     }
 

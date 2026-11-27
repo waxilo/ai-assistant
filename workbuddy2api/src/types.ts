@@ -42,6 +42,12 @@ export interface Account {
   credits: CreditFact | null;
   /** 服务端「今日是否已签到」的真实状态（持久化）；null = 未查询/失败 */
   checked_today: boolean | null;
+  /**
+   * 账号来源（后端现算，不落盘）：`local` = 本机登录，无条件续签；
+   * `cloud` = 从云端池收养的，只有续签设备才续；`imported` = JSON 导入的公用 token，
+   * 永不续签、永不上云（仅 2api 会出现）。
+   */
+  origin: "local" | "cloud" | "imported";
 }
 
 export interface Settings {
@@ -179,6 +185,16 @@ export interface BrokerStatus {
   error: string | null;
   /** 正在同步：长请求期间界面不至于显示成「从未同步」 */
   syncing: boolean;
+  /** 本机的组合 id（客户端类型 + 机器标识），与池上的 `renewer` 比对 */
+  self_id: string;
+  /** 池上当前的续签设备；null 且 `renewer_known` = 确实没有设备认领 */
+  renewer: string | null;
+  /** 是否已经问过池：false 时显示「同步后可知」，不要把 null 当成「没有」 */
+  renewer_known: boolean;
+  /** 本机是不是续签设备（只有它续签云端同步账号） */
+  is_renewer: boolean;
+  /** 取消续签的宽限截止（毫秒）；宽限内没有新设备，本机会自动写回去 */
+  grace_until: number | null;
 }
 
 /** 上传 / 绑定的结果：uuid 是唯一要展示给用户复制的东西 */
@@ -210,6 +226,8 @@ export interface SyncReport {
   failed: number;
   /** 本机续不动的账号数（票已失效、要重新登录），不拖停整池 */
   blocked: number;
+  /** 本机**故意没续**的云端账号数（本机不是续签设备）：不算失败 */
+  deferred_cloud: number;
   version: number | null;
   message: string;
 }

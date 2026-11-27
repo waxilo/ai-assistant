@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Account, BrokerStatus, CreditPackage } from "../types";
 import {
   AccountCell,
@@ -30,6 +30,8 @@ import {
   IconRefresh,
   IconSwap,
   IconClock,
+  IconPower,
+  IconShield,
 } from "../components/Icons";
 
 /** 账号签到状态 → 状态圆点文案（圆点本身的视觉由 common 的 StatusDot 统一提供） */
@@ -60,6 +62,9 @@ export function AccountsPage({
   onBrokerLink,
   onBrokerUnbind,
   onBrokerSync,
+  onBrokerClaim,
+  onBrokerRelease,
+  onRefreshBroker,
 }: {
   accounts: Account[];
   loading: boolean;
@@ -76,6 +81,12 @@ export function AccountsPage({
   onBrokerUnbind: () => void;
   /** 手动双向同步：本机新票/新账号推上去，云端新票/新账号拉下来 */
   onBrokerSync: () => void;
+  /** 把本机设为这一池的续签设备 */
+  onBrokerClaim: () => void;
+  /** 取消本机续签身份（10 秒内没有新设备接手会自动恢复） */
+  onBrokerRelease: () => void;
+  /** 只刷新凭证池状态（续签宽限倒计时用） */
+  onRefreshBroker: () => void;
 }) {
   // 订阅那个全局积分对象：后台一次采集（整点采样 / 刷新 / 签到）就会换掉它的引用，
   // 本页随之重渲染并显示新读数。hook 必须在任何提前 return 之前调用，所以挂在最上面。
@@ -94,6 +105,9 @@ export function AccountsPage({
       onLink={onBrokerLink}
       onUnbind={onBrokerUnbind}
       onSync={onBrokerSync}
+      onClaim={onBrokerClaim}
+      onRelease={onBrokerRelease}
+      onRefreshBroker={onRefreshBroker}
     />
   );
 
@@ -201,7 +215,20 @@ export function AccountsPage({
               return (
                 <tr key={a.id}>
                   <td>
-                    <AccountCell name={a.name} phone={a.phone} />
+                    <AccountCell
+                      name={a.name}
+                      phone={a.phone}
+                      badge={
+                        a.origin === "cloud" ? (
+                          <span
+                            className="badge badge-idle"
+                            title="从云端凭证池同步来的账号：只有续签设备（设为续签设备的那台机器）才续签"
+                          >
+                            云端
+                          </span>
+                        ) : undefined
+                      }
+                    />
                   </td>
                   <td className="num">
                     {bal != null ? (
@@ -466,6 +493,9 @@ function PoolBar({
   onLink,
   onUnbind,
   onSync,
+  onClaim,
+  onRelease,
+  onRefreshBroker,
 }: {
   status: BrokerStatus | null;
   accountCount: number;
@@ -474,9 +504,17 @@ function PoolBar({
   onLink: () => void;
   onUnbind: () => void;
   onSync: () => void;
+  /** 把本机设为这一池的续签设备（云端写入本机组合 id） */
+  onClaim: () => void;
+  /** 取消本机续签身份；10 秒内没有新设备接手会自动写回 */
+  onRelease: () => void;
+  /** 只刷新凭证池状态（宽限倒计时轮询用） */
+  onRefreshBroker: () => void;
 }) {
   const uuid = status?.uuid ?? null;
   const bound = Boolean(status?.bound && uuid);
+  const renewer = renewerInfo(status, bound);
+  const graceLeft = useGraceCountdown(status?.grace_until ?? null, onRefreshBroker);
 
   const note = (() => {
     // 错误优先：出过错的绑定状态比「已绑定」更该被看见
@@ -501,6 +539,21 @@ function PoolBar({
       <span className={`pool-bar-note${status?.error ? " err" : ""}`} title={note}>
         {note}
       </span>
+      {renewer && (
+        <span
+          className={`pool-renewer ${renewer.tone}`}
+          title={
+            graceLeft != null
+              ? `${renewer.title}；已取消续签，${graceLeft} 秒内没有新设备接手会自动恢复`
+              : renewer.title
+          }
+        >
+          {renewer.label}
+          {graceLeft != null && (
+            <em className="pool-renewer-grace">{graceLeft}s 后自动恢复</em>
+          )}
+        </span>
+      )}
       <span className="pool-bar-actions">
         {bound && uuid ? (
           <>
@@ -514,6 +567,31 @@ function PoolBar({
               <IconSwap size={13} />
               同步
             </button>
+            {renewer?.tone === "self" ? (
+              <button
+                className="btn small ghost"
+                disabled={busy}
+                onClick={onRelease}
+                title="云端清空续签设备；10 秒内没有新设备接手，本机自动恢复"
+              >
+                <IconPower size={13} />
+                取消本机续签
+              </button>
+            ) : renewer ? (
+              <button
+                className="btn small ghost"
+                disabled={busy}
+                onClick={onClaim}
+                title={
+                  renewer.tone === "other"
+                    ? "这一池的续签设备是另一台机器；要换过来，先在那台机器上取消续签"
+                    : "把本机设为这一池的续签设备：云端同步账号将由本机续签"
+                }
+              >
+                <IconShield size={13} />
+                设为本机续签
+              </button>
+            ) : null}
             <button
               className="btn small danger"
               disabled={busy}
@@ -548,6 +626,82 @@ function PoolBar({
       </span>
     </div>
   );
+}
+
+/**
+ * 续签设备的短标签：完整组合 id 在 `title` 里，界面上只给「本机 / 其他机器 / 未指定」。
+ *
+ * 一个池只认一个组合 id（客户端类型 + 机器标识），所以这一栏说的是**整池**的事：
+ * 云端同步账号由谁续签。本机登录的账号不受它影响（自己登的自己续）。
+ */
+function renewerInfo(
+  status: BrokerStatus | null,
+  bound: boolean
+): { label: string; title: string; tone: "self" | "other" | "none" | "unknown" } | null {
+  if (!status || !bound) return null;
+  if (!status.renewer_known) {
+    return {
+      label: "续签设备：同步后可知",
+      title: "本机还没跟云端同步过，暂时不知道这一池谁在续签",
+      tone: "unknown",
+    };
+  }
+  if (status.is_renewer) {
+    return {
+      label: "续签设备：本机",
+      title: `本机组合 id：${status.self_id}`,
+      tone: "self",
+    };
+  }
+  if (status.renewer) {
+    return {
+      label: "续签设备：其他机器",
+      title: `池上的续签设备是 ${status.renewer}；云端同步账号由它续签`,
+      tone: "other",
+    };
+  }
+  return {
+    label: "续签设备：未指定",
+    title:
+      "没有设备认领这一池：云端同步账号暂不续签（本机登录的账号不受影响）",
+    tone: "none",
+  };
+}
+
+/**
+ * 取消续签后的 10 秒倒计时：返回剩余秒数（没有宽限期时 `null`），并在到期前后轮询状态。
+ *
+ * 为什么要在前端轮询：宽限结束会发生两种事（本机自动写回 / 新设备接走后 409），
+ * 都由后端那支定时任务更新内存；界面不主动问就还停在「未指定」。
+ */
+function useGraceCountdown(
+  graceUntil: number | null,
+  onRefresh: () => void
+): number | null {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (graceUntil == null) return;
+    const timer = window.setInterval(() => tick((n) => n + 1), 500);
+    return () => window.clearInterval(timer);
+  }, [graceUntil]);
+  useEffect(() => {
+    if (graceUntil == null) return;
+    let alive = true;
+    const poll = async () => {
+      // 宽限结束后再问两三跳：写回是 10 秒整才发出的，内存更新还要一个来回
+      while (alive && Date.now() < graceUntil + 5000) {
+        await new Promise((r) => window.setTimeout(r, 1500));
+        if (!alive) return;
+        onRefresh();
+      }
+    };
+    void poll();
+    return () => {
+      alive = false;
+    };
+  }, [graceUntil, onRefresh]);
+  if (graceUntil == null) return null;
+  return Math.max(0, Math.ceil((graceUntil - Date.now()) / 1000));
 }
 
 /** 「上次同步」那句人话。同步是热路径上两分钟一跳的东西，说清时刻比说「同步中」有用 */

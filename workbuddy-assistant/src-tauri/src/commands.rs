@@ -902,10 +902,23 @@ pub async fn broker_unbind() -> Result<broker::BrokerStatus, String> {
     broker::unbind().await
 }
 
-/// 只读状态：绑没绑、uuid、云端版本、上次同步时刻、上次错误。无副作用。
+/// 只读状态：绑没绑、uuid、云端版本、上次同步时刻、上次错误、本机是不是续签设备。
+/// 无副作用。
 #[tauri::command]
 pub fn broker_state() -> broker::BrokerStatus {
     broker::status()
+}
+
+/// 把本机设为这一池的续签设备（云端账号只由它续签）。
+#[tauri::command]
+pub async fn broker_claim_renewer() -> Result<broker::BrokerStatus, String> {
+    broker::claim_renewer().await
+}
+
+/// 取消本机续签设备身份。10 秒内没有新设备认领，本机自动恢复（见 `broker::release_renewer`）。
+#[tauri::command]
+pub async fn broker_release_renewer() -> Result<broker::BrokerStatus, String> {
+    broker::release_renewer().await
 }
 
 /// 手动跑一轮**双向**整池同步：云端新票 / 新账号拉到本机，本机新票 / 新账号回写云端

@@ -62,8 +62,8 @@ npm run tauri build
 macOS universal + Windows NSIS 并更新 `workbuddy2api-latest` 通道。
 
 ```bash
-git tag workbuddy2api-v0.2.5
-git push origin workbuddy2api-v0.2.5
+git tag workbuddy2api-v0.2.6
+git push origin workbuddy2api-v0.2.6
 ```
 
 ---
@@ -79,6 +79,8 @@ git push origin workbuddy2api-v0.2.5
 - [x] 关网关自动收尾：断开 Codex 接入、按备份还原 `config.toml`，并重启正在运行的 Codex
 - [x] 紫色应用图标：与同门的 WorkBuddy Assistant（深绿底）在 Dock / 任务栏里一眼分开
 - [x] 添加账号支持 JSON 导入导出：导出的 JSON 只含 access token；导入的账号标记为**公用 token**——照常签到、走网关，但不自动续签、不上传凭证池（替共享票续签会把真正持链的一方踢下线）；重新从本机登录文件 / 浏览器登录导入同一账号即可恢复续签
+- [x] 同账号合并优先级：本地登录 > 云端同步 > 手动导入。低优先级的副本不覆盖可用的高优先级账号（只补空字段）；账号不可用（判死 / 续签链过期 / 无链且过期）时任何来源直接覆盖。导入账号被云端副本接管后转回正常续签规则，公用 token 本身永不回写池
+- [x] 一池一个**续签设备**：云端同步账号只有池上登记的那台机器续签（组合 id = 客户端类型 + 机器标识）；本地登录账号无条件续签，JSON 导入的公用 token 永不续签。换设备先在旧设备「取消本机续签」（10 秒内没有新设备接手会自动恢复），再在新设备「设为本机续签」
 
 ---
 

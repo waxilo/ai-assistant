@@ -223,6 +223,7 @@ mod tests {
                 last: rec,
             },
             credits: None,
+            origin: "local",
         }
     }
 

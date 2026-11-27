@@ -941,7 +941,7 @@ pub(crate) async fn checkin_all_inner(
     Ok(views)
 }
 
-// ── 凭证管家：四个命令都是**池级**的，都不带账号 id ────────────────────────
+// ── 凭证管家：都是**池级**命令，都不带账号 id ──────────────────────────────
 //
 // 一池一个 uuid，闸也按池给 —— 所以这里的动作作用范围是「整台机器」，
 // 而不是「某个账号」。界面上也因此没有逐个账号的开关。
@@ -979,6 +979,18 @@ pub fn broker_state() -> broker::BrokerStatus {
 /// 为什么要这个按钮：自动那轮只在**抢到闸**时跑，而闸可能长时间在别的机器手里
 /// —— 本机刚重新登录拿到新票却推不上去，别的机器就一直领过期票，反之亦然。
 /// 未绑定直接报错：用户点了就是想知道为什么没动，这里没有「静默跳过」的余地。
+/// 把本机设为这一池的续签设备。池上已有别的设备会 409（不提供强制覆盖）。
+#[tauri::command]
+pub async fn broker_claim_renewer() -> Result<broker::BrokerStatus, String> {
+    broker::claim_renewer().await
+}
+
+/// 取消本机的续签设备身份（云端组合 id 置空），10 秒内没有新设备接手则本机自动写回。
+#[tauri::command]
+pub async fn broker_release_renewer() -> Result<broker::BrokerStatus, String> {
+    broker::release_renewer().await
+}
+
 #[tauri::command]
 pub async fn broker_sync_now(app: AppHandle) -> Result<broker::SyncReport, String> {
     let dir = data_dir(&app);

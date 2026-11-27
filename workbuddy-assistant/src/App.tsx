@@ -23,6 +23,8 @@ import {
   brokerLink,
   brokerUnbind,
   brokerSyncNow,
+  brokerClaimRenewer,
+  brokerReleaseRenewer,
 } from "./api";
 import { accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
 import { bindCredits, seedCredits } from "./credits";
@@ -555,6 +557,58 @@ export default function App() {
     }
   }, [load, showToast]);
 
+  /** 只刷新凭证池状态（宽限倒计时 / 换设备期间轮询用），不重拉账号列表 */
+  const refreshBrokerStatus = useCallback(async () => {
+    try {
+      setBrokerStatus(await brokerState());
+    } catch {
+      // 轮询失败静默：下一跳还会再试，别在倒计时里弹错误
+    }
+  }, []);
+
+  /**
+   * 把本机设为这一池的续签设备。
+   *
+   * 云端一个池只认一个组合 id：成功之后，云端同步账号才由本机续签。
+   * 池上已有别的设备时后端拒绝并说明「先在旧设备取消」，这里照实转达。
+   */
+  const runBrokerClaimRenewer = useCallback(async () => {
+    setBrokerBusy(true);
+    try {
+      setBrokerStatus(await brokerClaimRenewer());
+      showToast({ kind: "ok", text: "本机已设为续签设备" });
+    } catch (e) {
+      showToast({ kind: "err", text: String(e) });
+    } finally {
+      setBrokerBusy(false);
+    }
+  }, [showToast]);
+
+  /**
+   * 取消本机的续签设备身份。10 秒内没有新设备接手，后端会自动写回去
+   * （界面按 `grace_until` 显示倒计时并轮询状态）。
+   */
+  const runBrokerReleaseRenewer = useCallback(async () => {
+    const ok = await askConfirm({
+      title: "取消本机续签？",
+      body: "云端会把这一池的续签设备清空：在你到新设备上点「设为本机续签」之前，云端同步账号不会续签。10 秒内没有新设备接手，本机会自动恢复为续签设备。",
+      okText: "取消续签",
+    });
+    if (!ok) return;
+    setBrokerBusy(true);
+    try {
+      setBrokerStatus(await brokerReleaseRenewer());
+      showToast({
+        kind: "info",
+        text: "已取消本机续签，10 秒内没有新设备接手会自动恢复",
+      });
+    } catch (e) {
+      showToast({ kind: "err", text: String(e) });
+    } finally {
+      setBrokerBusy(false);
+    }
+  }, [askConfirm, showToast]);
+
   const saveSettings = useCallback(async (s: Settings) => {
     // 设置页已改为「改动自动保存」，这里只负责落盘并刷新内存中的 settings，
     // 不再弹成功 toast（每次改动都弹会刷屏）。失败提示由设置页兜底。
@@ -738,6 +792,9 @@ export default function App() {
               onBrokerLink={() => setModal({ type: "brokerLink" })}
               onBrokerUnbind={() => void runBrokerUnbind()}
               onBrokerSync={() => void runBrokerSync()}
+              onBrokerClaim={() => void runBrokerClaimRenewer()}
+              onBrokerRelease={() => void runBrokerReleaseRenewer()}
+              onRefreshBroker={refreshBrokerStatus}
               onCheckinOne={(id) => void runCheckinOne(id)}
               onRemove={(a) => void removeOne(a)}
               onOpenLogs={(id) => {

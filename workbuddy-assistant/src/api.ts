@@ -85,6 +85,19 @@ export const brokerState = () => invoke<BrokerStatus>("broker_state");
  */
 export const brokerSyncNow = () => invoke<SyncReport>("broker_sync_now");
 
+/**
+ * 把本机设为这一池的续签设备（云端写入本机组合 id）。
+ * 池上已有别的设备时后端返回 409 并说明「先去旧设备取消」。
+ */
+export const brokerClaimRenewer = () => invoke<BrokerStatus>("broker_claim_renewer");
+
+/**
+ * 取消本机的续签设备身份（云端组合 id 置空）。
+ * 10 秒内没有新设备接手，本机会自动把自己写回去 —— 防止换设备时整池没人续签。
+ */
+export const brokerReleaseRenewer = () =>
+  invoke<BrokerStatus>("broker_release_renewer");
+
 export const getSettings = () => invoke<Settings>("get_settings");
 
 export const saveSettings = (settings: Settings) =>

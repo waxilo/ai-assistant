@@ -215,9 +215,12 @@ export function logStatus(l: LogEntry): { tone: DotTone; label: string } {
 export function AccountCell({
   name,
   phone,
+  badge,
 }: {
   name: string;
   phone?: string | null;
+  /** 名称行尾的可选徽标（如账号来源：云端同步） */
+  badge?: ReactNode;
 }) {
   const initial = /^\d/.test(name) ? null : name.slice(0, 1);
   const shown = maskPhone(name);
@@ -226,7 +229,10 @@ export function AccountCell({
     <div className="ac-cell-name">
       <span className="ac-avatar">{initial ?? <IconUser size={16} />}</span>
       <div className="ac-id">
-        <span className="ac-name">{shown}</span>
+        <span className="ac-name">
+          {shown}
+          {badge}
+        </span>
         {/* 手机号与名称相同时不再重复一行 */}
         {alt && alt !== shown && <span className="ac-phone">{alt}</span>}
       </div>
