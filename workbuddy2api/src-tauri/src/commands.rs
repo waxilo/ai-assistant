@@ -655,37 +655,6 @@ pub fn remove_account(
     Ok(())
 }
 
-/// 改云端账号的**资料**（昵称 / 手机号）。不动 token —— 换票只走续签。
-#[tauri::command]
-pub fn update_account_profile(
-    app: AppHandle,
-    id: String,
-    name: String,
-    phone: Option<String>,
-) -> Result<(), String> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("昵称不能为空".into());
-    }
-    let phone = phone
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
-    let dir = data_dir(&app);
-    let mut accounts = accounts::load_accounts(&dir);
-    let Some(acct) = accounts.iter_mut().find(|a| a.id == id) else {
-        return Err("账号不存在".into());
-    };
-    if acct.name == name && acct.phone == phone {
-        return Ok(());
-    }
-    acct.name = name;
-    acct.phone = phone;
-    accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
-    // 标记「下次同步只盖展示字段」：不能被当成一次换票（那会用旧票盖掉别机的新票）
-    broker::note_edited_account(&id);
-    Ok(())
-}
-
 /// 「已删除」列表：最近一次同步带回、且当前没有活账号对应的墓碑。
 #[tauri::command]
 pub fn broker_deleted_items() -> Vec<broker::DeletedItem> {

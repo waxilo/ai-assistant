@@ -40,12 +40,6 @@ export const importAccounts = (items: ImportItem[]) =>
 export const removeAccount = (id: string, fromCloudPool = false) =>
   invoke<void>("remove_account", { id, fromCloudPool });
 
-/**
- * 改云端账号的资料（昵称 / 手机号）：只盖展示字段，**不动 token**；随下一轮同步上传。
- */
-export const updateAccountProfile = (id: string, name: string, phone: string | null) =>
-  invoke<void>("update_account_profile", { id, name, phone });
-
 /** 「已删除」列表（最近一次同步带回、且当前没有活账号对应的墓碑） */
 export const brokerDeletedItems = () =>
   invoke<DeletedItem[]>("broker_deleted_items");

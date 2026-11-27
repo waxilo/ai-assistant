@@ -15,7 +15,6 @@ import {
 import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, soonestExpiringTotal, useCredits, seedCredits } from "../credits";
 import {
   refreshAccountCredits,
-  updateAccountProfile,
   brokerDeletedItems,
   brokerRestoreAccount,
 } from "../api";
@@ -24,7 +23,6 @@ import {
   IconBolt,
   IconCircleCheck,
   IconCloud,
-  IconEdit,
   IconFile,
   IconLink,
   IconList,
@@ -56,8 +54,8 @@ const STATUS_LABEL: Record<SignState, string> = {
  * 避免手工粘贴 token 出错。
  *
  * 主表放三类账号：本机登录 / 云端副本 / 手动导入；主表里的删除只动本机这一份
- * （删云端副本不会动云端池）。云端池本身在池栏的「云端账号」弹窗里操作 ——
- * 编辑资料、逻辑删除、恢复都在那儿做。
+ * （删云端副本不会动云端池）。云端池本身在池栏的「云端账号」弹窗里看：
+ * 逻辑删除与恢复只有**续签设备**能做，其他设备只能查看。
  */
 export function AccountsPage({
   accounts,
@@ -392,92 +390,12 @@ export function AccountsPage({
 }
 
 /**
- * 编辑云端账号资料：只改昵称与手机号，**凭证字段一律不碰**。
- *
- * 手机号同时是云端池条目的 key，改了会在下一轮同步里“漂移”成新 key ——
- * 后端专门只盖展示字段，不会把它当成一次换票（详见 broker::apply_profile_edits）。
- */
-function EditAccountDialog({
-  account,
-  onClose,
-  reload,
-}: {
-  account: Account;
-  onClose: () => void;
-  reload: () => Promise<void>;
-}) {
-  const [name, setName] = useState(account.name);
-  const [phone, setPhone] = useState(account.phone ?? "");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  const submit = async () => {
-    const trimmed = name.trim();
-    if (!trimmed) {
-      setErr("昵称不能为空");
-      return;
-    }
-    setBusy(true);
-    setErr("");
-    try {
-      await updateAccountProfile(account.id, trimmed, phone.trim() || null);
-      await reload();
-      onClose();
-    } catch (e) {
-      // 就地显示：关掉弹窗再弹 toast 会把「为什么没改成」藏起来
-      setErr(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Dialog
-      size="sm"
-      icon={<IconEdit size={16} />}
-      title="编辑云端账号资料"
-      subtitle="只改昵称与手机号，不会影响 token；随下一轮同步更新到云端池。"
-      onClose={onClose}
-      footer={
-        <>
-          <button className="btn ghost" onClick={onClose} disabled={busy}>
-            取消
-          </button>
-          <button className="btn primary" onClick={() => void submit()} disabled={busy}>
-            {busy ? "保存中…" : "保存"}
-          </button>
-        </>
-      }
-    >
-      <label>
-        昵称
-        <input
-          value={name}
-          autoFocus
-          onChange={(e) => setName(e.target.value)}
-          placeholder="给这个账号起个名字"
-        />
-      </label>
-      <label>
-        手机号
-        <input
-          value={phone}
-          onChange={(e) => setPhone(e.target.value)}
-          placeholder="可不填"
-        />
-      </label>
-      {err && <p className="note danger">{err}</p>}
-    </Dialog>
-  );
-}
-
-/**
  * 「云端账号」弹窗：云端列表的独立视图，和主表互不影响。
  *
- * - 在线：查看 / 编辑资料 / 从云端池逻辑删除。
- * - 已删除：最近一次同步带回的墓碑，可以恢复。
+ * - 在线：查看；**续签设备**还能从云端池逻辑删除。
+ * - 已删除：最近一次同步带回的墓碑，**续签设备**可以恢复。
  *
- * 编辑用同一层弹窗内的表单（`EditAccountDialog` 替换掉列表视图），不叠第二个弹窗。
+ * 写操作（删除 / 恢复）只对续签设备开放：其他设备进来看，按钮一概没有。
  */
 function CloudAccountsDialog({
   status,
@@ -493,8 +411,9 @@ function CloudAccountsDialog({
   reload: () => Promise<void>;
 }) {
   const book = useCredits();
+  // 云端池的写操作（删除 / 恢复）只给续签设备；其他设备在这份列表里只能查看
+  const canManage = status?.is_renewer ?? false;
   const [tab, setTab] = useState<"live" | "deleted">("live");
-  const [editing, setEditing] = useState<Account | null>(null);
 
   const [items, setItems] = useState<DeletedItem[] | null>(null);
   const [err, setErr] = useState("");
@@ -525,16 +444,6 @@ function CloudAccountsDialog({
       setBusyKey(null);
     }
   };
-
-  if (editing) {
-    return (
-      <EditAccountDialog
-        account={editing}
-        onClose={() => setEditing(null)}
-        reload={reload}
-      />
-    );
-  }
 
   const deletedCount = status?.deleted_count ?? items?.length ?? 0;
 
@@ -581,7 +490,7 @@ function CloudAccountsDialog({
                   <th>账号</th>
                   <th className="num">积分</th>
                   <th>Token 过期</th>
-                  <th className="col-actions">操作</th>
+                  {canManage && <th className="col-actions">操作</th>}
                 </tr>
               </thead>
               <tbody>
@@ -616,24 +525,19 @@ function CloudAccountsDialog({
                           </span>
                         )}
                       </td>
-                      <td className="col-actions">
-                        <div className="ac-cell-actions">
-                          <button
-                            className="icon-btn"
-                            title="编辑昵称 / 手机号（不影响凭证）"
-                            onClick={() => setEditing(a)}
-                          >
-                            <IconEdit size={16} />
-                          </button>
-                          <button
-                            className="icon-btn icon-danger"
-                            title="从云端池删除（可在「已删除」里恢复）"
-                            onClick={() => onRemove(a, true)}
-                          >
-                            <IconTrash size={16} />
-                          </button>
-                        </div>
-                      </td>
+                      {canManage && (
+                        <td className="col-actions">
+                          <div className="ac-cell-actions">
+                            <button
+                              className="icon-btn icon-danger"
+                              title="从云端池删除（可在「已删除」里恢复）"
+                              onClick={() => onRemove(a, true)}
+                            >
+                              <IconTrash size={16} />
+                            </button>
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   );
                 })}
@@ -653,7 +557,7 @@ function CloudAccountsDialog({
                 <th>账号</th>
                 <th>手机号</th>
                 <th>删除时间</th>
-                <th className="col-actions">操作</th>
+                {canManage && <th className="col-actions">操作</th>}
               </tr>
             </thead>
             <tbody>
@@ -664,15 +568,17 @@ function CloudAccountsDialog({
                   <td className="num-muted">
                     {it.deleted_at ? sinceMs(it.deleted_at) : "未知"}
                   </td>
-                  <td className="col-actions">
-                    <button
-                      className="btn small"
-                      disabled={busyKey !== null}
-                      onClick={() => void restore(it.key)}
-                    >
-                      {busyKey === it.key ? "恢复中…" : "恢复"}
-                    </button>
-                  </td>
+                  {canManage && (
+                    <td className="col-actions">
+                      <button
+                        className="btn small"
+                        disabled={busyKey !== null}
+                        onClick={() => void restore(it.key)}
+                      >
+                        {busyKey === it.key ? "恢复中…" : "恢复"}
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>

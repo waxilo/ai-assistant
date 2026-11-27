@@ -90,7 +90,6 @@ pub fn run() {
             commands::list_accounts,
             commands::import_accounts,
             commands::remove_account,
-            commands::update_account_profile,
             commands::checkin_one,
             commands::checkin_all,
             commands::refresh_all,

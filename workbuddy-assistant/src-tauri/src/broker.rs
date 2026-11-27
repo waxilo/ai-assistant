@@ -137,11 +137,6 @@ pub struct BrokerConfig {
     /// 数据源，也是恢复的唯一凭据（含 token）：恢复时把整条重新加进本机账号，再随
     /// 下一轮提交复活服务端那条墓碑。
     pub deleted_items: Vec<PoolItem>,
-    /// 本机改过昵称 / 手机号、还没提交到云端的账号本机 id（提交成功后清空）。
-    ///
-    /// 云端账号的普通回写只认「票更新」，改资料不会让 `should_upload` 放行，
-    /// 所以编辑必须单独记一笔，提交时把这几个 key 的展示字段强制覆盖到池里。
-    pub edited_ids: Vec<String>,
     /// 刚从墓碑恢复、还没提交的账号本机 id。
     ///
     /// 抢闸带回来的仍是「已删除」快照（提交前服务端还没复活它），若不跳过剪枝，
@@ -315,54 +310,20 @@ pub fn note_deleted_account(account: &Account) {
     });
 }
 
-/// 整池提交成功后清空本机待办：云端已经按「本轮没出现」记好墓碑、也收到编辑与恢复。
+/// 整池提交成功后清空本机待办：云端已经按「本轮没出现」记好墓碑、也收到恢复。
 fn clear_pending_changes() {
     mutate(|s| {
-        if s.cfg.deleted_keys.is_empty()
-            && s.cfg.edited_ids.is_empty()
-            && s.cfg.reviving_ids.is_empty()
-        {
+        if s.cfg.deleted_keys.is_empty() && s.cfg.reviving_ids.is_empty() {
             return;
         }
         s.cfg.deleted_keys.clear();
-        s.cfg.edited_ids.clear();
         s.cfg.reviving_ids.clear();
         let _ = save_config(&s.dir, &s.cfg);
     });
 }
 
-/// 本机改过资料、还没提交的账号 id。
-fn pending_edits() -> HashSet<String> {
-    mutate(|s| s.cfg.edited_ids.iter().cloned().collect()).unwrap_or_default()
-}
-
 fn pending_revives() -> HashSet<String> {
     mutate(|s| s.cfg.reviving_ids.iter().cloned().collect()).unwrap_or_default()
-}
-
-/// 记录一次资料编辑（昵称 / 手机号）。提交成功后由 [`clear_pending_changes`] 清掉。
-pub fn note_edited_account(id: &str) {
-    // 未绑定没有云端可同步，不记（同 [`note_deleted_account`]）
-    if !bound() {
-        return;
-    }
-    let written = mutate(|s| {
-        if s.cfg.edited_ids.iter().any(|x| x == id) {
-            return Ok(());
-        }
-        s.cfg.edited_ids.push(id.to_string());
-        save_config(&s.dir, &s.cfg)
-    });
-    if let Some(Err(e)) = written {
-        let dir = data_dir().unwrap_or_default();
-        crate::logs::push(
-            &dir,
-            crate::logs::CAT_SYSTEM,
-            "凭证池",
-            false,
-            format!("账号资料的待同步标记没能落盘：{e}（这次编辑可能传不到云端）"),
-        );
-    }
 }
 
 /// 恢复时记一笔：提交前跳过这条账号的剪枝（服务端此刻还认为它是墓碑）。
@@ -712,10 +673,9 @@ fn set_uuid(uuid: Option<String>) -> Result<(), String> {
         s.cfg.cloud_ids.clear();
         s.cfg.origin_seeded = false;
         s.cfg.renewer_seen = false;
-        // 「待删除 / 待编辑 / 待恢复」和墓碑都是相对某一池的：
+        // 「待删除 / 待恢复」和墓碑都是相对某一池的：
         // 换池后旧 key 与旧账号 id 没有意义，也不该在新池上生效
         s.cfg.deleted_keys.clear();
-        s.cfg.edited_ids.clear();
         s.cfg.reviving_ids.clear();
         s.cfg.deleted_items.clear();
         save_config(&s.dir, &s.cfg)
@@ -1330,39 +1290,6 @@ fn union_pool(
         }
     }
     pool
-}
-
-/// 把本机改过的展示字段盖到提交正文里（昵称 / 手机号，不改 token）。
-///
-/// 普通回写只看「票是否更新」，改个昵称不该也不能把整条凭证算成更新 —— 那会把
-/// 别的机器刚续出来的新票盖回旧票。所以这里只动 key / name / phone。
-/// 手机号变了 key 就跟着变：服务端按「本轮没出现的 key」把旧 key 记成墓碑。
-fn apply_profile_edits(
-    pool: &mut [PoolItem],
-    accounts: &[Account],
-    edited: &HashSet<String>,
-    now: i64,
-) -> usize {
-    let mut changed = 0usize;
-    for acct in accounts.iter().filter(|a| edited.contains(&a.id)) {
-        let key = item_key_of(acct);
-        if key.trim().is_empty() {
-            continue;
-        }
-        let Some(slot) = pool
-            .iter_mut()
-            .find(|i| i.key.trim() == key || same_subject(&i.access_token, &acct.token))
-        else {
-            // 池里没有对应条目：它本来就不在池里，不凭一次编辑把它塞进去
-            continue;
-        };
-        slot.key = key;
-        slot.name = acct.name.clone();
-        slot.phone = acct.phone.clone().unwrap_or_default();
-        slot.updated_at = Some(now);
-        changed += 1;
-    }
-    changed
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
@@ -2031,7 +1958,6 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     let already_seeded = origin_seeded();
     let mut cloud: HashSet<String> = current_cloud.iter().cloned().collect();
     let pending = pending_deletions();
-    let edited = pending_edits();
     let reviving = pending_revives();
     let live_items: Vec<PoolItem> = lease
         .items
@@ -2088,8 +2014,6 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     //    提交的初值取「云端 ∪ 本机」：`PUT` 是**整池替换**，若从 `lease.items` 起步，
     //    本机独有的账号就永远进不了正文，等于每同步一次都把并集缩回云端那份。
     let mut pool = union_pool(&live_items, &accounts, &cloud, now);
-    // 编辑只改展示字段，不碰 token —— 普通回写只看票是否更新，改昵称不该算一次换票
-    let edited_written = apply_profile_edits(&mut pool, &accounts, &edited, now);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
     let mut blocked = 0usize;
@@ -2244,12 +2168,8 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     //    这一步兜住「早就换过新票、但从没被传上去」的 —— 最典型：绑池期间在本机重新登录了一次
     //    （accounts.json 里已是新票，云端还停在旧票，别的机器每轮拿到的都是过期票）。
     //    判据与云端 → 本地方向对称（[`local_is_newer`]），只有严格更新才回写。
-    let mut uploaded = edited_written;
+    let mut uploaded = 0usize;
     for acct in accounts.iter() {
-        // 资料编辑已在上面单独盖过（只动展示字段），这里不再按「票更新」重复处理
-        if edited.contains(&acct.id) {
-            continue;
-        }
         let key = item_key_of(acct);
         if key.trim().is_empty() {
             continue;
@@ -2299,7 +2219,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         tombstones_after_commit(&lease.deleted, &lease.items, &pool, now),
         &pool,
     );
-    // 提交成功 = 云端已经按「本轮没出现」记好墓碑，也收到了编辑与恢复。
+    // 提交成功 = 云端已经按「本轮没出现」记好墓碑，也收到了恢复。
     // 提交失败 / abort 的路径都在这之前 return，三份待办会留到下一轮再试。
     clear_pending_changes();
 
@@ -2808,7 +2728,6 @@ mod tests {
             renewer_seen: true,
             deleted_keys: vec![],
             deleted_items: vec![],
-            edited_ids: vec![],
             reviving_ids: vec![],
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -3142,30 +3061,7 @@ mod tests {
         );
     }
 
-    // ── 续签设备：编辑资料 / 逻辑删除 / 恢复 ────────────────────────────
-
-    /// 资料编辑只盖展示字段：token / 到期时间必须是池里那份原样。
-    /// 把编辑当成「换票」回写，会拿本机旧票盖掉别机刚续出来的新票。
-    #[test]
-    fn profile_edits_only_touch_display_fields() {
-        let tok = jwt_claims("eeeeeeee-0000", 1_700);
-        let mut acct = acct("old-name", Some("111"), &tok);
-        acct.name = "新昵称".into();
-        acct.phone = Some("13800000000".into());
-        let mut pool = vec![item("old-key", &tok, Some(5_000))];
-        let edited: HashSet<String> = [acct.id.clone()].into_iter().collect();
-
-        let changed = apply_profile_edits(&mut pool, &[acct], &edited, 9_000);
-
-        assert_eq!(changed, 1);
-        assert_eq!(pool[0].name, "新昵称");
-        assert_eq!(pool[0].phone, "13800000000");
-        assert_eq!(pool[0].key, "13800000000", "key 跟着手机号走");
-        assert_eq!(pool[0].access_token, tok, "token 不许被编辑覆盖");
-        assert_eq!(pool[0].refresh_token, format!("rt-{tok}"));
-        assert_eq!(pool[0].expires_at, Some(5_000), "到期时间同理");
-        assert_eq!(pool[0].updated_at, Some(9_000));
-    }
+    // ── 逻辑删除 / 恢复 ────────────────────────────────────────────────
 
     /// 手机号漂移后旧 key 也会留下墓碑，但它和活条目指向同一个账号 ——
     /// 列出来只会诱导用户再恢复出第二条；必须过滤掉。
