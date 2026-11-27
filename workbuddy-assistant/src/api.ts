@@ -10,6 +10,7 @@ import type {
   ImportItem,
   ImportReport,
   BrokerStatus,
+  DeletedItem,
   PoolOp,
   SyncReport,
   NetReport,
@@ -30,6 +31,21 @@ export const importAccounts = (items: ImportItem[]) =>
 
 export const removeAccount = (id: string) =>
   invoke<void>("remove_account", { id });
+
+/**
+ * 改云端账号的资料（昵称 / 手机号），**不动 token**。
+ * 只有本池的续签设备能改（后端拒绝其它机器），改完随下一轮同步上传。
+ */
+export const updateAccountProfile = (id: string, name: string, phone: string | null) =>
+  invoke<void>("update_account_profile", { id, name, phone });
+
+/** 「已删除」列表（最近一次同步带回、且当前没有活账号对应的墓碑） */
+export const brokerDeletedItems = () =>
+  invoke<DeletedItem[]>("broker_deleted_items");
+
+/** 从「已删除」恢复一条：用墓碑快照重建本机账号，下一轮同步随整池 PUT 复活 */
+export const brokerRestoreAccount = (key: string) =>
+  invoke<void>("broker_restore_account", { key });
 
 export const checkinOne = (id: string) =>
   invoke<Account>("checkin_one", { id });

@@ -186,6 +186,18 @@ export interface BrokerStatus {
   is_renewer: boolean;
   /** 取消续签的宽限截止（毫秒）；宽限内没有新设备，本机会自动写回去 */
   grace_until: number | null;
+  /** 「已删除」列表里有多少条（最近一次同步的快照；0 时不展示入口） */
+  deleted_count: number;
+}
+
+/** 「已删除」列表的一条：只有展示字段，token 留在后端墓碑里 */
+export interface DeletedItem {
+  /** 池里那条的身份 key（手机号 → 昵称 → 本地 id），恢复时用它 */
+  key: string;
+  name: string;
+  phone: string;
+  /** 删除时间（毫秒）；旧数据可能为 null */
+  deleted_at: number | null;
 }
 
 /** 上传 / 绑定的结果：uuid 是唯一要展示给用户复制的东西 */

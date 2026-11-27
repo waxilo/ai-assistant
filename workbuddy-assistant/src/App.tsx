@@ -425,7 +425,9 @@ export default function App() {
     async (a: Account) => {
       const ok = await askConfirm({
         title: "删除账号",
-        body: `确认删除「${accountLabel(a.name, a.phone)}」？`,
+        body: brokerStatus?.bound
+          ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「已删除」里恢复。`
+          : `确认删除「${accountLabel(a.name, a.phone)}」？`,
         okText: "删除",
         danger: true,
       });
@@ -438,7 +440,7 @@ export default function App() {
         showToast({ kind: "err", text: "删除失败：" + String(e) });
       }
     },
-    [askConfirm, showToast]
+    [askConfirm, brokerStatus?.bound, showToast]
   );
 
   // 批量导入：后端按「手机号或 token」识别已有账号并合并补全凭证，不会产生重复条目
@@ -795,6 +797,7 @@ export default function App() {
               onBrokerClaim={() => void runBrokerClaimRenewer()}
               onBrokerRelease={() => void runBrokerReleaseRenewer()}
               onRefreshBroker={refreshBrokerStatus}
+              reload={load}
               onCheckinOne={(id) => void runCheckinOne(id)}
               onRemove={(a) => void removeOne(a)}
               onOpenLogs={(id) => {

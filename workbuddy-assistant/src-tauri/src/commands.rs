@@ -573,11 +573,88 @@ pub fn remove_account(app: AppHandle, id: String) -> Result<(), String> {
     let Some(victim) = accounts.iter().find(|a| a.id == id).cloned() else {
         return Err("账号不存在".into());
     };
+    // 云端账号的删除是**池级动作**（会随下一轮同步变成服务端墓碑），
+    // 只允许续签设备做 —— 否则每台绑着的机器都能各删各的，池就没人管了。
+    if broker::bound()
+        && broker::origin_of(&victim) == "cloud"
+        && !broker::can_manage_pool()
+    {
+        return Err("云端账号只能由本池的续签设备删除；先在这台机器上「设为本机续签」".into());
+    }
     accounts.retain(|a| a.id != id);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
     // 绑定时记一笔「待删除」：下一次同步的并集不会把它从云端原样加回来
     // （不记的话用户看到的是「删了又回来」）。未绑定 / 落盘失败都只影响这一轮的传播。
     broker::note_deleted_account(&victim);
+    Ok(())
+}
+
+/// 改云端账号的**资料**（昵称 / 手机号）。不动 token —— 换票只走续签。
+///
+/// 只有续签设备能改：资料随整池 PUT 上传，别的机器改会和续签设备抢同一份池。
+#[tauri::command]
+pub fn update_account_profile(
+    app: AppHandle,
+    id: String,
+    name: String,
+    phone: Option<String>,
+) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("昵称不能为空".into());
+    }
+    let phone = phone
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let dir = data_dir(&app);
+    let mut accounts = accounts::load_accounts(&dir);
+    let Some(acct) = accounts.iter_mut().find(|a| a.id == id) else {
+        return Err("账号不存在".into());
+    };
+    if broker::bound() && broker::origin_of(acct) == "cloud" && !broker::can_manage_pool() {
+        return Err("云端账号只能由本池的续签设备编辑；先在这台机器上「设为本机续签」".into());
+    }
+    if acct.name == name && acct.phone == phone {
+        return Ok(());
+    }
+    acct.name = name;
+    acct.phone = phone;
+    accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
+    // 标记「下次同步只盖展示字段」：不能被当成一次换票（那会用旧票盖掉别机的新票）
+    broker::note_edited_account(&id);
+    Ok(())
+}
+
+/// 「已删除」列表：最近一次同步带回、且当前没有活账号对应的墓碑。
+#[tauri::command]
+pub fn broker_deleted_items() -> Vec<broker::DeletedItem> {
+    broker::deleted_items()
+}
+
+/// 从「已删除」里恢复一条：用墓碑快照重建本机账号，等下一轮同步随整池 PUT 复活。
+#[tauri::command]
+pub fn broker_restore_account(app: AppHandle, key: String) -> Result<(), String> {
+    if broker::bound() && !broker::can_manage_pool() {
+        return Err("恢复云端账号只能由本池的续签设备操作；先在这台机器上「设为本机续签」".into());
+    }
+    let Some(tomb) = broker::find_tombstone(&key) else {
+        return Err("这条已删除记录不在了（可能已被别的机器恢复）".into());
+    };
+    let dir = data_dir(&app);
+    let mut accounts = accounts::load_accounts(&dir);
+    if accounts.iter().any(|a| broker::item_key_of(a) == key) {
+        broker::take_tombstone(&key);
+        return Err("账号已经在列表里了，刷新一下即可".into());
+    }
+    let acct = broker::account_from_item(&tomb);
+    let new_id = acct.id.clone();
+    accounts.push(acct);
+    accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
+    // 线上它还是墓碑：先登记成云端来源 + 恢复保护，再移出「已删除」。
+    // 顺序不能反：保护没落盘就丢了墓碑，下一轮同步会把它当成「云端已删」再剪一次。
+    broker::mark_cloud_member(&new_id);
+    broker::note_reviving(&new_id);
+    broker::take_tombstone(&key);
     Ok(())
 }
 
