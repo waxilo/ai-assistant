@@ -4,27 +4,37 @@ AI 桌面助手相关项目集合（迁移自 TraeWorkAssistant 与 workbuddy-as
 
 ## 子项目
 
-| 目录 | 说明 |
-| ---- | ---- |
-| [trae-assistant](./trae-assistant) | Trae Assistant（原 TraeWorkAssistant，只接管 Trae CN） |
-| [workbuddy-assistant](./workbuddy-assistant) | WorkBuddy Assistant |
-| [qoder-assistant](./qoder-assistant) | Qoder Assistant（多账号签到、token 自动续签、应用内自动更新） |
-| [cred-broker](./cred-broker) | 账号凭证池 + 续签闸（本机 Docker 容器 + 共享 MySQL） |
+| 目录 | 说明 | 维护状态 |
+| ---- | ---- | ---- |
+| [workbuddy-assistant](./workbuddy-assistant) | WorkBuddy Assistant | 维护中 |
+| [workbuddy2api](./workbuddy2api) | WorkBuddy 2api（同一套账号体系 + OpenAI 兼容网关） | 维护中 |
+| [trae-assistant](./trae-assistant) | Trae Assistant（原 TraeWorkAssistant，只接管 Trae CN） | **已停止维护** |
+| [qoder-assistant](./qoder-assistant) | Qoder Assistant（多账号签到、token 自动续签、应用内自动更新） | **已停止维护** |
+| [cred-broker](./cred-broker) | 账号凭证池 + 续签闸（本机 Docker 容器 + 共享 MySQL） | 维护中 |
 
-前三个子项目基于 Tauri + React + Rust；cred-broker 是它们共用的服务端，跨机器共用同一批
+桌面端基于 Tauri + React + Rust；cred-broker 是它们共用的服务端，跨机器共用同一批
 账号凭证，保证同一时刻只有一台机器在续签。它原本部署在 Cloudflare Workers + D1，现已迁到
 本机容器：数据已导入、公网域名由 `gw` 转进容器应答，Cloudflare 侧的 Worker 与 D1 库都已删除
 （详见该目录 README）。
 
+### 停止维护的应用（2026-11-27）
+
+- **Trae Assistant**（最后版本 `0.1.46`）：无法自动续签，且官方排队严重，已不再使用。
+- **Qoder Assistant**（最后版本 `0.1.42`）：无法签到领积分，已不再使用。
+
+两者**不再更新、不再发版**，也不再有应用内更新；对应 README 只作存档。它们的更新通道
+（`traework-latest` / `qoder-latest`）保留原样，不会再写入新产物。
+
 ## 应用发布（GitHub Actions）
 
-trae-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **macOS（universal 双架构）** 与
+workbuddy-assistant 与 workbuddy2api 由 CI 构建 **macOS（universal 双架构）** 与
 **Windows（NSIS）** 产物，统一发布到本仓库（ai-assistant）的 GitHub Release，应用内更新
-（`@tauri-apps/plugin-updater`）从各自的固定 tag 拉取：TraeAssistant 用
-`releases/download/traework-latest/latest.json`（通道名是改名前烧进老客户端的，**保持不动**，
-否则已安装的用户再也收不到更新），WorkBuddyAssistant 用
-`releases/download/workbuddy-latest/latest.json`，QoderAssistant 用
-`releases/download/qoder-latest/latest.json`。
+（`@tauri-apps/plugin-updater`）从各自的固定 tag 拉取：WorkBuddyAssistant 用
+`releases/download/workbuddy-latest/latest.json`，WorkBuddy2api 用
+`releases/download/workbuddy2api-latest/latest.json`（2api 的构建与发版细节见它的 README）。
+
+TraeAssistant（`traework-latest`）与 QoderAssistant（`qoder-latest`）**已停止维护**，不再产出
+新版本；这两个通道只为历史客户端保留。
 
 ### 发版流程
 
@@ -33,15 +43,16 @@ trae-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **macOS�
    `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（本包条目）、
    `package.json`、`package-lock.json` 的**顶层与 `packages[""]` 两处**
    （lock 里每个依赖都有 `version`，**不能 replace_all**，要用带 `"name"` 的上下文一次覆盖相邻两处）
-2. 打 tag 推送：`trae-v0.1.46` / `workbuddy-v0.1.59` / `qoder-v0.1.42`（版本以 tag 为准；
-   Trae 助手改名后前缀由 `traework-v` 换成 `trae-v`，更新通道 `traework-latest` 不变）
+2. 打 tag 推送：`workbuddy-v0.1.60` / `workbuddy2api-v0.2.6`（版本以 tag 为准；
+   `trae-v*` / `qoder-v*` 已停用，不要再打）
 3. CI 构建两个平台 → 由 `scripts/build-latest.mjs` 用 `.sig` 生成 `latest.json`
    （v2 的 `tauri build` 不产 manifest）→ delete+recreate 各自的固定 tag Release
 
 也可在 Actions 页面手动 `workflow_dispatch`（用配置里的版本号）。
 
-各应用用**独立的固定 tag**（`traework-latest`（TraeAssistant）/ `workbuddy-latest` / `qoder-latest`）作为更新通道，
+各应用用**独立的固定 tag**（`workbuddy-latest` / `workbuddy2api-latest`）作为更新通道，
 版本号各自演进、互不干扰——同一个仓库内不会像共用 `releases/latest` 那样串版本。
+已停用的 `traework-latest` / `qoder-latest` 保持原样、不再更新。
 
 ### 版本号规则（重要）
 
@@ -49,16 +60,18 @@ trae-assistant、workbuddy-assistant 与 qoder-assistant 由 CI 构建 **macOS�
 
 | 应用 | 当前版本 | 版本线起点 |
 |---|---|---|
-| TraeAssistant | `0.1.46` | 0.1.x（自身历史，原名 TraeWorkAssistant） |
-| WorkBuddyAssistant | `0.1.59` | 0.1.x（自身历史） |
-| QoderAssistant | `0.1.42` | **从 `0.1.0` 起算** |
+| WorkBuddyAssistant | `0.1.60` | 0.1.x（自身历史） |
+| WorkBuddy2api | `0.2.6` | 0.2.x（自身历史） |
+| TraeAssistant | `0.1.46`（最终版，停止维护） | 0.1.x（原名 TraeWorkAssistant） |
+| QoderAssistant | `0.1.42`（最终版，停止维护） | 从 `0.1.0` 起算 |
 
 > 上面两处（发版流程里的 tag 示例、本表的「当前版本」）**每次发版后都要同步**，
 > 否则下一版对照时会拿旧值推算。
 
 QoderAssistant 曾以 `0.1.36` 首次发布 —— 那是照搬 WorkBuddy 当时 `0.1.35` 的结果，
 不是它自己的版本历史，于是「一个全新应用的首个版本号带着另一个应用的历史」，三个应用
-挤在同一条 `0.1.3x` 序列上互相看不出谁是谁。**已重置为 `0.1.0`。新应用一律从 `0.1.0` 起算自己的线。**
+挤在同一条 `0.1.3x` 序列上互相看不出谁是谁。当时已重置为 `0.1.0`。
+**新应用一律从 `0.1.0` 起算自己的线。**
 
 > 重置版本号会让已装的旧版本（数字更高）**无法通过应用内更新降级**，需要手动装一次新包；
 > 之后就在自己的 `0.1.x` 线上正常更新了。
