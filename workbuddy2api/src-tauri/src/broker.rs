@@ -1582,9 +1582,15 @@ fn write_back_allowed(account: &Account) -> bool {
 
 /// 本地 → 云端：本机这份该不该盖掉池里那条？
 ///
-/// 与 [`adopt`] 同一套优先级，方向相反：本机**可用**的本地账号永远压过云端那份
-/// （本地登录就是权威副本）；云端账号照旧比新旧；导入账号**永不回写**。
-/// 本机不可用时绝不回写 —— 死票一旦进池，会把所有绑池机器一起污染。
+/// 与 [`adopt`] 同一套优先级，方向相反：导入账号**永不回写**；本机不可用时绝不回写 ——
+/// 死票一旦进池，会把所有绑池机器一起污染。
+///
+/// 本地登录不再「可用就无条件压过」：池里那份**可用且严格更新**（iat 更新）时本机不回写，
+/// 等下一轮本机续签把 iat 追过去再写。否则两台机器把同一账号都做成本地登录时，旧票会把
+/// 别的机器刚登录/续签传上来的新票作废，两边来回互盖永不收敛，续签设备恰好在旧票窗口
+/// 动手还会把活链续死。权威性靠「更新」而不是靠「身份」：本机续签一次 iat 就超过池里那份；
+/// 输了的本机副本由 [`adopt`] 的不可用换血救回。池里那份不可用（链过期等）仍然直接盖
+/// —— 那是救场方向，不设新旧闸。
 fn should_upload(account: &Account, item: &PoolItem, class: RenewClass, now: i64) -> bool {
     if class == RenewClass::Imported {
         return false;
@@ -1595,11 +1601,7 @@ fn should_upload(account: &Account, item: &PoolItem, class: RenewClass, now: i64
     if !item_usable(item, now) {
         return true;
     }
-    match class {
-        RenewClass::Local => true,
-        RenewClass::Cloud => local_is_newer(account, item),
-        RenewClass::Imported => false,
-    }
+    local_is_newer(account, item)
 }
 
 /// 提交给管家的整池内容 = **云端那份 ∪ 本机账号**。
@@ -1632,8 +1634,8 @@ fn union_pool(
             .iter()
             .position(|i| i.key.trim() == key || same_subject(&i.access_token, &acct.token));
         match hit {
-            // 同一个账号池里已经有一条：按来源优先级决定谁留下（见 [`should_upload`]）。
-            // 本地登录是权威副本，可用时无条件替换；云端账号只在「更新」时才覆盖。
+            // 同一个账号池里已经有一条：按来源优先级与新旧决定谁留下（见 [`should_upload`]）。
+            // 本地登录也只在「本机严格更新」时替换 —— 别拿旧票盖掉别的机器刚传的新票。
             Some(idx) => {
                 let class = renew_class(acct, cloud_ids);
                 if should_upload(acct, &pool[idx], class, now) {
@@ -2597,15 +2599,15 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     // ④ 本地 → 云端方向：把**本机比池里更新**的票回写进池。上面只回写「本轮续出来的」，
     //    这一步兜住「早就换过新票、但从没被传上去」的 —— 最典型：绑池期间在本机重新登录了一次
     //    （accounts.json 里已是新票，云端还停在旧票，别的机器每轮拿到的都是过期票）。
-    //    判据与云端 → 本地方向同源（[`should_upload`]）：本地优先、云端比新旧、导入永不回写。
+    //    判据与云端 → 本地方向同源（[`should_upload`]）：本地/云端都只认严格更新、导入永不回写。
     let mut uploaded = 0usize;
     for acct in accounts.iter() {
         let key = item_key_of(acct);
         if key.trim().is_empty() {
             continue;
         }
-        // 判据与云端 → 本地方向同源（[`should_upload`]）：本地账号可用就压过池里那份，
-        // 云端账号只在更新时回写，导入账号永不回写；死票在任何情况下都不许进池。
+        // 判据与云端 → 本地方向同源（[`should_upload`]）：本地/云端账号都只在严格更新时
+        // 回写（旧票不倒灌池里的新票），导入账号永不回写；死票在任何情况下都不许进池。
         let hit = pool.iter().find(|i| i.key.trim() == key);
         let write = hit.is_some_and(|item| {
             should_upload(acct, item, renew_class(acct, &cloud), now)
@@ -3502,20 +3504,42 @@ mod tests {
 
     // ── 本地 → 云端方向（[`local_is_newer`]，`cloud_is_newer` 的反方向）──
     //
-    // 与 [`adopt`] 同一套优先级：可用的本地登录账号永远压过池里那份；云端账号只在
-    // 严格更新时才回写；导入账号永不回写；死票（判死 / 链过期）任何情况下都不进池。
+    // 与 [`adopt`] 同一套优先级：本地登录也要**严格更新**才回写（别的机器刚传上来的
+    // 新票不倒灌）；云端账号同一条判据；导入账号永不回写；死票（判死 / 链过期）任何
+    // 情况下都不进池。
 
+    /// 本机重新登录/续签后 iat 追过池里那份：照常回写 —— 权威性靠「更新」，不靠「身份」。
     #[test]
-    fn a_usable_local_account_always_supersedes_the_pool_copy() {
-        let mut a = acct("n", Some("138"), "local");
-        a.expires_at = Some(1_000);
-        // 池里那份「更晚到期」也不行：本地登录是权威副本
+    fn a_usable_local_account_supersedes_the_pool_copy_once_it_is_newer() {
+        let a = acct("n", Some("138"), &jwt_claims("sub-138", 2_000));
         assert!(should_upload(
             &a,
-            &item("138", "pool", Some(9_000)),
+            &item("138", &jwt_claims("sub-138", 1_000), None),
             RenewClass::Local,
             0
         ));
+    }
+
+    /// 池里那份可用且严格更新（另一台机器刚登录/续签传上来的）：本机旧票不回写，
+    /// 等下一轮本机续签追过去 —— 否则两台机器来回互盖，同步永不收敛。
+    #[test]
+    fn a_stale_local_account_never_overwrites_a_newer_pool_token() {
+        let a = acct("n", Some("138"), &jwt_claims("sub-138", 1_000));
+        assert!(!should_upload(
+            &a,
+            &item("138", &jwt_claims("sub-138", 2_000), None),
+            RenewClass::Local,
+            0
+        ));
+    }
+
+    /// 池里那份已经不可用（续签链过期）：本机可用就压回去 —— 救场方向不设新旧闸。
+    #[test]
+    fn a_local_token_still_beats_a_dead_pool_row() {
+        let a = acct("n", Some("138"), &jwt_claims("sub-138", 1_000));
+        let mut it = item("138", &jwt_claims("sub-138", 2_000), None);
+        it.rt_expires_at = Some(0);
+        assert!(should_upload(&a, &it, RenewClass::Local, 0));
     }
 
     #[test]
