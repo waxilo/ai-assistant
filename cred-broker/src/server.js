@@ -16,6 +16,7 @@
 import { createServer } from 'node:http';
 import worker from './index.js';
 import { createDatabase, databaseConfigFromEnv } from './db.js';
+import { ensureSchema } from './schema.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -99,27 +100,17 @@ const { DB, close: closeDb } = createDatabase(databaseConfigFromEnv(env));
 env.DB = DB;
 
 /**
- * 老库升级：`pools.renewer` 是后加的列，而 db-init.sh 只跑
- * `CREATE TABLE IF NOT EXISTS`（已存在的表不会补列）。启动时补一次，幂等。
+ * 老库升级：建表（幂等）、补 `pools.renewer` 列、把 `pools.payload` 里的整池 JSON
+ * 摊进 `pool_items` 行表（2026-11-27 拆表），全部成功后才 DROP payload。
  *
- * 必须在 listen 之前完成：否则第一波请求就会撞上 `Unknown column 'renewer'`，
+ * 必须在 listen 之前完成：否则第一波请求就会撞上 `Unknown column` / `Table doesn't exist`，
  * 客户端把它当 5xx 记成「管家不可达」，看起来像网络问题。
- * DB 账号在建库脚本里已拿到 alter 权限。
+ * DB 账号在建库脚本里已拿到 create/alter 权限。
  */
-async function ensureSchema() {
-  const row = await DB.prepare(
-    "SELECT COUNT(*) AS n FROM information_schema.columns " +
-      "WHERE table_schema = DATABASE() AND table_name = 'pools' AND column_name = 'renewer'"
-  ).first();
-  if (Number(row?.n ?? 0) > 0) return;
-  await DB.prepare(
-    "ALTER TABLE pools ADD COLUMN renewer VARCHAR(255) NULL AFTER payload"
-  ).run();
-  console.log("schema_migrated", JSON.stringify({ table: "pools", column: "renewer" }));
-}
-
 try {
-  await ensureSchema();
+  await ensureSchema(DB, (kind, detail) =>
+    console.log(kind, JSON.stringify(detail))
+  );
 } catch (err) {
   console.error(
     "startup_migration_failed",

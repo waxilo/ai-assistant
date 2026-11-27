@@ -124,6 +124,13 @@ pub struct BrokerConfig {
     /// 认领过（或池上已有别人）就把这一位落下；之后的换设备必须照旧
     /// 「旧设备取消 → 新设备手动认领」。
     pub renewer_seen: bool,
+    /// 本机删掉、还**没让云端知道**的账号 key（同步成功后清空）。
+    ///
+    /// 删除必须由客户端告诉云端，否则下一次同步的「并集」会把它从池里原样加回来 ——
+    /// 用户看到的就是「删了又回来」。所以 `remove_account` 在这里记一笔，同步时：
+    /// 合并跳过它、提交时不带它（服务端把没出现的条目记成逻辑删除），提交成功后清空。
+    /// 绑定别的池时整组作废（key 是跟池走的东西）。
+    pub deleted_keys: Vec<String>,
 }
 
 /// 只存在于内存的运行时状态（进程重启就重来，不影响正确性）
@@ -256,6 +263,48 @@ pub fn bound() -> bool {
 /// 当前绑定的池 uuid
 pub fn uuid() -> Option<String> {
     snapshot().0
+}
+
+/// 本机删掉、还没同步给云端的账号 key（见 [`BrokerConfig::deleted_keys`]）。
+fn pending_deletions() -> HashSet<String> {
+    mutate(|s| s.cfg.deleted_keys.iter().cloned().collect()).unwrap_or_default()
+}
+
+/// 删除账号**之前**调一次：绑定期间把它的 key 记进「待删除」。
+///
+/// 不记这一笔的话，下一次同步的合并会把这条账号从池里原样加回来（用户看到「删了又回来」）。
+/// 未绑定时不记：key 是跟池走的东西，单机运行没有云端可通知。
+pub fn note_deleted_account(account: &Account) {
+    let key = item_key_of(account);
+    if key.trim().is_empty() {
+        return;
+    }
+    mutate(|s| {
+        if s.cfg.pool_uuid.is_none() || s.cfg.deleted_keys.iter().any(|k| k == &key) {
+            return;
+        }
+        s.cfg.deleted_keys.push(key.clone());
+        if let Err(e) = save_config(&s.dir, &s.cfg) {
+            crate::logs::push(
+                &s.dir,
+                crate::logs::CAT_SYSTEM,
+                "凭证池",
+                false,
+                format!("待删除账号的标记没能落盘：{e}（下次同步可能把这条账号又带回来）"),
+            );
+        }
+    });
+}
+
+/// 整池提交成功后清空「待删除」：云端已经按「本轮没出现」把它们记成墓碑了。
+fn clear_pending_deletions() {
+    mutate(|s| {
+        if s.cfg.deleted_keys.is_empty() {
+            return;
+        }
+        s.cfg.deleted_keys.clear();
+        let _ = save_config(&s.dir, &s.cfg);
+    });
 }
 
 /// 本机唯一标识（见 [`BrokerConfig::machine_id`]）。
@@ -414,6 +463,8 @@ fn set_uuid(uuid: Option<String>) -> Result<(), String> {
         s.cfg.cloud_ids.clear();
         s.cfg.origin_seeded = false;
         s.cfg.renewer_seen = false;
+        // 「待删除」是相对某一池的：换池后旧 key 没有意义，也不该在新池上误删
+        s.cfg.deleted_keys.clear();
         save_config(&s.dir, &s.cfg)
     });
     match written {
@@ -562,6 +613,8 @@ pub struct PoolItem {
     pub expires_at: Option<i64>,
     pub rt_expires_at: Option<i64>,
     pub updated_at: Option<i64>,
+    /// 逻辑删除时间（服务端墓碑）。`items` 里不会出现；只在响应顶层的 `deleted` 里出现。
+    pub deleted_at: Option<i64>,
 }
 
 /// 跨机认人的锚点：**手机号 → 昵称 → 本地 id**。
@@ -589,6 +642,7 @@ pub fn to_item(account: &Account) -> PoolItem {
         expires_at: acct_expiry(account),
         rt_expires_at: account.rt_expires_at,
         updated_at: Some(chrono::Utc::now().timestamp_millis()),
+        deleted_at: None,
     }
 }
 
@@ -857,6 +911,37 @@ fn prune_cloud_gone(
     removed
 }
 
+/// 云端墓碑 → 本机跟着删。返回被删账号的名字（给日志用）。
+///
+/// 服务端的逻辑删除会在响应顶层的 `deleted` 里带上墓碑；**不能靠「live 快照里没有」来剪**
+/// 唯一一个池被删到一条不剩的情形 —— 那时 live 是空集，而 `prune_cloud_gone` 出于
+/// 「空快照不剪」的安全阀（防坏 JSON 被读成空池）什么都不会删，于是本机那些账号
+/// 会被下一轮并集又传回云端，删除等于没发生。墓碑是**明确的删除证据**，所以照剪。
+///
+/// 判据与合并一致（key / JWT sub / RT），且**只动来源标记是「云端」的账号**；
+/// 公用 token（手动导入、从不上云）不连坐。
+fn prune_cloud_deleted(
+    accounts: &mut Vec<Account>,
+    cloud_ids: &HashSet<String>,
+    deleted: &[PoolItem],
+) -> Vec<String> {
+    if deleted.is_empty() {
+        return Vec::new();
+    }
+    let mut removed = Vec::new();
+    accounts.retain(|a| {
+        if a.shared_token || !cloud_ids.contains(&a.id) {
+            return true;
+        }
+        let gone = deleted.iter().any(|i| corresponds(a, i));
+        if gone {
+            removed.push(a.name.clone());
+        }
+        !gone
+    });
+    removed
+}
+
 /// 把「这一轮池快照里确实有的本机账号」登记为云端来源（按本机 id）。
 ///
 /// 这是老版本账号的**迁移入口**：升级前没有来源标记，第一次同步时池里有什么就登记什么，
@@ -904,6 +989,11 @@ fn merge_into(
     let mut changed = 0;
     for item in items {
         if item.key.trim().is_empty() {
+            continue;
+        }
+        // 墓碑不是账号。正常路径上服务端把它们放在 `deleted` 里、不会进 `items`，
+        // 这里再挡一次：哪怕调用方传错了列表，也不能让一条已删账号被「收养」回来。
+        if item.deleted_at.is_some() {
             continue;
         }
         // 失效条目连「建新账号」都不做：否则本机凭空多出一条签不动的账号，
@@ -972,7 +1062,12 @@ fn union_pool(
     cloud_ids: &HashSet<String>,
     now: i64,
 ) -> Vec<PoolItem> {
-    let mut pool: Vec<PoolItem> = cloud.to_vec();
+    // 墓碑一律不带回云端：`PUT` 是整池替换，把墓碑原样传回去等于复活它。
+    let mut pool: Vec<PoolItem> = cloud
+        .iter()
+        .filter(|i| i.deleted_at.is_none())
+        .cloned()
+        .collect();
     for acct in local {
         // 公用 token 不上云：它没有续签链，进池只会让别的机器拉到一张续不动的票
         if acct.shared_token {
@@ -1120,6 +1215,9 @@ struct LeaseResp {
     granted: bool,
     #[serde(default)]
     items: Vec<PoolItem>,
+    /// 云端已逻辑删除的账号（墓碑）。老服务端没有这个字段 → 空。
+    #[serde(default)]
+    deleted: Vec<PoolItem>,
     #[serde(default)]
     version: i64,
     #[serde(default)]
@@ -1665,11 +1763,23 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     //
     //    顺序是有意的：**先按旧标记删「云端已删」，再合并**。合并只会新增/更新池里还在的
     //    账号，被删的那条不会因为合并又回来。
+    //
+    //    「本机删掉、还没让云端知道」的账号（`pending`）不参与合并，也不进提交正文：
+    //    提交是整池替换，本轮没出现的 key 就是服务端要记的墓碑。少了这一步，
+    //    下一轮合并会把它从池里加回来 —— 用户看到「删了又回来」。
     let mut accounts = accounts::load_accounts(dir);
     let current_cloud = cloud_ids();
     let already_seeded = origin_seeded();
     let mut cloud: HashSet<String> = current_cloud.iter().cloned().collect();
-    let pruned_names = prune_cloud_gone(&mut accounts, &cloud, &lease.items);
+    let pending = pending_deletions();
+    let live_items: Vec<PoolItem> = lease
+        .items
+        .iter()
+        .filter(|i| !pending.contains(i.key.trim()))
+        .cloned()
+        .collect();
+    let mut pruned_names = prune_cloud_deleted(&mut accounts, &cloud, &lease.deleted);
+    pruned_names.extend(prune_cloud_gone(&mut accounts, &cloud, &live_items));
     // 合并前先记下已有的 id：合并后多出来的才是「从池里收养的」，要登记成云端。
     // **不能把「池里出现的所有账号」都登记** —— 本机登录后上传的账号也在池里，
     // 那样它们会丢掉「本地登录」身份，绑池后就不再无条件续签了。
@@ -1681,7 +1791,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         .filter(|a| a.shared_token)
         .map(|a| a.id.clone())
         .collect();
-    let merged = merge_into(&mut accounts, &lease.items, &cloud, now);
+    let merged = merge_into(&mut accounts, &live_items, &cloud, now);
     for a in accounts.iter() {
         if shared_before.contains(&a.id) && !a.shared_token {
             cloud.insert(a.id.clone());
@@ -1691,7 +1801,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         note_adopted(&accounts, &before_merge, &mut cloud);
     } else {
         // 升级 / 首次绑定：池里已有的全部登记一遍（兼容老池），之后只认新收养的。
-        note_cloud_members(&accounts, &lease.items, &mut cloud);
+        note_cloud_members(&accounts, &live_items, &mut cloud);
     }
     // 本机已经删掉的账号不留在标记里（手动删除 / 剪枝都会留下悬空 id）。
     cloud.retain(|id| accounts.iter().any(|a| &a.id == id));
@@ -1722,7 +1832,7 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
     //
     //    提交的初值取「云端 ∪ 本机」：`PUT` 是**整池替换**，若从 `lease.items` 起步，
     //    本机独有的账号就永远进不了正文，等于每同步一次都把并集缩回云端那份。
-    let mut pool = union_pool(&lease.items, &accounts, &cloud, now);
+    let mut pool = union_pool(&live_items, &accounts, &cloud, now);
     let mut refreshed = 0usize;
     let mut failed = 0usize;
     let mut blocked = 0usize;
@@ -1926,6 +2036,9 @@ pub async fn sync(dir: &Path, force: bool) -> Result<SyncReport, String> {
         }
     };
     note_ok(next_version);
+    // 提交成功 = 云端已经按「本轮没出现的 key」记好墓碑，待删除清单可以清了。
+    // 提交失败 / abort 的路径都在这之前 return，清单会留到下一轮再试。
+    clear_pending_deletions();
 
     let upload_note = if uploaded > 0 {
         format!("，回写 {uploaded} 个更新的本地票")
@@ -1983,6 +2096,7 @@ mod tests {
             expires_at: expires,
             rt_expires_at: expires.map(|e| e + 1),
             updated_at: Some(1),
+            deleted_at: None,
         }
     }
 
@@ -2467,6 +2581,7 @@ mod tests {
             cloud_ids: vec!["id-1".into()],
             origin_seeded: true,
             renewer_seen: true,
+            deleted_keys: vec![],
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("pool_uuid"));
@@ -2474,6 +2589,7 @@ mod tests {
         assert!(json.contains("cloud_ids"));
         assert!(json.contains("origin_seeded"));
         assert!(json.contains("renewer_seen"));
+        assert!(json.contains("deleted_keys"));
         assert!(!json.contains("version"), "版本号是运行时状态，不该落盘");
 
         // 旧版本残留的未知字段要能读进来而不是整份报废；
@@ -2788,6 +2904,50 @@ mod tests {
         let cloud: HashSet<String> = ["id-a".to_string()].into_iter().collect();
         assert!(prune_cloud_gone(&mut accounts, &cloud, &[]).is_empty());
         assert_eq!(accounts.len(), 1);
+    }
+
+    /// 墓碑是**明确的删除证据**：整池 live 已经一条不剩时也要照剪
+    /// （`prune_cloud_gone` 的空快照安全阀在这里不适用）；公用 token 不连坐。
+    #[test]
+    fn tombstones_prune_even_when_no_live_items_remain() {
+        let gone = acct("gone", Some("333"), "t-gone");
+        let local = acct("local", Some("111"), "t-local");
+        let mut shared = acct("shared", Some("444"), "t-shared");
+        shared.shared_token = true;
+        let mut accounts = vec![gone, local, shared];
+        let cloud: HashSet<String> = ["id-gone".to_string(), "id-shared".to_string()]
+            .into_iter()
+            .collect();
+        let mut tomb = item("333", "t-gone", None);
+        tomb.deleted_at = Some(1);
+        let mut shared_tomb = item("444", "t-shared", None);
+        shared_tomb.deleted_at = Some(1);
+
+        let removed = prune_cloud_deleted(&mut accounts, &cloud, &[tomb, shared_tomb]);
+
+        assert_eq!(removed, vec!["gone"]);
+        assert_eq!(
+            accounts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["id-local", "id-shared"],
+            "本地来源与公用 token 都不许动"
+        );
+    }
+
+    /// 墓碑就算被错传进合并 / 并集，也不能变成账号、更不能被回传云端。
+    #[test]
+    fn tombstones_never_become_accounts_or_get_reuploaded() {
+        let mut tomb = item("333", "t-gone", None);
+        tomb.deleted_at = Some(66);
+        let mut accounts = vec![];
+        assert_eq!(
+            merge_into(&mut accounts, &[tomb.clone()], &HashSet::new(), 0),
+            0
+        );
+        assert!(accounts.is_empty(), "墓碑不是账号");
+        assert!(
+            union_pool(&[tomb], &[], &HashSet::new(), 0).is_empty(),
+            "墓碑不能出现在提交正文里（整池替换等于复活它）"
+        );
     }
 
     /// 迁移：第一次同步只把「池里确实有」的登记为云端来源（只加不减）。

@@ -33,7 +33,9 @@ cred-broker 提供两样东西：
 
 | 能力 | 说明 |
 |---|---|
-| 凭证池存取 | 一整池账号凭证按 `uuid` 存 / 取，服务端只做规范化与透传，不解释业务含义 |
+| 凭证池存取 | 按 `uuid` 存 / 取，服务端只做规范化与透传，不解释业务含义 |
+| 逐账号存储 | 每条账号是 `pool_items` 里的一行，绑池 uuid；池配置（`renewer` / 闸 / 版本）留在 `pools` 表。整池 JSON 不再落一列 |
+| 逻辑删除 | 提交时本轮没出现的 key 记墓碑（`deleted_at`），随 `GET` / `lease` 的 `deleted` 发给客户端，避免「云端删了、别的机器又传回来」 |
 | 互斥续签闸 | 同一时刻只有拿到闸的机器能提交；租约到期自动释放，**无需任何后台任务** |
 | 一池一个续签设备 | 池上只存一个组合 id（客户端类型 + 机器唯一标识）；只有它续签云端账号，其余机器只同步。换设备必须旧设备先清空、新设备再认领 |
 | 取件即最新 | 抢闸成功时**顺带返回那一刻的整池内容**，客户端不必再 GET，杜绝「读了旧副本去签」 |
@@ -89,11 +91,18 @@ cred-broker 提供两样东西：
 服务端不提供强制覆盖 —— 旧设备没退位就让新设备接管，等于给自己留了一条两台同时续签的路。
 旧设备清空后有 10 秒宽限：没有新设备认领就自动把自己写回去，避免整池停在「无人续签」。
 
-**删除要能被别的机器看见**：池本身没有墓碑，`PUT` 是整池替换。客户端若只做并集，任何一台
-还持有被删账号的机器都会把它原样加回来。workbuddy 系客户端于是在本机记一份「跟着池走」的
-账号 id（客户端 `broker.json` 的 `cloud_ids`），抢到闸后**先删掉池快照里已经没有的那些**，
-再合并与回写。两个安全阀：第一次升级上来的机器只登记、不删（池里恰好没有的本机账号不能被
-误伤）；空快照一律不剪（服务端坏 JSON 会被静默读成空池，不能据此删光本机账号）。
+**删除要能被别的机器看见**：池里的账号是**逻辑删除**（`pool_items.deleted_at`）。一次 `PUT`
+是整池替换，本轮没出现的 key 就被记成墓碑；墓碑留在库里，随 `GET` / `lease` 的 `deleted`
+数组一起发出去。客户端：
+
+- 删账号时在本机 `broker.json` 的 `deleted_keys` 记一笔（同步成功后清空）—— 否则下一轮
+  同步的并集会把这条账号从池里原样加回来，用户看到「删了又回来」；
+- 同步时跳过这些 key、提交时不带它们（服务端据此记墓碑），同时按 `cloud_ids` 把
+  `deleted` 里对应的云端账号从本机移除；
+- 重新登录同一个账号后再上传，同一个 key 会**复活**墓碑（`deleted_at = NULL`）。
+
+`cloud_ids` 仍是「哪些账号跟着池走」的本机标记；第一次升级上来的机器只登记、不删，
+空快照（live 与墓碑都为空）一律不剪 —— 服务端坏 JSON 会被静默读成空池，不能据此删光本机账号。
 
 **同账号冲突按来源定优先级**（客户端规则，服务端不参与）：本地登录 > 云端同步 > 手动导入。
 高优先级那一份**可用**时，低优先级的不许覆盖它 —— 池里那张就算 `iat` / `exp` 更晚也一样；
@@ -151,8 +160,8 @@ cred-broker 提供两样东西：
 ### GET /v1/pool/:uuid
 
 ```json
-// 200
-{ "items": [ ...整池最新条目... ], "version": 0, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
+// 200：items 只有活条目；deleted 是云端已逻辑删除的账号（墓碑）
+{ "items": [ ...整池活条目... ], "deleted": [ ...墓碑... ], "version": 0, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
 
 // 404（池不存在，客户端据此判定「池在别处被解绑」）
 { "error": "gone", "now": 1760000000000 }
@@ -161,8 +170,8 @@ cred-broker 提供两样东西：
 ### POST /v1/pool/:uuid/lease
 
 ```json
-// 200 抢到：items 是那一刻的整池内容，客户端必须用它去签
-{ "granted": true, "items": [ ... ], "version": 0, "lease_until": 1760000180000, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
+// 200 抢到：items 是那一刻的整池活条目，客户端必须用它去签；deleted 同样带上
+{ "granted": true, "items": [ ... ], "deleted": [ ... ], "version": 0, "lease_until": 1760000180000, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
 
 // 200 没抢到：告知持闸人 / 冷却期 / 何时能再试
 { "granted": false, "retry_after": 1760000000000, "lease_owner": "mac-mini", "lease_until": 1760000180000, "renewer": "workbuddy-assistant:<机器标识>", "now": 1760000000000 }
@@ -217,6 +226,10 @@ cred-broker 提供两样东西：
 `version` **必须是数字**：字符串版本号等于默许两边对「版本」的理解不一致，会一直提交不上
 却看不出原因。
 
+`items` 是**整池替换**：本轮没出现的 key 会被记成墓碑（`deleted_at = now`），但行不删 ——
+墓碑要随 `GET` / `lease` 的 `deleted` 发出去，别的机器才能把本地那份云端账号移除。
+本轮出现的条目即使原来有墓碑，也会被 upsert 复活（`deleted_at = NULL`）。
+
 ### POST /v1/pool/:uuid/abort
 
 ```json
@@ -234,6 +247,9 @@ cred-broker 提供两样东西：
 { "ok": true, "now": 1760000000000 }
 ```
 
+删池是**硬删**（连 `pool_items` 整片清掉，不留墓碑）：它的语义是「解绑」，留墓碑只会让
+客户端误以为账号是被逐个删掉的。墓碑只用于池内的单条删除。
+
 ### 错误码汇总
 
 | 状态 | `error` | 含义 |
@@ -242,6 +258,7 @@ cred-broker 提供两样东西：
 | 400 | `bad_uuid` | 路径不是合法 uuid 形态（不去查库） |
 | 400 | `bad_version` | 提交时 `version` 不是非负整数 |
 | 400 | `bad_renewer` | 续签设备标识为空 / 非字符串 / 超过 255 字符 |
+| 400 | `bad_item_key` | 条目的 `key` 超过 512 字符（`pool_items.item_key` 的列宽，提前拒绝，不留到 INSERT 变 500） |
 | 404 | `gone` | 池不存在或已被删除 |
 | 404 | `not_found` | 路径不存在 / 前缀不是 `v1` |
 | 405 | `method_not_allowed` | 方法不对（如对 health 发 PUT） |
@@ -262,8 +279,13 @@ cred-broker 提供两样东西：
 ## 原子性
 
 准入判据**只有** `UPDATE … WHERE lease_until <= ? AND retry_after <= ?` 的 `changes === 1`；
-提交是 `version = version + 1 WHERE version = ? AND lease_owner = ?`。
+提交的准入是 `version = version + 1 WHERE version = ? AND lease_owner = ?`（同样是单条语句）。
 **不要写成「先 SELECT 判断、再 UPDATE」** —— 那中间就是双死窗口。
+
+抢到闸**之后**的那组写才是多条语句（CAS 改 pools → 整片标墓碑 → upsert 本轮条目），
+它们包在 `DB.transaction()` 里一起生一起死。否则 CAS 成功、条目写到一半失败，池会停在
+「版本号已进、内容还是旧的」这种谁也提交不上的状态。事务**只包这组写，抢闸本身仍是单条
+条件 UPDATE、不进事务** —— 准入判据没有因此变成「先查再写」。
 
 存储要的不是 D1，而是**「一条语句就能做完条件更新」**的引擎：抢闸与提交都必须是
 服务端原子的 read-free CAS。当年排除掉的 KV（全球最终一致、同 key 每秒只能写 1 次，
@@ -284,7 +306,11 @@ MySQL 的 `UPDATE` 默认上报「真正改变了值的行数」，而 SQLite/D1
 
 ## 条目结构
 
-服务端只做规范化与透传，不解释业务含义：
+服务端只做规范化与透传，不解释业务含义。每个条目在库里是 `pool_items` 的一行：
+`(pool_uuid, item_key)` 是主键，`region` 单独落列，`name` / `phone` / `email` 用 `TEXT`
+（保持原来「不设上限」的语义），两个 token 用 `LONGTEXT`，时间戳是 `BIGINT NULL`。
+拆行的目的不是查询性能，而是**删除只影响一条记录**：整段 JSON 改写式的删除无法区分
+「被删了」与「还没同步」，客户端一提交就把它原样带回来。
 
 ```json
 {
@@ -307,8 +333,8 @@ MySQL 的 `UPDATE` 默认上报「真正改变了值的行数」，而 SQLite/D1
   ⚠️ 这一条曾经被整条丢掉（返回值里根本没有这个键），后果不是「少个字段」而是**多出账号**：
   客户端拿回任何条目都落成国际版，于是同一条国内版凭证在池里被当成新账号收养一次，
   界面上就凭空多出一个「国际版」的重复账号，且因为区域不同，之后再怎么导入都不会与真身合并。
-  老 payload 里的区域只存在于 key 前缀中，所以**读出口也走一遍规范化**（`parseItems`），
-  老条目在读到的那一刻就自愈，不需要迁移脚本。
+  老 payload 里的区域只存在于 key 前缀中，所以**启动迁移也走同一套规范化**
+  （`schema.js` 的 `migrateLegacyPayload` 摊平进 `pool_items`），老条目在迁移的那一刻自愈。
 - `key` 是**跨机身份锚点**（客户端按 `显式 key → 手机号 → 昵称 → 本地 id` 生成，带区域前缀）；
   客户端的合并是并集，全靠它认人，本地独有的账号一条都不会被删。同 key 重复时后到的覆盖先到的。
   ⚠️ 它**会漂移**（手机号是后来才补上的、昵称会被改），所以客户端认人是「key 相等 **或**
@@ -330,11 +356,12 @@ MySQL 的 `UPDATE` 默认上报「真正改变了值的行数」，而 SQLite/D1
 
 ```
 cred-broker/
-├── src/cred.js          全部业务：路由 + 规范化 + 闸/CAS 的 SQL（引擎无关，迁移后一行没改）
+├── src/cred.js          全部业务：路由 + 规范化 + 池条目 / 闸 / CAS 的 SQL
 ├── src/index.js         请求边界：把异常收成 500（保留 fetch(request, env) 签名）
 ├── src/server.js        容器入口：node:http → fetch；/healthz 真查库
-├── src/db.js            MySQL → 与 D1 同形的 env.DB（prepare/bind/run/first/all + meta.changes）
-├── db/schema.mysql.sql  表结构（唯一真源）
+├── src/db.js            MySQL → 与 D1 同形的 env.DB（prepare/bind/run/first/all + meta.changes + transaction）
+├── src/schema.js        启动时建表、补列、把老 payload 摊平进 pool_items（幂等）
+├── db/schema.mysql.sql  表结构（唯一真源，镜像里也会带上）
 └── scripts/             db-init / deploy / gw-join
 ```
 
@@ -345,6 +372,10 @@ npm install                          # 只装 mysql2（测试与迁移脚本在�
 ./scripts/deploy.sh                  # npm test 闸门 → 构建 → 起容器 → 探活
 curl -s http://127.0.0.1:7003/v1/health
 ```
+
+容器启动时会先跑一次幂等 schema 迁移（建表 → 补 `renewer` 列 → 老 `payload` 摊平进
+`pool_items` → 全部成功才 `DROP COLUMN payload`）。迁移失败直接退出，不会带着半迁移的表
+对外服务。日志里看 `schema_migrated`。
 
 应用只听 `127.0.0.1:7003`（容器内监听 `80`；宿主 `7001`–`7004` 是各应用各自的回环调试端口），公网域名由
 `../../gw` 注入容器名 `cred-broker:80`，本项目自己不开公网端口、不碰证书。
@@ -378,7 +409,7 @@ docker exec -i mysql-server mysql -u"$DB_USER" -p"$DB_PASSWORD" cred_broker -e \
 ### 测试
 
 ```bash
-npm test        # 对 cred_broker_test 库跑，54 项
+npm test        # 对 cred_broker_test 库跑，60 项
 ```
 
 跑在**真实 MySQL** 上，不再用内存 SQLite：迁移之后生产引擎就是 MySQL，而这里最要紧的东西
@@ -389,7 +420,9 @@ npm test        # 对 cred_broker_test 库跑，54 项
 覆盖：健康检查、建池（颁发 uuid / 丢弃无 token 条目 / 去重 / 截断）、路径校验、取件、
 抢闸（互斥 / 租约过期接管 / 冷却）、CAS 提交（版本不符 / 持闸人不符 / version 类型）、
 abort（不要求持闸）、删池后全部 404、审计事件、**续签设备的认领 / 释放 / 冲突 / 非法值 / 删除后 404 / 审计**、actor 不参与判断、纯函数规范化、
-**区域往返（显式字段 / key 前缀回填 / 老 payload 在读出口自愈）**、**邮箱往返（透传 / 不进 key / 老条目落空串）**。
+**区域往返（显式字段 / key 前缀回填）**、**邮箱往返（透传 / 不进 key / 老条目落空串）**、
+**墓碑（items / deleted 分组、复活、整笔提交失败时版本与条目一起回滚、超长 key 走 400）**、
+**删池连 `pool_items` 一起清**、**老 `payload` 迁移（摊平 / DROP 列 / 重跑幂等）**。
 
 迁移新增的四条（都是「D1 时代不存在、换引擎后才可能错」的地方）：
 
@@ -397,7 +430,7 @@ abort（不要求持闸）、删池后全部 404、审计事件、**续签设备
 |---|---|
 | 匹配到但值没变的 UPDATE 仍报 `changes=1` | `src/db.js` 的 `FOUND_ROWS` 标志 |
 | 同一台机器租约到期后重拿自己的闸 | 上一条在生产路径上的后果 |
-| 200 条真实长度 token 原样往返 | `payload` 必须是 LONGTEXT（TEXT 的 64KB 装不下） |
+| 200 条真实长度 token 原样往返 | `access_token` / `refresh_token` 必须是 LONGTEXT（TEXT 的 64KB 装不下） |
 | uuid 换大小写读不到同一池 | 库表排序规则必须是 `utf8mb4_bin` |
 
 ---

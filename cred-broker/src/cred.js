@@ -55,8 +55,12 @@
 
 export const DEFAULT_LEASE_MS = 180_000;
 export const DEFAULT_FAIL_COOLDOWN_MS = 300_000;
-/** 一池最多塞多少条账号：既是防呆，也是防「一次请求写爆 payload」 */
+/** 一池最多塞多少条账号：既是防呆，也是防「一次请求写进太多行」 */
 export const MAX_ITEMS = 200;
+/** 条目 key 的长度上限，与 `pool_items.item_key VARCHAR(512)` 一致。
+ *  超长在这里就被拒（400），不留给 MySQL 在提交那一刻报 1406 —— 那会是一条 500，
+ *  而客户端会把 5xx 当成「管家不可达」，看起来像网络问题。 */
+export const MAX_KEY_LEN = 512;
 /** uuid 形态校验：只用于挡住明显不是 uuid 的路径，不解释它从哪来 */
 export const UUID_RE =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -111,6 +115,11 @@ function renewerOfBody(body) {
   } catch {
     return { ok: false };
   }
+}
+
+/** 条目 key 超长直接 400：让它在这里红，而不是在 INSERT 那一刻变成 500（见 MAX_KEY_LEN）。 */
+function keysFit(items) {
+  return items.every((i) => i.key.length <= MAX_KEY_LEN);
 }
 
 /** 条件更新上报的匹配行数：只有它等于 1 才算「这一条语句真的改到了那一行」。
@@ -211,19 +220,101 @@ export function normalizeItems(list) {
 }
 
 /**
- * 从落库的 payload 里取条目。
+ * 池条目的列清单（读写共用一份，避免两处字段顺序漂移）。
  *
- * **出口与入口共用同一套规范化**（`normalizeItems`）：落库的 `payload` 是不透明 JSON，
- * 历史行是在「区域还不进池」的年代写下的，读时再规范化一遍，老条目就能在**读的那一刻**
- * 把区域按 key 前缀补回来 —— 不必等下一次提交，也不必写迁移脚本。
+ * `deleted_at` **在出口带上**：墓碑要发给客户端，客户端据此移除本地那份云端账号。
+ * 入口（提交）**不看**它 —— 客户端不传墓碑，删除用「本轮没出现」表达。
  */
-function parseItems(payload) {
-  try {
-    const parsed = JSON.parse(payload ?? "[]");
-    return Array.isArray(parsed) ? normalizeItems(parsed) : [];
-  } catch {
-    return [];
+const ITEM_COLUMNS =
+  "item_key, region, name, phone, email, access_token, refresh_token, expires_at, rt_expires_at, updated_at, deleted_at";
+
+/** 库行 → 接口条目（字段名与 normalizeItem 的输出一致，客户端一套结构吃两种来源） */
+function itemFromRow(row) {
+  const num = (v) => (v === null || v === undefined ? null : Number(v));
+  return {
+    region: row.region,
+    key: row.item_key,
+    name: row.name ?? "",
+    phone: row.phone ?? "",
+    email: row.email ?? "",
+    access_token: row.access_token ?? "",
+    refresh_token: row.refresh_token ?? "",
+    expires_at: num(row.expires_at),
+    rt_expires_at: num(row.rt_expires_at),
+    updated_at: num(row.updated_at),
+    deleted_at: num(row.deleted_at),
+  };
+}
+
+/**
+ * 读一池的全部条目，并按 `deleted_at` 分成两组：
+ *   * `items` —— 活条目（deleted_at IS NULL），就是这一池现在的账号；
+ *   * `deleted` —— 墓碑（deleted_at 非 NULL），**也要发给客户端**：
+ *     别的机器拿它去移除本地那份「云端已删」的账号。条目内容（含 token）保留原样，
+ *     客户端靠它与本机账号做匹配（key / JWT sub / RT）。
+ *
+ * 按 key 排序只是让输出稳定（同一个池两次读的顺序一致，便于排障）；
+ * 客户端按 key 认人，不依赖顺序。
+ */
+async function readPoolItems(db, uuid) {
+  const { results } = await db
+    .prepare(`SELECT ${ITEM_COLUMNS} FROM pool_items WHERE pool_uuid = ? ORDER BY item_key`)
+    .bind(uuid)
+    .all();
+  const items = [];
+  const deleted = [];
+  for (const row of results) {
+    const item = itemFromRow(row);
+    (item.deleted_at === null ? items : deleted).push(item);
   }
+  return { items, deleted };
+}
+
+/**
+ * 把条目写进 pool_items（多行一条 INSERT，冲突时按 key 更新并**复活**）。
+ *
+ * `revive = false` 只给老 payload 迁移用：迁移是「把旧 JSON 摊成行」，不能拿旧 JSON
+ * 覆盖可能已经写进来的新行，所以用 INSERT IGNORE。
+ *
+ * `deleted_at = NULL` 是复活语义：用户重新登录同一个账号后再上传，那条墓碑应当变回活条目。
+ */
+export async function insertItems(db, uuid, items, { revive = true } = {}) {
+  if (!items.length) return;
+  const tuples = items.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+  const params = [];
+  for (const it of items) {
+    params.push(
+      uuid,
+      it.key,
+      it.region,
+      it.name,
+      it.phone,
+      it.email,
+      it.access_token,
+      it.refresh_token,
+      it.expires_at,
+      it.rt_expires_at,
+      it.updated_at,
+      null // deleted_at：新写的行一律是活的
+    );
+  }
+  if (!revive) {
+    await db
+      .prepare(`INSERT IGNORE INTO pool_items (pool_uuid, ${ITEM_COLUMNS}) VALUES ${tuples}`)
+      .bind(...params)
+      .run();
+    return;
+  }
+  await db
+    .prepare(
+      `INSERT INTO pool_items (pool_uuid, ${ITEM_COLUMNS}) VALUES ${tuples} AS new ` +
+        "ON DUPLICATE KEY UPDATE region = new.region, name = new.name, phone = new.phone, " +
+        "email = new.email, access_token = new.access_token, refresh_token = new.refresh_token, " +
+        "expires_at = new.expires_at, rt_expires_at = new.rt_expires_at, updated_at = new.updated_at, " +
+        "deleted_at = NULL"
+    )
+    .bind(...params)
+    .run();
 }
 
 /** 审计事件：纯旁路，**不参与任何判断**。写不进去也不该让请求失败 */
@@ -251,13 +342,18 @@ async function logEvent(db, uuid, kind, actor, note, at) {
 export async function createPool(db, rawItems, renewer, actor, at) {
   const items = normalizeItems(rawItems);
   const uuid = crypto.randomUUID();
-  await db
-    .prepare(
-      "INSERT INTO pools (uuid, payload, renewer, version, lease_owner, lease_until, retry_after, created_at, updated_at) " +
-        "VALUES (?, ?, ?, 0, NULL, 0, 0, ?, ?)"
-    )
-    .bind(uuid, JSON.stringify(items), renewer, at, at)
-    .run();
+  // 池行与条目行必须一起落：只写进池行的池会是一个「永远空着」的池，
+  // 而客户端那边看起来就是「刚上传的账号全丢了」。
+  await db.transaction(async (tx) => {
+    await tx
+      .prepare(
+        "INSERT INTO pools (uuid, renewer, version, lease_owner, lease_until, retry_after, created_at, updated_at) " +
+          "VALUES (?, ?, 0, NULL, 0, 0, ?, ?)"
+      )
+      .bind(uuid, renewer, at, at)
+      .run();
+    await insertItems(tx, uuid, items);
+  });
   await logEvent(
     db,
     uuid,
@@ -269,17 +365,19 @@ export async function createPool(db, rawItems, renewer, actor, at) {
   return { uuid, version: 0, count: items.length, renewer: renewer ?? null };
 }
 
-/** 取件：只读，不动闸 */
+/** 取件：只读，不动闸。条目**含墓碑**（deleted_at 非 NULL），由客户端负责剪枝。 */
 export async function fetchPool(db, uuid, actor, at) {
   const row = await db
-    .prepare("SELECT payload, version, renewer FROM pools WHERE uuid = ?")
+    .prepare("SELECT version, renewer FROM pools WHERE uuid = ?")
     .bind(uuid)
     .first();
   if (!row) return { kind: "gone" };
+  const parts = await readPoolItems(db, uuid);
   await logEvent(db, uuid, "fetched", actor, null, at);
   return {
     kind: "ok",
-    items: parseItems(row.payload),
+    items: parts.items,
+    deleted: parts.deleted,
     version: Number(row.version),
     renewer: row.renewer ?? null,
   };
@@ -302,7 +400,7 @@ export async function leasePool(db, uuid, actor, at, leaseMs) {
 
   const row = await db
     .prepare(
-      "SELECT payload, version, renewer, lease_owner, lease_until, retry_after FROM pools WHERE uuid = ?"
+      "SELECT version, renewer, lease_owner, lease_until, retry_after FROM pools WHERE uuid = ?"
     )
     .bind(uuid)
     .first();
@@ -330,10 +428,12 @@ export async function leasePool(db, uuid, actor, at, leaseMs) {
     };
   }
 
+  const parts = await readPoolItems(db, uuid);
   await logEvent(db, uuid, "leased", actor, `闸保持到 ${until}`, at);
   return {
     kind: "granted",
-    items: parseItems(row.payload),
+    items: parts.items,
+    deleted: parts.deleted,
     version: Number(row.version),
     lease_until: until,
     renewer: row.renewer ?? null,
@@ -416,18 +516,38 @@ export async function releaseRenewer(db, uuid, renewer, actor, at) {
   return { kind: "not_renewer", renewer: current };
 }
 
-/** 提交整池（CAS）：版本 +1，同时归还闸 */
+/**
+ * 提交整池（CAS）：版本 +1、归还闸、用本轮条目重写池内容。
+ *
+ * 三条语句一个事务：
+ *   1. CAS 改 pools（`version = ? AND lease_owner = ?`）—— 判据仍然是 `changes === 1`
+ *   2. 把**还活着的**条目整片标删（deleted_at = now）
+ *   3. 把本轮带来的条目 upsert 进来并复活（deleted_at = NULL）
+ *
+ * 第 2 步就是「逻辑删除」的全部入口：提交是整池替换，本轮没出现的 key 就是被删掉的。
+ * 不删除墓碑行 —— 墓碑要随 GET / lease 发给客户端，让别的机器移除本地那份云端账号。
+ * 反过来，客户端带回来的条目里即使有墓碑也会被第 3 步复活（用户重新登录同一个账号）。
+ */
 export async function commitPool(db, uuid, actor, version, rawItems, at) {
   const items = normalizeItems(rawItems);
-  const res = await db
-    .prepare(
-      "UPDATE pools SET payload = ?, version = version + 1, lease_owner = NULL, lease_until = 0, updated_at = ? " +
-        "WHERE uuid = ? AND version = ? AND lease_owner = ?"
-    )
-    .bind(JSON.stringify(items), at, uuid, version, actor)
-    .run();
+  const casOk = await db.transaction(async (tx) => {
+    const res = await tx
+      .prepare(
+        "UPDATE pools SET version = version + 1, lease_owner = NULL, lease_until = 0, updated_at = ? " +
+          "WHERE uuid = ? AND version = ? AND lease_owner = ?"
+      )
+      .bind(at, uuid, version, actor)
+      .run();
+    if (changes(res) !== 1) return false; // 事务里什么都没写，commit / rollback 等价
+    await tx
+      .prepare("UPDATE pool_items SET deleted_at = ? WHERE pool_uuid = ? AND deleted_at IS NULL")
+      .bind(at, uuid)
+      .run();
+    await insertItems(tx, uuid, items);
+    return true;
+  });
 
-  if (changes(res) === 1) {
+  if (casOk) {
     await logEvent(db, uuid, "committed", actor, `v${version} → v${version + 1}，${items.length} 项`, at);
     return { kind: "ok", version: version + 1, count: items.length };
   }
@@ -467,10 +587,15 @@ export async function abortPool(db, uuid, note, at, cooldownMs) {
   return { kind: "ok", retry_after: retryAfter };
 }
 
-/** 删池 = 解绑。绑过同一 uuid 的其他机器之后会拿到 gone，需要重新上传或重新绑定 */
+/** 删池 = 解绑（连同池里的条目行一起硬删）。绑过同一 uuid 的其他机器之后会拿到 gone，需要重新上传或重新绑定 */
 export async function deletePool(db, uuid, actor, at) {
-  const res = await db.prepare("DELETE FROM pools WHERE uuid = ?").bind(uuid).run();
-  if (changes(res) !== 1) return { kind: "gone" };
+  const removed = await db.transaction(async (tx) => {
+    const res = await tx.prepare("DELETE FROM pools WHERE uuid = ?").bind(uuid).run();
+    if (changes(res) !== 1) return false;
+    await tx.prepare("DELETE FROM pool_items WHERE pool_uuid = ?").bind(uuid).run();
+    return true;
+  });
+  if (!removed) return { kind: "gone" };
   await logEvent(db, uuid, "deleted", actor, null, at);
   return { kind: "ok" };
 }
@@ -501,6 +626,7 @@ export async function handle(request, env) {
     if (!body) return json({ error: "bad_json" }, 400);
     const renewer = renewerOfBody(body);
     if (!renewer.ok) return json({ error: "bad_renewer" }, 400);
+    if (!keysFit(normalizeItems(body.items))) return json({ error: "bad_item_key" }, 400);
     const created = await createPool(
       db,
       body.items,
@@ -523,7 +649,13 @@ export async function handle(request, env) {
     if (method === "GET") {
       const r = await fetchPool(db, uuid, actor, at);
       if (r.kind === "gone") return json({ error: "gone", now: at }, 404);
-      return json({ items: r.items, version: r.version, renewer: r.renewer, now: at });
+      return json({
+        items: r.items,
+        deleted: r.deleted,
+        version: r.version,
+        renewer: r.renewer,
+        now: at,
+      });
     }
 
     if (method === "PUT") {
@@ -534,6 +666,7 @@ export async function handle(request, env) {
       if (typeof version !== "number" || !Number.isInteger(version) || version < 0) {
         return json({ error: "bad_version" }, 400);
       }
+      if (!keysFit(normalizeItems(body.items))) return json({ error: "bad_item_key" }, 400);
       const r = await commitPool(db, uuid, actor, version, body.items, at);
       if (r.kind === "gone") return json({ error: "gone", now: at }, 404);
       if (r.kind === "stale") {
@@ -601,6 +734,7 @@ export async function handle(request, env) {
     return json({
       granted: true,
       items: r.items,
+      deleted: r.deleted,
       version: r.version,
       lease_until: r.lease_until,
       renewer: r.renewer,

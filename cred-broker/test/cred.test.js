@@ -1,6 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { handle, normalizeItem, normalizeItems, MAX_ITEMS } from "../src/cred.js";
+import { handle, normalizeItem, normalizeItems, commitPool, MAX_ITEMS, MAX_KEY_LEN } from "../src/cred.js";
+import { migrateLegacyPayload } from "../src/schema.js";
 import { createEnv, closeEnv } from "./mysql-env.js";
 
 after(() => closeEnv());   // 连接池不关，进程会挂在退出流程上
@@ -643,9 +644,8 @@ test("normalizeItem：显式 region 非法 / 大小写不规范时也不丢区�
   assert.equal(normalizeItem({ key: "cn:k", access_token: "t", region: "火星版" }).region, "cn");
 });
 
-test("落库的旧条目在读出口就被补上区域（不必等下一次提交）", async () => {
+test("落库的旧条目在读出口就有区域（老客户端上传时没带 region，靠 key 前缀回填）", async () => {
   const env = createEnv();
-  // 老格式：payload 里没有 region（服务端当年就是不存它）
   const uuid = await newPool(env, [
     { key: "cn:19174256652", name: "n", phone: "19174256652", access_token: "at", refresh_token: "rt" },
   ]);
@@ -706,7 +706,7 @@ test("同一台机器在租约到期后能重新拿到自己的闸（值相同�
   assert.equal(r.data.granted, true);
 });
 
-test("整池 200 条真实长度的 token 原样往返（payload 必须是 LONGTEXT，TEXT 的 64KB 装不下）", async () => {
+test("整池 200 条真实长度的 token 原样往返（token 列必须是 LONGTEXT，TEXT 的 64KB 装不下）", async () => {
   const env = createEnv();
   const many = Array.from({ length: MAX_ITEMS }, (_, i) =>
     item(`k${i}`, { access_token: "at".repeat(300), refresh_token: "rt".repeat(300) })
@@ -717,7 +717,8 @@ test("整池 200 条真实长度的 token 原样往返（payload 必须是 LONGT
 
   const got = await call(env, "GET", `/v1/pool/${created.data.uuid}`);
   assert.equal(got.data.items.length, MAX_ITEMS);
-  assert.equal(got.data.items[MAX_ITEMS - 1].access_token, "at".repeat(300));
+  const last = got.data.items.find((i) => i.key === `k${MAX_ITEMS - 1}`);
+  assert.equal(last.access_token, "at".repeat(300));
 });
 
 test("uuid 与 key 按字节比较：换大小写不等于同一个键（与 D1/SQLite 一致）", async () => {
@@ -728,4 +729,140 @@ test("uuid 与 key 按字节比较：换大小写不等于同一个键（与 D1/
   const r = await call(env, "GET", `/v1/pool/${uuid.toUpperCase()}`);
   assert.equal(r.status, 404);
   assert.equal(r.data.error, "gone");
+});
+
+// ── 行表 + 逻辑删除（2026-11-27 拆表） ─────────────────────────────────────
+
+test("提交时本轮没出现的条目标成墓碑：items 只给活的，deleted 给墓碑", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a"), item("b")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  assert.equal(lease.data.items.length, 2);
+  assert.deepEqual(lease.data.deleted, []);
+
+  const done = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a", { access_token: "rotated" })] },
+  });
+  assert.equal(done.status, 200);
+  assert.equal(done.data.count, 1, "count 只数活条目");
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["a"]);
+  assert.equal(got.data.items[0].deleted_at, null);
+  assert.equal(got.data.deleted.length, 1);
+  assert.equal(got.data.deleted[0].key, "b");
+  assert.ok(got.data.deleted[0].deleted_at > 0);
+  // 墓碑带着原来的 token：别的机器要靠 JWT sub / RT 认出「这是同一条账号」
+  assert.equal(got.data.deleted[0].refresh_token, "rt-b");
+
+  // 抢闸也带同一份墓碑 —— 客户端靠它剪掉本机那份云端账号
+  const next = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m2" });
+  assert.equal(next.data.granted, true);
+  assert.deepEqual(next.data.items.map((i) => i.key), ["a"]);
+  assert.equal(next.data.deleted[0].key, "b");
+  // 墓碑不参与版本 / 条目数
+  assert.equal(next.data.version, 1);
+});
+
+test("重新带上的 key 会复活墓碑（用户重新登录同一个账号再上传）", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a"), item("b")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a")] },
+  });
+  assert.equal((await call(env, "GET", `/v1/pool/${uuid}`)).data.deleted[0].key, "b");
+
+  const lease2 = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  const back = await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease2.data.version, items: [item("a"), item("b", { access_token: "new" })] },
+  });
+  assert.equal(back.status, 200);
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.deepEqual(got.data.items.map((i) => i.key), ["a", "b"]);
+  assert.equal(got.data.items[1].access_token, "new");
+  assert.deepEqual(got.data.deleted, [], "复活之后墓碑必须消失");
+});
+
+test("整池提交是一笔事务：条目写到一半失败时，版本号与旧条目都回滚", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  await assert.rejects(
+    commitPool(env.DB, uuid, "m1", lease.data.version, [item("x".repeat(MAX_KEY_LEN + 1))], Date.now()),
+    "超长 key 在库里必须报错（1406），不能静默截断"
+  );
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.equal(got.data.version, lease.data.version, "CAS 的版本 +1 也必须回滚");
+  assert.deepEqual(got.data.items.map((i) => i.key), ["a"]);
+  assert.deepEqual(got.data.deleted, [], "旧条目不能被这次失败的提交标成墓碑");
+});
+
+test("条目 key 超长在路由层就 400，不落到 500（客户端会把 5xx 当成管家不可达）", async () => {
+  const env = createEnv();
+  const r = await call(env, "POST", "/v1/pool", {
+    body: { items: [item("k".repeat(MAX_KEY_LEN + 1))] },
+  });
+  assert.equal(r.status, 400);
+  assert.equal(r.data.error, "bad_item_key");
+});
+
+test("删池把条目行（含墓碑）一并删掉，不留孤儿行", async () => {
+  const env = createEnv();
+  const uuid = await newPool(env, [item("a"), item("b")]);
+  const lease = await call(env, "POST", `/v1/pool/${uuid}/lease`, { actor: "m1" });
+  await call(env, "PUT", `/v1/pool/${uuid}`, {
+    actor: "m1",
+    body: { version: lease.data.version, items: [item("a")] },
+  });
+  assert.equal((await call(env, "DELETE", `/v1/pool/${uuid}`)).status, 200);
+  const row = await env.DB
+    .prepare("SELECT COUNT(*) AS n FROM pool_items WHERE pool_uuid = ?")
+    .bind(uuid)
+    .first();
+  assert.equal(Number(row.n), 0);
+});
+
+test("老 payload 迁移：一池一段 JSON 摊成行表，成功后删掉 payload 列；重跑是空操作", async () => {
+  const env = createEnv();
+  // 模拟拆表前的库：加回 payload 列，插一行老数据（同 key 重复，验证后到覆盖先到）
+  await env.DB.prepare("ALTER TABLE pools ADD COLUMN payload LONGTEXT NULL").run();
+  const uuid = "33333333-3333-3333-3333-333333333333";
+  const legacy = [
+    { key: "cn:191", name: "老账号", phone: "191", access_token: "at-old", refresh_token: "rt-old" },
+    { key: "cn:191", name: "重复", access_token: "at-dup" },
+  ];
+  await env.DB
+    .prepare(
+      "INSERT INTO pools (uuid, payload, version, lease_until, retry_after, created_at, updated_at) VALUES (?, ?, 0, 0, 0, 0, 0)"
+    )
+    .bind(uuid, JSON.stringify(legacy))
+    .run();
+
+  const r = await migrateLegacyPayload(env.DB);
+  assert.equal(r.skipped, false);
+  assert.ok(r.pools >= 1, "本文件前面建的池也会被扫一遍（它们的 payload 是 ALTER 补出来的 NULL）");
+
+  const got = await call(env, "GET", `/v1/pool/${uuid}`);
+  assert.equal(got.status, 200);
+  assert.equal(got.data.items.length, 1);
+  assert.equal(got.data.items[0].region, "cn");
+  assert.equal(got.data.items[0].access_token, "at-dup");
+  assert.equal(got.data.items[0].name, "重复");
+  assert.equal(got.data.items[0].deleted_at, null);
+
+  const col = await env.DB
+    .prepare(
+      "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'pools' AND column_name = 'payload'"
+    )
+    .first();
+  assert.equal(Number(col.n), 0, "迁移完成后 payload 列必须删掉（不能留两份真相）");
+
+  const again = await migrateLegacyPayload(env.DB);
+  assert.equal(again.skipped, true);
 });

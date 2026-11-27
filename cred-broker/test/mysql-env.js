@@ -59,7 +59,7 @@ const schemaStatements = () =>
 
 // 连不上 / 建不起来就硬失败退出，绝不跳过：静默的绿是假的安全感。
 try {
-  for (const t of ['pool_events', 'pools']) {
+  for (const t of ['pool_events', 'pool_items', 'pools']) {
     await DB.prepare(`DROP TABLE IF EXISTS \`${t}\``).run();
   }
   for (const stmt of schemaStatements()) await DB.prepare(stmt).run();

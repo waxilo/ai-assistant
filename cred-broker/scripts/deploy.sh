@@ -5,7 +5,7 @@
 #   ./scripts/deploy.sh --skip-checks   # 跳过本地闸门（紧急回滚时用，别当常态）
 #   ./scripts/deploy.sh --logs          # 结束后跟踪日志
 #
-# 为什么把 npm test 放在构建前面：54 项断言里有一批直接跑在真实 MySQL 上，测的正是
+# 为什么把 npm test 放在构建前面：60 项断言里有一批直接跑在真实 MySQL 上，测的正是
 # 迁移最容易悄悄变味的那几处 —— 抢闸的 changes===1 判定（FOUND_ROWS）、CAS 提交、
 # 200 条整池过 LONGTEXT、uuid 按字节比较。镜像构建本身不跑测试；少这道闸门，
 # 一个方言差异就是要到某台机器真的去续签那一刻才暴露，而那时的代价是一池凭证。

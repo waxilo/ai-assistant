@@ -2,11 +2,15 @@
 // （prepare(sql).bind(...).run()/first()/all() + meta.changes / meta.last_row_id），
 // 所以 src/cred.js 里的 SQL 与全部业务判据一行都不用改 —— 迁移动了引擎，没动语义。
 //
-// 只实现真正用到的那一面：没有 batch()、没有显式事务。原子性从来不靠事务，
-// 靠的是单条语句：抢闸是 `UPDATE … WHERE lease_until <= ? AND retry_after <= ?` 的
-// `changes === 1`，提交是 `version = version + 1 WHERE version = ? AND lease_owner = ?`。
-// InnoDB 对 UPDATE 持行锁，autocommit 下单条语句即原子 —— 与 D1 当时给的保护同级。
-// 把「先查再写」请回来才是事故（那中间就是双死窗口，见 src/cred.js 文件头）。
+// 只实现真正用到的那一面：没有 batch()。抢闸的准入判据仍然只是**单条语句**
+// `UPDATE … WHERE lease_until <= ? AND retry_after <= ?` 的 `changes === 1`
+// （InnoDB 行锁 + autocommit，与 D1 当时给的保护同级），**不许改写成「先查再写」**
+// （那中间就是双死窗口，见 src/cred.js 文件头）。
+//
+// 另加 `transaction(fn)`：账号条目拆成 pool_items 行之后，一次整池提交是多条语句
+// （CAS 改版本 → 标删旧条目 → upsert 新条目），必须一起生一起死 —— 否则 CAS 成功后
+// 条目写到一半失败，池会停在「版本号已进、内容还是旧的」这种谁也提交不上的状态。
+// 事务**只包住「已经抢到闸之后的那组写」**，抢闸本身仍是单条条件 UPDATE，不进事务。
 //
 // 三处参数是 D1 语义与 MySQL 默认行为对不上导致的，少一个都会静默改变判定：
 //   * flags: ['FOUND_ROWS'] —— MySQL 的 UPDATE 默认上报「实际改变了值的行数」，
@@ -64,7 +68,7 @@ function createStatement(exec, sql, params) {
 
 /**
  * @param {{host:string,port:number,user:string,password:string,database:string,connectionLimit?:number}} cfg
- * @returns {{ DB: { prepare(sql: string): object }, close(): Promise<void> }}
+ * @returns {{ DB: { prepare(sql: string): object, transaction<T>(fn: (tx: {prepare(sql: string): object}) => Promise<T>): Promise<T> }, close(): Promise<void> }}
  */
 export function createDatabase(cfg) {
   const pool = mysql.createPool({
@@ -85,8 +89,33 @@ export function createDatabase(cfg) {
 
   const exec = (sql, params) => pool.execute(sql, params);
 
+  /**
+   * 在**同一个连接**上跑一组语句：成功 commit，抛错 rollback，连接一定归还。
+   * 回调拿到的 `tx` 与 `DB` 同形（prepare().bind().run()/first()/all()），
+   * 但语句只在这次事务里可见 —— 绝不要把 `tx` 传给会在事务外被 await 的代码。
+   */
+  async function transaction(fn) {
+    const conn = await pool.getConnection();
+    const tx = { prepare: (sql) => createStatement((s, p) => conn.execute(s, p), sql, []) };
+    try {
+      await conn.beginTransaction();
+      const result = await fn(tx);
+      await conn.commit();
+      return result;
+    } catch (err) {
+      try {
+        await conn.rollback();
+      } catch {
+        /* 回滚失败也要把原始异常抛出去 */
+      }
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
   return {
-    DB: { prepare: (sql) => createStatement(exec, sql, []) },
+    DB: { prepare: (sql) => createStatement(exec, sql, []), transaction },
     close: () => pool.end(),
   };
 }

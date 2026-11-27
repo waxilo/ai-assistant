@@ -570,12 +570,14 @@ mod import_tests {
 pub fn remove_account(app: AppHandle, id: String) -> Result<(), String> {
     let dir = data_dir(&app);
     let mut accounts = accounts::load_accounts(&dir);
-    let before = accounts.len();
-    accounts.retain(|a| a.id != id);
-    if accounts.len() == before {
+    let Some(victim) = accounts.iter().find(|a| a.id == id).cloned() else {
         return Err("账号不存在".into());
-    }
+    };
+    accounts.retain(|a| a.id != id);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
+    // 绑定时记一笔「待删除」：下一次同步的并集不会把它从云端原样加回来
+    // （不记的话用户看到的是「删了又回来」）。未绑定 / 落盘失败都只影响这一轮的传播。
+    broker::note_deleted_account(&victim);
     Ok(())
 }
 
