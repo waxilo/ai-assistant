@@ -549,6 +549,14 @@ function CloudAccountsDialog({
       }
     >
       <div className="cloud-dialog-bar">
+        <button
+          className="btn small ghost"
+          disabled={busy}
+          onClick={onRefresh}
+          title="重新读取云端池（跳过缓存）"
+        >
+          {busy ? "读取中…" : "刷新"}
+        </button>
         <span className="pool-bar-actions">
           <button
             className={"btn small" + (tab === "live" ? " primary" : " ghost")}
@@ -562,127 +570,121 @@ function CloudAccountsDialog({
           >
             已删除 {snapshot ? deleted.length : "…"}
           </button>
-          <button
-            className="btn small ghost"
-            disabled={busy}
-            onClick={onRefresh}
-            title="重新读取云端池（跳过缓存）"
-          >
-            {busy ? "读取中…" : "刷新"}
-          </button>
         </span>
       </div>
 
       {note && <p className="note danger">{note}</p>}
 
-      {snapshot === null ? (
-        <p className="note">加载中…</p>
-      ) : tab === "live" ? (
-        live.length === 0 ? (
-          <p className="note">云端池里还没有账号。</p>
+      <div className="cloud-list-body">
+        {snapshot === null ? (
+          <p className="note">加载中…</p>
+        ) : tab === "live" ? (
+          live.length === 0 ? (
+            <p className="note">云端池里还没有账号。</p>
+          ) : (
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th className="num">积分</th>
+                    <th>Token 过期</th>
+                    {canManage && <th className="col-actions">操作</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {live.map((a) => {
+                    // 只做展示对照：云端条目按 key 对到本机副本才有台账读数
+                    const local = localAccounts.find((x) => accountKey(x) === a.key);
+                    const bal = local ? creditsOf(book, local.id) : null;
+                    const tok = tokenCountdown(a.expires_at);
+                    return (
+                      <tr key={a.key}>
+                        <td>
+                          <AccountCell name={a.name} phone={a.phone} />
+                        </td>
+                        <td className="num">
+                          {bal != null ? (
+                            formatCredits(bal)
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                        <td>
+                          {needsRelogin(a.rt_expires_at) ? (
+                            <span className="sub bad" title="登录已失效，需重新登录">
+                              需重新登录
+                            </span>
+                          ) : tok.text === "—" ? (
+                            <span className="muted">—</span>
+                          ) : (
+                            <span
+                              className={"sub" + (tok.expired ? " bad" : "")}
+                              title={tok.expired ? `已于 ${tok.at} 过期` : `${tok.at} 过期`}
+                            >
+                              {tok.text}
+                            </span>
+                          )}
+                        </td>
+                        {canManage && (
+                          <td className="col-actions">
+                            <div className="ac-cell-actions">
+                              <button
+                                className="icon-btn icon-danger"
+                                title="从云端池删除（可在「已删除」里恢复）"
+                                onClick={() => void onDelete(a)}
+                              >
+                                <IconTrash size={16} />
+                              </button>
+                            </div>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : deleted.length === 0 ? (
+          <p className="note">没有已删除的账号。</p>
         ) : (
           <div className="table-wrap">
             <table className="data-table">
               <thead>
                 <tr>
                   <th>账号</th>
-                  <th className="num">积分</th>
-                  <th>Token 过期</th>
+                  <th>手机号</th>
+                  <th>删除时间</th>
                   {canManage && <th className="col-actions">操作</th>}
                 </tr>
               </thead>
               <tbody>
-                {live.map((a) => {
-                  // 只做展示对照：云端条目按 key 对到本机副本才有台账读数
-                  const local = localAccounts.find((x) => accountKey(x) === a.key);
-                  const bal = local ? creditsOf(book, local.id) : null;
-                  const tok = tokenCountdown(a.expires_at);
-                  return (
-                    <tr key={a.key}>
-                      <td>
-                        <AccountCell name={a.name} phone={a.phone} />
+                {deleted.map((it) => (
+                  <tr key={it.key}>
+                    <td>{it.name || it.key}</td>
+                    <td>{it.phone || <span className="muted">—</span>}</td>
+                    <td className="num-muted">
+                      {it.deleted_at ? sinceMs(it.deleted_at) : "未知"}
+                    </td>
+                    {canManage && (
+                      <td className="col-actions">
+                        <button
+                          className="btn small"
+                          disabled={busyKey !== null}
+                          onClick={() => void restore(it.key)}
+                        >
+                          {busyKey === it.key ? "恢复中…" : "恢复"}
+                        </button>
                       </td>
-                      <td className="num">
-                        {bal != null ? (
-                          formatCredits(bal)
-                        ) : (
-                          <span className="muted">—</span>
-                        )}
-                      </td>
-                      <td>
-                        {needsRelogin(a.rt_expires_at) ? (
-                          <span className="sub bad" title="登录已失效，需重新登录">
-                            需重新登录
-                          </span>
-                        ) : tok.text === "—" ? (
-                          <span className="muted">—</span>
-                        ) : (
-                          <span
-                            className={"sub" + (tok.expired ? " bad" : "")}
-                            title={tok.expired ? `已于 ${tok.at} 过期` : `${tok.at} 过期`}
-                          >
-                            {tok.text}
-                          </span>
-                        )}
-                      </td>
-                      {canManage && (
-                        <td className="col-actions">
-                          <div className="ac-cell-actions">
-                            <button
-                              className="icon-btn icon-danger"
-                              title="从云端池删除（可在「已删除」里恢复）"
-                              onClick={() => void onDelete(a)}
-                            >
-                              <IconTrash size={16} />
-                            </button>
-                          </div>
-                        </td>
-                      )}
-                    </tr>
-                  );
-                })}
+                    )}
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
-        )
-      ) : deleted.length === 0 ? (
-        <p className="note">没有已删除的账号。</p>
-      ) : (
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>账号</th>
-                <th>手机号</th>
-                <th>删除时间</th>
-                {canManage && <th className="col-actions">操作</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {deleted.map((it) => (
-                <tr key={it.key}>
-                  <td>{it.name || it.key}</td>
-                  <td>{it.phone || <span className="muted">—</span>}</td>
-                  <td className="num-muted">
-                    {it.deleted_at ? sinceMs(it.deleted_at) : "未知"}
-                  </td>
-                  {canManage && (
-                    <td className="col-actions">
-                      <button
-                        className="btn small"
-                        disabled={busyKey !== null}
-                        onClick={() => void restore(it.key)}
-                      >
-                        {busyKey === it.key ? "恢复中…" : "恢复"}
-                      </button>
-                    </td>
-                  )}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+        )}
+      </div>
     </Dialog>
   );
 }
