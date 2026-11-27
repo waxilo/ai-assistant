@@ -426,7 +426,7 @@ export default function App() {
       const ok = await askConfirm({
         title: "删除账号",
         body: brokerStatus?.bound
-          ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「已删除」里恢复。`
+          ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「云端账号 → 已删除」里恢复。`
           : `确认删除「${accountLabel(a.name, a.phone)}」？`,
         okText: "删除",
         danger: true,

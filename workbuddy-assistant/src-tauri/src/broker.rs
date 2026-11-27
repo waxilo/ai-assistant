@@ -481,12 +481,6 @@ pub fn mark_cloud_member(id: &str) {
     }
 }
 
-/// 本机是不是这一池的续签设备（= 有管理云端账号的资格）。
-pub fn can_manage_pool() -> bool {
-    let (uuid, rt) = snapshot();
-    uuid.is_some() && rt.renewer_known && rt.renewer.as_deref() == Some(self_id().as_str())
-}
-
 /// 两条池条目是不是同一个账号（用于「已删除」快照去重）。
 ///
 /// 除了 key 与 JWT `sub`，还要认**同一张票 / 同一条续签链**：手机号 / 昵称改了 key 就变了，

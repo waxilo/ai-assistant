@@ -33,8 +33,7 @@ export const removeAccount = (id: string) =>
   invoke<void>("remove_account", { id });
 
 /**
- * 改云端账号的资料（昵称 / 手机号），**不动 token**。
- * 只有本池的续签设备能改（后端拒绝其它机器），改完随下一轮同步上传。
+ * 改云端账号的资料（昵称 / 手机号）：只盖展示字段，**不动 token**；随下一轮同步上传。
  */
 export const updateAccountProfile = (id: string, name: string, phone: string | null) =>
   invoke<void>("update_account_profile", { id, name, phone });

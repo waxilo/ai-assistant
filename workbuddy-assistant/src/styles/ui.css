@@ -387,6 +387,9 @@
   min-width: 0;
 }
 .ac-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-size: var(--fs-cell);
   font-weight: 600;
   color: var(--text);
@@ -1508,6 +1511,13 @@ body.modal-open .content {
 .badge-already {
   background: var(--warn-soft);
   color: var(--warn-d);
+}
+
+/* 云端账号弹窗顶部：「账号 / 已删除」切换 */
+.cloud-dialog-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
 }
 
 /* ── WorkBuddy：零散表单/提示件 ─────────────────────────────── */

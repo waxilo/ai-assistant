@@ -1524,6 +1524,13 @@ body.modal-open .content {
   color: var(--warn-d);
 }
 
+/* 云端账号弹窗顶部：「账号 / 已删除」切换 */
+.cloud-dialog-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+
 /* ── WorkBuddy：零散表单/提示件 ─────────────────────────────── */
 .opt-row {
   display: flex;

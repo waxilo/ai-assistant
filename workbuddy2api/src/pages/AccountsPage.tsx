@@ -50,11 +50,13 @@ const STATUS_LABEL: Record<SignState, string> = {
 };
 
 /**
- * 首页：账号列表 + 签到操作。
+ * 首页：本机账号列表 + 签到操作。
  *
  * 账号的**凭证**没有编辑入口：一律来自页头「添加账号」（本机登录文件或 OAuth），
- * 避免手工粘贴 token 出错。账号资料（昵称 / 手机号）不碰凭证，行内可以直接改；
- * 云端同步账号的这份资料由续签设备维护。
+ * 避免手工粘贴 token 出错。
+ *
+ * 两块列表互相独立：主表只放本机账号（本机登录 / 手动导入），云端同步来的账号
+ * 只出现在池栏的「云端账号」弹窗里 —— 编辑资料、逻辑删除、恢复都在那儿做。
  */
 export function AccountsPage({
   accounts,
@@ -103,20 +105,19 @@ export function AccountsPage({
   const book = useCredits();
   // 当前被点开「资源包列表」的账号（null = 没有弹窗打开）
   const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
-  // 正在编辑资料的账号；null = 编辑弹窗没开
-  const [editing, setEditing] = useState<Account | null>(null);
-  // 「已删除」弹窗是否打开
-  const [showDeleted, setShowDeleted] = useState(false);
-  // 云端账号的编辑 / 删除 / 恢复都是池级动作，只有续签设备能做
-  // （未绑定时没有云端账号，这条判据只影响云端条目）
-  const canManage = Boolean(brokerStatus?.is_renewer);
+  // 「云端账号」弹窗是否打开（云端账号 / 已删除都在它里面）
+  const [showCloud, setShowCloud] = useState(false);
+  // 两块独立列表：主表只放本机账号，云端账号只在弹窗里
+  const localAccounts = accounts.filter((a) => a.origin !== "cloud");
+  const cloudAccounts = accounts.filter((a) => a.origin === "cloud");
 
   // 凭证池那一栏在**两种空态下都要在**：一台全新的机器正是「先绑定、再拿账号」的
   // 典型场景 —— 把它藏在「先有账号」之后，等于逼用户在一台空机器上没法接上已有的池。
   const poolBar = (
     <PoolBar
       status={brokerStatus}
-      accountCount={accounts.length}
+      accountCount={localAccounts.length}
+      cloudCount={cloudAccounts.length}
       busy={brokerBusy}
       onUpload={onBrokerUpload}
       onLink={onBrokerLink}
@@ -125,14 +126,18 @@ export function AccountsPage({
       onClaim={onBrokerClaim}
       onRelease={onBrokerRelease}
       onRefreshBroker={onRefreshBroker}
-      onOpenDeleted={() => setShowDeleted(true)}
+      onOpenCloud={() => setShowCloud(true)}
     />
   );
 
-  // 「已删除」弹窗在空态与正常态都要能打开：全部删光之后正是最需要恢复的时候
-  const deletedDialog = showDeleted ? (
-    <DeletedAccountsDialog
-      onClose={() => setShowDeleted(false)}
+  // 云端弹窗在空态与正常态都要能打开：池栏入口与行内「云端」徽标都指向它，
+  // 全部账号删光之后也还能从中恢复墓碑
+  const cloudDialog = showCloud ? (
+    <CloudAccountsDialog
+      status={brokerStatus}
+      accounts={cloudAccounts}
+      onClose={() => setShowCloud(false)}
+      onRemove={onRemove}
       reload={reload}
     />
   ) : null;
@@ -145,7 +150,7 @@ export function AccountsPage({
         </div>
       </section>
     );
-  if (accounts.length === 0)
+  if (localAccounts.length === 0)
     return (
       <>
         <section className="panel-page">
@@ -153,20 +158,20 @@ export function AccountsPage({
           <div className="card">
             <EmptyState
               icon={<IconUser size={26} />}
-              title="还没有账号"
-              hint="从页头「添加账号」接入，也可以绑定云端凭证池。"
+              title="还没有本机账号"
+              hint="从页头「添加账号」接入；云端同步来的账号在「云端账号」里。"
             />
           </div>
         </section>
-        {deletedDialog}
+        {cloudDialog}
       </>
     );
 
-  const total = accounts.length;
-  const done = accounts.filter((a) => signState(a, false) === "done").length;
-  const credits = totalCredits(book, accounts);
+  const total = localAccounts.length;
+  const done = localAccounts.filter((a) => signState(a, false) === "done").length;
+  const credits = totalCredits(book, localAccounts);
   // 「即将过期」= 最近一个到期日到期的所有资源包剩余积分之和（与行内天数同一判据）
-  const expiringSoon = soonestExpiringTotal(book, accounts);
+  const expiringSoon = soonestExpiringTotal(book, localAccounts);
 
   return (
     <>
@@ -232,7 +237,7 @@ export function AccountsPage({
             </tr>
           </thead>
           <tbody>
-            {accounts.map((a) => {
+            {localAccounts.map((a) => {
               const busy = busyIds.has(a.id);
               const st = signState(a, busy);
               const bal = creditsOf(book, a.id);
@@ -254,13 +259,6 @@ export function AccountsPage({
                             title="JSON 导入的公用 token：不自动续签、不上传凭证池"
                           >
                             手动导入·不续签
-                          </span>
-                        ) : a.origin === "cloud" ? (
-                          <span
-                            className="badge badge-idle"
-                            title="从云端凭证池同步来的账号：只有续签设备（设为续签设备的那台机器）才续签"
-                          >
-                            云端
                           </span>
                         ) : undefined
                       }
@@ -357,26 +355,13 @@ export function AccountsPage({
                       >
                         <IconFile size={16} />
                       </button>
-                      {/* 本地账号哪台机器都能改；云端账号的资料随整池上传，只有续签设备能改 */}
-                      {(a.origin !== "cloud" || canManage) && (
-                        <button
-                          className="icon-btn"
-                          title="编辑昵称 / 手机号（不影响凭证）"
-                          onClick={() => setEditing(a)}
-                        >
-                          <IconEdit size={16} />
-                        </button>
-                      )}
-                      {/* 云端账号的删除是池级动作，非续签设备上不出现这个入口 */}
-                      {(a.origin !== "cloud" || canManage) && (
-                        <button
-                          className="icon-btn icon-danger"
-                          title="删除账号"
-                          onClick={() => onRemove(a)}
-                        >
-                          <IconTrash size={16} />
-                        </button>
-                      )}
+                      <button
+                        className="icon-btn icon-danger"
+                        title="删除账号"
+                        onClick={() => onRemove(a)}
+                      >
+                        <IconTrash size={16} />
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -403,20 +388,13 @@ export function AccountsPage({
           <PkgListAccount book={book} account={pkgAccount} />
         </Dialog>
       )}
-      {editing && (
-        <EditAccountDialog
-          account={editing}
-          onClose={() => setEditing(null)}
-          reload={reload}
-        />
-      )}
-      {deletedDialog}
+      {cloudDialog}
     </>
   );
 }
 
 /**
- * 编辑账号资料：只改昵称与手机号，**凭证字段一律不碰**。
+ * 编辑云端账号资料：只改昵称与手机号，**凭证字段一律不碰**。
  *
  * 手机号同时是云端池条目的 key，改了会在下一轮同步里“漂移”成新 key ——
  * 后端专门只盖展示字段，不会把它当成一次换票（详见 broker::apply_profile_edits）。
@@ -459,8 +437,8 @@ function EditAccountDialog({
     <Dialog
       size="sm"
       icon={<IconEdit size={16} />}
-      title="编辑账号资料"
-      subtitle="只改昵称与手机号，不会影响 token；绑定云端后随下一轮同步生效。"
+      title="编辑云端账号资料"
+      subtitle="只改昵称与手机号，不会影响 token；随下一轮同步更新到云端池。"
       onClose={onClose}
       footer={
         <>
@@ -496,23 +474,35 @@ function EditAccountDialog({
 }
 
 /**
- * 「已删除」列表：云端池最近一次同步带回的墓碑，可以从中恢复。
+ * 「云端账号」弹窗：云端列表的独立视图，和主表互不影响。
  *
- * 只给续签设备看（池栏也只在那时露出入口）：恢复会写云端，别的机器做了会和
- * 续签设备抢同一份池 —— 后端同样会拒绝。
+ * - 在线：查看 / 编辑资料 / 从云端池逻辑删除。
+ * - 已删除：最近一次同步带回的墓碑，可以恢复。
+ *
+ * 编辑用同一层弹窗内的表单（`EditAccountDialog` 替换掉列表视图），不叠第二个弹窗。
  */
-function DeletedAccountsDialog({
+function CloudAccountsDialog({
+  status,
+  accounts,
   onClose,
+  onRemove,
   reload,
 }: {
+  status: BrokerStatus | null;
+  accounts: Account[];
   onClose: () => void;
+  onRemove: (a: Account) => void;
   reload: () => Promise<void>;
 }) {
+  const book = useCredits();
+  const [tab, setTab] = useState<"live" | "deleted">("live");
+  const [editing, setEditing] = useState<Account | null>(null);
+
   const [items, setItems] = useState<DeletedItem[] | null>(null);
   const [err, setErr] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
 
-  const refresh = async () => {
+  const refreshDeleted = async () => {
     try {
       setItems(await brokerDeletedItems());
       setErr("");
@@ -521,8 +511,8 @@ function DeletedAccountsDialog({
     }
   };
   useEffect(() => {
-    void refresh();
-  }, []);
+    if (tab === "deleted") void refreshDeleted();
+  }, [tab]);
 
   const restore = async (key: string) => {
     setBusyKey(key);
@@ -530,7 +520,7 @@ function DeletedAccountsDialog({
     try {
       await brokerRestoreAccount(key);
       await reload();
-      await refresh();
+      await refreshDeleted();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -538,12 +528,24 @@ function DeletedAccountsDialog({
     }
   };
 
+  if (editing) {
+    return (
+      <EditAccountDialog
+        account={editing}
+        onClose={() => setEditing(null)}
+        reload={reload}
+      />
+    );
+  }
+
+  const deletedCount = status?.deleted_count ?? items?.length ?? 0;
+
   return (
     <Dialog
       size="lg"
-      icon={<IconTrash size={16} />}
-      title="已删除的账号"
-      subtitle="从云端池删掉的账号会留在这里，恢复后随下一轮同步复活。"
+      icon={<IconCloud size={16} />}
+      title="云端账号"
+      subtitle="从云端凭证池同步来的账号单独放在这里，不混入本机账号列表。"
       onClose={onClose}
       footer={
         <button className="btn" onClick={onClose}>
@@ -551,8 +553,97 @@ function DeletedAccountsDialog({
         </button>
       }
     >
+      <div className="cloud-dialog-bar">
+        <span className="pool-bar-actions">
+          <button
+            className={"btn small" + (tab === "live" ? " primary" : " ghost")}
+            onClick={() => setTab("live")}
+          >
+            账号 {accounts.length}
+          </button>
+          <button
+            className={"btn small" + (tab === "deleted" ? " primary" : " ghost")}
+            onClick={() => setTab("deleted")}
+          >
+            已删除 {deletedCount}
+          </button>
+        </span>
+      </div>
+
       {err && <p className="note danger">{err}</p>}
-      {items === null ? (
+
+      {tab === "live" ? (
+        accounts.length === 0 ? (
+          <p className="note">云端池里还没有账号。</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th className="num">积分</th>
+                  <th>Token 过期</th>
+                  <th className="col-actions">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {accounts.map((a) => {
+                  const bal = creditsOf(book, a.id);
+                  const tok = tokenCountdown(a.expires_at);
+                  return (
+                    <tr key={a.id}>
+                      <td>
+                        <AccountCell name={a.name} phone={a.phone} />
+                      </td>
+                      <td className="num">
+                        {bal != null ? (
+                          formatCredits(bal)
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </td>
+                      <td>
+                        {needsRelogin(a.rt_expires_at) ? (
+                          <span className="sub bad" title="登录已失效，需重新登录">
+                            需重新登录
+                          </span>
+                        ) : tok.text === "—" ? (
+                          <span className="muted">—</span>
+                        ) : (
+                          <span
+                            className={"sub" + (tok.expired ? " bad" : "")}
+                            title={tok.expired ? `已于 ${tok.at} 过期` : `${tok.at} 过期`}
+                          >
+                            {tok.text}
+                          </span>
+                        )}
+                      </td>
+                      <td className="col-actions">
+                        <div className="ac-cell-actions">
+                          <button
+                            className="icon-btn"
+                            title="编辑昵称 / 手机号（不影响凭证）"
+                            onClick={() => setEditing(a)}
+                          >
+                            <IconEdit size={16} />
+                          </button>
+                          <button
+                            className="icon-btn icon-danger"
+                            title="从云端池删除（可在「已删除」里恢复）"
+                            onClick={() => onRemove(a)}
+                          >
+                            <IconTrash size={16} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      ) : items === null ? (
         <p className="note">加载中…</p>
       ) : items.length === 0 ? (
         <p className="note">没有已删除的账号。</p>
@@ -730,6 +821,7 @@ function CopyChip({ uuid }: { uuid: string }) {
 function PoolBar({
   status,
   accountCount,
+  cloudCount,
   busy,
   onUpload,
   onLink,
@@ -738,10 +830,13 @@ function PoolBar({
   onClaim,
   onRelease,
   onRefreshBroker,
-  onOpenDeleted,
+  onOpenCloud,
 }: {
   status: BrokerStatus | null;
+  /** 本机**本地**账号数（上传 / 简介都按这个数说） */
   accountCount: number;
+  /** 云端同步来的账号数（弹窗入口上的数字） */
+  cloudCount: number;
   busy: boolean;
   onUpload: () => void;
   onLink: () => void;
@@ -753,8 +848,8 @@ function PoolBar({
   onRelease: () => void;
   /** 只刷新凭证池状态（宽限倒计时轮询用） */
   onRefreshBroker: () => void;
-  /** 打开「已删除」列表（恢复云端删掉的账号） */
-  onOpenDeleted: () => void;
+  /** 打开「云端账号」弹窗（在线 / 已删除都在里面） */
+  onOpenCloud: () => void;
 }) {
   const uuid = status?.uuid ?? null;
   const bound = Boolean(status?.bound && uuid);
@@ -812,18 +907,16 @@ function PoolBar({
               <IconSwap size={13} />
               同步
             </button>
-            {/* 只有续签设备能恢复：别的机器恢复了也会被后端拒绝 */}
-            {status?.is_renewer && status.deleted_count > 0 && (
-              <button
-                className="btn small ghost"
-                disabled={busy}
-                onClick={onOpenDeleted}
-                title="查看并恢复从云端池删除的账号"
-              >
-                <IconTrash size={13} />
-                已删除 {status.deleted_count}
-              </button>
-            )}
+            {/* 云端列表的独立入口：在线与已删除都在弹窗里，和主表互不影响 */}
+            <button
+              className="btn small ghost"
+              disabled={busy}
+              onClick={onOpenCloud}
+              title="查看 / 管理云端账号"
+            >
+              <IconCloud size={13} />
+              云端账号 {cloudCount}
+            </button>
             {renewer?.tone === "self" ? (
               <button
                 className="btn small ghost"
