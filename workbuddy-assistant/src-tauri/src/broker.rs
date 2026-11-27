@@ -46,7 +46,7 @@ use crate::accounts::{self, Account};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 管家地址：cred-broker 的公网入口（共享网关 cloudflared → nginx → 容器:80）。
 /// 容器**不在本机** —— 旧常量 `http://127.0.0.1:7003` 预设「容器与桌面端同机」，
@@ -74,6 +74,12 @@ pub const RELEASE_GRACE_MS: i64 = 10_000;
 /// 注意它只挡「重复的整池同步」，不挡「续签」本身 —— 续签阈值是 48 小时，
 /// 两分钟的窗口相对它完全可以忽略。
 pub const SYNC_TTL_MS: i64 = 120_000;
+
+/// 「云端账号」弹窗读数的缓存寿命。
+///
+/// 弹窗的数据源是 `GET /v1/pool/{uuid}` —— **云端那一份**，不是本机账号列表。
+/// 缓存只用来挡「同一次浏览里反复打接口」：打开弹窗、手动同步后都会强制刷新。
+pub const CLOUD_TTL_MS: i64 = 60_000;
 
 /// 本机的「整池同步单飞闸」。
 ///
@@ -166,6 +172,11 @@ struct Runtime {
     renewer_known: bool,
     /// 取消续签后的宽限截止（毫秒）；宽限内没有新设备，本机自动写回。
     grace_until: Option<i64>,
+    /// 最近一次**直接读云端池**的结果（云端账号弹窗 / 池栏计数，见 [`cloud_snapshot`]）。
+    ///
+    /// 用 `Arc` 是因为 [`status`] 每次都克隆一份运行时状态：整池条目含票，
+    /// 深拷贝一遍只为了让界面显示一个数字并不划算。
+    cloud: Option<Arc<CloudCache>>,
 }
 
 struct State {
@@ -258,6 +269,7 @@ fn clone_runtime(rt: &Runtime) -> Runtime {
         renewer: rt.renewer.clone(),
         renewer_known: rt.renewer_known,
         grace_until: rt.grace_until,
+        cloud: rt.cloud.clone(),
     }
 }
 
@@ -289,15 +301,20 @@ fn pending_deletions() -> HashSet<String> {
 /// 不记这一笔的话，下一次同步的合并会把这条账号从池里原样加回来（用户看到「删了又回来」）。
 /// 未绑定时不记：key 是跟池走的东西，单机运行没有云端可通知。
 pub fn note_deleted_account(account: &Account) {
-    let key = item_key_of(account);
-    if key.trim().is_empty() {
+    note_deleted_key(&item_key_of(account));
+}
+
+/// 只知道 key 的删除（「云端账号」弹窗里那条可能没有本机副本）。
+pub fn note_deleted_key(key: &str) {
+    let key = key.trim();
+    if key.is_empty() {
         return;
     }
     mutate(|s| {
-        if s.cfg.pool_uuid.is_none() || s.cfg.deleted_keys.iter().any(|k| k == &key) {
+        if s.cfg.pool_uuid.is_none() || s.cfg.deleted_keys.iter().any(|k| k == key) {
             return;
         }
-        s.cfg.deleted_keys.push(key.clone());
+        s.cfg.deleted_keys.push(key.to_string());
         if let Err(e) = save_config(&s.dir, &s.cfg) {
             crate::logs::push(
                 &s.dir,
@@ -308,6 +325,29 @@ pub fn note_deleted_account(account: &Account) {
             );
         }
     });
+}
+
+/// 撤回一条「刚删、还没提交」的账号：恢复时要先撤掉待删除，
+/// 否则下一轮提交照样漏掉它，服务端仍会记成墓碑。
+pub fn cancel_pending_deletion(key: &str) {
+    let written = mutate(|s| {
+        let before = s.cfg.deleted_keys.len();
+        s.cfg.deleted_keys.retain(|k| k.trim() != key.trim());
+        if s.cfg.deleted_keys.len() == before {
+            return Ok(());
+        }
+        save_config(&s.dir, &s.cfg)
+    });
+    if let Some(Err(e)) = written {
+        let dir = data_dir().unwrap_or_default();
+        crate::logs::push(
+            &dir,
+            crate::logs::CAT_SYSTEM,
+            "凭证池",
+            false,
+            format!("撤回待删除标记失败：{e}（恢复的账号可能仍被云端判成已删）"),
+        );
+    }
 }
 
 /// 整池提交成功后清空本机待办：云端已经按「本轮没出现」记好墓碑、也收到恢复。
@@ -350,42 +390,203 @@ pub fn note_reviving(id: &str) {
     }
 }
 
-/// 已删除账号的展示形状（不含 token：恢复由后端从墓碑快照直接取）。
+/// 云端池里的一条（发给界面）：**不带令牌** —— 界面只需要认出账号、看到有效期。
 #[derive(Serialize, Clone, Debug)]
-pub struct DeletedItem {
+pub struct CloudAccount {
+    /// 跨机身份锚点（手机号 → 昵称 → 本地 id），删除 / 恢复都用它
     pub key: String,
     pub name: String,
     pub phone: String,
+    /// 访问票到期：字段缺失时从票里折算（见 [`item_expiry`]）
+    pub expires_at: Option<i64>,
+    pub rt_expires_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    /// 只在「已删除」里出现
     pub deleted_at: Option<i64>,
 }
 
-/// 最近一次同步带回、且当前没有活条目对应的墓碑（按删除时间倒序）。
-pub fn deleted_items() -> Vec<DeletedItem> {
-    let Some(lock) = STATE.get() else {
-        return Vec::new();
-    };
-    let items = match lock.lock() {
-        Ok(s) => s.cfg.deleted_items.clone(),
-        Err(_) => return Vec::new(),
-    };
-    let mut out: Vec<DeletedItem> = items
-        .into_iter()
-        .map(|i| DeletedItem {
-            key: i.key,
-            name: i.name,
-            phone: i.phone,
-            deleted_at: i.deleted_at,
-        })
-        .collect();
-    out.sort_by(|a, b| b.deleted_at.unwrap_or(0).cmp(&a.deleted_at.unwrap_or(0)));
-    out
+/// `broker_cloud_snapshot` 的返回：一次读取云端池的结果（可能来自缓存）。
+///
+/// 这是**云端那一份**：主表里的「云端副本」是它的本地投影，两者不共享来源。
+#[derive(Serialize, Clone, Debug)]
+pub struct CloudSnapshot {
+    pub uuid: String,
+    pub accounts: Vec<CloudAccount>,
+    pub deleted: Vec<CloudAccount>,
+    pub version: Option<i64>,
+    /// 这份读数入缓存的时刻（毫秒）
+    pub fetched_at: i64,
+    /// `true` = 这次没打通云端，返回的是旧缓存（原因在 `error`）
+    pub stale: bool,
+    pub error: Option<String>,
 }
 
-pub fn deleted_count() -> usize {
-    STATE
-        .get()
-        .and_then(|l| l.lock().ok().map(|s| s.cfg.deleted_items.len()))
-        .unwrap_or(0)
+/// 最近一次直接读取的云端池：完整条目（含恢复所需的票），只在内存里。
+#[derive(Clone, Debug)]
+struct CloudCache {
+    uuid: String,
+    items: Vec<PoolItem>,
+    deleted: Vec<PoolItem>,
+    version: Option<i64>,
+    at_ms: i64,
+}
+
+fn cloud_account(item: &PoolItem) -> CloudAccount {
+    CloudAccount {
+        key: item.key.clone(),
+        name: if item.name.trim().is_empty() {
+            item.key.clone()
+        } else {
+            item.name.clone()
+        },
+        phone: item.phone.clone(),
+        expires_at: item_expiry(item),
+        rt_expires_at: item.rt_expires_at,
+        updated_at: item.updated_at,
+        deleted_at: item.deleted_at,
+    }
+}
+
+/// 缓存 → 界面视图。
+///
+/// 「本机已请求删除、还没提交」的条目先从在线列表里挡掉：不挡的话，刚点完删除
+/// 再打开弹窗，它又出现在云端列表里（服务端要等下一轮整池提交才记墓碑）。
+fn cloud_view(
+    cache: &CloudCache,
+    pending: &HashSet<String>,
+    stale: bool,
+    error: Option<String>,
+) -> CloudSnapshot {
+    let pending: HashSet<String> = pending.iter().map(|k| k.trim().to_string()).collect();
+    let accounts: Vec<CloudAccount> = cache
+        .items
+        .iter()
+        .filter(|i| i.deleted_at.is_none() && !pending.contains(i.key.trim()))
+        .map(cloud_account)
+        .collect();
+    let mut deleted: Vec<CloudAccount> = cache.deleted.iter().map(cloud_account).collect();
+    deleted.sort_by(|a, b| b.deleted_at.unwrap_or(0).cmp(&a.deleted_at.unwrap_or(0)));
+    CloudSnapshot {
+        uuid: cache.uuid.clone(),
+        accounts,
+        deleted,
+        version: cache.version,
+        fetched_at: cache.at_ms,
+        stale,
+        error,
+    }
+}
+
+fn cloud_cache() -> Option<Arc<CloudCache>> {
+    snapshot().1.cloud
+}
+
+/// 当前缓存对应的视图（不打网络）。没读过、或池已换绑时返回 `None`。
+pub fn cached_snapshot() -> Option<CloudSnapshot> {
+    let uuid = snapshot().0;
+    let cache = cloud_cache()?;
+    if uuid.as_deref() != Some(cache.uuid.as_str()) {
+        return None;
+    }
+    Some(cloud_view(&cache, &pending_deletions(), false, None))
+}
+
+/// 云端池的读取结果（`GET /v1/pool/{uuid}`）。
+#[derive(Deserialize, Debug)]
+struct PoolResp {
+    #[serde(default)]
+    items: Vec<PoolItem>,
+    #[serde(default)]
+    deleted: Vec<PoolItem>,
+    #[serde(default)]
+    version: i64,
+    #[serde(default)]
+    renewer: Option<String>,
+}
+
+/// 直接读云端那一池，**不经过本地账号列表**。
+///
+/// 缓存 [`CLOUD_TTL_MS`]：`force` 时照样先取网络（打开弹窗、手动同步）；
+/// 打不通就回落到旧缓存（`stale = true`），连缓存都没有才报错。
+pub async fn cloud_snapshot(force: bool) -> Result<CloudSnapshot, String> {
+    let Some(uuid) = uuid() else {
+        return Err("本机未绑定凭证池".to_string());
+    };
+    let cached = cloud_cache().filter(|c| c.uuid == uuid);
+    let now = chrono::Utc::now().timestamp_millis();
+    if !force {
+        if let Some(c) = cached.as_ref() {
+            if now - c.at_ms < CLOUD_TTL_MS {
+                return Ok(cloud_view(c, &pending_deletions(), false, None));
+            }
+        }
+    }
+    match request(reqwest::Method::GET, &format!("/v1/pool/{uuid}"), None).await {
+        Ok(raw) => {
+            let renewer_present = raw.get("renewer").is_some();
+            let resp: PoolResp = serde_json::from_value(raw)
+                .map_err(|e| format!("凭证管家的池内容看不懂：{e}"))?;
+            let cache = Arc::new(CloudCache {
+                uuid: uuid.clone(),
+                items: resp.items.clone(),
+                deleted: resp.deleted.clone(),
+                version: Some(resp.version),
+                at_ms: now,
+            });
+            mutate(|s| {
+                s.rt.version = Some(resp.version);
+                if renewer_present {
+                    s.rt.renewer = resp.renewer.clone();
+                    s.rt.renewer_known = true;
+                }
+                s.rt.cloud = Some(cache.clone());
+            });
+            // 墓碑快照照旧落盘：离线时换绑前的「已删除」还能恢复
+            store_tombstones(resp.deleted, &resp.items);
+            Ok(cloud_view(&cache, &pending_deletions(), false, None))
+        }
+        Err((kind, m)) => match cached {
+            Some(c) => Ok(cloud_view(&c, &pending_deletions(), true, Some(m))),
+            None => Err(on_failure(kind, m)),
+        },
+    }
+}
+
+/// 删除成功后把缓存里那条挪进「已删除」：界面不用干等下一轮同步。
+pub fn cache_mark_deleted(key: &str) {
+    let key = key.trim();
+    let now = chrono::Utc::now().timestamp_millis();
+    mutate(|s| {
+        let Some(arc) = s.rt.cloud.as_mut() else {
+            return;
+        };
+        let cache = Arc::make_mut(arc);
+        let Some(pos) = cache.items.iter().position(|i| i.key.trim() == key) else {
+            return;
+        };
+        let mut item = cache.items.remove(pos);
+        item.deleted_at = Some(now);
+        cache.deleted.retain(|i| i.key.trim() != key);
+        cache.deleted.insert(0, item);
+    });
+}
+
+/// 恢复成功后把缓存里那条挪回「在线」：服务端要到下一轮提交才真正复活。
+pub fn cache_mark_revived(key: &str) {
+    let key = key.trim();
+    mutate(|s| {
+        let Some(arc) = s.rt.cloud.as_mut() else {
+            return;
+        };
+        let cache = Arc::make_mut(arc);
+        let Some(pos) = cache.deleted.iter().position(|i| i.key.trim() == key) else {
+            return;
+        };
+        let mut item = cache.deleted.remove(pos);
+        item.deleted_at = None;
+        cache.items.retain(|i| i.key.trim() != key);
+        cache.items.push(item);
+    });
 }
 
 /// 取一条墓碑并把账本交给调用方（**不落盘**：账号先写成功，调用方再 [`take_tombstone`]）。
@@ -397,6 +598,17 @@ pub fn find_tombstone(key: &str) -> Option<PoolItem> {
         .iter()
         .find(|i| i.key == key)
         .cloned()
+}
+
+/// 恢复用的墓碑：优先最近一次**直接从云端读到**的「已删除」，没有再看同步落盘的快照。
+pub fn find_cloud_tombstone(key: &str) -> Option<PoolItem> {
+    let key = key.trim();
+    if let Some(cache) = cloud_cache() {
+        if let Some(i) = cache.deleted.iter().find(|i| i.key.trim() == key) {
+            return Some(i.clone());
+        }
+    }
+    find_tombstone(key)
 }
 
 /// 从「已删除」里移除一条（恢复成功后调）。
@@ -678,6 +890,8 @@ fn set_uuid(uuid: Option<String>) -> Result<(), String> {
         s.cfg.deleted_keys.clear();
         s.cfg.reviving_ids.clear();
         s.cfg.deleted_items.clear();
+        // 云端读数缓存跟着这一池走：换池 / 解绑后旧的「云端账号」不能再显示
+        s.rt.cloud = None;
         save_config(&s.dir, &s.cfg)
     });
     match written {
@@ -757,15 +971,12 @@ pub struct BrokerStatus {
     pub is_renewer: bool,
     /// 取消续签的宽限截止；宽限内没有新设备，本机会自动写回去
     pub grace_until: Option<i64>,
-    /// 「已删除」列表里有多少条（最近一次同步的快照；0 时不展示入口）
-    pub deleted_count: usize,
 }
 
 pub fn status() -> BrokerStatus {
     let (uuid, rt) = snapshot();
     let self_id = self_id();
     BrokerStatus {
-        deleted_count: deleted_count(),
         bound: uuid.is_some(),
         uuid,
         version: rt.version,
@@ -2858,6 +3069,61 @@ mod tests {
         assert_eq!(parsed.key, "k");
         assert_eq!(parsed.access_token, "");
         assert_eq!(parsed.expires_at, None);
+    }
+
+    #[test]
+    fn cloud_view_hides_pending_deletions_and_sorts_tombstones() {
+        let cache = CloudCache {
+            uuid: "u".into(),
+            items: vec![
+                item("138", "alive", Some(1)),
+                item("139", "pending", Some(1)),
+            ],
+            deleted: vec![
+                PoolItem {
+                    key: "old".into(),
+                    name: "旧".into(),
+                    deleted_at: Some(10),
+                    ..PoolItem::default()
+                },
+                PoolItem {
+                    key: "older".into(),
+                    name: "更旧".into(),
+                    deleted_at: Some(20),
+                    ..PoolItem::default()
+                },
+            ],
+            version: Some(7),
+            at_ms: 123,
+        };
+        let pending: HashSet<String> = ["139".to_string()].into_iter().collect();
+        let view = cloud_view(&cache, &pending, false, None);
+        let keys: Vec<&str> = view.accounts.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, vec!["138"], "已请求删除、还没提交的不该出现在在线列表");
+        let tomb: Vec<&str> = view.deleted.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(tomb, vec!["older", "old"], "墓碑按删除时间倒序");
+        assert_eq!(view.version, Some(7));
+    }
+
+    #[test]
+    fn cloud_snapshot_never_carries_tokens() {
+        // 弹窗只需要认人 + 看有效期：整条序列化出去时不能带票
+        let view = cloud_view(
+            &CloudCache {
+                uuid: "u".into(),
+                items: vec![item("138", "a", Some(1))],
+                deleted: Vec::new(),
+                version: Some(1),
+                at_ms: 1,
+            },
+            &HashSet::new(),
+            false,
+            None,
+        );
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("access_token"));
+        assert!(!json.contains("refresh_token"));
+        assert!(json.contains("\"accounts\""));
     }
 
     // ── 本地 → 云端方向（[`local_is_newer`]，`cloud_is_newer` 的反方向）──

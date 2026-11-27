@@ -10,7 +10,7 @@ import type {
   ImportItem,
   ImportReport,
   BrokerStatus,
-  DeletedItem,
+  CloudSnapshot,
   PoolOp,
   SyncReport,
   NetReport,
@@ -30,23 +30,29 @@ export const importAccounts = (items: ImportItem[]) =>
   invoke<ImportReport>("import_accounts", { items });
 
 /**
- * 删除账号。
+ * 从主表删除账号：只移除本机这一份，不动云端池。
  *
- * - `fromCloudPool = false`（主表）：只移除本机这一份；云端副本 / 导入账号都走这里，
- *   不动云端池。
- * - `fromCloudPool = true`（云端账号弹窗）：删的是云端池本身，下一轮同步变成墓碑，
- *   可在「已删除」里恢复。
+ * 云端池的删除在「云端账号」弹窗里，按 key 直接删云端（见 `brokerDeleteCloudAccount`），
+ * 与本机有没有副本无关 —— 两条路所以不共用这个命令。
  */
-export const removeAccount = (id: string, fromCloudPool = false) =>
-  invoke<void>("remove_account", { id, fromCloudPool });
+export const removeAccount = (id: string) => invoke<void>("remove_account", { id });
 
-/** 「已删除」列表（最近一次同步带回、且当前没有活账号对应的墓碑） */
-export const brokerDeletedItems = () =>
-  invoke<DeletedItem[]>("broker_deleted_items");
+/**
+ * 云端池的读数：**直接读云端**（缓存 60 秒），不是主表「云端副本」的投影。
+ *
+ * `force = true` 会跳过缓存（打开弹窗 / 手动同步后用）；打不通云端时后端回落到
+ * 旧缓存，返回值里 `stale = true`、`error` 说明原因。
+ */
+export const brokerCloudSnapshot = (force = false) =>
+  invoke<CloudSnapshot>("broker_cloud_snapshot", { force });
 
-/** 从「已删除」恢复一条：用墓碑快照重建本机账号，下一轮同步随整池 PUT 复活 */
+/** 从云端池删除一条（按 key，不要求本机有副本）；返回更新后的缓存视图 */
+export const brokerDeleteCloudAccount = (key: string) =>
+  invoke<CloudSnapshot | null>("broker_delete_cloud_account", { key });
+
+/** 从「已删除」恢复一条：重建本机账号，下一轮同步随整池 PUT 复活；返回更新后的缓存视图 */
 export const brokerRestoreAccount = (key: string) =>
-  invoke<void>("broker_restore_account", { key });
+  invoke<CloudSnapshot | null>("broker_restore_account", { key });
 
 export const checkinOne = (id: string) =>
   invoke<Account>("checkin_one", { id });

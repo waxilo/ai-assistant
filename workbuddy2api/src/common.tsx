@@ -93,6 +93,14 @@ export function accountLabel(name: string, phone?: string | null): string {
   return phone ? `${maskPhone(name)}（${maskPhone(phone)}）` : maskPhone(name);
 }
 
+/**
+ * 跨机认人的锚点，与后端 `broker::item_key_of` 同口径：手机号 → 昵称 → 本地 id。
+ * 用来把云端池里的一条对到本机这条（只做展示对照，比如读本机台账的积分）。
+ */
+export function accountKey(a: Account): string {
+  return a.phone?.trim() || a.name.trim() || a.id;
+}
+
 /** 解析「YYYY-MM-DD HH:MM:SS」为 Date；格式不符返回 null */
 function parseAt(at?: string | null): Date | null {
   if (!at) return null;
@@ -191,14 +199,11 @@ export function StatusDot({ tone, label }: { tone: DotTone; label: string }) {
  * 日志的一条结果 → 状态圆点。
  *
  * 文案按**类别**微调，而不是一律「成功 / 失败」：通知的成败叫「已发送 / 失败」，
- * 接管动作叫「完成 / 异常」—— 同一个绿点，说的是不同的事。
+ * 同一个绿点，说的是不同的事。
  */
 export function logStatus(l: LogEntry): { tone: DotTone; label: string } {
-  if (!l.success) {
-    return { tone: "fail", label: l.category === "takeover" ? "异常" : "失败" };
-  }
+  if (!l.success) return { tone: "fail", label: "失败" };
   if (l.category === "notify") return { tone: "done", label: "已发送" };
-  if (l.category === "takeover") return { tone: "done", label: "完成" };
   // 签到「今日已签到」也是成功，但说「已签」比「成功」更准确
   if (l.category === "checkin" && l.message.includes("已签到")) {
     return { tone: "done", label: "已签" };

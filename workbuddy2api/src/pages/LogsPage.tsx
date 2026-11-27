@@ -8,16 +8,14 @@ import { IconList, IconSearch, IconTrash } from "../components/Icons";
 /**
  * 日志管理页：把**全部**日志并成一条按时间倒序的流水。
  *
- * 数据源有两路（后端 `logs::unified` 已并好）：
- * - 应用日志：签到 / 续签 / 通知 / 系统，落盘、跨重启；
- * - 接管动态：谁用了哪个账号、限流切没切（`takeover-journal.jsonl`，持久化）。
+ * 数据源只有应用日志：签到 / 续签 / 通知 / 网关访问 / 系统，落盘、跨重启。
  *
  * 「报错」不是一个类别，而是**横跨全部的成败筛选**：排查时关心的是「哪里出错了」，
  * 不是「哪个模块出错了」，所以来源与成败是两个独立的筛选轴。
  *
- * 每 5 秒轮询而不是只读一次：日志多半由后台线程写（定时签到 / 自动续签 / 反代），
+ * 每 5 秒轮询而不是只读一次：日志多半由后台线程写（定时签到 / 自动续签 / 网关），
  * 打开页面时它们已经发生；轮询才能让它像「正在看」而不是一张快照。
- * 窗口隐藏时跳过（与接管页同一个口径）。
+ * 窗口隐藏时跳过。
  */
 const POLL_MS = 5000;
 
@@ -38,7 +36,6 @@ const CATEGORY_LABEL: Record<LogCategory, string> = {
   renew: "续签",
   notify: "通知",
   api: "API",
-  takeover: "接管",
   system: "系统",
 };
 
@@ -103,7 +100,6 @@ export function LogsPage({
       renew: 0,
       notify: 0,
       api: 0,
-      takeover: 0,
       system: 0,
     };
     for (const l of logs) {
@@ -127,11 +123,11 @@ export function LogsPage({
     });
   }, [logs, q, filter]);
 
-  /** 清空日志（不可恢复）：应用日志与接管动态一起清，界面上不留半张流水。 */
+  /** 清空日志（不可恢复）。 */
   const doClear = async () => {
     const ok = await askConfirm({
       title: "清空全部日志",
-      body: `确认清空全部日志（当前 ${logs.length} 条，含接管动态）？清空后无法恢复。`,
+      body: `确认清空全部日志（当前 ${logs.length} 条）？清空后无法恢复。`,
       okText: "清空",
       danger: true,
     });
@@ -204,7 +200,7 @@ export function LogsPage({
             hint={
               error ??
               (logs.length === 0
-                ? "签到、续签、通知与接管动作都会记录在这里"
+                ? "签到、续签、通知与网关访问都会记录在这里"
                 : "换一个关键字或类别试试")
             }
           />

@@ -93,6 +93,14 @@ export function accountLabel(name: string, phone?: string | null): string {
   return phone ? `${maskPhone(name)}（${maskPhone(phone)}）` : maskPhone(name);
 }
 
+/**
+ * 跨机认人的锚点，与后端 `broker::item_key_of` 同口径：手机号 → 昵称 → 本地 id。
+ * 用来把云端池里的一条对到本机这条（只做展示对照，比如读本机台账的积分）。
+ */
+export function accountKey(a: Account): string {
+  return a.phone?.trim() || a.name.trim() || a.id;
+}
+
 /** 解析「YYYY-MM-DD HH:MM:SS」为 Date；格式不符返回 null */
 function parseAt(at?: string | null): Date | null {
   if (!at) return null;

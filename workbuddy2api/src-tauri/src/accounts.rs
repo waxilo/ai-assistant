@@ -200,11 +200,6 @@ pub struct Settings {
     /// 空 = 全部账号都可作为备选（智能轮换）。
     #[serde(default)]
     pub billing_account_ids: Vec<String>,
-    /// 限流无感切换生效的模型（多选）：这些模型触发 429 时自动换备用账号重发同一请求。
-    /// 0 积分（免费）模型恒生效、无需勾选；这里只存用户额外勾选的付费模型。
-    /// 空 = 仅 0 积分免费模型享受限流切换。
-    #[serde(default)]
-    pub rate_limit_models: Vec<String>,
     /// 多账号风控预防：批量签到时在账号之间加入随机间隔，避免同一 IP 瞬时连发多账号请求。
     #[serde(default = "default_true")]
     pub stagger_checkin: bool,
@@ -227,13 +222,6 @@ pub struct Settings {
     /// 比自动签到小得多：手动场景还得让人等得下去。
     #[serde(default = "default_manual_stagger_max")]
     pub manual_stagger_max_seconds: u32,
-    /// 限流（429）时是否在同一会话内换备用账号。
-    ///
-    /// true = 无感续跑，但同一个会话会出现「中途换凭证」——正常用户的一个会话
-    /// 自始至终只有一个账号，这在风控眼里是极高异常值。false = 防御优先：
-    /// 429 原样透传、不记冷却，该会话不会被切到别的账号上。
-    #[serde(default = "default_true")]
-    pub failover_on_rate_limit: bool,
     /// 积分简报：后台每小时结算一次时条目，日条目是当天时条目之和。
     ///
     /// 开关的入口在**积分简报页**（那一页才是它的主场），不在设置页。
@@ -287,13 +275,11 @@ impl Default for Settings {
             gateway_port: default_gateway_port(),
             gateway_api_key: String::new(),
             billing_account_ids: Vec::new(),
-            rate_limit_models: Vec::new(),
             stagger_checkin: true,
             stagger_max_seconds: default_stagger_max(),
             shuffle_checkin_order: true,
             manual_stagger: true,
             manual_stagger_max_seconds: default_manual_stagger_max(),
-            failover_on_rate_limit: true,
             // 积分简报默认关闭：它要按小时打接口、改写台账，用户主动开启才跑
             briefing_enabled: false,
             notify_on_briefing: true,
@@ -602,8 +588,6 @@ mod tests {
         assert!(s.shuffle_checkin_order);
         assert!(s.manual_stagger);
         assert_eq!(s.manual_stagger_max_seconds, 8);
-        // 限流换号默认保持开启 = 与升级前的行为一致（关掉才是主动选的防御姿态）
-        assert!(s.failover_on_rate_limit);
         // 积分简报：**默认关闭**（老配置里没有这个键 → 不能替用户把它打开）。
         // 它自己的推送开关仍是默认开，只在简报真的开着时才有意义
         assert!(!s.briefing_enabled);

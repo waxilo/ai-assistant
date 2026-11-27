@@ -4,6 +4,7 @@ import brandIcon from "../src-tauri/icons/icon-source.svg";
 import type {
   Account,
   BrokerStatus,
+  CloudSnapshot,
   ImportItem,
   ImportReport,
   Settings,
@@ -25,8 +26,16 @@ import {
   brokerSyncNow,
   brokerClaimRenewer,
   brokerReleaseRenewer,
+  brokerDeleteCloudAccount,
 } from "./api";
-import { accountLabel, tally, formatBytes, type ConfirmReq, type Toast } from "./common";
+import {
+  accountKey,
+  accountLabel,
+  tally,
+  formatBytes,
+  type ConfirmReq,
+  type Toast,
+} from "./common";
 import { bindCredits, seedCredits } from "./credits";
 import {
   autoUpdateProgress,
@@ -67,8 +76,7 @@ import { TitleBar } from "./components/TitleBar";
 /**
  * 应用外壳：左侧导航栏 + 右侧内容区。
  *
- * 页面（tab）承载常驻功能：账号签到 / 智能接管 / 日志管理 / 设置
- * （网络急救已作为一张卡并入设置页，见 NetfixCard）；
+ * 页面（tab）承载常驻功能：账号签到 / API 接入 / 积分简报 / 日志管理 / 设置；
  * 弹窗只留给「做完即走」的任务流（添加账号、绑定凭证池、危险操作确认）。
  */
 type Page = "accounts" | "api" | "briefing" | "logs" | "settings";
@@ -418,14 +426,13 @@ export default function App() {
   }, [showToast]);
 
   const removeOne = useCallback(
-    async (a: Account, fromCloudPool = false) => {
-      const body = fromCloudPool
-        ? `确认从云端池删除「${accountLabel(a.name, a.phone)}」？下一轮同步会把它变成墓碑，之后可在「已删除」里恢复。`
-        : a.origin === "cloud"
-        ? `确认删除本机副本「${accountLabel(a.name, a.phone)}」？云端池不受影响；下一轮同步可能又把它拉回来。`
-        : brokerStatus?.bound
-        ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「云端账号 → 已删除」里恢复。`
-        : `确认删除「${accountLabel(a.name, a.phone)}」？`;
+    async (a: Account) => {
+      const body =
+        a.origin === "cloud"
+          ? `确认删除本机副本「${accountLabel(a.name, a.phone)}」？云端池不受影响；下一轮同步可能又把它拉回来。`
+          : brokerStatus?.bound
+          ? `确认删除「${accountLabel(a.name, a.phone)}」？绑定期间会随下一轮同步变成云端墓碑，之后可在「云端账号 → 已删除」里恢复。`
+          : `确认删除「${accountLabel(a.name, a.phone)}」？`;
       const ok = await askConfirm({
         title: "删除账号",
         body,
@@ -434,7 +441,7 @@ export default function App() {
       });
       if (!ok) return;
       try {
-        await removeAccount(a.id, fromCloudPool);
+        await removeAccount(a.id);
         setAccounts((l) => l.filter((x) => x.id !== a.id));
         showToast({ kind: "ok", text: `已删除 ${accountLabel(a.name, a.phone)}` });
       } catch (e) {
@@ -442,6 +449,34 @@ export default function App() {
       }
     },
     [askConfirm, brokerStatus?.bound, showToast]
+  );
+
+  /**
+   * 「云端账号」弹窗里的删除：删的是**云端池那一条**（按 key），本机有副本就一起移除。
+   *
+   * 返回值是后端更新后的云端读数（`null` = 用户取消 / 失败 / 还没读到云端）：
+   * 弹窗拿它就地换列表，不必再打一趟云端（服务端要到下一轮同步才记墓碑）。
+   */
+  const removeCloudOne = useCallback(
+    async (key: string, label: string): Promise<CloudSnapshot | null> => {
+      const ok = await askConfirm({
+        title: "从云端池删除",
+        body: `确认从云端池删除「${label}」？下一轮同步会把它变成墓碑，之后可在「已删除」里恢复。`,
+        okText: "删除",
+        danger: true,
+      });
+      if (!ok) return null;
+      try {
+        const snap = await brokerDeleteCloudAccount(key);
+        setAccounts((l) => l.filter((x) => accountKey(x) !== key));
+        showToast({ kind: "ok", text: `已从云端池删除 ${label}` });
+        return snap;
+      } catch (e) {
+        showToast({ kind: "err", text: "删除失败：" + String(e) });
+        return null;
+      }
+    },
+    [askConfirm, showToast]
   );
 
   // 批量导入：后端按「手机号或 token」识别已有账号并合并补全凭证，不会产生重复条目
@@ -800,7 +835,8 @@ export default function App() {
               onRefreshBroker={refreshBrokerStatus}
               reload={load}
               onCheckinOne={(id) => void runCheckinOne(id)}
-              onRemove={(a, fromCloudPool) => void removeOne(a, fromCloudPool)}
+              onRemove={(a) => void removeOne(a)}
+              onRemoveCloud={removeCloudOne}
               onOpenLogs={(id) => {
                 // 从账号条目进日志页：锁定该账号
                 setLogsInitial(id);

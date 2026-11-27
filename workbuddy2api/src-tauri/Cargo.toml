@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy2api"
-version = "0.2.11"
+version = "0.2.12"
 description = "WorkBuddy2API：WorkBuddy 账号池转 OpenAI / Responses 兼容 API"
 authors = ["waxilo"]
 edition = "2021"
@@ -42,6 +42,8 @@ thiserror = "1"
 # 「从本机凭证导入」必须能解开它，否则读到的只是 `$wbEncrypted` 壳子（详见 atrest.rs）。
 aes-gcm = "0.10"
 sha2 = "0.10"
+# 改 Codex 的 config.toml：保留注释/键序/字面量的可编辑 TOML 文档
+toml_edit = "0.25"
 
 [profile.release]
 panic = "abort"

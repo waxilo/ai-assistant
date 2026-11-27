@@ -78,12 +78,6 @@ export interface Settings {
   gateway_api_key: string;
   /** 扣费备选账号 id 列表（多选）：网关只在这批账号里选号扣费；空 = 全部可用 */
   billing_account_ids: string[];
-  /** 限流无感切换生效的模型 id 列表（多选）：这些模型触发 429 时自动换备用账号重发；
-   *  0 积分免费模型恒生效无需勾选，这里只存用户额外勾选的付费模型；空 = 仅免费模型 */
-  rate_limit_models: string[];
-  /** 限流（429）时是否在**同一会话内**换备用账号。
-   *  true = 无感续跑，但同一会话会出现中途换凭证；false = 防御优先，429 原样透传 */
-  failover_on_rate_limit: boolean;
   /** 多账号风控预防：批量签到时在账号之间加入随机间隔 */
   stagger_checkin: boolean;
   /** 随机间隔上限（秒），实际在 2..=max 之间取值 */
@@ -195,18 +189,33 @@ export interface BrokerStatus {
   is_renewer: boolean;
   /** 取消续签的宽限截止（毫秒）；宽限内没有新设备，本机会自动写回去 */
   grace_until: number | null;
-  /** 「已删除」列表里有多少条（最近一次同步的快照；0 时不展示入口） */
-  deleted_count: number;
 }
 
-/** 「已删除」列表的一条：只有展示字段，token 留在后端墓碑里 */
-export interface DeletedItem {
-  /** 池里那条的身份 key（手机号 → 昵称 → 本地 id），恢复时用它 */
+/** 云端池里的一条：**直接来自云端**，不是主表里的「云端副本」投影。不含令牌 */
+export interface CloudAccount {
+  /** 跨机身份锚点（手机号 → 昵称 → 本地 id），删除 / 恢复都用它 */
   key: string;
   name: string;
   phone: string;
-  /** 删除时间（毫秒）；旧数据可能为 null */
+  /** 访问票到期（毫秒）；字段缺失时后端从票里折算 */
+  expires_at: number | null;
+  rt_expires_at: number | null;
+  updated_at: number | null;
+  /** 只在「已删除」里出现 */
   deleted_at: number | null;
+}
+
+/** 一次读取云端池的结果（可能来自缓存） */
+export interface CloudSnapshot {
+  uuid: string;
+  accounts: CloudAccount[];
+  deleted: CloudAccount[];
+  version: number | null;
+  /** 这份读数入缓存的时刻（毫秒） */
+  fetched_at: number;
+  /** true = 这次没打通云端，返回的是旧缓存（原因在 error） */
+  stale: boolean;
+  error: string | null;
 }
 
 /** 上传 / 绑定的结果：uuid 是唯一要展示给用户复制的东西 */
@@ -349,7 +358,7 @@ export interface CodexRestartOutcome {
   app: string | null;
 }
 
-export type LogCategory = "checkin" | "renew" | "notify" | "api" | "takeover" | "system";
+export type LogCategory = "checkin" | "renew" | "notify" | "api" | "system";
 
 /**
  * 「日志管理」里的一条。来源是 `logs.rs` 的持久化日志（后端已按时间倒序）。

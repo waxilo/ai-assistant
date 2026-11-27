@@ -1,7 +1,7 @@
 //! 上游模型清单的整理：从 `/v1/models` 里挑出**能聊天**的模型，按价格梯度排。
 //!
-//! 这段原先是给 Codex 写模型目录用的，Cursor 接入同样需要，所以抽成独立模块。
 //! 它只做纯数据变换，不碰任何文件 —— 写不写、写到哪由调用方决定。
+//! 倍率解析 [`rate_of`] 也供网关的 `/v1/models` 转换复用，避免两份口径漂移。
 
 use serde::Serialize;
 
@@ -72,7 +72,10 @@ pub fn chat_models(body: &str) -> Vec<ChatModel> {
 }
 
 /// 倍率串 → 数值（`x0.29 credits` → 0.29）。解析不出来返回 `None`（排序时垫底）。
-fn rate_of(credits: &str) -> Option<f64> {
+///
+/// 上游两种写法混着来：免费模型是裸的 `x0.00`，付费的常带 ` credits` 后缀
+/// （实测 `hy4std x0.29 credits`）。只取第一段，别把后缀当数字。
+pub(crate) fn rate_of(credits: &str) -> Option<f64> {
     credits
         .split_whitespace()
         .next()?
@@ -114,6 +117,15 @@ mod tests {
         assert!(!is_chat_model("bge-rerank-large"));
         assert!(!is_chat_model("whisper-1"));
         assert!(!is_chat_model("FLUX.1-schnell"));
+    }
+
+    #[test]
+    fn rate_of_parses_both_upstream_formats() {
+        assert_eq!(rate_of("x0.00"), Some(0.0));
+        assert_eq!(rate_of("x0.29 credits"), Some(0.29), "付费倍率常带 credits 后缀");
+        assert_eq!(rate_of("X0.11"), Some(0.11));
+        assert_eq!(rate_of(""), None);
+        assert_eq!(rate_of("unknown"), None);
     }
 
     #[test]

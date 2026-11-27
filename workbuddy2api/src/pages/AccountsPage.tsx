@@ -1,9 +1,17 @@
-import { useEffect, useState } from "react";
-import type { Account, BrokerStatus, CreditPackage, DeletedItem } from "../types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  Account,
+  BrokerStatus,
+  CloudAccount,
+  CloudSnapshot,
+  CreditPackage,
+} from "../types";
 import {
   AccountCell,
   EmptyState,
   StatusDot,
+  accountKey,
+  accountLabel,
   copyText,
   formatCredits,
   signState,
@@ -15,8 +23,9 @@ import {
 import { packagesOf, creditsOf, expiryOf, totalCredits, soonestExpiry, soonestExpiringTotal, useCredits, seedCredits } from "../credits";
 import {
   refreshAccountCredits,
-  brokerDeletedItems,
+  brokerCloudSnapshot,
   brokerRestoreAccount,
+  brokerSyncNow,
 } from "../api";
 import { Dialog } from "../components/Dialog";
 import {
@@ -63,6 +72,7 @@ export function AccountsPage({
   busyIds,
   onCheckinOne,
   onRemove,
+  onRemoveCloud,
   onOpenLogs,
   brokerStatus,
   brokerBusy,
@@ -79,7 +89,9 @@ export function AccountsPage({
   loading: boolean;
   busyIds: Set<string>;
   onCheckinOne: (id: string) => void;
-  onRemove: (a: Account, fromCloudPool?: boolean) => void;
+  onRemove: (a: Account) => void;
+  /** 从云端池删一条（按 key，不要求本机有副本）；返回打过补丁的云端视图 */
+  onRemoveCloud: (key: string, label: string) => Promise<CloudSnapshot | null>;
   onOpenLogs: (accountId: string) => void;
   /** 凭证池状态；null = 还没读到（首屏那一瞬） */
   brokerStatus: BrokerStatus | null;
@@ -106,8 +118,68 @@ export function AccountsPage({
   const [pkgAccount, setPkgAccount] = useState<Account | null>(null);
   // 「云端账号」弹窗是否打开（云端账号 / 已删除都在它里面）
   const [showCloud, setShowCloud] = useState(false);
-  // 云端副本：主表照常显示，弹窗里管理的是云端池那一份
-  const cloudAccounts = accounts.filter((a) => a.origin === "cloud");
+  // 云端池的读数：**直接来自云端**（缓存 60 秒），不是主表「云端副本」的过滤结果
+  const [cloudSnap, setCloudSnap] = useState<CloudSnapshot | null>(null);
+  const [cloudErr, setCloudErr] = useState("");
+  const [cloudBusy, setCloudBusy] = useState(false);
+
+  const refreshCloud = useCallback(
+    async (force: boolean) => {
+      if (!brokerStatus?.bound) {
+        setCloudSnap(null);
+        setCloudErr("");
+        return;
+      }
+      setCloudBusy(true);
+      try {
+        const snap = await brokerCloudSnapshot(force);
+        setCloudSnap(snap);
+        setCloudErr(
+          snap.stale && snap.error
+            ? `云端暂时没连上，显示的是 ${sinceMs(snap.fetched_at)}的缓存：${snap.error}`
+            : ""
+        );
+      } catch (e) {
+        // 读不到就保留上一次成功的列表，只把原因说出来
+        setCloudErr(String(e));
+      } finally {
+        setCloudBusy(false);
+      }
+    },
+    [brokerStatus?.bound]
+  );
+
+  // 绑定状态 / 同步版本变化时重读：版本变了说明刚同步过，强制绕过缓存
+  const cloudVer = useRef<number | null | undefined>(undefined);
+  useEffect(() => {
+    const v = brokerStatus?.version ?? null;
+    const changed = cloudVer.current !== undefined && cloudVer.current !== v;
+    cloudVer.current = v;
+    void refreshCloud(changed);
+  }, [brokerStatus?.bound, brokerStatus?.version, refreshCloud]);
+
+  const openCloud = () => {
+    setShowCloud(true);
+    void refreshCloud(true);
+  };
+
+  const deleteCloud = async (a: CloudAccount) => {
+    const snap = await onRemoveCloud(a.key, accountLabel(a.name, a.phone));
+    if (snap) {
+      setCloudSnap(snap);
+      setCloudErr("");
+    }
+  };
+
+  const restoreCloud = async (key: string) => {
+    const snap = await brokerRestoreAccount(key);
+    if (snap) setCloudSnap(snap);
+    await reload();
+    // 提交复活 + 刷新：后台跑，成功后会带回新的池版本，上面的 effect 再强制读一次云端
+    void brokerSyncNow()
+      .then(() => reload())
+      .catch(() => {});
+  };
 
   // 凭证池那一栏在**两种空态下都要在**：一台全新的机器正是「先绑定、再拿账号」的
   // 典型场景 —— 把它藏在「先有账号」之后，等于逼用户在一台空机器上没法接上已有的池。
@@ -115,7 +187,7 @@ export function AccountsPage({
     <PoolBar
       status={brokerStatus}
       accountCount={accounts.length}
-      cloudCount={cloudAccounts.length}
+      cloudCount={cloudSnap?.accounts.length ?? null}
       busy={brokerBusy}
       onUpload={onBrokerUpload}
       onLink={onBrokerLink}
@@ -124,7 +196,7 @@ export function AccountsPage({
       onClaim={onBrokerClaim}
       onRelease={onBrokerRelease}
       onRefreshBroker={onRefreshBroker}
-      onOpenCloud={() => setShowCloud(true)}
+      onOpenCloud={openCloud}
     />
   );
 
@@ -133,10 +205,14 @@ export function AccountsPage({
   const cloudDialog = showCloud ? (
     <CloudAccountsDialog
       status={brokerStatus}
-      accounts={cloudAccounts}
+      snapshot={cloudSnap}
+      error={cloudErr}
+      busy={cloudBusy}
+      localAccounts={accounts}
       onClose={() => setShowCloud(false)}
-      onRemove={onRemove}
-      reload={reload}
+      onRefresh={() => void refreshCloud(true)}
+      onDelete={deleteCloud}
+      onRestore={restoreCloud}
     />
   ) : null;
 
@@ -403,54 +479,53 @@ export function AccountsPage({
 }
 
 /**
- * 「云端账号」弹窗：云端列表的独立视图，和主表互不影响。
+ * 「云端账号」弹窗：云端池的独立视图，和主表的本机副本无关。
  *
+ * - 数据源 `GET /v1/pool/{uuid}`（后端缓存 60 秒，打开弹窗 / 同步后强制刷新）；
+ *   云端正发生的增删不必等本机下一轮同步就能看见。
  * - 在线：查看；**续签设备**还能从云端池逻辑删除。
- * - 已删除：最近一次同步带回的墓碑，**续签设备**可以恢复。
+ * - 已删除：云端墓碑，**续签设备**可以恢复。
  *
  * 写操作（删除 / 恢复）只对续签设备开放：其他设备进来看，按钮一概没有。
+ * 「积分」一列是本地台账的旁注（按 key 对照到本机副本才有），列表本身不依赖本机账号。
  */
 function CloudAccountsDialog({
   status,
-  accounts,
+  snapshot,
+  error,
+  busy,
+  localAccounts,
   onClose,
-  onRemove,
-  reload,
+  onRefresh,
+  onDelete,
+  onRestore,
 }: {
   status: BrokerStatus | null;
-  accounts: Account[];
+  snapshot: CloudSnapshot | null;
+  error: string;
+  busy: boolean;
+  /** 只用于「积分」对照：按 key 找到本机副本才显示读数 */
+  localAccounts: Account[];
   onClose: () => void;
-  onRemove: (a: Account, fromCloudPool?: boolean) => void;
-  reload: () => Promise<void>;
+  onRefresh: () => void;
+  onDelete: (a: CloudAccount) => Promise<void>;
+  onRestore: (key: string) => Promise<void>;
 }) {
   const book = useCredits();
   // 云端池的写操作（删除 / 恢复）只给续签设备；其他设备在这份列表里只能查看
   const canManage = status?.is_renewer ?? false;
   const [tab, setTab] = useState<"live" | "deleted">("live");
-
-  const [items, setItems] = useState<DeletedItem[] | null>(null);
   const [err, setErr] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
 
-  const refreshDeleted = async () => {
-    try {
-      setItems(await brokerDeletedItems());
-      setErr("");
-    } catch (e) {
-      setErr(String(e));
-    }
-  };
-  useEffect(() => {
-    if (tab === "deleted") void refreshDeleted();
-  }, [tab]);
+  const live = snapshot?.accounts ?? [];
+  const deleted = snapshot?.deleted ?? [];
 
   const restore = async (key: string) => {
     setBusyKey(key);
     setErr("");
     try {
-      await brokerRestoreAccount(key);
-      await reload();
-      await refreshDeleted();
+      await onRestore(key);
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -458,14 +533,14 @@ function CloudAccountsDialog({
     }
   };
 
-  const deletedCount = status?.deleted_count ?? items?.length ?? 0;
+  const note = err || error;
 
   return (
     <Dialog
       size="lg"
       icon={<IconCloud size={16} />}
       title="云端账号"
-      subtitle="从云端凭证池同步来的账号单独放在这里，不混入本机账号列表。"
+      subtitle="直接读取云端凭证池（缓存 60 秒），与主表的本机副本无关。"
       onClose={onClose}
       footer={
         <button className="btn" onClick={onClose}>
@@ -479,21 +554,31 @@ function CloudAccountsDialog({
             className={"btn small" + (tab === "live" ? " primary" : " ghost")}
             onClick={() => setTab("live")}
           >
-            账号 {accounts.length}
+            账号 {snapshot ? live.length : "…"}
           </button>
           <button
             className={"btn small" + (tab === "deleted" ? " primary" : " ghost")}
             onClick={() => setTab("deleted")}
           >
-            已删除 {deletedCount}
+            已删除 {snapshot ? deleted.length : "…"}
+          </button>
+          <button
+            className="btn small ghost"
+            disabled={busy}
+            onClick={onRefresh}
+            title="重新读取云端池（跳过缓存）"
+          >
+            {busy ? "读取中…" : "刷新"}
           </button>
         </span>
       </div>
 
-      {err && <p className="note danger">{err}</p>}
+      {note && <p className="note danger">{note}</p>}
 
-      {tab === "live" ? (
-        accounts.length === 0 ? (
+      {snapshot === null ? (
+        <p className="note">加载中…</p>
+      ) : tab === "live" ? (
+        live.length === 0 ? (
           <p className="note">云端池里还没有账号。</p>
         ) : (
           <div className="table-wrap">
@@ -507,11 +592,13 @@ function CloudAccountsDialog({
                 </tr>
               </thead>
               <tbody>
-                {accounts.map((a) => {
-                  const bal = creditsOf(book, a.id);
+                {live.map((a) => {
+                  // 只做展示对照：云端条目按 key 对到本机副本才有台账读数
+                  const local = localAccounts.find((x) => accountKey(x) === a.key);
+                  const bal = local ? creditsOf(book, local.id) : null;
                   const tok = tokenCountdown(a.expires_at);
                   return (
-                    <tr key={a.id}>
+                    <tr key={a.key}>
                       <td>
                         <AccountCell name={a.name} phone={a.phone} />
                       </td>
@@ -544,7 +631,7 @@ function CloudAccountsDialog({
                             <button
                               className="icon-btn icon-danger"
                               title="从云端池删除（可在「已删除」里恢复）"
-                              onClick={() => onRemove(a, true)}
+                              onClick={() => void onDelete(a)}
                             >
                               <IconTrash size={16} />
                             </button>
@@ -558,9 +645,7 @@ function CloudAccountsDialog({
             </table>
           </div>
         )
-      ) : items === null ? (
-        <p className="note">加载中…</p>
-      ) : items.length === 0 ? (
+      ) : deleted.length === 0 ? (
         <p className="note">没有已删除的账号。</p>
       ) : (
         <div className="table-wrap">
@@ -574,7 +659,7 @@ function CloudAccountsDialog({
               </tr>
             </thead>
             <tbody>
-              {items.map((it) => (
+              {deleted.map((it) => (
                 <tr key={it.key}>
                   <td>{it.name || it.key}</td>
                   <td>{it.phone || <span className="muted">—</span>}</td>
@@ -752,8 +837,8 @@ function PoolBar({
   status: BrokerStatus | null;
   /** 本机**本地**账号数（上传 / 简介都按这个数说） */
   accountCount: number;
-  /** 云端同步来的账号数（弹窗入口上的数字） */
-  cloudCount: number;
+  /** 云端池在线条数（直接读云端；null = 还没读到） */
+  cloudCount: number | null;
   busy: boolean;
   onUpload: () => void;
   onLink: () => void;
@@ -832,7 +917,7 @@ function PoolBar({
               title="查看 / 管理云端账号"
             >
               <IconCloud size={13} />
-              云端账号 {cloudCount}
+              云端账号{cloudCount == null ? "" : ` ${cloudCount}`}
             </button>
             {renewer?.tone === "self" ? (
               <button

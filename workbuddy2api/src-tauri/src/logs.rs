@@ -3,24 +3,20 @@
 //! ## 为什么合并
 //!
 //! 以前只有一张「签到日志」：签到结果单独一份 JSON，调度 / 续签 / 告警的失败挤在
-//! 纯文本的 `scheduler.log` 里，接管动态另有一份 jsonl —— 用户想知道「刚才那条通知
-//! 到底发出去没有」时，得在三个地方猜。现在统一成一个入口：
-//!
-//! - 本模块写**应用日志**（签到 / 续签 / 通知 / 系统），落盘、跨重启；
-//! - [`unified`] 再把接管动态（`stealth.rs` 的 `takeover-journal.jsonl`）按类别并进来
-//!   —— 接管那一份仍是唯一真相，本模块不复制它，因此两处永远不会漂移。
+//! 纯文本的 `scheduler.log` 里。用户想知道「刚才那条通知到底发出去没有」时，
+//! 得在两个地方猜。现在统一成一个入口：签到 / 续签 / 通知 / 网关 / 系统
+//! 都写进同一份应用日志，落盘、跨重启。
 //!
 //! ## 容量
 //!
-//! 应用日志保留最近 [`MAX_LOGS`] 条。合并后的列表最多再加接管动态，
-//! 界面上仍是「最近发生的事」，不会无限长。
+//! 应用日志保留最近 [`MAX_LOGS`] 条，界面直接按「最近发生的事」展示。
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// 应用日志文件名（数据目录下）。接管动态仍在 `takeover-journal.jsonl`，不并进来。
+/// 应用日志文件名（数据目录下）。
 const LOG_FILE: &str = "app-logs.jsonl";
 const MAX_LOGS: usize = 500;
 
@@ -30,9 +26,6 @@ pub const CAT_RENEW: &str = "renew";
 pub const CAT_NOTIFY: &str = "notify";
 /// 网关对外服务的访问记录（哪个账号、哪个模型、多久、成没成）
 pub const CAT_API: &str = "api";
-/// 历史类别：本项目已移除接管反代，保留常量只为让老日志仍能按它分组显示
-#[allow(dead_code)]
-pub const CAT_TAKEOVER: &str = "takeover";
 pub const CAT_SYSTEM: &str = "system";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -42,7 +35,7 @@ pub struct LogEntry {
     pub at_ms: i64,
     /// 见 `CAT_*`
     pub category: String,
-    /// 账号名；系统 / 接管类事件为空串
+    /// 账号名；系统类事件为空串
     pub account: String,
     pub message: String,
     pub success: bool,
@@ -142,7 +135,6 @@ pub fn clear(dir: &Path) {
 
 /// 界面用的**统一日志流**：应用日志，按时间倒序。
 ///
-/// 接管反代已从本项目移除，所以这里不再合并 `takeover-journal.jsonl`；
 /// 网关的访问记录直接写进应用日志的 `api` 类别，天然就在同一条流水里。
 pub fn unified(dir: &Path) -> Vec<LogEntry> {
     let mut all = entries(dir);

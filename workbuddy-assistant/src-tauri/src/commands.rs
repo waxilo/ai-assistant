@@ -567,44 +567,76 @@ mod import_tests {
 }
 
 #[tauri::command]
-pub fn remove_account(
-    app: AppHandle,
-    id: String,
-    from_cloud_pool: Option<bool>,
-) -> Result<(), String> {
-    let from_cloud_pool = from_cloud_pool.unwrap_or(false);
+pub fn remove_account(app: AppHandle, id: String) -> Result<(), String> {
     let dir = data_dir(&app);
     let mut accounts = accounts::load_accounts(&dir);
     let Some(victim) = accounts.iter().find(|a| a.id == id).cloned() else {
         return Err("账号不存在".into());
     };
-    // 主表（from_cloud_pool = false）删云端副本只动本机这一份，不记待删除；
-    // 云端弹窗（true）删的才是池本身，下一轮同步变成墓碑。
-    let local_removal_only = broker::origin_of(&victim) == "cloud" && !from_cloud_pool;
+    // 主表删除只动本机这一份：云端副本删掉不影响云端池（下次同步可能又拉回来）；
+    // 本机账号则记一笔「待删除」，下一次同步的并集不会把它从云端原样加回来。
+    // 云端池本身的删除走 `broker_delete_cloud_account`（按 key），不经这里。
+    let local_removal_only = broker::origin_of(&victim) == "cloud";
     accounts.retain(|a| a.id != id);
     accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
-    // 绑定时记一笔「待删除」：下一次同步的并集不会把它从云端原样加回来。
     if !local_removal_only {
         broker::note_deleted_account(&victim);
     }
     Ok(())
 }
 
-/// 「已删除」列表：最近一次同步带回、且当前没有活账号对应的墓碑。
+/// 「云端账号」弹窗的数据源：**直接读云端那一池**（缓存 60 秒，`force` 强制刷新）。
+///
+/// 与主表的「云端副本」无关：后者是同步投影，云端池在别处刚发生的增删要等下一轮
+/// 同步才会反映到主表里，而这里打开弹窗就能看见。
 #[tauri::command]
-pub fn broker_deleted_items() -> Vec<broker::DeletedItem> {
-    broker::deleted_items()
+pub async fn broker_cloud_snapshot(force: bool) -> Result<broker::CloudSnapshot, String> {
+    broker::cloud_snapshot(force).await
 }
 
-/// 从「已删除」里恢复一条：用墓碑快照重建本机账号，等下一轮同步随整池 PUT 复活。
+/// 从云端池删除一条（按 key）：本机有副本就一起移除，并把 key 记进待删除，
+/// 下一轮同步提交时服务端记墓碑。**不要求本机存在这条账号**。
 #[tauri::command]
-pub fn broker_restore_account(app: AppHandle, key: String) -> Result<(), String> {
-    let Some(tomb) = broker::find_tombstone(&key) else {
+pub fn broker_delete_cloud_account(
+    app: AppHandle,
+    key: String,
+) -> Result<Option<broker::CloudSnapshot>, String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("缺少账号标识".into());
+    }
+    if !broker::bound() {
+        return Err("本机未绑定凭证池".into());
+    }
+    let dir = data_dir(&app);
+    let mut accounts = accounts::load_accounts(&dir);
+    let before = accounts.len();
+    accounts.retain(|a| broker::item_key_of(a).trim() != key);
+    if accounts.len() != before {
+        accounts::save_accounts(&dir, &accounts).map_err(|e| e.to_string())?;
+    }
+    broker::note_deleted_key(&key);
+    // 就地更新缓存：界面立刻看到它进了「已删除」，不必再打一趟云端
+    broker::cache_mark_deleted(&key);
+    Ok(broker::cached_snapshot())
+}
+
+/// 从「已删除」里恢复一条：优先用**云端刚读到的**墓碑重建本机账号，
+/// 等下一轮同步随整池 PUT 复活。
+#[tauri::command]
+pub fn broker_restore_account(
+    app: AppHandle,
+    key: String,
+) -> Result<Option<broker::CloudSnapshot>, String> {
+    let Some(tomb) = broker::find_cloud_tombstone(&key) else {
         return Err("这条已删除记录不在了（可能已被别的机器恢复）".into());
     };
     let dir = data_dir(&app);
     let mut accounts = accounts::load_accounts(&dir);
-    if accounts.iter().any(|a| broker::item_key_of(a) == key) {
+    if accounts
+        .iter()
+        .any(|a| broker::item_key_of(a).trim() == key.trim())
+    {
         broker::take_tombstone(&key);
         return Err("账号已经在列表里了，刷新一下即可".into());
     }
@@ -616,8 +648,11 @@ pub fn broker_restore_account(app: AppHandle, key: String) -> Result<(), String>
     // 顺序不能反：保护没落盘就丢了墓碑，下一轮同步会把它当成「云端已删」再剪一次。
     broker::mark_cloud_member(&new_id);
     broker::note_reviving(&new_id);
+    // 刚删又恢复：撤掉待删除，否则本轮提交照样漏掉它
+    broker::cancel_pending_deletion(&key);
     broker::take_tombstone(&key);
-    Ok(())
+    broker::cache_mark_revived(&key);
+    Ok(broker::cached_snapshot())
 }
 
 /// 本次真的签到过的账号里，那些带回了余额读数的记录 → `(账号 id, 余额, 读数时刻)`。

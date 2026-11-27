@@ -12,6 +12,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::catalog::rate_of;
 use crate::routing;
 
 const CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -45,18 +46,6 @@ pub async fn fetch(host: &str, token: &str) -> Option<serde_json::Value> {
     resp.json().await.ok()
 }
 
-/// 倍率串（`x0.00` / `x0.29 credits`）→ 数值。
-///
-/// 上游两种写法混着来：免费模型是裸的 `x0.00`，付费的常带 ` credits` 后缀
-/// （实测 `hy4std x0.29 credits`）。只取第一段，别把后缀当数字。
-fn multiplier(v: &str) -> Option<f64> {
-    v.split_whitespace()
-        .next()?
-        .trim_start_matches(['x', 'X'])
-        .parse::<f64>()
-        .ok()
-}
-
 /// 私有结构 → OpenAI `/v1/models` 响应体（纯函数，便于单测）
 pub fn to_openai(upstream: &serde_json::Value) -> String {
     let empty = Vec::new();
@@ -80,7 +69,7 @@ pub fn to_openai(upstream: &serde_json::Value) -> String {
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            let free = multiplier(&credits).is_some_and(|x| x == 0.0);
+            let free = rate_of(&credits).is_some_and(|x| x == 0.0);
             Some((free, id, name, credits))
         })
         .collect();
@@ -175,13 +164,4 @@ mod tests {
             serde_json::from_str(&to_openai(&serde_json::json!({}))).unwrap();
         assert_eq!(v["data"].as_array().unwrap().len(), 0);
     }
-
-    #[test]
-    fn multiplier_parses_gateway_format() {
-        assert_eq!(multiplier("x0.00"), Some(0.0));
-        assert_eq!(multiplier("x0.29 credits"), Some(0.29), "付费倍率常带 credits 后缀");
-        assert_eq!(multiplier("x0.11"), Some(0.11));
-        assert_eq!(multiplier(""), None);
-    }
-
 }

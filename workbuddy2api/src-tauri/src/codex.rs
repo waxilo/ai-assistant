@@ -1,15 +1,15 @@
 //! 一键接入 Codex：改写 `~/.codex/config.toml` + 生成模型目录。
 //!
-//! # 为什么不用 TOML 库
+//! # 为什么用 toml_edit
 //!
 //! 用户的 `config.toml` 里有 `plugins`、`marketplaces`、`notify`、Windows 的
-//! `\\?\C:\...` 转义路径一大堆。用 `toml::to_string` 整体重写会：打乱注释、
-//! 重排键序、把 `\?\` 这类字面量重新转义 —— 相当于为了改 3 行而重写整个文件。
+//! `\\?\C:\...` 转义路径一大堆。`toml::to_string` 整体重写会打乱注释、重排键序、
+//! 把 `\?\` 这类字面量重新转义 —— 相当于为了改 3 行而重写整个文件。
 //!
-//! 所以这里是**外科手术式文本编辑**：只碰三个顶层键（`model_provider`、
-//! `model_catalog_json`、`model`）、`[features]` 里[受管的那几个开关]
+//! `toml_edit` 是保留原始格式的可编辑文档：只改我们关心的三个顶层键
+//! （`model_provider`、`model_catalog_json`、`model`）、`[features]` 里[受管的那几个开关]
 //! （[`DISABLED_FEATURES`]）与一个表（`[model_providers.workbuddy2api]`），
-//! 其余字节不动。
+//! 其余注释、键序与字面量原样保留。
 //!
 //! # 为什么写之前要备份
 //!
@@ -72,6 +72,7 @@
 use crate::catalog::ChatModel;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table};
 
 /// 写进 `config.toml` 的 provider id
 pub const PROVIDER_ID: &str = "workbuddy2api";
@@ -176,10 +177,11 @@ fn state_at(home: &Path) -> CodexState {
         return st;
     }
     let text = std::fs::read_to_string(&config).unwrap_or_default();
-    st.connected = get_top_level(&text, "model_provider").as_deref() == Some(PROVIDER_ID);
-    st.base_url = table_value(&text, &format!("model_providers.{PROVIDER_ID}"), "base_url")
-        .unwrap_or_default();
-    st.model = get_top_level(&text, "model").unwrap_or_default();
+    if let Ok(doc) = parse_config(&text) {
+        st.connected = top_level_str(&doc, "model_provider").as_deref() == Some(PROVIDER_ID);
+        st.base_url = provider_base_url(&doc).unwrap_or_default();
+        st.model = top_level_str(&doc, "model").unwrap_or_default();
+    }
     st.catalog_models = catalog_slugs(
         &std::fs::read_to_string(home.join(CATALOG_FILE)).unwrap_or_default(),
     );
@@ -250,6 +252,8 @@ fn connect_in(
     }
     let config = home.join("config.toml");
     let original = std::fs::read_to_string(&config).unwrap_or_default();
+    // 先解析再动手：文件不是有效 TOML 时直接报错，绝不拿空文档覆盖用户配置
+    let mut doc = parse_config(&original)?;
 
     // 只在**首次**接入时备份：重复接入时原文件已经是改过的版本，
     // 再存一次就把「原件」覆盖成了「改过的」，断开时会恢复不回去
@@ -265,21 +269,16 @@ fn connect_in(
     std::fs::write(home.join(CATALOG_FILE), catalog)
         .map_err(|e| format!("写模型目录失败：{e}"))?;
 
-    let mut text = original;
     // 关掉那几个「要 ChatGPT 账号」的开关（见文件头）：它们会在 turn 开始前串行阻塞，
     // 界面表现就是一直「正在思考」。feature 进 `[features]`，analytics 进 `[analytics]`。
-    text = apply_disabled_features(&text);
-    text = upsert_table(
-        &text,
-        &format!("model_providers.{PROVIDER_ID}"),
-        &provider_block(port, key),
-    );
-    text = set_top_level(&text, "model_provider", &format!("\"{PROVIDER_ID}\""));
-    text = set_top_level(&text, "model_catalog_json", &format!("\"{CATALOG_FILE}\""));
+    apply_disabled_features(&mut doc)?;
+    upsert_provider(&mut doc, port, key)?;
+    set_top_level(&mut doc, "model_provider", PROVIDER_ID);
+    set_top_level(&mut doc, "model_catalog_json", CATALOG_FILE);
     if !model.trim().is_empty() {
-        text = set_top_level(&text, "model", &format!("\"{}\"", model.trim()));
+        set_top_level(&mut doc, "model", model.trim());
     }
-    std::fs::write(&config, text).map_err(|e| format!("写 Codex 配置失败：{e}"))?;
+    std::fs::write(&config, doc.to_string()).map_err(|e| format!("写 Codex 配置失败：{e}"))?;
 
     // 回读确认：写成功不代表写对了（权限、并发编辑都可能让结果不如预期）
     let st = state_at(home);
@@ -301,24 +300,30 @@ fn disconnect_in(home: &Path, backup_dir: &Path) -> Result<CodexState, String> {
         return Err(format!("没有找到 Codex 配置目录（{}）", home.display()));
     }
     let config = home.join("config.toml");
-    let mut text = std::fs::read_to_string(&config).unwrap_or_default();
-    text = remove_table(&text, &format!("model_providers.{PROVIDER_ID}"));
+    let text = std::fs::read_to_string(&config).unwrap_or_default();
+    let mut doc = parse_config(&text)?;
+    remove_provider(&mut doc);
 
     let backup = backup_dir.join(BACKUP_FILE);
-    let orig = std::fs::read_to_string(&backup).unwrap_or_default();
+    let orig_text = std::fs::read_to_string(&backup).unwrap_or_default();
+    let orig = parse_config(&orig_text).unwrap_or_default();
     // `model` 也要恢复：留着我们的模型名，换回官方/别的 provider 后 Codex
     // 会因为「模型不存在」直接起不来
     for key in ["model_provider", "model_catalog_json", "model"] {
-        text = match get_top_level(&orig, key) {
-            Some(v) => set_top_level(&text, key, &format!("\"{v}\"")),
-            None => remove_top_level(&text, key),
-        };
+        match orig.get(key) {
+            // 原样搬回：原文是字符串就还是字符串，不重新拼引号
+            Some(item) => {
+                doc.insert(key, item.clone());
+            }
+            None => {
+                doc.remove(key);
+            }
+        }
     }
     // `[features]` 里我们改过的那几个开关，断开必须逐个还原：备份里原本没有这个键
-    // 就删掉它（表空了连表头一起删），有则按原文写回（原文可能是不带引号的布尔，
-    // 套上引号就变成了字符串，语义不同）。
-    text = restore_disabled_features(&text, &orig);
-    std::fs::write(&config, text).map_err(|e| format!("写 Codex 配置失败：{e}"))?;
+    // 就删掉它（表空了连表头一起删），有则按**原文的值类型**写回（布尔不能变成字符串）。
+    restore_disabled_features(&mut doc, &orig)?;
+    std::fs::write(&config, doc.to_string()).map_err(|e| format!("写 Codex 配置失败：{e}"))?;
     // 模型目录是我们生成的文件（固定文件名、只写不读别的），断开时一并清掉：
     // 留着它，下次换回官方 provider 后 Codex 里会多出一份「模型目录」残留。
     // 删不掉（被占用/权限）不算失败 —— 配置已经还原，一个孤儿 json 不致命。
@@ -355,12 +360,18 @@ pub fn pick_models(all: &[ChatModel], picked: &[String]) -> Result<Vec<(String, 
         .collect())
 }
 
-fn provider_block(port: u16, key: &str) -> String {
-    format!(
-        // 用 127.0.0.1 而不是 localhost：Windows 上 localhost 可能先解析到 ::1，
-        // 而网关只绑 127.0.0.1（IPv4），会连不上
-        "name = \"WorkBuddy2API\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{key}\""
-    )
+fn provider_table(port: u16, key: &str) -> Table {
+    let mut table = Table::new();
+    // 用 127.0.0.1 而不是 localhost：Windows 上 localhost 可能先解析到 ::1，
+    // 而网关只绑 127.0.0.1（IPv4），会连不上
+    table.insert("name", toml_edit::value("WorkBuddy2API"));
+    table.insert(
+        "base_url",
+        toml_edit::value(format!("http://127.0.0.1:{port}/v1")),
+    );
+    table.insert("wire_api", toml_edit::value("responses"));
+    table.insert("experimental_bearer_token", toml_edit::value(key));
+    table
 }
 
 /// 生成 Codex 的 `model_catalog_json`。
@@ -410,355 +421,125 @@ pub fn build_catalog(models: &[(String, String)], default_model: &str) -> String
 }
 
 // ---------------------------------------------------------------------------
-// 文本手术（纯函数，全部可测）
+// TOML 编辑（纯函数，全部可测）
 // ---------------------------------------------------------------------------
 
-/// 顶层键区域的字节长度：第一个 `[table]` 行之前的部分。
-fn head_span(text: &str) -> usize {
-    let mut off = 0;
-    for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with('[') {
-            return off;
-        }
-        off += line.len();
-    }
-    off
+/// 解析用户配置。解析失败必须让调用方报错，不能拿空文档覆盖原文件。
+fn parse_config(text: &str) -> Result<DocumentMut, String> {
+    text.parse::<DocumentMut>()
+        .map_err(|e| format!("Codex 配置不是有效的 TOML：{e}"))
 }
 
-fn is_key_line(line: &str, key: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') || t.starts_with('[') {
-        return false;
-    }
-    match t.split_once('=') {
-        Some((k, _)) => k.trim().trim_matches('"') == key,
-        None => false,
+fn top_level_str(doc: &DocumentMut, key: &str) -> Option<String> {
+    doc.get(key).and_then(Item::as_str).map(str::to_string)
+}
+
+fn provider_base_url(doc: &DocumentMut) -> Option<String> {
+    doc.get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|t| t.get(PROVIDER_ID))
+        .and_then(Item::as_table)
+        .and_then(|t| t.get("base_url"))
+        .and_then(Item::as_str)
+        .map(str::to_string)
+}
+
+fn set_top_level(doc: &mut DocumentMut, key: &str, val: &str) {
+    doc.insert(key, toml_edit::value(val));
+}
+
+/// 整段替换 `[model_providers.workbuddy2api]`；`model_providers` 下别的 provider 原样保留。
+fn upsert_provider(doc: &mut DocumentMut, port: u16, key: &str) -> Result<(), String> {
+    let providers = doc
+        .entry("model_providers")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or("Codex 配置里的 model_providers 不是表，无法写入网关 provider")?;
+    providers.insert(PROVIDER_ID, Item::Table(provider_table(port, key)));
+    Ok(())
+}
+
+/// 删掉网关 provider；`model_providers` 因此变空时连父表一起删。
+fn remove_provider(doc: &mut DocumentMut) {
+    let empty = {
+        let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) else {
+            return;
+        };
+        providers.remove(PROVIDER_ID);
+        providers.is_empty()
+    };
+    if empty {
+        doc.remove("model_providers");
     }
 }
 
-fn unquote(v: &str) -> &str {
-    let v = v.trim();
-    let bytes = v.as_bytes();
-    if bytes.len() >= 2 {
-        let (a, b) = (bytes[0], bytes[bytes.len() - 1]);
-        if (a == b'"' && b == b'"') || (a == b'\'' && b == b'\'') {
-            return &v[1..v.len() - 1];
-        }
-    }
-    v
+/// 表内设置一个键：表不存在就建，键已存在就替换值。
+fn set_table_key(doc: &mut DocumentMut, table: &str, key: &str, val: Item) -> Result<(), String> {
+    let t = doc
+        .entry(table)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("Codex 配置里的 [{table}] 不是表"))?;
+    t.insert(key, val);
+    Ok(())
 }
 
-/// 读一个顶层键（只在第一个表头之前找，避免把表里的同名键当成顶层键）
-fn get_top_level(text: &str, key: &str) -> Option<String> {
-    let span = head_span(text);
-    for line in text[..span].lines() {
-        if is_key_line(line, key) {
-            if let Some((_, v)) = line.split_once('=') {
-                return Some(unquote(v).to_string());
-            }
-        }
+/// 删表内的一个键；删完表体空了，连表头一起删。
+fn drop_table_key(doc: &mut DocumentMut, table: &str, key: &str) {
+    let empty = {
+        let Some(t) = doc.get_mut(table).and_then(Item::as_table_mut) else {
+            return;
+        };
+        t.remove(key);
+        t.is_empty()
+    };
+    if empty {
+        doc.remove(table);
     }
-    None
-}
-
-/// 设置一个顶层键：有就原地替换，没有就插在顶层区末尾
-fn set_top_level(text: &str, key: &str, val: &str) -> String {
-    let span = head_span(text);
-    let (head, rest) = text.split_at(span);
-    let mut lines: Vec<String> = Vec::new();
-    let mut found = false;
-    for line in head.lines() {
-        if is_key_line(line, key) {
-            lines.push(format!("{key} = {val}"));
-            found = true;
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-    if !found {
-        // 插在顶层键块的末尾（尾部空行**之前**）：跟在空行后面会让新键看起来
-        // 像是属于下一张表的
-        let mut at = lines.len();
-        while at > 0 && lines[at - 1].trim().is_empty() {
-            at -= 1;
-        }
-        lines.insert(at, format!("{key} = {val}"));
-    }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out.push_str(rest);
-    out
-}
-
-/// 删一个顶层键
-fn remove_top_level(text: &str, key: &str) -> String {
-    let span = head_span(text);
-    let (head, rest) = text.split_at(span);
-    let lines: Vec<&str> = head
-        .lines()
-        .filter(|l| !is_key_line(l, key))
-        .collect();
-    let mut out = lines.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(rest);
-    out
-}
-
-/// 读某张表里的一个键的**原文**（保留引号）—— 「原样写回」必须靠它：
-/// `apps = false` 是布尔、`"false"` 是字符串，去引号再写回去语义就变了。
-fn table_raw_value(text: &str, table: &str, key: &str) -> Option<String> {
-    let header = format!("[{table}]");
-    let mut inside = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            inside = t == header;
-            continue;
-        }
-        if inside && is_key_line(line, key) {
-            if let Some((_, v)) = line.split_once('=') {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 读某张表里的一个键（去掉引号）
-fn table_value(text: &str, table: &str, key: &str) -> Option<String> {
-    table_raw_value(text, table, key).map(|v| unquote(&v).to_string())
-}
-
-/// 在列表末尾、但**在尾部空行之前**插一行。
-///
-/// 跟在空行后面会让这一行看起来属于下一张表 —— TOML 里那等于把键写进了别的表。
-fn push_before_blanks(out: &mut Vec<String>, line: String) {
-    let mut at = out.len();
-    while at > 0 && out[at - 1].trim().is_empty() {
-        at -= 1;
-    }
-    out.insert(at, line);
-}
-
-/// 表内设置一个键：有就原地替换，没有就追加到表体末尾，表不存在就新建整张表。
-///
-/// 与 [`upsert_table`] 的分工：`[model_providers.workbuddy2api]` 是**我们自己的**表，
-/// 整段覆盖才对；`[features]` 是用户本来就有的表，只许碰 [`DISABLED_FEATURES`]
-/// 里的那几行 —— 整表替换会把用户开的其它 feature 一起吞掉。
-fn set_table_key(text: &str, table: &str, key: &str, val: &str) -> String {
-    let header = format!("[{table}]");
-    let mut out: Vec<String> = Vec::new();
-    let mut inside = false;
-    let mut done = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            // 这张表到头了：该键还没出现过就补在表体末尾（有空行则在空行之前）
-            if inside && !done {
-                push_before_blanks(&mut out, format!("{key} = {val}"));
-                done = true;
-            }
-            inside = t == header;
-            out.push(line.to_string());
-            continue;
-        }
-        if inside {
-            if is_key_line(line, key) {
-                if !done {
-                    out.push(format!("{key} = {val}"));
-                    done = true;
-                }
-                continue; // 同名的重复行丢掉，只留一行
-            }
-            out.push(line.to_string());
-            continue;
-        }
-        out.push(line.to_string());
-    }
-    if inside && !done {
-        push_before_blanks(&mut out, format!("{key} = {val}"));
-        done = true;
-    }
-    if !done {
-        if out.last().is_some_and(|l| !l.trim().is_empty()) {
-            out.push(String::new());
-        }
-        out.push(header);
-        out.push(format!("{key} = {val}"));
-    }
-    let mut s = out.join("\n");
-    s.push('\n');
-    s
-}
-
-/// 删表内的一个键；删完表体空了，连表头一起删 —— 空表是只在文件里多出来的东西。
-fn drop_table_key(text: &str, table: &str, key: &str) -> String {
-    let header = format!("[{table}]");
-    // 表头是最后压进去的一行 ⇒ 表体一行都没留下 ⇒ 连表头（与其前空行）一起摘掉。
-    //
-    // 表在**文件中间**时，表尾那几行空行是它与下一张表的分隔，得先收起来再判断：
-    // 只看 `last()` 会把「`[features]` 后面跟着空行 + `[analytics]`」判成「表体非空」，
-    // 结果在文件里留下一张空表头（2026-11-25 加 `[analytics]` 时踩到）。
-    fn prune(out: &mut Vec<String>, header: &str) {
-        let mut blanks = 0;
-        while out.last().is_some_and(|l| l.trim().is_empty()) {
-            out.pop();
-            blanks += 1;
-        }
-        if out.last().is_some_and(|l| l.trim() == header) {
-            out.pop();
-            while out.last().is_some_and(|l| l.trim().is_empty()) {
-                out.pop();
-            }
-            if blanks > 0 {
-                out.push(String::new()); // 中间的表：留一行空行给下一张表
-            }
-        } else if blanks > 0 {
-            for _ in 0..blanks {
-                out.push(String::new());
-            }
-        }
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut inside = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            if inside {
-                prune(&mut out, &header);
-            }
-            inside = t == header;
-            out.push(line.to_string());
-            continue;
-        }
-        if inside && is_key_line(line, key) {
-            continue;
-        }
-        out.push(line.to_string());
-    }
-    if inside {
-        prune(&mut out, &header);
-    }
-    while out.last().is_some_and(|l| l.trim().is_empty()) {
-        out.pop();
-    }
-    if out.is_empty() {
-        return String::new();
-    }
-    let mut s = out.join("\n");
-    s.push('\n');
-    s
 }
 
 /// 把 [`DISABLED_FEATURES`] 逐个写进 `[features]`、把 [`DISABLED_TABLES`] 写进各自的表：
 /// 只碰这几行，同表其它键（用户自己开的开关、别人的 analytics 设置）原样保留。
-fn apply_disabled_features(text: &str) -> String {
-    let acc = DISABLED_FEATURES
-        .iter()
-        .fold(text.to_string(), |acc, (key, val)| {
-            set_table_key(&acc, "features", key, val)
-        });
-    DISABLED_TABLES
-        .iter()
-        .fold(acc, |acc, (table, key, val)| {
-            set_table_key(&acc, table, key, val)
-        })
+fn apply_disabled_features(doc: &mut DocumentMut) -> Result<(), String> {
+    for &(key, val) in DISABLED_FEATURES.iter() {
+        set_table_key(doc, "features", key, toml_edit::value(val == "true"))?;
+    }
+    for &(table, key, val) in DISABLED_TABLES.iter() {
+        set_table_key(doc, table, key, toml_edit::value(val == "true"))?;
+    }
+    Ok(())
+}
+
+fn restore_table_key(
+    doc: &mut DocumentMut,
+    orig: &DocumentMut,
+    table: &str,
+    key: &str,
+) -> Result<(), String> {
+    let original = orig
+        .get(table)
+        .and_then(Item::as_table)
+        .and_then(|t| t.get(key))
+        .cloned();
+    match original {
+        Some(item) => set_table_key(doc, table, key, item),
+        None => {
+            drop_table_key(doc, table, key);
+            Ok(())
+        }
+    }
 }
 
 /// 按备份把 [`DISABLED_FEATURES`] 与 [`DISABLED_TABLES`] 逐个还原：原文里没有这个键就
-/// 删掉（表空了连表头一起删），有则按**原文**写回 —— 去引号再写会把布尔变成字符串。
-fn restore_disabled_features(text: &str, orig: &str) -> String {
-    let acc = DISABLED_FEATURES
-        .iter()
-        .fold(text.to_string(), |acc, (key, _)| {
-            match table_raw_value(orig, "features", key) {
-                Some(v) => set_table_key(&acc, "features", key, &v),
-                None => drop_table_key(&acc, "features", key),
-            }
-        });
-    DISABLED_TABLES
-        .iter()
-        .fold(acc, |acc, (table, key, _)| {
-            match table_raw_value(orig, table, key) {
-                Some(v) => set_table_key(&acc, table, key, &v),
-                None => drop_table_key(&acc, table, key),
-            }
-        })
-}
-
-/// 整段替换一张表（不存在就追加到文件末尾）
-fn upsert_table(text: &str, table: &str, body: &str) -> String {
-    let header = format!("[{table}]");
-    let mut out: Vec<String> = Vec::new();
-    let mut replaced = false;
-    let mut skipping = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t == header {
-            if !replaced {
-                out.push(header.clone());
-                for b in body.lines() {
-                    out.push(b.to_string());
-                }
-                replaced = true;
-            }
-            skipping = true;
-            continue;
-        }
-        if skipping {
-            if t.starts_with('[') {
-                skipping = false; // 落到下面照常输出
-            } else {
-                continue; // 丢掉旧表体
-            }
-        }
-        out.push(line.to_string());
+/// 删掉（表空了连表头一起删），有则按**原值**写回 —— 布尔不能变成字符串。
+fn restore_disabled_features(doc: &mut DocumentMut, orig: &DocumentMut) -> Result<(), String> {
+    for &(key, _) in DISABLED_FEATURES.iter() {
+        restore_table_key(doc, orig, "features", key)?;
     }
-    if !replaced {
-        if out.last().is_some_and(|l| !l.trim().is_empty()) {
-            out.push(String::new());
-        }
-        out.push(header);
-        for b in body.lines() {
-            out.push(b.to_string());
-        }
+    for &(table, key, _) in DISABLED_TABLES.iter() {
+        restore_table_key(doc, orig, table, key)?;
     }
-    let mut s = out.join("\n");
-    s.push('\n');
-    s
-}
-
-/// 整段删掉一张表
-fn remove_table(text: &str, table: &str) -> String {
-    let header = format!("[{table}]");
-    let mut out: Vec<String> = Vec::new();
-    let mut skipping = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t == header {
-            skipping = true;
-            continue;
-        }
-        if skipping {
-            if t.starts_with('[') {
-                skipping = false;
-            } else {
-                continue;
-            }
-        }
-        out.push(line.to_string());
-    }
-    while out.last().is_some_and(|l| l.trim().is_empty()) {
-        out.pop();
-    }
-    if out.is_empty() {
-        return String::new();
-    }
-    let mut s = out.join("\n");
-    s.push('\n');
-    s
+    Ok(())
 }
 
 #[cfg(test)]
@@ -795,121 +576,141 @@ enabled = true
         .to_string()
     }
 
-    #[test]
-    fn head_span_stops_at_the_first_table() {
-        let text = "a = 1\nb = 2\n\n[t]\nc = 3\n";
-        assert_eq!(&text[..head_span(text)], "a = 1\nb = 2\n\n");
+    fn parse(text: &str) -> DocumentMut {
+        parse_config(text).expect("测试配置必须是有效 TOML")
     }
 
     #[test]
-    fn head_span_of_a_table_only_file_is_zero() {
-        assert_eq!(head_span("[t]\na = 1\n"), 0);
+    fn state_values_come_from_the_top_level_and_provider_table() {
+        let doc = parse(
+            "model = \"outer\"\nmodel_provider = \"workbuddy2api\"\n\
+             [model_providers.workbuddy2api]\nbase_url = \"http://127.0.0.1:8790/v1\"\n\
+             [t]\nmodel = \"inside\"\n",
+        );
+        assert_eq!(top_level_str(&doc, "model").as_deref(), Some("outer"));
+        assert_eq!(
+            top_level_str(&doc, "model_provider").as_deref(),
+            Some(PROVIDER_ID)
+        );
+        assert_eq!(
+            provider_base_url(&doc).as_deref(),
+            Some("http://127.0.0.1:8790/v1")
+        );
     }
 
     #[test]
-    fn set_top_level_replaces_in_place() {
-        let out = set_top_level("a = 1\nmodel_provider = \"old\"\nb = 2\n", "model_provider", "\"new\"");
-        assert!(out.contains("model_provider = \"new\""));
-        assert!(!out.contains("\"old\""));
-        // 位置不变：还在 a 与 b 之间
-        assert_eq!(out.lines().nth(1).unwrap(), "model_provider = \"new\"");
-    }
-
-    #[test]
-    fn set_top_level_inserts_when_missing() {
-        let out = set_top_level("a = 1\n\n[t]\nb = 2\n", "model_provider", "\"wb\"");
-        assert_eq!(out, "a = 1\nmodel_provider = \"wb\"\n\n[t]\nb = 2\n");
+    fn same_named_key_inside_a_table_is_not_a_top_level_key() {
+        let doc = parse("[t]\nmodel = \"inside\"\n");
+        assert_eq!(top_level_str(&doc, "model"), None);
     }
 
     #[test]
     fn set_top_level_does_not_touch_same_named_key_inside_a_table() {
-        let text = "[t]\nmodel = \"inside\"\n";
-        let out = set_top_level(text, "model", "\"outside\"");
+        let mut doc = parse("[t]\nmodel = \"inside\"\n");
+        set_top_level(&mut doc, "model", "outside");
+        let out = doc.to_string();
         assert!(out.contains("model = \"inside\""), "表里的同名键不能改");
         assert!(out.contains("model = \"outside\""));
     }
 
     #[test]
-    fn get_top_level_ignores_table_values() {
-        let text = "[t]\nmodel = \"inside\"\n";
-        assert_eq!(get_top_level(text, "model"), None);
-        let text = "model = \"outer\"\n[t]\nmodel = \"inside\"\n";
-        assert_eq!(get_top_level(text, "model").as_deref(), Some("outer"));
+    fn top_level_reads_both_quote_styles() {
+        let doc = parse("a = \"x\"\nb = 'y'\nc = 3\n");
+        assert_eq!(top_level_str(&doc, "a").as_deref(), Some("x"));
+        assert_eq!(top_level_str(&doc, "b").as_deref(), Some("y"));
     }
 
     #[test]
-    fn unquotes_both_quote_styles() {
-        let text = "a = \"x\"\nb = 'y'\nc = 3\n";
-        assert_eq!(get_top_level(text, "a").as_deref(), Some("x"));
-        assert_eq!(get_top_level(text, "b").as_deref(), Some("y"));
-        assert_eq!(get_top_level(text, "c").as_deref(), Some("3"));
-    }
-
-    #[test]
-    fn upsert_table_replaces_only_that_table() {
-        let out = upsert_table(&real_config(), "model_providers.kiro2api", "name = \"replaced\"");
-        assert!(out.contains("[model_providers.kiro2api]\nname = \"replaced\""));
-        assert!(!out.contains("k2a-xxx"), "旧表体必须整段丢掉");
+    fn upsert_provider_replaces_only_that_table() {
+        let mut doc = parse(&real_config());
+        upsert_provider(&mut doc, 8790, "sk-wb-test").unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("[model_providers.workbuddy2api]"));
+        assert!(out.contains("base_url = \"http://127.0.0.1:8790/v1\""));
+        assert!(out.contains("experimental_bearer_token = \"sk-wb-test\""));
         // 邻居表原样保留
         assert!(out.contains("[model_providers.custom]"));
         assert!(out.contains("https://example.com/v1"));
+        assert!(out.contains("[model_providers.kiro2api]"));
+        assert!(out.contains("k2a-xxx"));
         assert!(out.contains("[plugins.\"browser@openai-bundled\"]"));
         assert!(out.contains("enabled = true"));
     }
 
     #[test]
-    fn upsert_table_appends_when_absent() {
-        let out = upsert_table(&real_config(), "model_providers.workbuddy2api", "name = \"new\"");
-        assert!(out.ends_with("[model_providers.workbuddy2api]\nname = \"new\"\n"));
-        assert!(out.contains("[model_providers.kiro2api]"), "已有的表不能被碰到");
+    fn upsert_provider_replaces_its_old_body() {
+        let mut doc = parse(&real_config());
+        upsert_provider(&mut doc, 8790, "old-key").unwrap();
+        upsert_provider(&mut doc, 8791, "new-key").unwrap();
+        let out = doc.to_string();
+        assert_eq!(out.matches("[model_providers.workbuddy2api]").count(), 1);
+        assert!(out.contains("http://127.0.0.1:8791/v1"));
+        assert!(!out.contains("old-key"), "旧表体必须整段丢掉");
     }
 
     #[test]
-    fn remove_table_leaves_neighbours_intact() {
-        let out = remove_table(&real_config(), "model_providers.kiro2api");
-        assert!(!out.contains("[model_providers.kiro2api]"));
-        assert!(!out.contains("k2a-xxx"));
+    fn remove_provider_leaves_neighbours_intact() {
+        let mut doc = parse(&real_config());
+        upsert_provider(&mut doc, 8790, "sk-wb-test").unwrap();
+        remove_provider(&mut doc);
+        let out = doc.to_string();
+        assert!(!out.contains("workbuddy2api"));
+        assert!(out.contains("[model_providers.kiro2api]"));
+        assert!(out.contains("k2a-xxx"));
         assert!(out.contains("[windows]\nsandbox = \"elevated\""));
-        assert!(out.contains("model_provider = \"kiro2api\""), "顶层键不归 remove_table 管");
-    }
-
-    #[test]
-    fn remove_top_level_drops_the_line() {
-        let out = remove_top_level("a = 1\nmodel_catalog_json = \"x.json\"\n[t]\nb = 2\n", "model_catalog_json");
-        assert!(!out.contains("model_catalog_json"));
-        assert!(out.contains("[t]\nb = 2"));
+        assert!(
+            out.contains("model_provider = \"kiro2api\""),
+            "顶层键不归 remove_provider 管"
+        );
     }
 
     /// 接入 → 断开 必须回到原样（这是"改了用户文件"的最低要求）
     #[test]
     fn connect_then_disconnect_restores_the_original_top_level_keys() {
-        let orig = real_config();
-        let mut t = orig.clone();
-        t = upsert_table(&t, "model_providers.workbuddy2api", &provider_block(8790, "sk-wb-1"));
-        t = set_top_level(&t, "model_provider", "\"workbuddy2api\"");
-        t = set_top_level(&t, "model_catalog_json", "\"workbuddy2api-model-catalog.json\"");
-        t = set_top_level(&t, "model", "\"hy4flash-free\"");
+        let orig_text = real_config();
+        let orig = parse(&orig_text);
+        let mut doc = parse(&orig_text);
+        apply_disabled_features(&mut doc).unwrap();
+        upsert_provider(&mut doc, 8790, "sk-wb-1").unwrap();
+        set_top_level(&mut doc, "model_provider", PROVIDER_ID);
+        set_top_level(&mut doc, "model_catalog_json", CATALOG_FILE);
+        set_top_level(&mut doc, "model", "hy4flash-free");
 
-        assert_eq!(get_top_level(&t, "model_provider").as_deref(), Some("workbuddy2api"));
-        assert_eq!(table_value(&t, "model_providers.workbuddy2api", "base_url").as_deref(), Some("http://127.0.0.1:8790/v1"));
+        assert_eq!(
+            top_level_str(&doc, "model_provider").as_deref(),
+            Some(PROVIDER_ID)
+        );
+        assert_eq!(
+            provider_base_url(&doc).as_deref(),
+            Some("http://127.0.0.1:8790/v1")
+        );
 
         // 断开
-        let mut back = remove_table(&t, "model_providers.workbuddy2api");
+        remove_provider(&mut doc);
         for key in ["model_provider", "model_catalog_json", "model"] {
-            back = match get_top_level(&orig, key) {
-                Some(v) => set_top_level(&back, key, &format!("\"{v}\"")),
-                None => remove_top_level(&back, key),
-            };
+            match orig.get(key) {
+                Some(item) => {
+                    doc.insert(key, item.clone());
+                }
+                None => {
+                    doc.remove(key);
+                }
+            }
         }
+        restore_disabled_features(&mut doc, &orig).unwrap();
         for key in ["model_provider", "model_catalog_json", "model"] {
-            assert_eq!(get_top_level(&back, key), get_top_level(&orig, key), "{key} 没恢复");
+            assert_eq!(
+                top_level_str(&doc, key),
+                top_level_str(&orig, key),
+                "{key} 没恢复"
+            );
         }
-        assert!(!back.contains("workbuddy2api"));
+        assert!(!doc.to_string().contains("workbuddy2api"));
     }
 
     #[test]
-    fn provider_block_pins_ipv4_loopback() {
-        let b = provider_block(8790, "sk-wb-abc");
+    fn provider_table_pins_ipv4_loopback() {
+        let b = provider_table(8790, "sk-wb-abc").to_string();
         assert!(b.contains("http://127.0.0.1:8790/v1"));
         assert!(!b.contains("localhost"), "Windows 上 localhost 可能先走 ::1");
         assert!(b.contains("wire_api = \"responses\""));
@@ -988,47 +789,53 @@ enabled = true
 
     #[test]
     fn set_table_key_replaces_only_that_key() {
-        let out = set_table_key(&config_with_features(), "features", "apps", "false");
-        assert!(
-            out.contains("[features]\napps = false\nmulti_agent = true\n"),
-            "{out}"
-        );
+        let mut doc = parse(&config_with_features());
+        set_table_key(&mut doc, "features", "apps", toml_edit::value(false)).unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("apps = false"), "{out}");
         assert!(!out.contains("apps = true"), "旧值必须被替换掉：\n{out}");
+        assert!(
+            out.contains("multi_agent = true"),
+            "用户自己的开关被吞了：\n{out}"
+        );
     }
 
     #[test]
     fn set_table_key_appends_when_the_key_is_missing() {
-        // 表在、键不在（用户开了别的 feature，但没写 apps）
-        let src = "[features]\nmulti_agent = true\n\n[windows]\nsandbox = \"elevated\"\n";
-        let out = set_table_key(src, "features", "apps", "false");
-        // 必须插在空行**之前** —— 跟在空行后面就成了 `[windows]` 的键
-        assert_eq!(
-            out,
-            "[features]\nmulti_agent = true\napps = false\n\n[windows]\nsandbox = \"elevated\"\n"
-        );
+        let mut doc =
+            parse("[features]\nmulti_agent = true\n\n[windows]\nsandbox = \"elevated\"\n");
+        set_table_key(&mut doc, "features", "apps", toml_edit::value(false)).unwrap();
+        let features = doc.get("features").and_then(Item::as_table).unwrap();
+        assert_eq!(features.get("apps").and_then(Item::as_bool), Some(false));
+        let windows = doc.get("windows").and_then(Item::as_table).unwrap();
+        assert!(windows.get("apps").is_none(), "apps 不能写进 windows 表");
     }
 
     #[test]
     fn set_table_key_creates_the_table_when_absent() {
-        let out = set_table_key("model = \"x\"\n", "features", "apps", "false");
-        assert_eq!(out, "model = \"x\"\n\n[features]\napps = false\n");
+        let mut doc = parse("model = \"x\"\n");
+        set_table_key(&mut doc, "features", "apps", toml_edit::value(false)).unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("[features]"), "{out}");
+        assert!(out.contains("apps = false"), "{out}");
     }
 
     #[test]
     fn drop_table_key_keeps_the_table_when_others_remain() {
-        let src = "[features]\napps = false\nmulti_agent = true\n\n[windows]\nsandbox = \"elevated\"\n";
-        let out = drop_table_key(src, "features", "apps");
-        assert_eq!(
-            out,
-            "[features]\nmulti_agent = true\n\n[windows]\nsandbox = \"elevated\"\n"
-        );
+        let mut doc = parse("[features]\napps = false\nmulti_agent = true\n");
+        drop_table_key(&mut doc, "features", "apps");
+        assert!(doc.get("features").is_some());
+        let out = doc.to_string();
+        assert!(!out.contains("apps ="), "{out}");
+        assert!(out.contains("multi_agent = true"), "{out}");
     }
 
     #[test]
     fn drop_table_key_removes_the_emptied_table() {
-        // 这个键是我们加的、表里原本没别的 → 表头也要一起删，不留空表
-        let out = drop_table_key("model = \"x\"\n\n[features]\napps = false\n", "features", "apps");
-        assert_eq!(out, "model = \"x\"\n");
+        let mut doc = parse("model = \"x\"\n\n[features]\napps = false\n");
+        drop_table_key(&mut doc, "features", "apps");
+        assert!(doc.get("features").is_none(), "不该留一张空表");
+        assert!(!doc.to_string().contains("[features]"));
     }
 
     /// 三个受管开关都要落进 `[features]`，且用户自己开的开关一个都不能少。
@@ -1037,14 +844,19 @@ enabled = true
     /// 去打 chatgpt.com，访问不到的机器上就是「一直正在思考」。
     #[test]
     fn apply_disabled_features_writes_all_three_and_keeps_user_switches() {
-        let out = apply_disabled_features(&config_with_features());
+        let mut doc = parse(&config_with_features());
+        apply_disabled_features(&mut doc).unwrap();
+        let out = doc.to_string();
         for (key, val) in DISABLED_FEATURES {
             assert!(
                 out.contains(&format!("{key} = {val}")),
                 "{key} 没写进去：\n{out}"
             );
         }
-        assert!(out.contains("multi_agent = true"), "用户自己的开关被吞了：\n{out}");
+        assert!(
+            out.contains("multi_agent = true"),
+            "用户自己的开关被吞了：\n{out}"
+        );
         assert_eq!(out.matches("[features]").count(), 1, "不该重复建表：\n{out}");
     }
 
@@ -1054,51 +866,71 @@ enabled = true
     fn apply_disabled_features_also_disables_analytics_table() {
         for (table, key, val) in DISABLED_TABLES {
             // 没有这张表 → 建表
-            let out = apply_disabled_features("model = \"x\"\n");
+            let mut doc = parse("model = \"x\"\n");
+            apply_disabled_features(&mut doc).unwrap();
+            let out = doc.to_string();
             assert!(
-                out.contains(&format!("[{table}]\n{key} = {val}")),
+                out.contains(&format!("[{table}]")),
                 "没建出 [{table}]：\n{out}"
             );
-            // 表在、里面有用户自己的键 → 只加我们这行
-            let src = format!("[{table}]\nsome_user_key = true\n");
-            let out = apply_disabled_features(&src);
-            assert!(out.contains("some_user_key = true"), "用户自己的键被吞了：\n{out}");
             assert!(out.contains(&format!("{key} = {val}")), "没写进去：\n{out}");
-            assert_eq!(out.matches(&format!("[{table}]")).count(), 1, "重复建表：\n{out}");
+            // 表在、里面有用户自己的键 → 只加我们这行
+            let mut doc = parse(&format!("[{table}]\nsome_user_key = true\n"));
+            apply_disabled_features(&mut doc).unwrap();
+            let t = doc.get(table).and_then(Item::as_table).unwrap();
+            assert_eq!(t.get("some_user_key").and_then(Item::as_bool), Some(true));
+            assert_eq!(t.get(key).and_then(Item::as_bool), Some(false));
+            assert_eq!(doc.to_string().matches(&format!("[{table}]")).count(), 1);
         }
     }
 
     /// 重复接入不能把同一行写两遍（第二次接入门槛最低，最容易出这事）
     #[test]
     fn apply_disabled_features_is_idempotent() {
-        let once = apply_disabled_features(&real_config());
-        let twice = apply_disabled_features(&once);
-        assert_eq!(once, twice);
+        let mut once = parse(&real_config());
+        apply_disabled_features(&mut once).unwrap();
+        let once = once.to_string();
+        let mut twice = parse(&once);
+        apply_disabled_features(&mut twice).unwrap();
+        assert_eq!(once, twice.to_string());
         for (key, _) in DISABLED_FEATURES {
-            assert_eq!(twice.matches(&format!("{key} = ")).count(), 1, "{key} 重复了：\n{twice}");
+            assert_eq!(
+                once.matches(&format!("{key} = ")).count(),
+                1,
+                "{key} 重复了：\n{once}"
+            );
         }
         for (_, key, val) in DISABLED_TABLES {
             assert_eq!(
-                twice.matches(&format!("{key} = {val}")).count(),
+                once.matches(&format!("{key} = {val}")).count(),
                 1,
-                "{key} 重复了：\n{twice}"
+                "{key} 重复了：\n{once}"
             );
         }
     }
 
-    /// 断开：原文没有的键删掉、有的按原文写回；表里只剩用户自己的开关
+    /// 断开：原文没有的键删掉、有的按原值写回；表里只剩用户自己的开关
     #[test]
-    fn restore_disabled_features_follows_the_backup_byte_for_byte() {
-        let orig = "[features]\napps = true\nmulti_agent = true\n";
-        let connected = apply_disabled_features(orig);
-        let back = restore_disabled_features(&connected, orig);
-        assert_eq!(back, "[features]\napps = true\nmulti_agent = true\n");
+    fn restore_disabled_features_follows_the_backup() {
+        let orig_text = "[features]\napps = true\nmulti_agent = true\n";
+        let orig = parse(orig_text);
+        let mut doc = parse(orig_text);
+        apply_disabled_features(&mut doc).unwrap();
+        restore_disabled_features(&mut doc, &orig).unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("apps = true"), "{out}");
+        assert!(!out.contains("apps = false"), "{out}");
+        assert!(out.contains("multi_agent = true"), "{out}");
 
-        // 原文根本没有 `[features]` → 三个键全删，表头一起消失
-        // （用「表里只有我们写的键」的文本，否则用户自己的开关会留下，表头也必须留）
-        let connected = apply_disabled_features("model = \"x\"\n");
-        let back = restore_disabled_features(&connected, "model = \"x\"\n");
-        assert_eq!(back, "model = \"x\"\n");
+        // 原文根本没有 `[features]` / `[analytics]` → 三个键全删，表头一起消失
+        let orig = parse("model = \"x\"\n");
+        let mut doc = parse("model = \"x\"\n");
+        apply_disabled_features(&mut doc).unwrap();
+        restore_disabled_features(&mut doc, &orig).unwrap();
+        let out = doc.to_string();
+        assert!(!out.contains("[features]"), "{out}");
+        assert!(!out.contains("[analytics]"), "{out}");
+        assert!(out.contains("model = \"x\""), "{out}");
     }
 
     /// 接入把三个「要 ChatGPT 账号」的 feature 都关掉，且**不**碰已废弃的
@@ -1306,12 +1138,20 @@ enabled = true
             println!("读不到 {}", path.display());
             return;
         };
-        let mut after = text.clone();
-        after = apply_disabled_features(&after);
-        after = upsert_table(&after, &format!("model_providers.{PROVIDER_ID}"), &provider_block(8790, "sk-wb-preview"));
-        after = set_top_level(&after, "model_provider", &format!("\"{PROVIDER_ID}\""));
-        after = set_top_level(&after, "model_catalog_json", &format!("\"{CATALOG_FILE}\""));
-        after = set_top_level(&after, "model", "\"hy4flash-free\"");
+        let mut doc = match parse_config(&text) {
+            Ok(doc) => doc,
+            Err(e) => {
+                println!("{e}");
+                return;
+            }
+        };
+        let orig = doc.clone();
+        apply_disabled_features(&mut doc).unwrap();
+        upsert_provider(&mut doc, 8790, "sk-wb-preview").unwrap();
+        set_top_level(&mut doc, "model_provider", PROVIDER_ID);
+        set_top_level(&mut doc, "model_catalog_json", CATALOG_FILE);
+        set_top_level(&mut doc, "model", "hy4flash-free");
+        let after = doc.to_string();
 
         let a: Vec<&str> = text.lines().collect();
         let b: Vec<&str> = after.lines().collect();
@@ -1328,11 +1168,13 @@ enabled = true
         }
         println!("=== 断开应恢复成 ===");
         for k in ["model_provider", "model_catalog_json", "model"] {
-            println!("{k} = {:?}", get_top_level(&text, k));
+            println!("{k} = {:?}", top_level_str(&orig, k));
         }
         println!(
             "features.apps = {:?}（原文；原来是 None 就删掉这个键）",
-            table_raw_value(&text, "features", "apps")
+            orig.get("features")
+                .and_then(Item::as_table)
+                .and_then(|t| t.get("apps"))
         );
     }
 

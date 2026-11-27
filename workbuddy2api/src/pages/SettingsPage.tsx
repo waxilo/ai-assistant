@@ -18,8 +18,8 @@ import Switch from "../components/Switch";
  * 「设置」页：定时签到 / 通知 / 风控 / 自启动等常规配置。
  *
  * 卡片式分组布局：每个主题一张卡，每条设置左右分栏（左侧标题 + 说明，右侧控件），
- * 开关统一用 .switch 切换。网络急救作为一张卡收敛在本页底部（见 NetfixCard），
- * 智能接管仍独立成页；接管相关字段（proxy_* / billing_account_ids）本页没有编辑权，保存时原样透传。
+ * 开关统一用 .switch 切换。网关的扣费账号列表在「API 接入」页维护，
+ * 本页没有编辑权，保存时原样透传。
  *
  * 简报的**开关**在「积分简报」页（那一页才是它的主场），本页只留它的
  * **推送开关**并与两条签到通知并排 —— 「哪些东西会推送」集中在一处才看得清。
@@ -80,13 +80,13 @@ export function SettingsPage({
   const [autostart, setAutostartOn] = useState<boolean | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
 
-  // 当前草稿：含其它页托管的字段（proxy_* / billing_account_ids 等），原样透传，
-  // 每次改动都基于它合并后自动保存，避免覆盖「智能接管」页改过的值。
+  // 当前草稿：含其它页托管的字段（billing_account_ids 等），原样透传，
+  // 每次改动都基于它合并后自动保存，避免覆盖「API 接入」页改过的值。
   const draftRef = useRef<Settings>({ ...settings });
   const saveTimer = useRef<number | null>(null);
 
-  // 外部来源改了 settings 时要同步草稿：网络急救的「一键恢复」会安全关闭智能接管并落盘，
-  // 若草稿仍攥着旧的 proxy_enabled=true，用户随后改任意一项都会把它写回去——等于把反代「复活」。
+  // 外部来源改了 settings 时要同步草稿：其它页面可能改了扣费账号或网关设置并落盘，
+  // 若草稿仍攥着旧值，用户随后改任意一项都会把它写回去。
   // 保存走的是 setSettings(服务端返回值)，这里同步到的始终是权威值，不会覆盖正在编辑的内容
   //（patch 用闭包里的 next 落盘，不依赖同步时机）。
   useEffect(() => {
