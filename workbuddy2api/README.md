@@ -62,8 +62,8 @@ npm run tauri build
 macOS universal + Windows NSIS 并更新 `workbuddy2api-latest` 通道。
 
 ```bash
-git tag workbuddy2api-v0.2.10
-git push origin workbuddy2api-v0.2.10
+git tag workbuddy2api-v0.2.11
+git push origin workbuddy2api-v0.2.11
 ```
 
 ---
